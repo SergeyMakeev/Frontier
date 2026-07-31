@@ -6,7 +6,16 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 option(HLOD_BUILD_TESTS "Build unit tests" ON)
 option(HLOD_BUILD_BENCH "Build performance tests" ON)
-option(HLOD_AVX2 "Enable AVX2 code generation" ON)
+option(HLOD_AVX2 "Enable AVX2 code generation (x86-64 only)" ON)
+option(HLOD_FORCE_SCALAR "Disable SIMD intrinsics; use the portable scalar paths" OFF)
+
+# AVX2 flags only make sense on x86-64; other architectures pick their SIMD
+# path (NEON on arm64, SSE2 baseline on x86) automatically in math.h.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|x64)$")
+    set(HLOD_ARCH_X64 TRUE)
+else()
+    set(HLOD_ARCH_X64 FALSE)
+endif()
 
 # ---- core library -----------------------------------------------------------
 add_library(hlod STATIC
@@ -17,14 +26,18 @@ target_include_directories(hlod PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
 if(MSVC)
     target_compile_options(hlod PRIVATE /W4 /permissive-)
-    if(HLOD_AVX2)
+    if(HLOD_AVX2 AND HLOD_ARCH_X64 AND NOT HLOD_FORCE_SCALAR)
         target_compile_options(hlod PUBLIC /arch:AVX2)
     endif()
 else()
     target_compile_options(hlod PRIVATE -Wall -Wextra)
-    if(HLOD_AVX2)
+    if(HLOD_AVX2 AND HLOD_ARCH_X64 AND NOT HLOD_FORCE_SCALAR)
         target_compile_options(hlod PUBLIC -mavx2 -mfma)
     endif()
+endif()
+
+if(HLOD_FORCE_SCALAR)
+    target_compile_definitions(hlod PUBLIC HLOD_FORCE_SCALAR=1)
 endif()
 
 # ---- external deps via FetchContent ------------------------------------------

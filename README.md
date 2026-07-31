@@ -1,5 +1,7 @@
 # HLodTree
 
+[![CI](https://github.com/SergeyMakeev/HLod-tree/actions/workflows/ci.yml/badge.svg)](https://github.com/SergeyMakeev/HLod-tree/actions/workflows/ci.yml)
+
 External hierarchical-LOD cut selection, implemented from `hlod_design.md`.
 See `ARCHITECTURE.md` for the implemented architecture, why it is fast, and
 the journal of optimization experiments (including the failed ones).
@@ -41,7 +43,24 @@ ctest --test-dir build -C Release          # unit tests
 build\bench\Release\hlod_bench.exe         # performance tests
 ```
 
-Options: `-DHLOD_BUILD_TESTS=OFF`, `-DHLOD_BUILD_BENCH=OFF`, `-DHLOD_AVX2=OFF`.
+Options: `-DHLOD_BUILD_TESTS=OFF`, `-DHLOD_BUILD_BENCH=OFF`, `-DHLOD_AVX2=OFF`,
+`-DHLOD_FORCE_SCALAR=ON`.
+
+### SIMD support
+
+`math.h` picks its wide (8-lane) implementation at compile time:
+
+| Backend | Selected when |
+|---|---|
+| AVX2 + FMA | `-DHLOD_AVX2=ON` (default) on x86-64 |
+| NEON | any 64-bit ARM target (Apple Silicon, Windows/Linux arm64) |
+| SSE2 (SSE4.1 blends when available) | x86 targets without AVX2 (`-DHLOD_AVX2=OFF`) |
+| scalar loops | `-DHLOD_FORCE_SCALAR=ON`, or any other architecture |
+
+All backends produce bit-identical results to the scalar reference paths;
+CI (`.github/workflows/ci.yml`) runs the unit and performance tests across
+Linux/Windows/macOS on x86-64 and arm64 with GCC, Clang, MSVC, clang-cl and
+AppleClang, covering every backend.
 
 ## Dependencies
 

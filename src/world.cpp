@@ -972,21 +972,16 @@ void World::selectCut(const CullView& view, const CutParams& params, ViewScratch
     const size_t nVis = visibleTmp_.size();
     auto prefetchStages = [&](size_t i)
     {
-#if HLOD_AVX2
         if (i + 2 < nVis)
-            _mm_prefetch(reinterpret_cast<const char*>(&instances_[visibleTmp_[i + 2].first]),
-                         _MM_HINT_T0);
+            HLOD_PREFETCH(&instances_[visibleTmp_[i + 2].first]);
         if (i + 1 < nVis)
         {
             const Instance& next = instances_[visibleTmp_[i + 1].first];
             const PageRt& nrt = slots_[next.rootSlot];
-            _mm_prefetch(reinterpret_cast<const char*>(nrt.page.wide.data()), _MM_HINT_T0);
-            _mm_prefetch(reinterpret_cast<const char*>(nrt.page.meta.data()), _MM_HINT_T0);
-            _mm_prefetch(reinterpret_cast<const char*>(nrt.page.payload.data()), _MM_HINT_T0);
+            HLOD_PREFETCH(nrt.page.wide.data());
+            HLOD_PREFETCH(nrt.page.meta.data());
+            HLOD_PREFETCH(nrt.page.payload.data());
         }
-#else
-        (void)i;
-#endif
     };
 
     for (size_t i = 0; i < nVis; ++i)
