@@ -117,8 +117,74 @@ jobs:
                    --benchmark_out=bench-${{ matrix.name }}.json \
                    --benchmark_out_format=json
 
+      # Short retention: these are merged into the single bench-all artifact
+      # by the collect-bench job below.
       - name: Upload benchmark results
         uses: actions/upload-artifact@v4
         with:
           name: bench-${{ matrix.name }}
           path: bench-${{ matrix.name }}.json
+          retention-days: 3
+
+  collect-bench:
+    name: collect-bench-results
+    needs: build-test
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all benchmark artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: bench-*
+          merge-multiple: true
+          path: bench
+
+      - name: Merge results
+        shell: python
+        run: |
+          import csv, glob, json, os
+
+          rows = {}       # benchmark name -> {config: cpu_time in us}
+          configs = []
+          merged = {}
+          scale = {"ns": 1e-3, "us": 1.0, "ms": 1e3, "s": 1e6}
+
+          for path in sorted(glob.glob("bench/bench-*.json")):
+              cfg = os.path.basename(path)[len("bench-"):-len(".json")]
+              configs.append(cfg)
+              with open(path) as f:
+                  data = json.load(f)
+              merged[cfg] = data
+              for b in data.get("benchmarks", []):
+                  if b.get("run_type") == "aggregate":
+                      continue
+                  us = b["cpu_time"] * scale[b.get("time_unit", "ns")]
+                  rows.setdefault(b["name"], {})[cfg] = us
+
+          with open("bench-all.json", "w") as f:
+              json.dump(merged, f, indent=1)
+
+          with open("bench-all.csv", "w", newline="") as f:
+              w = csv.writer(f)
+              w.writerow(["benchmark (cpu_time, us)"] + configs)
+              for name, per in rows.items():
+                  w.writerow([name] +
+                             [format(per[c], ".4g") if c in per else "" for c in configs])
+
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "w") as f:
+              f.write("## Benchmark results (cpu_time, microseconds)\n\n")
+              f.write("Full data: `bench-all` artifact "
+                      "(bench-all.csv / bench-all.json).\n\n")
+              f.write("| benchmark | " + " | ".join(configs) + " |\n")
+              f.write("|---" * (len(configs) + 1) + "|\n")
+              for name, per in rows.items():
+                  cells = [format(per[c], ".4g") if c in per else "" for c in configs]
+                  f.write("| " + name + " | " + " | ".join(cells) + " |\n")
+
+      - name: Upload combined results
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-all
+          path: |
+            bench-all.json
+            bench-all.csv
