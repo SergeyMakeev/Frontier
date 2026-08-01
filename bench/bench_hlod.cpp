@@ -340,6 +340,7 @@ static void BM_MovingInstances(benchmark::State& state)
     ViewScratch s;
     Outputs o;
     const CutParams p{4.0f, 0.1f, 0.0f};
+    XorShift32 fast;
 
     float t = 0.0f;
     size_t cursor = 0;
@@ -349,7 +350,8 @@ static void BM_MovingInstances(benchmark::State& state)
         for (int m = 0; m < movers; ++m)
         {
             w.moveInstance(insts[cursor++ % insts.size()],
-                           float4::point(uni(rng), 0, uni(rng)));
+                           float4::point(fast.uniform(-area, area), 0,
+                                         fast.uniform(-area, area)));
         }
         const CullView v = orbitView(t, area * 0.4f);
         w.beginFrame();
@@ -541,8 +543,7 @@ static void BM_MovingLeafNodes(benchmark::State& state)
         for (uint32_t i : leafIdx) leaves.push_back(nodeAt(inst.rootPage, i));
     }
 
-    std::mt19937 rng(31337);
-    std::uniform_real_distribution<float> uni(-900.0f, 900.0f);
+    XorShift32 rng;
     const int movers = int(state.range(0));
 
     ViewScratch s;
@@ -558,7 +559,9 @@ static void BM_MovingLeafNodes(benchmark::State& state)
         {
             const NodeHandle h = leaves[cursor++ % leaves.size()];
             w.setNodeBounds(h, AABB::fromCenterExtent(
-                                   float4::vec(uni(rng), uni(rng) * 0.1f, uni(rng)),
+                                   float4::vec(rng.uniform(-900, 900),
+                                               rng.uniform(-90, 90),
+                                               rng.uniform(-900, 900)),
                                    float4::vec(2, 2, 2)));
         }
         const CullView v = orbitView(t, 2500.0f);
@@ -688,7 +691,8 @@ static void BM_Combined_KitchenSink(benchmark::State& state)
         {
             const size_t i = propCursor++ % props.size();
             if (m < 5)
-                propHome[i] = float4::point(uni(rng), 0, uni(rng));
+                propHome[i] = float4::point(fast.uniform(-half, half), 0,
+                                            fast.uniform(-half, half));
             const float4 d = float4::vec(fast.uniform(-10, 10), 0,
                                          fast.uniform(-10, 10));
             w.moveInstance(props[i], propHome[i] + d);
@@ -1079,6 +1083,7 @@ static void BM_CameraTeleport_ColdFrame(benchmark::State& state)
     ViewScratch s;
     std::vector<CutEntry> cut;
     const CutParams p{4.0f, 0.1f, 1.0f};
+    XorShift32 fast;
 
     double steadyNs = 0, teleportNs = 0;
     size_t steadyFrames = 0, teleportFrames = 0;
@@ -1088,7 +1093,8 @@ static void BM_CameraTeleport_ColdFrame(benchmark::State& state)
     {
         t += 0.01f;
         const bool jump = ((steadyFrames + teleportFrames) % 16) == 15;
-        if (jump) center = float4::point(uni(rng), 0, uni(rng));
+        if (jump) center = float4::point(fast.uniform(-half, half), 0,
+                                         fast.uniform(-half, half));
         const CullView v = orbitView(t, 400.0f, center);
 
         const auto t0 = clock::now();
@@ -1495,3 +1501,43 @@ static void BM_Adversarial_DeepPageChain(benchmark::State& state)
     state.counters["cut"] = double(cut.size());
 }
 BENCHMARK(BM_Adversarial_DeepPageChain)->Unit(benchmark::kMicrosecond);
+
+// ---------------------------------------------------------------------------
+// Harness self-check: the cost of the random numbers themselves, arg = draws
+// per iteration. Measures the generator, not the library.
+//
+// std::uniform_real_distribution over libstdc++ is pathologically slow under
+// clang: generate_canonical() computes logl() of a constant, which GCC folds
+// at compile time but clang calls at runtime, per sample — ~90 ns on x86-64
+// (x87 fp80) and ~480 ns on aarch64 where long double is software binary128
+// (llvm/llvm-project#19916). BM_MovingLeafNodes/10000 used to draw 30k such
+// samples per frame inside its timed loop, which made it look 6-25x slower
+// on linux-clang. All timed loops now use XorShift32; these two benches keep
+// the harness cost visible so a regression of this kind is obvious.
+// ---------------------------------------------------------------------------
+static void BM_Harness_StdUniformReal(benchmark::State& state)
+{
+    std::mt19937 rng(31337);
+    std::uniform_real_distribution<float> uni(-900.0f, 900.0f);
+    const int draws = int(state.range(0));
+    float acc = 0.0f;
+    for (auto _ : state)
+    {
+        for (int i = 0; i < draws; ++i) acc += uni(rng);
+        benchmark::DoNotOptimize(acc);
+    }
+}
+BENCHMARK(BM_Harness_StdUniformReal)->Arg(30000)->Unit(benchmark::kMicrosecond);
+
+static void BM_Harness_XorShift(benchmark::State& state)
+{
+    XorShift32 rng;
+    const int draws = int(state.range(0));
+    float acc = 0.0f;
+    for (auto _ : state)
+    {
+        for (int i = 0; i < draws; ++i) acc += rng.uniform(-900.0f, 900.0f);
+        benchmark::DoNotOptimize(acc);
+    }
+}
+BENCHMARK(BM_Harness_XorShift)->Arg(30000)->Unit(benchmark::kMicrosecond);
