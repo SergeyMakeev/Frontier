@@ -66,5 +66,5 @@ AppleClang, covering every backend.
 
 | Package | Version | Use |
 |---|---|---|
-| GoogleTest | v1.17.0 | unit tests |
+| GoogleTest | v1.17.0 + `fa8438ae` (clang 21 build fix) | unit tests |
 | Google Benchmark | v1.9.4 | performance tests |

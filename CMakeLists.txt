@@ -47,8 +47,9 @@ if(HLOD_BUILD_TESTS)
     FetchContent_Declare(
         googletest
         GIT_REPOSITORY https://github.com/google/googletest.git
-        GIT_TAG        v1.17.0
-        GIT_SHALLOW    TRUE
+        # v1.17.0 + fa8438ae: fixes a -Wcharacter-conversion error in
+        # gtest-printers.h that breaks the build with clang >= 21 / clang-cl.
+        GIT_TAG        fa8438ae6b70c57010177de47a9f13d7041a6328
     )
     # Required on Windows: match the parent project's CRT.
     set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
