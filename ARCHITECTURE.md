@@ -79,6 +79,7 @@ benchmarks; fixed-trajectory `SelectionContext` cases use 600 iterations.
 | `DeepTree_CutOnly/6` | 1.72 ms | 2.4M nodes authored; 259,933 cut entries |
 | `SelectionContext_FlyThrough/20000`, stateless | 0.486 ms selection | 8,587 average cut entries |
 | Same 20k case, contextual | 0.121 ms selection | 94.8% instances reused; 2.91 MiB context |
+| 10k instances, 700 assets, moving camera / 1k moving | 0.118 ms selection | 82.4% reused; 27.8% visible; 5,920-entry cut |
 | 80k instances, moving camera / static objects | 0.40 ms selection | 97.6% reused; 24,986-entry cut |
 | 80k instances, moving camera / 5% moving | 0.50 ms selection | 92.6% reused; 24,986-entry cut |
 | Same 80k cases, six nearby views | 3.32 / 3.84 ms total selection | static / 5% moving; one context per view |

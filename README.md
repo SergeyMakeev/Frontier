@@ -122,6 +122,28 @@ same movers do not periodically force a rebuild merely by moving every frame.
 If enough different instances escape, or accumulated lane area grows too far,
 the next query repairs the TLAS and that call is intentionally more expensive.
 
+### Smaller 10,000-instance world
+
+The smaller test uses 10,000 instances spread over a roughly 2.4 km square.
+They draw from 700 separately registered, fully resident 85-node assets with
+maximum depth 3, instead of sharing one asset across the entire world. The
+moving-object cases update exactly 1,000 instances per frame. Creating and
+populating this world takes 12.4 ms; its first `selectCut`, including the
+initial quality TLAS build and context population, takes 5.08-5.82 ms.
+
+| HLodTree work per frame | Camera and 1,000 objects moving | Static camera, 1,000 objects moving | Moving camera, static objects |
+|---|---:|---:|---:|
+| Apply transform updates and maintain the TLAS | 34 µs | 33 µs | n/a |
+| `beginFrame` and flush pending node-bound changes | <0.1 µs | <0.1 µs | <0.1 µs |
+| `selectCut` | 118 µs | 102 µs | 78 µs |
+| **Total HLodTree frame work** | **152 µs** | **135 µs** | **78 µs** |
+
+The moving-camera cases average about 2,782 visible instances (27.8% of the
+world) and a 5,920-entry cut. Reuse is 82.4% with 1,000 movers and 93.3% with
+static objects; the context occupies 2.45 MiB. The fixed-camera case averages
+2,501 visible instances (25.0%), a 5,792-entry cut, 85.8% reuse, and a 0.58 MiB
+context.
+
 ### Multiple views
 
 Each view needs its own `SelectionContext`. With the same moving-camera route

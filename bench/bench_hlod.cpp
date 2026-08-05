@@ -1807,29 +1807,38 @@ BENCHMARK(BM_SelectionContext_FlyThrough)
     ->Iterations(600)
     ->Unit(benchmark::kMicrosecond);
 
-// Operation-level breakdown for the representative README workload. This is
-// deliberately SelectionContext-only: the three arms separate object motion
-// from camera motion while keeping the world, view, and 600-frame route fixed.
+// Operation-level breakdown for the representative README workloads. This is
+// deliberately SelectionContext-only: three arms at each scale separate object
+// motion from camera motion while keeping the view and 600-frame route fixed.
 //
-// arg0 = percent of instances moved per frame
-// arg1 = 0 fixed camera / 1 continuous fly-through
+// arg0 = instance count
+// arg1 = separately registered assets shared by those instances
+// arg2 = instances moved per frame
+// arg3 = 0 fixed camera / 1 continuous fly-through
 static void BM_SelectionContext_Breakdown(benchmark::State& state)
 {
     using clock = std::chrono::steady_clock;
 
-    constexpr int count = 80000;
-    const int movePct = int(state.range(0));
-    const bool cameraMoves = state.range(1) != 0;
+    const int count = int(state.range(0));
+    const int assetCount = int(state.range(1));
+    const int movers = int(state.range(2));
+    const bool cameraMoves = state.range(3) != 0;
 
     const auto init0 = clock::now();
     TreeGen gen;
     gen.fanout = 4;
     gen.depth = 3;
-    Page proto = gen.makeRootPage(unitRegion(3.0f), 2.0f, 0);
-    const uint32_t nodes = proto.nodeCount();
 
     World w;
-    const AssetHandle asset = w.registerAsset(std::move(proto));
+    std::vector<AssetHandle> assets;
+    assets.reserve(size_t(assetCount));
+    uint32_t nodes = 0;
+    for (int i = 0; i < assetCount; ++i)
+    {
+        Page proto = gen.makeRootPage(unitRegion(3.0f), 2.0f, 0);
+        if (i == 0) nodes = proto.nodeCount();
+        assets.push_back(w.registerAsset(std::move(proto)));
+    }
     const float half = 12.0f * std::sqrt(float(count));
     std::mt19937 rng(4242);
     std::uniform_real_distribution<float> uni(-half, half);
@@ -1840,9 +1849,10 @@ static void BM_SelectionContext_Breakdown(benchmark::State& state)
     for (int i = 0; i < count; ++i)
     {
         home.push_back(float4::point(uni(rng), 0, uni(rng)));
-        insts.push_back(w.addInstance(asset, home.back()));
+        insts.push_back(w.addInstance(assets[size_t(i) % assets.size()], home.back()));
     }
-    markAllResident(w, w.assetRootPage(asset), nodes);
+    for (const AssetHandle asset : assets)
+        markAllResident(w, w.assetRootPage(asset), nodes);
     const auto init1 = clock::now();
 
     const auto viewAt = [&](size_t frame)
@@ -1867,7 +1877,6 @@ static void BM_SelectionContext_Breakdown(benchmark::State& state)
     w.selectCut(coldView, params, context, cut);
     const auto cold1 = clock::now();
 
-    const int movers = count * movePct / 100;
     XorShift32 fast;
     double moveNs = 0.0;
     double maintenanceNs = 0.0;
@@ -1925,10 +1934,13 @@ static void BM_SelectionContext_Breakdown(benchmark::State& state)
     state.counters["cache_MB"] = double(context.bytes()) / (1024.0 * 1024.0);
 }
 BENCHMARK(BM_SelectionContext_Breakdown)
-    ->Args({5, 1})   // moving camera, 5% moving objects
-    ->Args({5, 0})   // static camera, 5% moving objects
-    ->Args({0, 1})   // moving camera, static objects
-    ->ArgNames({"move_pct", "camera_moves"})
+    ->Args({80000, 1, 4000, 1})    // large: moving camera and objects
+    ->Args({80000, 1, 4000, 0})    // large: static camera, moving objects
+    ->Args({80000, 1, 0, 1})       // large: moving camera, static objects
+    ->Args({10000, 700, 1000, 1})  // small: moving camera and objects
+    ->Args({10000, 700, 1000, 0})  // small: static camera, moving objects
+    ->Args({10000, 700, 0, 1})     // small: moving camera, static objects
+    ->ArgNames({"instances", "assets", "movers", "camera_moves"})
     ->Iterations(600)
     ->Unit(benchmark::kMicrosecond);
 
