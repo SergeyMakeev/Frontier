@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <limits>
 #include <memory>
 #include <queue>
 #include <random>
@@ -1430,6 +1431,63 @@ static void BM_TlasScale(benchmark::State& state)
 BENCHMARK(BM_TlasScale)
     ->Arg(200000)->Arg(500000)
     ->Unit(benchmark::kMicrosecond);
+
+// End-to-end Morton rebuild cost. After one quality build, move one instance
+// between opposite corners on every iteration. A zero escape budget forces the
+// next cut to rebuild through the fast Morton tier; the area budget is disabled
+// so it cannot promote that rebuild back to the quality tier.
+static void BM_TlasMortonRebuild(benchmark::State& state)
+{
+    const int count = int(state.range(0));
+    const bool stacked = state.range(1) != 0;
+    const float half = 40.0f * std::sqrt(float(count));
+
+    WorldConfig config;
+    config.tlasEscapeFraction = 0.0f;
+    config.tlasAreaDrift = std::numeric_limits<float>::max();
+    World w(config);
+
+    TreeGen gen;
+    gen.fanout = 4;
+    gen.depth = 1;
+    Page proto = gen.makeRootPage(unitRegion(5.0f), 16.0f, 0);
+    const uint32_t nodes = proto.nodeCount();
+    const AssetHandle asset = w.registerAsset(std::move(proto));
+
+    std::mt19937 rng(1919);
+    std::uniform_real_distribution<float> uni(-half, half);
+    std::vector<World::InstanceRef> refs;
+    refs.reserve(count);
+    for (int i = 0; i < count; ++i)
+    {
+        const float4 pos = stacked ? float4::point(0, 0, 0)
+                                   : float4::point(uni(rng), 0, uni(rng));
+        refs.push_back(w.addInstance(asset, pos));
+    }
+    markAllResident(w, w.assetRootPage(asset), nodes);
+
+    std::vector<CutEntry> cut;
+    const CutParams params{4.0f, 1.0f};
+    const CullView view = orbitView(0.0f, half * 0.25f);
+    w.selectCut(view, params, cut);   // establish the quality tree
+
+    bool high = false;
+    for (auto _ : state)
+    {
+        high = !high;
+        const float corner = high ? half * 0.95f : -half * 0.95f;
+        w.moveInstance(refs[0], float4::point(corner, 0, corner));
+        w.beginFrame();
+        w.selectCut(view, params, cut);
+        benchmark::DoNotOptimize(cut.data());
+    }
+    state.counters["cut"] = double(cut.size());
+    state.counters["instances"] = double(count);
+    state.counters["stacked"] = double(stacked);
+}
+BENCHMARK(BM_TlasMortonRebuild)
+    ->Args({100000, 0})->Args({500000, 0})->Args({100000, 1})
+    ->Unit(benchmark::kMillisecond);
 
 // Rebuild after a world has shrunk far below its historical peak. Instance
 // slots are recycled rather than erased, so a rebuild that scans capacity pays

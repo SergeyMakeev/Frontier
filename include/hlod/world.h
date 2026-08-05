@@ -1033,6 +1033,7 @@ private:
     std::vector<std::pair<uint32_t, uint8_t>>  visibleTmp_;
     std::vector<TlasItem>                      tlasStack_;
     std::vector<std::pair<uint64_t, uint32_t>> tlasKeys_;
+    std::vector<std::pair<uint64_t, uint32_t>> tlasKeysTmp_;
     std::vector<int32_t>                       tlasLevelTmp_;
     std::vector<uint32_t>                      tlasItemsTmp_;
 };

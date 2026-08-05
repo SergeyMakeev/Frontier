@@ -1,6 +1,7 @@
 #include "hlod/world.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <bit>
 
@@ -1136,6 +1137,53 @@ static inline uint64_t expandBits21(uint64_t v)
     return v;
 }
 
+// Stable LSD radix sort of the 63-bit Morton coordinate. Up to six 11-bit
+// passes keep the histogram in L1 and turn the rebuild's O(N log N) comparison
+// sort into linear streaming passes. Equal coordinates retain live-instance
+// order; their order is immaterial to the tree and stability keeps it fully
+// deterministic without paying for a second comparison sort.
+static void radixSortMorton(
+    std::vector<std::pair<uint64_t, uint32_t>>& keys,
+    std::vector<std::pair<uint64_t, uint32_t>>& scratch,
+    uint64_t keyVariation)
+{
+    if (keys.size() < 1024)
+    {
+        std::sort(keys.begin(), keys.end());
+        return;
+    }
+    if (keyVariation == 0) return;
+
+    constexpr uint32_t kBits = 11;
+    constexpr uint32_t kBuckets = 1u << kBits;
+    constexpr uint64_t kMask = kBuckets - 1;
+    std::array<uint32_t, kBuckets> offsets{};
+    scratch.resize(keys.size());
+
+    auto* src = &keys;
+    auto* dst = &scratch;
+    for (uint32_t shift = 0; shift < 63; shift += kBits)
+    {
+        if (((keyVariation >> shift) & kMask) == 0) continue;
+        offsets.fill(0);
+        for (const auto& item : *src)
+            ++offsets[size_t((item.first >> shift) & kMask)];
+
+        uint32_t next = 0;
+        for (uint32_t& count : offsets)
+        {
+            const uint32_t begin = next;
+            next += count;
+            count = begin;
+        }
+
+        for (const auto& item : *src)
+            (*dst)[offsets[size_t((item.first >> shift) & kMask)]++] = item;
+        std::swap(src, dst);
+    }
+    if (src != &keys) keys.swap(scratch);
+}
+
 // Partition items[lo, hi) into [lo, m) and [m, hi). BinnedSAH scans 16 bins on
 // all three axes and takes the cheapest plane; Median (and any degenerate SAH
 // case, e.g. coincident centroids) falls back to a longest-axis median split,
@@ -1343,6 +1391,8 @@ void World::tlasRebuild()
     else
     {
         tlasKeys_.clear();
+        uint64_t firstMorton = 0;
+        uint64_t mortonVariation = 0;
         AABB cb = AABB::empty();
         for (const InstanceId i : liveInstances_)
             cb.expand(instanceTlas_[i].worldBox.center());
@@ -1357,12 +1407,15 @@ void World::tlasRebuild()
             const uint64_t kx = expandBits21(uint64_t((c.x - lo.x) * sx));
             const uint64_t ky = expandBits21(uint64_t((c.y - lo.y) * sy));
             const uint64_t kz = expandBits21(uint64_t((c.z - lo.z) * sz));
-            tlasKeys_.push_back({(kx << 2) | (ky << 1) | kz, i});
+            const uint64_t morton = (kx << 2) | (ky << 1) | kz;
+            if (tlasKeys_.empty()) firstMorton = morton;
+            else mortonVariation |= morton ^ firstMorton;
+            tlasKeys_.push_back({morton, i});
         }
         tlasLeafCount_ = uint32_t(tlasKeys_.size());
         if (!tlasKeys_.empty())
         {
-            std::sort(tlasKeys_.begin(), tlasKeys_.end());
+            radixSortMorton(tlasKeys_, tlasKeysTmp_, mortonVariation);
 
             // Leaf level: consecutive groups of kWide instances.
             std::vector<int32_t>& cur = tlasLevelTmp_;

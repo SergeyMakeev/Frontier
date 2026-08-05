@@ -609,6 +609,10 @@ model:
 - A dense `liveInstances_` list makes TLAS rebuild enumeration proportional to
   current population rather than historical slot count. With 100k peak slots
   and 10k survivors, rebuild time fell 9.0%; selection remained neutral.
+- Morton rebuilds use a stable six-pass, 11-bit LSD radix sort with retained
+  scratch. End-to-end rebuild cost fell 36.2% at 100k instances and 42.0% at
+  500k; a 100k coincident-centroid stress case improved 6.4%. Equal keys retain
+  deterministic live-instance order rather than paying for a second sort.
 - TLAS contribution culling now uses squared box distance and
   `screenErrorFromSq8`, matching the page walk's reciprocal-square-root path and
   improving the focused 50k-200k cases by 3.0-3.5%.
@@ -624,15 +628,12 @@ model:
   selection 21.9%.
 
 See `HANDOFF.md` section 14 for the interleaved A/B methodology, rejected margin
-vectorization, and detailed measurements.
+vectorization, radix-sort tradeoffs, and detailed measurements.
 
 ---
 
 ## 3. Ideas considered and left for later
 
-- **Radix sort for Morton rebuilds.** `std::sort` on 63-bit keys is the
-  bulk of the motion rebuild; an LSD radix sort would roughly halve it.
-  Not done: the two-tier policy already made rebuilds a minor term.
 - **Parallelism.** The whole design is single-writer by construction, but
   `selectCut` is embarrassingly parallel across instances (forest case) and
   across independent subtrees (deep case): the DFS stack is already the

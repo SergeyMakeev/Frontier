@@ -19,7 +19,7 @@ open performance findings in sections 10.7 and 11.2-11.5.
 | `tests/test_contracts.cpp` | Done (`MultiViewDamperIsolation` replaces scratch isolation) |
 | `tests/test_cache.cpp` | New — SelectionContext equivalence, damping, churn, multi-view |
 | `bench/bench_hlod.cpp` | Done (+ `BM_DeepTree_FlyThroughDamped`, `BM_AssetSharing_CutCost`, `BM_DeformedCutCost`, `BM_SelectionContext_FlyThrough`) |
-| Test run | **87/87 green** (pre-rework baseline was 56/56; the rework and audits added tests) |
+| Test run | **88/88 green** (pre-rework baseline was 56/56; the rework and audits added tests) |
 | §8 measurements | **Done**, results below — one real regression found (refit +28%) |
 | Cut-path optimisation | **Done** — five theories A/B tested, one kept (§9) |
 | `WideBlock` 288 -> 256 bytes | **Done** — blob version 2; up to 10% wherever the working set exceeds cache (§9.5) |
@@ -1398,10 +1398,38 @@ equivalence tests, but both tracked their untouched control within roughly 0.4%
 and won only four of seven rounds. The scalar square root/divide remains because
 the proposed version added SIMD bookkeeping without a measurable benefit.
 
-### 14.3 Remaining opportunities
+### 14.3 Morton rebuild radix sort
 
-- A radix sort for the 63-bit Morton keys remains the clearest rebuild-only
-  opportunity; dense live enumeration removes dead-slot scans but not sort cost.
+The follow-up opportunity was implemented after profiling it directly. Morton
+rebuilds now use a stable LSD radix sort with up to six 11-bit passes instead of
+`std::sort` on `(63-bit key, instance id)` pairs. The 2,048-entry histogram is
+8 KiB and stays in L1; the scatter buffer is retained with the other World
+scratch so repeated motion rebuilds do not allocate. Populations below 1,024
+keep the comparison sort. Passes whose key bits do not vary are skipped.
+
+Equal Morton keys retain dense live-instance order rather than being re-sorted
+by id. That order has no semantic meaning, and the stable input is deterministic.
+Keeping the old tie order was tested first, but its second comparison sort erased
+the benefit in the coincident-centroid case; removing it made the implementation
+simpler and the adversarial case faster. `Tlas.MortonRebuildHandlesCoincidentCentroids`
+pins structural and cut correctness for that distribution.
+
+Seven alternating baseline/candidate rounds, MSVC `/O2 /arch:AVX2`:
+
+| workload | `std::sort` | radix | change |
+|---|---:|---:|---:|
+| forced Morton rebuild, 100k random | 13.931 ms | 8.883 ms | **36.2% faster** |
+| forced Morton rebuild, 500k random | 77.599 ms | 45.024 ms | **42.0% faster** |
+| sparse rebuild, 100k peak / 10k live | 1.265 ms | 0.829 ms | **34.5% faster** |
+| forced rebuild, 100k coincident | 13.833 ms | 12.947 ms | **6.4% faster** |
+| normal motion, 50k / 1k movers | 34.544 ms | 33.655 ms | 2.6% faster |
+
+The cost is one additional retained key buffer: 16 bytes per live instance at
+peak Morton rebuild size (7.63 MiB at 500k). The 36-42% end-to-end rebuild win
+comfortably justifies that bounded scratch footprint.
+
+### 14.4 Remaining opportunities
+
 - `SelectionContext` reuse remains serial. Combining it with parallel instance
   traversal needs deterministic flat-output ordering and is not a mechanical
   merge of the two existing overloads.

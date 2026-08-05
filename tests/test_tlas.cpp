@@ -448,4 +448,28 @@ TEST(Tlas, MovingAnIncrementallyInsertedInstanceRefitsCorrectly)
     EXPECT_TRUE(tagsOf(cut).count(r.tag)) << "moved after insertion and lost";
 }
 
+// The radix rebuild must also handle the worst Morton distribution: almost
+// every centroid quantises to the same key. Stable scatter keeps that cohort
+// deterministic without needing a comparison sort inside the equal-key run.
+TEST(Tlas, MortonRebuildHandlesCoincidentCentroids)
+{
+    WorldConfig config = onlyEditBudget();
+    config.tlasEscapeFraction = 0.0f;
+    Field f(config);
+
+    std::vector<Placed> refs;
+    refs.reserve(1100);
+    for (int i = 0; i < 1100; ++i) refs.push_back(f.add(0.0f, 0.0f));
+
+    const CullView view = viewFrom(0.0f, 0.0f, 400.0f);
+    std::vector<CutEntry> cut;
+    f.w.selectCut(view, kParams, cut);   // initial quality build
+
+    f.w.moveInstance(refs[0].ref, float4::point(300.0f, 0.0f, 300.0f));
+    f.w.selectCut(view, kParams, cut);   // forced Morton rebuild
+
+    EXPECT_EQ(TAX::tlasValidate(f.w), "");
+    EXPECT_EQ(tagsOf(cut), tagsOf(TAX::referenceCut(f.w, view, kParams).cut));
+}
+
 }   // namespace hlodtest
