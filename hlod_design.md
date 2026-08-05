@@ -358,9 +358,11 @@ split the leaf; removals invalidate a lane. `tlasEditFraction` bounds how many
 such quality-losing edits accumulate before a Morton rebuild. Large population
 drift (`tlasCountDrift`) promotes the rebuild to the configured quality tier.
 
-Instance motion updates its lane and grows ancestors only as needed. Escape
-count can request a fast Morton rebuild; sufficient aggregate area growth can
-promote a later rebuild to restore quality. These thresholds are exposed as
+Instance motion updates its lane and grows ancestors only as needed. The escape
+budget counts each distinct instance at most once between builds; crossing the
+configured fraction can request a fast Morton rebuild without letting a small
+bounded cohort consume the budget repeatedly. Sufficient aggregate area growth
+can promote a later rebuild to restore quality. These thresholds are exposed as
 `tlasEscapeFraction` and `tlasAreaDrift`.
 
 Morton builds quantize each centroid to 21 bits per axis for a 63-bit key.

@@ -63,6 +63,7 @@ struct World::TestAccess
     // test asserts that an edit was applied INCREMENTALLY rather than by
     // deferring a full rebuild, which is invisible in the cut either way.
     static bool tlasDirty(World& w) { return w.tlasDirty_; }
+    static uint32_t tlasEscapes(World& w) { return w.tlasEscapes_; }
     static size_t tlasNodeCount(World& w) { return w.tlasNodes_.size(); }
     static size_t pageRtBytes() { return sizeof(PageRt); }
 

@@ -405,6 +405,35 @@ TEST(Tlas, SustainedChurnEventuallyForcesARebuild)
     EXPECT_EQ(TAX::tlasValidate(f.w), "");
 }
 
+// tlasEscapeFraction is a fraction of the population, not a counter of move
+// calls. A small cohort that keeps moving may loosen its own lanes, but must
+// not eventually look like the whole world escaped merely by being updated on
+// many frames. Distinct escaped instances still consume the budget normally.
+TEST(Tlas, EscapeBudgetCountsDistinctInstances)
+{
+    WorldConfig config = neverRebuild();
+    config.tlasEscapeFraction = 0.25f;
+    Field f(config);
+    std::vector<Placed> refs;
+    for (int i = 0; i < 200; ++i)
+        refs.push_back(f.add(float(i % 20) * 4.0f, float(i / 20) * 4.0f));
+
+    std::vector<CutEntry> cut;
+    f.w.selectCut(viewFrom(40.0f, 20.0f, 80.0f), kParams, cut);
+    ASSERT_FALSE(TAX::tlasDirty(f.w));
+
+    for (int frame = 0; frame < 100; ++frame)
+        f.w.moveInstance(refs[0].ref,
+                         float4::point(frame & 1 ? 1000.0f : -1000.0f, 0.0f, 0.0f));
+    EXPECT_FALSE(TAX::tlasDirty(f.w));
+    EXPECT_EQ(TAX::tlasEscapes(f.w), 1u);
+
+    for (int i = 1; i <= 50; ++i)
+        f.w.moveInstance(refs[size_t(i)].ref,
+                         float4::point(1000.0f + float(i), 0.0f, 1000.0f));
+    EXPECT_TRUE(TAX::tlasDirty(f.w));
+}
+
 // A mass despawn is a real population change, not churn, and should still take
 // the immediate quality rebuild rather than thousands of incremental removals.
 TEST(Tlas, MassDespawnStillForcesAQualityRebuild)

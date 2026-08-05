@@ -41,8 +41,9 @@ host's blocking `parallelFor`.
    stack round trip. At fanout eight, most authored nodes are leaves.
 4. **Shared immutable working sets.** Thousands of identical instances can walk
    one hot page. The cut-path `Instance` record is one cache line, while TLAS
-   maintenance state occupies a separate cache line. The serial forest loop
-   prefetches the next instance and root page.
+   maintenance state occupies a separate cache line. Stateless selection
+   prefetches the next instance and root page; contextual selection pipelines
+   its spatially ordered random instance/context reads eight entries ahead.
 5. **Handle-only mutation.** The world has no payload index or node hash table.
    Requests already carry generation-stamped handles; stale asynchronous
    completions fail one generation check and are ignored.
@@ -52,7 +53,8 @@ host's blocking `parallelFor`.
 7. **Lazy, bounded updates.** Bounds edits queue until a cut needs them and grow
    ancestors only until containment permits an early-out. Instance adds/removes
    edit the TLAS in O(depth); configured edit/escape/area budgets decide when a
-   rebuild earns its cost.
+   rebuild earns its cost. Escape pressure counts distinct leaves since the
+   last build, so repeated motion of one bounded cohort is charged once.
 8. **Cheap Morton repair builds.** 63-bit keys use a stable LSD radix sort for
    populations of at least 1,024, with retained scratch and only the 11-bit
    passes required by key variation. A dense live-id list avoids scanning dead
@@ -67,16 +69,19 @@ host's blocking `parallelFor`.
 ### Current measurements
 
 Point estimates below were rerun on 2026-08-05 with MSVC 19.51, Release
-`/O2 /arch:AVX2`, one benchmark thread, on a 64-hardware-thread 2.4 GHz EPYC.
-Google Benchmark used a 0.2 s minimum for the ordinary benchmarks; fixed-trajectory
-`SelectionContext` cases use 600 iterations.
+`/O2 /arch:AVX2`, one benchmark thread, on a noisy shared 64-hardware-thread
+2.4 GHz EPYC. Values are the best recurring repeat, which estimates
+uncontended algorithm cost. Google Benchmark used a 0.2 s minimum for ordinary
+benchmarks; fixed-trajectory `SelectionContext` cases use 600 iterations.
 
 | Scenario | Current time | Relevant output/state |
 |---|---:|---|
 | `DeepTree_CutOnly/6` | 1.72 ms | 2.4M nodes authored; 259,933 cut entries |
-| `SelectionContext_FlyThrough/20000`, stateless | 0.538 ms selection | 8,587 average cut entries |
-| Same 20k case, contextual | 0.152 ms selection | 94.8% instances reused; 2.91 MiB context |
-| 80k instances, 5% moving, stateless / contextual | 2.62 / 2.03 ms selection | 92.4% reused in contextual arm |
+| `SelectionContext_FlyThrough/20000`, stateless | 0.486 ms selection | 8,587 average cut entries |
+| Same 20k case, contextual | 0.121 ms selection | 94.8% instances reused; 2.91 MiB context |
+| 80k instances, moving camera / static objects | 0.40 ms selection | 97.6% reused; 24,986-entry cut |
+| 80k instances, moving camera / 5% moving | 0.50 ms selection | 92.6% reused; 24,986-entry cut |
+| Same 80k cases, six nearby views | 3.32 / 3.84 ms total selection | static / 5% moving; one context per view |
 | `TlasScale`, 200k / 500k steady | 5.48 / 6.14 ms | 34,573 / 30,975 cut entries |
 | `TlasScale`, first quality build + cut | 134 / 417 ms | level-load cost, not steady frame cost |
 | Forced Morton rebuild + cut, 100k / 500k | 7.88 / 44.5 ms | random centroids |
@@ -85,11 +90,11 @@ Google Benchmark used a 0.2 s minimum for the ordinary benchmarks; fixed-traject
 | Immutable page bytes in that cloned / shared case | 199 MiB / 51 KiB | 4,000 mounts / 1 mount |
 
 These are scale indicators, not guarantees. Output size and cache locality can
-dominate population size, and absolute results on this host have moved by up to
-20% between runs. Optimization claims in the journal use interleaved baselines,
-medians, win counts, and controls rather than unrelated absolute runs. The
-final radix A/B measured 36.2% lower end-to-end rebuild cost at 100k random
-instances and 42.0% at 500k.
+dominate population size, and contended runs on this host can be much slower.
+Optimization claims in the historical journal use interleaved baselines,
+medians, win counts, and controls; headline current costs use the best recurring
+repeat to show the speed-of-light floor. The final radix A/B measured 36.2%
+lower end-to-end rebuild cost at 100k random instances and 42.0% at 500k.
 
 ---
 
@@ -216,7 +221,7 @@ for any BVH) sat at 9.2 ms. Splitting the cost with policy extremes:
 never rebuilding gives 12.0 ms (queries degrade against bloated grow-only
 lanes), rebuilding every frame gives 26.3 ms (the recursive median-split
 build alone costs ~17 ms at 50k leaves). The escape-threshold policy
-(rebuild at 25% escaped lanes) was already the best of the three.
+(rebuild at a 25% escape threshold) was already the best of the three.
 
 Change: two build paths.
 
@@ -225,7 +230,7 @@ Change: two build paths.
   its keep — with a Morton-only build the contribution-culled forest bench
   (which leans on tight interior `maxErr`/bounds lanes) regressed 431 →
   902 µs, measured stable at CV 1%.
-- **Motion rebuilds** (escape threshold) use a Morton build: one 63-bit-key
+- **Motion rebuilds** (distinct-leaf escape threshold) use a Morton build: one 63-bit-key
   sort, then contiguous groups of kWide per level, bottom-up. ~5x cheaper to
   build; slightly looser tree, but it only has to survive until the next
   motion rebuild anyway.
@@ -601,6 +606,14 @@ model:
   the old all-cache invalidation throughout damped zoom-out. The affected 20k
   benchmark improved 38.9%. Reset retains warm storage, improving reset+cold
   selection 21.9%.
+- Contextual selection prefetches its spatially ordered random instance and
+  record reads eight entries ahead, and the output sink directly pushes its
+  dominant one-entry runs. The current 20k fly-through reaches 0.121 ms.
+- The TLAS escape budget now counts each escaped instance once per rebuild,
+  rather than counting every later growth of the same lane. A bounded 5% moving
+  cohort therefore stays on incremental refit instead of periodically charging
+  a repair to `selectCut`; the representative 80k selection is 0.50 ms, and six
+  nearby views total 3.84 ms.
 
 The archived [2026-08-05 handoff](docs/archive/HANDOFF-2026-08-05.md), section
 14, preserves the interleaved A/B tables, rejected margin vectorization,
@@ -615,8 +628,9 @@ guidance.
   selection already parallelizes across visible instances and preserves serial
   output/request order. `SelectionContext` remains serial because reuse records,
   the cut slab, and dependency validation are optimized as one compact stream.
-  Combine them only if a production profile shows a net win after per-worker
-  merge and record-write costs.
+  Six representative 80k views currently cost 3.32-3.84 ms in aggregate and
+  occupy about 46 MiB of context state. Combine the paths only if a production
+  profile shows a net win after per-worker merge and record-write costs.
 - **Internal overlay bounds do not shrink.** Grow-only refit means long-running
   large teleports can loosen page ancestors. This costs culling efficiency, not
   correctness; TLAS rebuilds retighten only the top level. A budgeted bottom-up

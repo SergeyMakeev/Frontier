@@ -1932,6 +1932,117 @@ BENCHMARK(BM_SelectionContext_Breakdown)
     ->Iterations(600)
     ->Unit(benchmark::kMicrosecond);
 
+// Multi-view scaling for the same representative world. Object updates happen
+// once per frame; each nearby view owns its own SelectionContext and output.
+// `select_us` is the aggregate selection cost, while `first_us` and `extra_us`
+// show the marginal cost after the first view has consumed world maintenance.
+//
+// arg0 = percent of instances moved per frame
+// arg1 = number of views
+static void BM_SelectionContext_MultiView(benchmark::State& state)
+{
+    using clock = std::chrono::steady_clock;
+
+    constexpr int count = 80000;
+    const int movePct = int(state.range(0));
+    const int viewCount = int(state.range(1));
+
+    TreeGen gen;
+    gen.fanout = 4;
+    gen.depth = 3;
+    Page proto = gen.makeRootPage(unitRegion(3.0f), 2.0f, 0);
+    const uint32_t nodes = proto.nodeCount();
+
+    World w;
+    const AssetHandle asset = w.registerAsset(std::move(proto));
+    const float half = 12.0f * std::sqrt(float(count));
+    std::mt19937 rng(4242);
+    std::uniform_real_distribution<float> uni(-half, half);
+    std::vector<World::InstanceRef> insts;
+    std::vector<float4> home;
+    insts.reserve(count);
+    home.reserve(count);
+    for (int i = 0; i < count; ++i)
+    {
+        home.push_back(float4::point(uni(rng), 0, uni(rng)));
+        insts.push_back(w.addInstance(asset, home.back()));
+    }
+    markAllResident(w, w.assetRootPage(asset), nodes);
+
+    const auto viewAt = [&](size_t frame, int viewIndex)
+    {
+        const float t = float(frame % 600) / 600.0f;
+        const float z = (t * 2.0f - 1.0f) * half * 0.8f;
+        const float x = (float(viewIndex) - float(viewCount - 1) * 0.5f) * 24.0f;
+        return makePerspectiveView(
+            float4::point(x, 2.0f, z), float4::vec(0.0f, 0.0f, 1.0f),
+            float4::vec(0, 1, 0), 1.0f, 16.0f / 9.0f, 1080.0f, 0.1f, 1.0e9f);
+    };
+
+    std::vector<SelectionContext> contexts(static_cast<size_t>(viewCount));
+    std::vector<std::vector<CutEntry>> cuts(static_cast<size_t>(viewCount));
+    const CutParams params{4.0f, 0.0f};
+
+    w.beginFrame();
+    for (int v = 0; v < viewCount; ++v)
+        w.selectCut(viewAt(0, v), params, contexts[size_t(v)], cuts[size_t(v)]);
+
+    const int movers = count * movePct / 100;
+    XorShift32 fast;
+    double selectNs = 0.0;
+    double firstNs = 0.0;
+    double entries = 0.0;
+    double reuse = 0.0;
+    size_t frames = 0;
+
+    for (auto _ : state)
+    {
+        for (int i = 0; i < movers; ++i)
+            w.moveInstance(insts[i], home[i] + float4::vec(fast.uniform(-0.4f, 0.4f), 0,
+                                                           fast.uniform(-0.4f, 0.4f)));
+        w.beginFrame();
+        w.flushBounds();
+
+        for (int v = 0; v < viewCount; ++v)
+        {
+            const auto one0 = clock::now();
+            w.selectCut(viewAt(frames, v), params, contexts[size_t(v)], cuts[size_t(v)]);
+            const auto one1 = clock::now();
+            const double oneNs =
+                std::chrono::duration<double, std::nano>(one1 - one0).count();
+            selectNs += oneNs;
+            if (v == 0)
+                firstNs += oneNs;
+            const double n = double(contexts[size_t(v)].reused() +
+                                    contexts[size_t(v)].walked());
+            reuse += n > 0.0 ? 100.0 * double(contexts[size_t(v)].reused()) / n : 0.0;
+            entries += double(cuts[size_t(v)].size());
+            benchmark::DoNotOptimize(cuts[size_t(v)].data());
+        }
+        ++frames;
+    }
+
+    const double f = double(frames ? frames : 1);
+    const double calls = f * double(viewCount);
+    const double selectUs = selectNs / f / 1000.0;
+    const double firstUs = firstNs / f / 1000.0;
+    state.counters["select_us"] = selectUs;
+    state.counters["first_us"] = firstUs;
+    state.counters["extra_us"] =
+        viewCount > 1 ? (selectUs - firstUs) / double(viewCount - 1) : 0.0;
+    state.counters["per_view"] = selectUs / double(viewCount);
+    state.counters["reuse%"] = reuse / calls;
+    state.counters["avg_cut"] = entries / calls;
+}
+BENCHMARK(BM_SelectionContext_MultiView)
+    ->Args({0, 1})
+    ->Args({0, 6})
+    ->Args({5, 1})
+    ->Args({5, 6})
+    ->ArgNames({"move_pct", "views"})
+    ->Iterations(600)
+    ->Unit(benchmark::kMicrosecond);
+
 // ---------------------------------------------------------------------------
 // Projection-scale motion under damping. Every flip point sits at
 // eff * k / threshold; the cache stores a conservative per-record slope and

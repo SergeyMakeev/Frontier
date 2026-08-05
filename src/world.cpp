@@ -1040,6 +1040,7 @@ void World::tlasInsert(InstanceId id)
     h.validMask |= 1u << lane;
     inst.tlasNode = host;
     inst.tlasLane = lane;
+    inst.escapedSinceBuild = false;
     ++tlasLeafCount_;
 
     tlasNoteGrowth(tlasGrowUp(host, inst.worldBox, inst.maxErrWorld, inst.mask));
@@ -1065,6 +1066,11 @@ void World::tlasRemove(InstanceId id)
         return;
     }
 
+    if (inst.escapedSinceBuild)
+    {
+        if (tlasEscapes_) --tlasEscapes_;
+        inst.escapedSinceBuild = false;
+    }
     tlasNodes_[nodeIdx].validMask &= ~(1u << lane);
     inst.tlasNode = kInvalidIndex;
     if (tlasLeafCount_) --tlasLeafCount_;
@@ -1102,7 +1108,9 @@ void World::tlasOnInstanceMoved(InstanceId id)
         return;
     }
 
-    // Grow-only lane refit up the parent chain; escapes trigger a rebuild.
+    // Grow-only lane refit up the parent chain. The rebuild budget counts
+    // distinct escaped leaves, not escape events: a bounded moving cohort
+    // should not force periodic rebuilds merely because it moves every frame.
     const uint32_t nodeIdx = inst.tlasNode;
     const uint32_t lane = inst.tlasLane;
     TlasNode& node = tlasNodes_[nodeIdx];
@@ -1110,7 +1118,11 @@ void World::tlasOnInstanceMoved(InstanceId id)
         node.maxErr.v[lane] >= inst.maxErrWorld)
         return;
 
-    ++tlasEscapes_;
+    if (!inst.escapedSinceBuild)
+    {
+        inst.escapedSinceBuild = true;
+        ++tlasEscapes_;
+    }
     AABB grown = node.bounds.lane(lane);
     const float wasArea = surfaceArea(grown);
     grown.expand(inst.worldBox);
@@ -1317,6 +1329,7 @@ int32_t World::tlasBuildRange(std::vector<uint32_t>& items, int lo, int hi, int3
             n.validMask |= 1u << k;
             inst.tlasNode = uint32_t(idx);
             inst.tlasLane = uint32_t(k);
+            inst.escapedSinceBuild = false;
         }
         return idx;
     }
@@ -1445,6 +1458,7 @@ void World::tlasRebuild()
                     n.validMask |= 1u << k;
                     inst.tlasNode = uint32_t(idx);
                     inst.tlasLane = k;
+                    inst.escapedSinceBuild = false;
                 }
                 cur.push_back(idx);
             }
@@ -2146,6 +2160,18 @@ void World::selectCut(const CullView& view, const CutParams& params,
     const uint32_t nVis = uint32_t(visibleTmp_.size());
     for (uint32_t i = 0; i < nVis; ++i)
     {
+        // TLAS order is spatial, whereas instance ids follow insertion order.
+        // With a large, randomly placed population that makes both of the
+        // indexed reads below latency-bound. Give the hardware several
+        // iterations of useful work to fetch the two records before use.
+        constexpr uint32_t kPrefetchDistance = 8;
+        if (i + kPrefetchDistance < nVis)
+        {
+            const uint32_t next = visibleTmp_[i + kPrefetchDistance].first;
+            HLOD_PREFETCH(&instances_[next]);
+            HLOD_PREFETCH(&ctx.rec_[next]);
+        }
+
         const uint32_t instIdx = visibleTmp_[i].first;
         const uint8_t  mask = visibleTmp_[i].second;
         const Instance& inst = instances_[instIdx];

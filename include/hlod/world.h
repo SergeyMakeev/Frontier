@@ -192,6 +192,14 @@ public:
         if (n == 0) return;
         if (vec_)
         {
+            // Contextual cuts are usually one entry per distant instance.
+            // Avoid std::vector's range-insert machinery for that dominant
+            // case; capacity is already retained across selectCut calls.
+            if (n == 1)
+            {
+                vec_->push_back(*p);
+                return;
+            }
             vec_->insert(vec_->end(), p, p + n);
             return;
         }
@@ -308,14 +316,15 @@ using RequestSink = Sink<LoadRequest>;
 // distant instances that collapse to a node or two. So the descriptor array was
 // as large as the data it described -- 350 KB of spans for 400 KB of entries at
 // 80k -- and had to be rewritten every frame anyway, including for the 92% of
-// instances that were reused. Copying those entries instead is ~40 us against a
-// 2.7 ms cut, about 1.5%.
+// instances that were reused. Copying the shallow entries into one caller-owned
+// array remains cheaper than constructing and consuming almost as many spans;
+// the dominant one-entry case takes the sink's direct push path.
 //
 // Fusing adjacent spans was tried and does not rescue it: the storage is
 // ordered by first-walk, the caller iterates in TLAS order, and the two coincide
 // only on the first frame. Measured, span count did not budge (21,919 of them,
-// fused or not) outside a stationary camera. What buys 1.3-3.0x is skipping the
-// WALK; skipping the copy was never where the money was.
+// fused or not) outside a stationary camera. Skipping the WALK remains the
+// useful saving; replacing the flat output does not.
 //
 // WHAT IS EXACT AND WHAT IS NOT
 // -----------------------------
@@ -467,7 +476,8 @@ struct WorldConfig
     // bloat that a steady population hides from tlasCountDrift.
     float tlasAreaDrift = 0.5f;
 
-    // Fraction of leaves that may escape their lane before a rebuild.
+    // Fraction of distinct leaves that may escape their build-time lane before
+    // a rebuild. Repeated growth of the same moving leaf is charged once.
     float tlasEscapeFraction = 0.25f;
 
     // Fraction of the population that may be spawned or removed INCREMENTALLY
@@ -830,6 +840,10 @@ private:
         uint32_t tlasNode = kInvalidIndex;
         uint32_t tlasLane = 0;
         uint32_t liveIndex = kInvalidIndex;
+        // Escape budgeting is population-based: once this instance has grown
+        // beyond its build-time lane, later growth before the next rebuild
+        // must not charge the same leaf again.
+        bool     escapedSinceBuild = false;
     };
     static_assert(sizeof(InstanceTlas) == 64,
                   "TLAS instance state should stay one cache line");

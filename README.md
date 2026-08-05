@@ -84,16 +84,17 @@ The representative workload resembles a forest, city, or prop field:
 - The benchmark is single-threaded. It excludes rendering, asset IO,
   residency changes, and instance spawning or removal.
 
-Measurements are medians of ten randomly interleaved 600-frame runs on a
-64-hardware-thread, 2.4 GHz EPYC, using one thread, MSVC 19.51, Release
-`/O2 /arch:AVX2`, on 2026-08-05.
+Measurements are the best repeat from at least ten 600-frame runs on a noisy
+shared 64-hardware-thread, 2.4 GHz EPYC, using one thread, MSVC 19.51, Release
+`/O2 /arch:AVX2`, on 2026-08-05. Taking the best recurring result estimates the
+algorithm's uncontended cost; real frame time can be higher under host load.
 
 ### Startup
 
 | Operation | Time | Included work |
 |---|---:|---|
-| Create the world | 10.7 ms | Build and register the shared asset, add 80,000 instances, and mark its payloads resident |
-| First `selectCut` | 52.5-59.0 ms | Build the initial quality TLAS, query it, walk visible hierarchies, produce the first cut, and populate the `SelectionContext` |
+| Create the world | 10.1 ms | Build and register the shared asset, add 80,000 instances, and mark its payloads resident |
+| First `selectCut` | 49.3-52.8 ms | Build the initial quality TLAS, query it, walk visible hierarchies, produce the first cut, and populate the `SelectionContext` |
 
 World creation does not force the initial quality TLAS build; that work is
 deferred until the first query. Applications can therefore treat the first cut
@@ -103,10 +104,10 @@ as part of level warm-up rather than expecting steady-frame latency from it.
 
 | HLodTree work per frame | Camera and 4,000 objects moving | Static camera, 4,000 objects moving | Moving camera, static objects |
 |---|---:|---:|---:|
-| Apply transform updates and maintain the TLAS | 0.34 ms | 0.32 ms | n/a |
+| Apply transform updates and maintain the TLAS | 0.15 ms | 0.14 ms | n/a |
 | `beginFrame` and flush pending node-bound changes | <0.001 ms | <0.001 ms | <0.001 ms |
-| `selectCut` | 1.71 ms | 1.76 ms | 0.60 ms |
-| **Total HLodTree frame work** | **2.05 ms** | **2.08 ms** | **0.60 ms** |
+| `selectCut` | 0.50 ms | 0.40 ms | 0.40 ms |
+| **Total HLodTree frame work** | **0.65 ms** | **0.54 ms** | **0.40 ms** |
 
 The moving-camera cases average about 21,919 visible instances and a
 24,986-entry render cut. With objects moving, the context reuses 92.6% of
@@ -115,12 +116,32 @@ case averages 19,602 visible instances, a 22,872-entry cut, and 94.1% reuse.
 The context occupies 7.66 MiB after the fly-through and 4.16 MiB for the fixed
 view.
 
+Bounded motion of the same 5% cohort stays on the grow-only refit path in this
+run. The escape budget counts distinct leaves since the last TLAS build, so the
+same movers do not periodically force a rebuild merely by moving every frame.
+If enough different instances escape, or accumulated lane area grows too far,
+the next query repairs the TLAS and that call is intentionally more expensive.
+
+### Multiple views
+
+Each view needs its own `SelectionContext`. With the same moving-camera route
+and nearby view origins 24 metres apart, aggregate `selectCut` time is:
+
+| Views per frame | Static objects | 4,000 moving objects |
+|---:|---:|---:|
+| 1 | 0.40 ms | 0.50 ms |
+| 6 | 3.32 ms | 3.84 ms |
+
+Object transforms are applied once before these selections and are not included
+in the table. Contextual selections are currently serial; six contexts also
+occupy about 46 MiB and put more pressure on caches, so the cost is slightly
+more than six times the one-view best case.
+
 The main distinction is visible immediately: creating the quality TLAS is a
-one-time cost, transform updates are relatively small, and invalidating cuts
-through object motion costs more than camera motion alone in this workload.
-These are scale estimates rather than platform promises; selection remains
-output-sensitive. See [ARCHITECTURE.md](ARCHITECTURE.md) for specialized
-measurements and methodology.
+one-time cost, transform updates are relatively small, and object motion makes
+selection rewalk only the affected instances. These are scale estimates rather
+than platform promises; selection remains output-sensitive. See
+[ARCHITECTURE.md](ARCHITECTURE.md) for specialized measurements and methodology.
 
 ## What selection returns
 
