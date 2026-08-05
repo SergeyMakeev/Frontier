@@ -65,10 +65,10 @@ struct Outputs
     std::vector<LoadRequest> reqs;
 };
 
-Outputs run(World& w, ViewScratch& s, const CullView& v, const CutParams& p)
+Outputs run(World& w, const CullView& v, const CutParams& p)
 {
     Outputs o;
-    w.selectCut(v, p, s, o.cut, o.ideal, o.reqs);
+    w.selectCut(v, p, o.cut, o.ideal, o.reqs);
     return o;
 }
 
@@ -94,11 +94,10 @@ TEST(Cut, TownExample)
     markAllResident(w, ids);
     w.beginFrame();
 
-    ViewScratch s;
     // Both buildings on screen; A close enough to refine into walls, the
     // walls themselves fine at this distance, B drawn as one proxy.
     const CullView v = makeLookAtView(float4::point(250, 0, -600), float4::point(250, 0, 0));
-    const auto o = run(w, s, v, {4.0f, 0.0f, 0.0f});
+    const auto o = run(w, v, {4.0f, 0.0f});
 
     std::set<UserId> got;
     for (const auto& e : o.cut) got.insert(e.payload);
@@ -129,12 +128,11 @@ TEST(Cut, CoarsensWithDistance)
     markAllResident(w, ids);
     w.beginFrame();
 
-    ViewScratch s;
     size_t lastSize = SIZE_MAX;
     for (float d : {80.0f, 300.0f, 1500.0f, 30000.0f})
     {
         const CullView v = makeLookAtView(float4::point(0, 0, -d), float4::point(0, 0, 0));
-        const auto o = run(w, s, v, {4.0f, 0.0f, 0.0f});
+        const auto o = run(w, v, {4.0f, 0.0f});
         ASSERT_FALSE(o.cut.empty()) << "distance " << d;
         EXPECT_LE(o.cut.size(), lastSize) << "distance " << d;
         lastSize = o.cut.size();
@@ -170,9 +168,8 @@ TEST(Cut, IsAntichain)
     }
     w.beginFrame();
 
-    ViewScratch s;
     const CullView v = makeLookAtView(float4::point(10, 20, -100), float4::point(0, 0, 0));
-    const auto o = run(w, s, v, {6.0f, 0.0f, 0.0f});
+    const auto o = run(w, v, {6.0f, 0.0f});
 
     std::set<UserId> inCut;
     for (const auto& e : o.cut) inCut.insert(e.payload);
@@ -239,7 +236,6 @@ TEST(Cut, MatchesBruteForceReference)
 
         CutParams p;
         p.threshold = 1.0f + uni(rng) * 30.0f;
-        p.hysteresis = 0.0f;   // reference keeps no history
         p.minPix = (iter % 4 == 0) ? 0.5f : 0.0f;
 
         const float4 camPos = float4::point(uni(rng) * 800 - 400, uni(rng) * 300 - 150,
@@ -247,8 +243,7 @@ TEST(Cut, MatchesBruteForceReference)
         const float4 camTgt = float4::point(uni(rng) * 200 - 100, 0, uni(rng) * 200 - 100);
         const CullView v = makeLookAtView(camPos, camTgt);
 
-        ViewScratch s;
-        const auto got = run(w, s, v, p);
+        const auto got = run(w, v, p);
         const RefResult want = TA::referenceCut(w, v, p);
 
         SCOPED_TRACE("iter " + std::to_string(iter));
@@ -272,62 +267,156 @@ TEST(Cut, StableAcrossFrames)
     w.addInstance(std::move(pg), float4::point(0, 0, 0));
     markAllResident(w, ids);
 
-    ViewScratch s;
     const CullView v = makeLookAtView(float4::point(20, 10, -90), float4::point(0, 0, 0));
     w.beginFrame();
-    const auto first = run(w, s, v, {5.0f, 0.1f, 0.0f});
+    const auto first = run(w, v, {5.0f, 0.0f});
     for (int f = 0; f < 5; ++f)
     {
         w.beginFrame();
-        const auto o = run(w, s, v, {5.0f, 0.1f, 0.0f});
+        const auto o = run(w, v, {5.0f, 0.0f});
         expectSameCut(o.cut, first.cut);
     }
 }
 
 // ---------------------------------------------------------------------------
-// Hysteresis: refine at threshold*(1+h), un-refine at threshold*(1-h);
-// between the bars the previous decision is sticky.
+// LOD damping. There is no per-node hysteresis state any more: the memory
+// lives on the camera as an envelope of where it has recently been, and error
+// is measured to the nearest point of that envelope. These tests pin the
+// three properties that buys.
 // ---------------------------------------------------------------------------
-TEST(Cut, Hysteresis)
+namespace {
+
+// A tiny tree whose root has geometric error 1, so err(root) = k / dist.
+struct DampFixture
 {
-    HLodBuilder b;
-    const auto root = b.createRoot(1, 1.0f);   // ge = 1
-    b.createNode(root, 2, 0.001f, AABB::fromCenterExtent(float4::vec(-0.01f, 0, 0),
-                                                         float4::vec(0.005f, 0.01f, 0.01f)));
-    b.createNode(root, 3, 0.001f, AABB::fromCenterExtent(float4::vec(0.01f, 0, 0),
-                                                         float4::vec(0.005f, 0.01f, 0.01f)));
-    Page pg = b.build();
-    const auto ids = pageIds(pg);
-
     World w;
-    w.addInstance(std::move(pg), float4::point(0, 0, 0));
-    markAllResident(w, ids);
+    float k;
 
-    const CutParams p{10.0f, 0.2f, 0.0f};   // bars at 12 and 8
-    ViewScratch s;
+    DampFixture()
+    {
+        HLodBuilder b;
+        const auto root = b.createRoot(1, 1.0f);
+        b.createNode(root, 2, 0.001f,
+                     AABB::fromCenterExtent(float4::vec(-0.01f, 0, 0),
+                                            float4::vec(0.005f, 0.01f, 0.01f)));
+        b.createNode(root, 3, 0.001f,
+                     AABB::fromCenterExtent(float4::vec(0.01f, 0, 0),
+                                            float4::vec(0.005f, 0.01f, 0.01f)));
+        Page pg = b.build();
+        const auto ids = pageIds(pg);
+        w.addInstance(std::move(pg), float4::point(0, 0, 0));
+        markAllResident(w, ids);
+        k = makeLookAtView(float4::point(0, 0, -1), float4::point(0, 0, 0)).k;
+    }
 
-    // err(root) = ge * k / dist; the root box is tiny around the origin.
-    const float k = makeLookAtView(float4::point(0, 0, -1), float4::point(0, 0, 0)).k;
-    auto camAtErr = [&](float errTarget)
+    // A camera placed so the root projects to `errTarget` pixels.
+    CullView camAtErr(float errTarget) const
     {
         const float dist = 1.0f * k / errTarget;
-        return makeLookAtView(float4::point(0, 0, -(dist + 0.01f)), float4::point(0, 0, 0));
-    };
-    auto cutIsRoot = [&](const Outputs& o)
-    {
-        return o.cut.size() == 1 && o.cut[0].payload == 1;
-    };
+        return makeLookAtView(float4::point(0, 0, -(dist + 0.01f)),
+                              float4::point(0, 0, 0));
+    }
 
-    w.beginFrame();
-    EXPECT_TRUE(cutIsRoot(run(w, s, camAtErr(11.0f), p)));    // below start bar: coarse
-    w.beginFrame();
-    EXPECT_TRUE(cutIsRoot(run(w, s, camAtErr(11.9f), p)));    // still sticky-coarse
-    w.beginFrame();
-    EXPECT_FALSE(cutIsRoot(run(w, s, camAtErr(13.0f), p)));   // crossed 12: refined
-    w.beginFrame();
-    EXPECT_FALSE(cutIsRoot(run(w, s, camAtErr(9.0f), p)));    // sticky-refined above 8
-    w.beginFrame();
-    EXPECT_TRUE(cutIsRoot(run(w, s, camAtErr(7.0f), p)));     // below 8: coarse again
+    bool coarse(const CullView& v, const CutParams& p)
+    {
+        w.beginFrame();
+        const Outputs o = run(w, v, p);
+        return o.cut.size() == 1 && o.cut[0].payload == 1;
+    }
+};
+
+} // namespace
+
+// A camera jittering around the threshold is the case hysteresis exists for.
+// Undamped it flips every frame; damped, the envelope covers both positions,
+// so the measured error is the closer one's and the decision never moves.
+TEST(Cut, DampingSurvivesJitter)
+{
+    const CutParams p{10.0f, 0.0f};
+
+    {
+        DampFixture f;
+        ViewDamper none(0.0f);
+        std::vector<bool> flips;
+        for (int i = 0; i < 6; ++i)
+            flips.push_back(f.coarse(none.damp(f.camAtErr(i % 2 ? 9.5f : 10.5f)), p));
+        // Undamped: strictly alternating, i.e. a visible pop every frame.
+        for (size_t i = 1; i < flips.size(); ++i)
+            EXPECT_NE(flips[i], flips[i - 1]) << "frame " << i;
+    }
+    {
+        DampFixture f;
+        ViewDamper damper(4.0f);
+        std::vector<bool> flips;
+        for (int i = 0; i < 6; ++i)
+            flips.push_back(f.coarse(damper.damp(f.camAtErr(i % 2 ? 9.5f : 10.5f)), p));
+        // Damped: one steady decision, and it is the refined one (the envelope
+        // is conservative, so damping never gives up detail it already had).
+        for (size_t i = 1; i < flips.size(); ++i)
+            EXPECT_EQ(flips[i], flips[i - 1]) << "frame " << i;
+        EXPECT_FALSE(flips.back());
+    }
+}
+
+// Detail must arrive the instant the camera gets close enough, and be given up
+// only reluctantly. The envelope always contains the current position, so
+// approach is undamped by construction; recede is damped by the decay.
+TEST(Cut, DampingIsAsymmetric)
+{
+    const CutParams p{10.0f, 0.0f};
+    DampFixture f;
+    ViewDamper damper(4.0f);
+
+    // Settle far away and coarse.
+    for (int i = 0; i < 12; ++i) EXPECT_TRUE(f.coarse(damper.damp(f.camAtErr(7.0f)), p));
+
+    // Approach: refined on the very first frame past the threshold.
+    EXPECT_FALSE(f.coarse(damper.damp(f.camAtErr(13.0f)), p));
+
+    // Recede: still refined immediately after falling below the threshold...
+    EXPECT_FALSE(f.coarse(damper.damp(f.camAtErr(7.0f)), p));
+    // ...and eventually collapses as the envelope relaxes onto the camera.
+    bool collapsed = false;
+    for (int i = 0; i < 20 && !collapsed; ++i)
+        collapsed = f.coarse(damper.damp(f.camAtErr(7.0f)), p);
+    EXPECT_TRUE(collapsed);
+}
+
+// Damping off must be bit-identical to no damping at all, so every existing
+// expectation about undamped selection stays exactly valid.
+TEST(Cut, DampingOffIsExact)
+{
+    const CutParams p{10.0f, 0.0f};
+    DampFixture f;
+    ViewDamper off(0.0f);
+
+    for (float err : {11.0f, 9.0f, 13.0f, 7.0f, 10.001f})
+    {
+        const CullView raw = f.camAtErr(err);
+        const CullView damped = off.damp(raw);
+        EXPECT_EQ(damped.envLo.x, 0.0f);
+        EXPECT_EQ(damped.envHi.x, 0.0f);
+        EXPECT_FALSE(damped.damped());
+        EXPECT_EQ(damped.k, raw.k);
+        // Same view in, same decision out.
+        DampFixture a, b;
+        EXPECT_EQ(a.coarse(raw, p), b.coarse(damped, p)) << "err " << err;
+    }
+}
+
+// reset() forgets the window, so a teleport does not stretch the envelope
+// across the discontinuity and over-refine everything in between.
+TEST(Cut, DamperResetForgetsTheWindow)
+{
+    const CutParams p{10.0f, 0.0f};
+    DampFixture f;
+    ViewDamper damper(8.0f);
+
+    for (int i = 0; i < 8; ++i) f.coarse(damper.damp(f.camAtErr(20.0f)), p);
+    EXPECT_FALSE(f.coarse(damper.damp(f.camAtErr(3.0f)), p));   // envelope holds detail
+
+    damper.reset();
+    EXPECT_TRUE(f.coarse(damper.damp(f.camAtErr(3.0f)), p));    // history gone
 }
 
 // ---------------------------------------------------------------------------
@@ -350,12 +439,10 @@ TEST(Cut, ContributionCulling)
     markAllResident(w, farIds);
     w.beginFrame();
 
-    ViewScratch s;
     const CullView v = makeLookAtView(float4::point(0, 5, -60), float4::point(0, 0, 100));
 
-    const auto without = run(w, s, v, {4.0f, 0.0f, 0.0f});
-    ViewScratch s2;
-    const auto with = run(w, s2, v, {4.0f, 0.0f, 0.5f});
+    const auto without = run(w, v, {4.0f, 0.0f});
+    const auto with = run(w, v, {4.0f, 0.5f});
 
     std::set<UserId> withoutIds, withIds;
     for (const auto& e : without.cut) withoutIds.insert(e.payload);
@@ -374,7 +461,7 @@ TEST(Cut, ContributionCulling)
 }
 
 // ---------------------------------------------------------------------------
-// Two views over the same world get independent scratch and correct cuts.
+// Two views over the same world produce independent, correct cuts.
 // ---------------------------------------------------------------------------
 TEST(Cut, MultiViewIndependence)
 {
@@ -386,15 +473,14 @@ TEST(Cut, MultiViewIndependence)
     w.addInstance(std::move(pg), float4::point(0, 0, 0));
     markAllResident(w, ids);
 
-    ViewScratch sNear, sFar;
     const CullView vNear = makeLookAtView(float4::point(0, 0, -70), float4::point(0, 0, 0));
     const CullView vFar = makeLookAtView(float4::point(0, 0, -20000), float4::point(0, 0, 0));
 
     for (int f = 0; f < 3; ++f)
     {
         w.beginFrame();
-        const auto oNear = run(w, sNear, vNear, {4.0f, 0.1f, 0.0f});
-        const auto oFar = run(w, sFar, vFar, {4.0f, 0.1f, 0.0f});
+        const auto oNear = run(w, vNear, {4.0f, 0.0f});
+        const auto oFar = run(w, vFar, {4.0f, 0.0f});
         EXPECT_GT(oNear.cut.size(), oFar.cut.size());
         EXPECT_EQ(oFar.cut.size(), 1u);
     }

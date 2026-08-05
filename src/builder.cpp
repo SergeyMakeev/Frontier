@@ -1,25 +1,13 @@
 #include "hlod/builder.h"
 
-#include <stdexcept>
-#include <string>
+#include <cstring>
 
 namespace hlod {
-
-namespace {
-[[noreturn]] void fail(const std::string& msg)
-{
-    throw std::logic_error("HLodBuilder: " + msg);
-}
-void check(bool cond, const char* msg)
-{
-    if (!cond) fail(msg);
-}
-} // namespace
 
 HLodBuilder::NodeId HLodBuilder::createRoot(UserPayload payload, float geometricError,
                                             const AABB& bbox)
 {
-    check(!built_, "builder already consumed");
+    HLOD_CHECK(!built_, "HLodBuilder: builder already consumed");
     BuildNode n;
     n.bbox = bbox;
     n.geometricError = geometricError;
@@ -33,9 +21,9 @@ HLodBuilder::NodeId HLodBuilder::createRoot(UserPayload payload, float geometric
 HLodBuilder::NodeId HLodBuilder::createNode(NodeId parent, UserPayload payload,
                                             float geometricError, const AABB& bbox)
 {
-    check(!built_, "builder already consumed");
-    check(parent < nodes_.size(), "invalid parent");
-    check(!nodes_[parent].expansion, "expansion point must stay a leaf");
+    HLOD_CHECK(!built_, "HLodBuilder: builder already consumed");
+    HLOD_CHECK(parent < nodes_.size(), "HLodBuilder: invalid parent");
+    HLOD_CHECK(!nodes_[parent].expansion, "HLodBuilder: expansion point must stay a leaf");
     BuildNode n;
     n.bbox = bbox;
     n.geometricError = geometricError;
@@ -44,50 +32,65 @@ HLodBuilder::NodeId HLodBuilder::createNode(NodeId parent, UserPayload payload,
     nodes_.push_back(n);
     const NodeId me = NodeId(nodes_.size() - 1);
     nodes_[parent].children.push_back(me);
-    check(nodes_[parent].children.size() <= kMaxChildren, "fanout exceeds kMaxChildren");
+    HLOD_CHECK(nodes_[parent].children.size() <= kMaxChildren,
+               "HLodBuilder: fanout exceeds kMaxChildren");
     return me;
 }
 
 void HLodBuilder::markExpansion(NodeId node)
 {
-    check(!built_, "builder already consumed");
-    check(node < nodes_.size(), "invalid node");
-    check(nodes_[node].children.empty(), "expansion point must stay a leaf");
+    HLOD_CHECK(!built_, "HLodBuilder: builder already consumed");
+    HLOD_CHECK(node < nodes_.size(), "HLodBuilder: invalid node");
+    HLOD_CHECK(nodes_[node].children.empty(),
+               "HLodBuilder: expansion point must stay a leaf");
     nodes_[node].expansion = true;
 }
 
-Page HLodBuilder::build()
+Page HLodBuilder::build(const HlodContext& ctx)
 {
-    check(!built_, "builder already consumed");
+    HLOD_CHECK(!built_, "HLodBuilder: builder already consumed");
     built_ = true;
-    check(!roots_.empty(), "page has no roots");
-    check(roots_.size() <= kMaxChildren, "too many page roots");
+    HLOD_CHECK(!roots_.empty(), "HLodBuilder: page has no roots");
+    HLOD_CHECK(roots_.size() <= kMaxChildren, "HLodBuilder: too many page roots");
 
     const uint32_t total = uint32_t(nodes_.size()) + 1;   // +1 sentinel
 
-    Page pg;
-    pg.parent.reserve(total);
-    pg.subtreeSize.reserve(total);
-    pg.meta.reserve(total);
-    pg.payload.reserve(total);
-    pg.bbox.reserve(total);
-    pg.geometricError.reserve(total);
+    // The passes below work in plain scratch arrays; the blob is packed once
+    // at the end. Authoring is not perf-sensitive and the final memcpy is a
+    // rounding error next to the DFS passes.
+    std::vector<uint32_t>    parent;
+    std::vector<uint32_t>    subtreeSize;
+    std::vector<uint32_t>    meta;
+    std::vector<UserPayload> payload;
+    std::vector<AABB>        bbox;
+    std::vector<float>       geometricError;
+    std::vector<WideBlock>   wide;
+    std::vector<uint32_t>    blockMask;   // parallel to wide, one word per block
 
-    auto emit = [&](uint32_t parent, uint32_t childCount, bool expansion,
-                    UserPayload payload, const AABB& bbox, float ge) -> uint32_t
+    parent.reserve(total);
+    subtreeSize.reserve(total);
+    meta.reserve(total);
+    payload.reserve(total);
+    bbox.reserve(total);
+    geometricError.reserve(total);
+
+    auto emit = [&](uint32_t par, uint32_t childCount, bool expansion,
+                    UserPayload pay, const AABB& box, float ge) -> uint32_t
     {
-        pg.parent.push_back(parent);
-        pg.subtreeSize.push_back(1);
-        pg.meta.push_back(childCount | (expansion ? kMetaExpansion : 0u));
-        pg.payload.push_back(payload);
-        pg.bbox.push_back(bbox);
-        pg.geometricError.push_back(ge);
-        return uint32_t(pg.parent.size() - 1);
+        parent.push_back(par);
+        subtreeSize.push_back(1);
+        meta.push_back(childCount | (expansion ? kMetaExpansion : 0u));
+        payload.push_back(pay);
+        bbox.push_back(box);
+        geometricError.push_back(ge);
+        return uint32_t(parent.size() - 1);
     };
 
     // ---- Sentinel at index 0: stand-in for this page's owner ----------------
-    // FLT_MAX error means the roots are never clamped here; attachPage()
-    // overwrites it with the owning expansion node's error.
+    // FLT_MAX error means the roots are never clamped here. A page attached
+    // under an expansion point is clamped at runtime by the owner's error,
+    // which the World carries as a per-attachment scalar rather than by
+    // rewriting the page (that is what lets one page back many attachments).
     emit(0, uint32_t(roots_.size()), false, kSentinelPayload, AABB::empty(), FLT_MAX);
 
     // ---- Pass A: preorder DFS emission — establishes (A) and (B) ------------
@@ -99,37 +102,37 @@ Page HLodBuilder::build()
         const uint32_t b = stack.back();
         stack.pop_back();
         const BuildNode& n = nodes_[b];
-        const uint32_t parent = n.parent == kInvalidIndex ? 0 : remap[n.parent];
-        remap[b] = emit(parent, uint32_t(n.children.size()), n.expansion,
+        const uint32_t par = n.parent == kInvalidIndex ? 0 : remap[n.parent];
+        remap[b] = emit(par, uint32_t(n.children.size()), n.expansion,
                         n.payload, n.bbox, n.geometricError);
         for (auto c = n.children.rbegin(); c != n.children.rend(); ++c)
             stack.push_back(*c);
     }
-    check(pg.nodeCount() == total, "internal: emission count mismatch");
+    HLOD_CHECK(parent.size() == total, "HLodBuilder: internal emission count mismatch");
 
     // ---- Pass B: bottom-up fold — subtree sizes and bounds, one reverse sweep
     // Unioning children into the parent ESTABLISHES (C); an author-supplied
     // bbox is treated as a lower bound.
     for (uint32_t i = total - 1; i >= 1; --i)
     {
-        pg.subtreeSize[pg.parent[i]] += pg.subtreeSize[i];
-        pg.bbox[pg.parent[i]].expand(pg.bbox[i]);
+        subtreeSize[parent[i]] += subtreeSize[i];
+        bbox[parent[i]].expand(bbox[i]);
     }
     for (uint32_t i = 1; i < total; ++i)
-        check(!pg.bbox[i].isEmpty(), "leaf node without bounds");
+        HLOD_CHECK(!bbox[i].isEmpty(), "HLodBuilder: leaf node without bounds");
 
     // ---- Pass C: enforce monotone error (D), forward sweep ------------------
     for (uint32_t i = 1; i < total; ++i)
     {
-        const float pe = pg.geometricError[pg.parent[i]];
-        if (pg.geometricError[i] > pe) pg.geometricError[i] = pe;
+        const float pe = geometricError[parent[i]];
+        if (geometricError[i] > pe) geometricError[i] = pe;
     }
 
     // ---- Pass D: emit wide child blocks --------------------------------------
     std::vector<uint32_t> kids;
     for (uint32_t i = 0; i < total; ++i)
     {
-        const uint32_t cc = pg.childCount(i);
+        const uint32_t cc = metaChildCount(meta[i]);
         if (cc == 0) continue;
 
         kids.clear();
@@ -137,12 +140,13 @@ Page HLodBuilder::build()
         for (uint32_t k = 0; k < cc; ++k)
         {
             kids.push_back(c);
-            c += pg.subtreeSize[c];
+            c += subtreeSize[c];
         }
 
-        const uint32_t offset = uint32_t(pg.wide.size());
-        check(offset <= kMaxWideOffset, "page too large: wide offset overflow");
-        pg.meta[i] |= offset << kMetaOffsetShift;
+        const uint32_t offset = uint32_t(wide.size());
+        HLOD_CHECK(offset <= kMaxWideOffset,
+                   "HLodBuilder: page too large: wide offset overflow");
+        meta[i] |= offset << kMetaOffsetShift;
 
         for (uint32_t base = 0; base < cc; base += kWide)
         {
@@ -150,17 +154,19 @@ Page HLodBuilder::build()
             blk.bounds = WideBounds::allEmpty();
             blk.error  = float8::splat(0.0f);
             for (uint32_t l = 0; l < kWide; ++l) blk.child[l] = kInvalidIndex;
+            uint32_t valid = 0, leaf = 0;
             for (uint32_t l = 0; l < kWide && base + l < cc; ++l)
             {
                 const uint32_t ci = kids[base + l];
-                blk.bounds.setLane(l, pg.bbox[ci]);
-                blk.error.v[l] = pg.geometricError[ci];
+                blk.bounds.setLane(l, bbox[ci]);
+                blk.error.v[l] = geometricError[ci];
                 blk.child[l]   = ci;
-                blk.validMask |= 1u << l;
-                if (pg.childCount(ci) == 0 && !pg.isExpansion(ci))
-                    blk.leafMask |= 1u << l;
+                valid |= 1u << l;
+                if (metaChildCount(meta[ci]) == 0 && !metaIsExpansion(meta[ci]))
+                    leaf |= 1u << l;
             }
-            pg.wide.push_back(blk);
+            wide.push_back(blk);
+            blockMask.push_back(valid | (leaf << kBlockLeafShift));
         }
     }
 
@@ -168,17 +174,58 @@ Page HLodBuilder::build()
     // Payloads are opaque user data: no uniqueness or reserved-value checks.
     for (uint32_t i = 1; i < total; ++i)
     {
-        check(pg.parent[i] < i, "(A) violated");                              // (A)
-        check(i + pg.subtreeSize[i] <= total, "(B) violated");                // (B)
-        check(pg.childCount(i) == 0 || pg.parent[i + 1] == i,
-              "(B) first child not adjacent");
-        check(pg.bbox[pg.parent[i]].contains(pg.bbox[i]), "(C) violated");    // (C)
-        check(pg.geometricError[i] <= pg.geometricError[pg.parent[i]],
-              "(D) violated");                                                // (D)
-        check(pg.childCount(i) == 0 || !pg.isExpansion(i),
-              "local XOR paged children");
+        HLOD_CHECK(parent[i] < i, "HLodBuilder: (A) violated");                    // (A)
+        HLOD_CHECK(i + subtreeSize[i] <= total, "HLodBuilder: (B) violated");      // (B)
+        HLOD_CHECK(metaChildCount(meta[i]) == 0 || parent[i + 1] == i,
+                   "HLodBuilder: (B) first child not adjacent");
+        HLOD_CHECK(bbox[parent[i]].contains(bbox[i]), "HLodBuilder: (C) violated"); // (C)
+        HLOD_CHECK(geometricError[i] <= geometricError[parent[i]],
+                   "HLodBuilder: (D) violated");                                    // (D)
+        HLOD_CHECK(metaChildCount(meta[i]) == 0 || !metaIsExpansion(meta[i]),
+                   "HLodBuilder: local XOR paged children");
     }
-    return pg;
+
+    // ---- Pass F: pack the blob -------------------------------------------------
+    const uint32_t wideCount = uint32_t(wide.size());
+    const size_t   bytes = pageBlobBytes(total, wideCount);
+
+    void* blob = ctx.alloc(bytes, kPageAlign, ctx.user);
+    HLOD_CHECK(blob != nullptr, "HLodBuilder: page allocation failed");
+    std::memset(blob, 0, bytes);
+
+    auto* base = static_cast<std::byte*>(blob);
+    auto* h = reinterpret_cast<PageHeader*>(base);
+    h->magic       = kPageMagic;
+    h->version     = kPageVersion;
+    h->headerBytes = uint16_t(sizeof(PageHeader));
+    h->totalBytes  = uint32_t(bytes);
+    h->nodeCount   = total;
+    h->wideCount   = wideCount;
+
+    // Mirrors the layout in page.cpp; PageView::fromBytes recomputes it and
+    // rejects the blob if the two ever disagree.
+    size_t o = sizeof(PageHeader);
+    auto place = [&](uint32_t& outOffset, size_t align, size_t count, size_t stride,
+                     const void* src)
+    {
+        o = (o + align - 1) & ~(align - 1);
+        outOffset = uint32_t(o);
+        if (count) std::memcpy(base + o, src, count * stride);
+        o += count * stride;
+    };
+    place(h->wideOffset, alignof(WideBlock), wideCount, sizeof(WideBlock), wide.data());
+    place(h->maskOffset, alignof(uint32_t), wideCount, sizeof(uint32_t),
+          blockMask.data());
+    place(h->bboxOffset, alignof(AABB), total, sizeof(AABB), bbox.data());
+    place(h->payloadOffset, alignof(UserPayload), total, sizeof(UserPayload),
+          payload.data());
+    place(h->parentOffset, alignof(uint32_t), total, sizeof(uint32_t), parent.data());
+    place(h->subtreeOffset, alignof(uint32_t), total, sizeof(uint32_t),
+          subtreeSize.data());
+    place(h->metaOffset, alignof(uint32_t), total, sizeof(uint32_t), meta.data());
+    place(h->errorOffset, alignof(float), total, sizeof(float), geometricError.data());
+
+    return Page::adopt(blob, bytes, ctx);
 }
 
 } // namespace hlod

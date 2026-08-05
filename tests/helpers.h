@@ -2,8 +2,10 @@
 // Shared test utilities: World internals access, a brute-force scalar
 // reference implementation of selectCut, and deterministic tree generators.
 
+#include <algorithm>
 #include <cstdint>
 #include <stdexcept>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -21,8 +23,9 @@ struct RefResult
 
 // Full access to World internals plus a straightforward recursive scalar
 // reference for selectCut (no wide tests, no masks, no epoch stamps, no
-// pruning shortcuts beyond the algorithm's own semantics).
-// Requires params.hysteresis == 0 (the reference keeps no per-frame state).
+// pruning shortcuts beyond the algorithm's own semantics). It reads the
+// camera envelope the same way the production path does, so it stays valid
+// under LOD damping — there is no per-frame state on either side to diverge.
 //
 // The production API is handle-only; the World keeps no payload index. For
 // test readability everything here resolves payloads by brute-force scan
@@ -47,7 +50,7 @@ struct World::TestAccess
         if (!h.valid()) throw std::logic_error("TestAccess: unknown payload");
         return h;
     }
-    static const Page& pageOf(World& w, UserPayload anyNodeInPage)
+    static const PageView& pageOf(World& w, UserPayload anyNodeInPage)
     {
         return w.slots_[requireByScan(w, anyNodeInPage).slot].page;
     }
@@ -56,7 +59,53 @@ struct World::TestAccess
         return w.slots_[requireByScan(w, anyNodeInPage).slot].lastTouched;
     }
     static void forceTlasRebuild(World& w) { w.tlasDirty_ = true; }
+    // False means the next query will use the tree as it stands. This is how a
+    // test asserts that an edit was applied INCREMENTALLY rather than by
+    // deferring a full rebuild, which is invisible in the cut either way.
+    static bool tlasDirty(World& w) { return w.tlasDirty_; }
+    static size_t tlasNodeCount(World& w) { return w.tlasNodes_.size(); }
     static size_t pageRtBytes() { return sizeof(PageRt); }
+
+    // Invariant (D) across a page boundary is a per-mount scalar now, not a
+    // rewrite of the child page's error array (page bytes are immutable).
+    static float errClampOf(World& w, UserPayload anyNodeInPage)
+    {
+        return w.slots_[requireByScan(w, anyNodeInPage).slot].errClamp;
+    }
+
+    // How many mounts this instance has taken a private copy of the bounds
+    // for. Zero unless the instance has been deformed.
+    static size_t overlaysOf(World& w, World::InstanceRef ref)
+    {
+        const Instance* inst = w.resolveInstance(ref);
+        return inst ? inst->overlays.size() : 0;
+    }
+
+    // Bounds AS THIS INSTANCE SEES THEM. Refit no longer writes into the page
+    // (it is shared and immutable), so a test that wants to observe motion has
+    // to read through the instance, not through the page.
+    static const AABB* bboxOf(World& w, World::InstanceRef ref, uint32_t slot)
+    {
+        Instance* inst = w.resolveInstance(ref);
+        return inst ? w.boundsFor(*inst, slot, w.slots_[slot]) : nullptr;
+    }
+    static WideBoundsRef wideOf(World& w, World::InstanceRef ref, uint32_t slot)
+    {
+        Instance* inst = w.resolveInstance(ref);
+        return inst ? w.wideBoundsFor(*inst, slot, w.slots_[slot]) : WideBoundsRef{};
+    }
+    static AABB instanceWorldBox(World& w, World::InstanceRef ref)
+    {
+        w.flushBounds();
+        const Instance* inst = w.resolveInstance(ref);
+        return inst ? inst->worldBox : AABB::empty();
+    }
+    // The runtime state a mount holds, which every instance of the asset
+    // shares: used to assert that deforming one instance does not fork it.
+    static const void* mountStateOf(World& w, UserPayload anyNodeInPage)
+    {
+        return &w.slots_[requireByScan(w, anyNodeInPage).slot];
+    }
 
     static std::vector<std::pair<uint32_t, uint8_t>> tlasQuery(World& w,
                                                                const CullView& v,
@@ -65,6 +114,75 @@ struct World::TestAccess
         std::vector<std::pair<uint32_t, uint8_t>> out;
         w.tlasQuery(v, minPix, out);
         return out;
+    }
+
+    // Structural audit of the top-level tree. Returns "" when sound, otherwise
+    // the first thing found wrong. Incremental insertion and removal edit this
+    // tree in place, so every one of these is a way for a spawn to make an
+    // instance invisible or a stale one visible -- exactly the failures a cut
+    // comparison can miss when the camera happens not to look there.
+    static std::string tlasValidate(World& w)
+    {
+        if (w.tlasDirty_) return "";   // a rebuild is pending; nothing to audit
+        std::vector<uint32_t> seen(w.instances_.size(), 0);
+        size_t alive = 0;
+        for (const World::Instance& i : w.instances_)
+            if (i.alive) ++alive;
+        if (w.tlasRoot_ < 0)
+            return alive == 0 ? "" : "empty tree with " + std::to_string(alive) +
+                                         " live instances";
+
+        std::vector<int32_t> stack{w.tlasRoot_};
+        std::vector<uint8_t> visited(w.tlasNodes_.size(), 0);
+        size_t found = 0;
+        while (!stack.empty())
+        {
+            const int32_t ni = stack.back();
+            stack.pop_back();
+            if (visited[size_t(ni)]) return "node reachable twice";
+            visited[size_t(ni)] = 1;
+            const World::TlasNode& n = w.tlasNodes_[size_t(ni)];
+            if (n.validMask == 0) return "reachable node with no valid lane";
+            for (uint32_t l = 0; l < kWide; ++l)
+            {
+                if (!(n.validMask & (1u << l))) continue;
+                const AABB lane = n.bounds.lane(l);
+                if (n.child[l] < 0)
+                {
+                    const uint32_t id = uint32_t(~n.child[l]);
+                    if (id >= w.instances_.size()) return "lane names no instance";
+                    const World::Instance& inst = w.instances_[id];
+                    if (!inst.alive) return "dead instance still in the tree";
+                    if (seen[id]++) return "instance in the tree twice";
+                    if (inst.tlasNode != uint32_t(ni) || inst.tlasLane != l)
+                        return "instance back-pointer disagrees with its lane";
+                    if (!lane.contains(inst.worldBox))
+                        return "lane does not contain its instance";
+                    if ((n.laneMask[l] & inst.mask) != inst.mask)
+                        return "lane mask drops layers its instance is on";
+                    if (n.maxErr.v[l] < inst.maxErrWorld)
+                        return "lane error below its instance's";
+                    ++found;
+                }
+                else
+                {
+                    const World::TlasNode& c = w.tlasNodes_[size_t(n.child[l])];
+                    if (c.parent != ni) return "child's parent link is wrong";
+                    float childErr = 0.0f;
+                    uint32_t childMask = 0;
+                    const AABB ext = w.tlasNodeExtent(c, childErr, childMask);
+                    if (!lane.contains(ext)) return "lane does not contain its subtree";
+                    if ((n.laneMask[l] & childMask) != childMask)
+                        return "lane mask drops layers its subtree is on";
+                    if (n.maxErr.v[l] < childErr) return "lane error below its subtree's";
+                    stack.push_back(n.child[l]);
+                }
+            }
+        }
+        if (found != alive)
+            return "tree holds " + std::to_string(found) + " of " +
+                   std::to_string(alive) + " live instances";
+        return "";
     }
 
     // Ancestor chain of a node as payloads, walking parent links inside pages
@@ -91,6 +209,7 @@ struct World::TestAccess
 
     static RefResult referenceCut(World& w, const CullView& view, const CutParams& p)
     {
+        w.flushBounds();
         RefResult out;
         for (const Instance& inst : w.instances_)
         {
@@ -100,40 +219,47 @@ struct World::TestAccess
                 continue;
             if (p.minPix > 0.0f)
             {
-                const float e = screenError(inst.maxErrWorld, view.k,
-                                            distanceToBox(inst.worldBox, view.pos));
+                const float e = screenError(
+                    inst.maxErrWorld, view.k,
+                    distanceToBox(inst.worldBox, view.queryMin(), view.queryMax()));
                 if (e < p.minPix) continue;
             }
             const CullView local = toLocal(view, inst.pos, inst.scale);
-            refChildren(w, inst.rootSlot, 0, true, local, p, out);
+            refChildren(w, inst, inst.rootSlot, 0, true, local, p, out);
         }
         return out;
     }
 
 private:
-    static void refChildren(World& w, uint32_t slot, uint32_t node, bool alive,
-                            const CullView& local, const CutParams& p, RefResult& out)
+    static void refChildren(World& w, const Instance& inst, uint32_t slot,
+                            uint32_t node, bool alive, const CullView& local,
+                            const CutParams& p, RefResult& out)
     {
-        const Page& pg = w.slots_[slot].page;
+        const PageView& pg = w.slots_[slot].page;
         uint32_t c = node + 1;
         for (uint32_t k = 0; k < pg.childCount(node); ++k)
         {
-            refNode(w, slot, c, alive, local, p, out);
+            refNode(w, inst, slot, c, alive, local, p, out);
             c += pg.subtreeSize[c];
         }
     }
 
-    static void refNode(World& w, uint32_t slot, uint32_t i, bool alive,
-                        const CullView& local, const CutParams& p, RefResult& out)
+    static void refNode(World& w, const Instance& inst, uint32_t slot, uint32_t i,
+                        bool alive, const CullView& local, const CutParams& p,
+                        RefResult& out)
     {
         const PageRt& rt = w.slots_[slot];
-        const Page& pg = rt.page;
+        const PageView& pg = rt.page;
+        // Whatever bounds this instance sees: its overlay if it has been
+        // deformed, the shared page otherwise.
+        const AABB* bbox = w.boundsFor(inst, slot, rt);
 
         uint8_t mask = kAllPlanes;
-        if (testAabb(pg.bbox[i], local.frustum, mask) == CullState::Outside) return;
+        if (testAabb(bbox[i], local.frustum, mask) == CullState::Outside) return;
 
-        const float err = screenError(pg.geometricError[i], local.k,
-                                      distanceToBox(pg.bbox[i], local.pos));
+        const float err = screenError(
+            std::min(pg.geometricError[i], rt.errClamp), local.k,
+            distanceToBox(bbox[i], local.queryMin(), local.queryMax()));
         const uint32_t cc = pg.childCount(i);
         const bool exp = pg.isExpansion(i);
         const bool wants = (cc > 0 || exp) && err > p.threshold;
@@ -141,8 +267,8 @@ private:
         const NodeHandle here{slot, i, rt.generation};
         if (!wants)
         {
-            if (alive) out.cut.push_back({pg.payload[i], err});
-            out.ideal.push_back({pg.payload[i], here, err, IdealTag::Direct});
+            if (alive) out.cut.push_back({pg.payload[i], err, inst.tag});
+            out.ideal.push_back({pg.payload[i], here, err, inst.tag, IdealTag::Direct});
             return;
         }
 
@@ -150,8 +276,9 @@ private:
             (exp && !rt.expSlot.empty()) ? rt.expSlot[i] : kInvalidIndex;
         if (exp && childSlot == kInvalidIndex)
         {
-            if (alive) out.cut.push_back({pg.payload[i], err});
-            out.ideal.push_back({pg.payload[i], here, err, IdealTag::NeedsExpansion});
+            if (alive) out.cut.push_back({pg.payload[i], err, inst.tag});
+            out.ideal.push_back(
+                {pg.payload[i], here, err, inst.tag, IdealTag::NeedsExpansion});
             return;
         }
 
@@ -168,7 +295,7 @@ private:
 
         if (!ready && alive)
         {
-            out.cut.push_back({pg.payload[i], err});
+            out.cut.push_back({pg.payload[i], err, inst.tag});
             const PageRt& target = exp ? w.slots_[childSlot] : rt;
             const uint32_t ts = exp ? childSlot : slot;
             const uint32_t tn = exp ? 0u : i;
@@ -184,9 +311,9 @@ private:
 
         const bool a2 = alive && ready;
         if (exp)
-            refChildren(w, childSlot, 0, a2, local, p, out);
+            refChildren(w, inst, childSlot, 0, a2, local, p, out);
         else
-            refChildren(w, slot, i, a2, local, p, out);
+            refChildren(w, inst, slot, i, a2, local, p, out);
     }
 };
 
@@ -201,7 +328,7 @@ using TAX = World::TestAccess;
 // payload. The alias keeps test code reading naturally.
 using UserId = UserPayload;
 
-inline std::vector<UserPayload> pageIds(const Page& pg)
+inline std::vector<UserPayload> pageIds(const PageView& pg)
 {
     std::vector<UserPayload> out;
     for (uint32_t i = 1; i < pg.nodeCount(); ++i) out.push_back(pg.payload[i]);
@@ -234,9 +361,14 @@ inline bool isAttached(World& w, UserPayload expansion)
     const NodeHandle h = TAX::findByScan(w, expansion);
     return h.valid() && w.isAttached(h);
 }
-inline void setNodeBounds(World& w, UserPayload p, const AABB& b)
+inline void setNodeBounds(World& w, World::InstanceRef inst, UserPayload p,
+                          const AABB& b)
 {
-    w.setNodeBounds(handleOf(w, p), b);
+    w.setNodeBounds(inst, handleOf(w, p), b);
+}
+inline AABB nodeBounds(World& w, World::InstanceRef inst, UserPayload p)
+{
+    return w.nodeBounds(inst, handleOf(w, p));
 }
 
 // Deterministic paged-tree generator. Space is subdivided into slabs along

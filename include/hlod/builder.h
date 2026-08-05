@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <vector>
 
+#include "config.h"
 #include "page.h"
 
 namespace hlod {
@@ -26,8 +27,13 @@ public:
     void markExpansion(NodeId node);
 
     // Consumes the builder. Establishes invariants (A)-(D), emits wide child
-    // blocks, verifies the contract. Throws std::logic_error on violations.
-    Page build();
+    // blocks, verifies the contract, and packs everything into one blob
+    // allocated through `ctx`. Fires HLOD_FATAL on contract violations.
+    //
+    // The returned Page owns that blob; `ctx` must outlive it. Write
+    // page.data()/page.byteSize() straight to disk to cache the result —
+    // that byte range is the on-disk format.
+    Page build(const HlodContext& ctx = defaultContext());
 
 private:
     struct BuildNode

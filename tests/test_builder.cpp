@@ -52,7 +52,7 @@ void verifyInvariants(const Page& pg)
             const WideBlock& blk = pg.wide[b];
             for (uint32_t l = 0; l < kWide; ++l)
             {
-                if (!(blk.validMask & (1u << l)))
+                if (!(pg.validLanes(b) & (1u << l)))
                 {
                     EXPECT_EQ(blk.child[l], kInvalidIndex);
                     continue;
@@ -60,7 +60,7 @@ void verifyInvariants(const Page& pg)
                 const uint32_t c = blk.child[l];
                 ++seen;
                 EXPECT_EQ(pg.parent[c], i);
-                EXPECT_EQ((blk.leafMask >> l) & 1u,
+                EXPECT_EQ((pg.leafLanes(b) >> l) & 1u,
                           (pg.childCount(c) == 0 && !pg.isExpansion(c)) ? 1u : 0u);
                 const AABB lane = blk.bounds.lane(l);
                 EXPECT_EQ(lane.mn.x, pg.bbox[c].mn.x);

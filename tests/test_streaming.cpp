@@ -18,11 +18,11 @@ struct Outputs
     std::vector<LoadRequest> reqs;
 };
 
-Outputs frame(World& w, ViewScratch& s, const CullView& v, const CutParams& p)
+Outputs frame(World& w, const CullView& v, const CutParams& p)
 {
     w.beginFrame();
     Outputs o;
-    w.selectCut(v, p, s, o.cut, o.ideal, o.reqs);
+    w.selectCut(v, p, o.cut, o.ideal, o.reqs);
     return o;
 }
 
@@ -52,24 +52,23 @@ TEST(Streaming, AllOrNothingRefinement)
     w.addInstance(std::move(pg), float4::point(0, 0, 0));
     // Root is pinned-resident automatically. Children start non-resident.
 
-    ViewScratch s;
     const CullView v = makeLookAtView(float4::point(0, 0, -20), float4::point(0, 0, 0));
-    const CutParams p{4.0f, 0.0f, 0.0f};
+    const CutParams p{4.0f, 0.0f};
 
-    auto o = frame(w, s, v, p);
+    auto o = frame(w, v, p);
     EXPECT_EQ(cutIds(o), std::set<UserId>{1});                    // parent draws
     EXPECT_EQ(o.reqs.size(), 3u);                                 // wants all three
 
     markResident(w, 10);
     markResident(w, 11);
-    o = frame(w, s, v, p);
+    o = frame(w, v, p);
     EXPECT_EQ(cutIds(o), std::set<UserId>{1});                    // still all-or-nothing
     ASSERT_EQ(o.reqs.size(), 1u);
     EXPECT_EQ(o.reqs[0].payload, 12u);                            // only the missing one
 
     // The production flow: complete the load via the request's handle.
     w.markResident(o.reqs[0].node);
-    o = frame(w, s, v, p);
+    o = frame(w, v, p);
     EXPECT_EQ(cutIds(o), (std::set<UserId>{10, 11, 12}));         // refined
     EXPECT_TRUE(o.reqs.empty());
 
@@ -78,7 +77,7 @@ TEST(Streaming, AllOrNothingRefinement)
 
     // Eviction: parent falls back next frame, no holes.
     markNonResident(w, 11);
-    o = frame(w, s, v, p);
+    o = frame(w, v, p);
     EXPECT_EQ(cutIds(o), std::set<UserId>{1});
     ASSERT_EQ(o.reqs.size(), 1u);
     EXPECT_EQ(o.reqs[0].payload, 11u);
@@ -100,9 +99,8 @@ TEST(Streaming, IdealCutLeadsActualCut)
     w.addInstance(std::move(pg), float4::point(0, 0, 0));
     // Nothing resident except the pinned root.
 
-    ViewScratch s;
     const CullView v = makeLookAtView(float4::point(0, 0, -50), float4::point(0, 0, 0));
-    const auto o = frame(w, s, v, {4.0f, 0.0f, 0.0f});
+    const auto o = frame(w, v, {4.0f, 0.0f});
 
     // Actual cut: the root proxy only. Ideal cut: deeper, all DIRECT.
     EXPECT_EQ(cutIds(o), std::set<UserId>{ids.front()});
@@ -132,13 +130,12 @@ TEST(Streaming, ExpansionLifeCycle)
 
     ASSERT_FALSE(gen.recipes.empty());
 
-    ViewScratch s;
-    const CutParams p{4.0f, 0.0f, 0.0f};
+    const CutParams p{4.0f, 0.0f};
 
     // Far away: collapsed expansion points draw their proxies; steady state.
     {
         const CullView far = makeLookAtView(float4::point(0, 0, -100000), float4::point(0, 0, 0));
-        const auto o = frame(w, s, far, p);
+        const auto o = frame(w, far, p);
         for (const auto& e : o.ideal) EXPECT_EQ(int(e.tag), int(IdealTag::Direct));
     }
 
@@ -147,7 +144,7 @@ TEST(Streaming, ExpansionLifeCycle)
     const CullView near = makeLookAtView(float4::point(0, 0, -45), float4::point(0, 0, 0));
     std::vector<UserId> needed;
     {
-        const auto o = frame(w, s, near, p);
+        const auto o = frame(w, near, p);
         for (const auto& e : o.ideal)
             if (e.tag == IdealTag::NeedsExpansion) needed.push_back(e.payload);
         ASSERT_FALSE(needed.empty());
@@ -165,12 +162,12 @@ TEST(Streaming, ExpansionLifeCycle)
         EXPECT_TRUE(isAttached(w, id));
     }
     {
-        const auto o = frame(w, s, near, p);
+        const auto o = frame(w, near, p);
         EXPECT_FALSE(o.reqs.empty());               // root payloads wanted now
         for (const auto& r : o.reqs) w.markResident(r.node);
     }
     {
-        const auto o = frame(w, s, near, p);
+        const auto o = frame(w, near, p);
         const auto ids = cutIds(o);
         for (UserId id : needed) EXPECT_FALSE(ids.count(id));   // refined through
     }
@@ -179,36 +176,67 @@ TEST(Streaming, ExpansionLifeCycle)
     detachPage(w, needed[0]);
     EXPECT_FALSE(isAttached(w, needed[0]));
     {
-        const auto o = frame(w, s, near, p);
+        const auto o = frame(w, near, p);
         EXPECT_TRUE(cutIds(o).count(needed[0]));
     }
 }
 
 // ---------------------------------------------------------------------------
-// Attach-time clamp: child page errors are clamped to the expansion node's
-// error so invariant (D) holds across the boundary.
+// Attach-time clamp: invariant (D) across the page boundary is enforced by a
+// per-mount scalar (errClamp), NOT by rewriting the child page's error array
+// — page bytes are immutable at runtime. A child authored with a too-large
+// error must behave exactly as one authored at the expansion node's error.
 // ---------------------------------------------------------------------------
 TEST(Streaming, AttachClampsChildErrors)
 {
-    HLodBuilder rb;
-    const auto r = rb.createRoot(1, 8.0f);
-    const auto e = rb.createNode(r, 2, 0.5f,   // deliberately small error
-                                 AABB::fromCenterExtent(float4::vec(0, 0, 0), float4::vec(2, 2, 2)));
-    rb.markExpansion(e);
-    Page root = rb.build();
-
-    HLodBuilder cb;
-    cb.createRoot(10, 100.0f,   // way larger than the expansion node's 0.5
-                  AABB::fromCenterExtent(float4::vec(0, 0, 0), float4::vec(1, 1, 1)));
-    Page child = cb.build();
+    auto makeRoot = [] {
+        HLodBuilder rb;
+        const auto r = rb.createRoot(1, 8.0f);
+        const auto e = rb.createNode(r, 2, 0.5f,   // deliberately small error
+                                     AABB::fromCenterExtent(float4::vec(0, 0, 0),
+                                                            float4::vec(2, 2, 2)));
+        rb.markExpansion(e);
+        return rb.build();
+    };
+    auto makeChild = [](float rootErr) {
+        HLodBuilder cb;
+        cb.createRoot(10, rootErr,
+                      AABB::fromCenterExtent(float4::vec(0, 0, 0), float4::vec(1, 1, 1)));
+        return cb.build();
+    };
+    auto cutOf = [](World& w) {
+        markResident(w, 2);
+        markResident(w, 10);
+        // Close enough that the expansion node (err 0.5, box within 2 units)
+        // always wants to refine into the attached page.
+        const CullView v = makeLookAtView(float4::point(0, 0, -6), float4::point(0, 0, 0));
+        return frame(w, v, {4.0f, 0.0f});
+    };
 
     World w;
-    w.addInstance(std::move(root), float4::point(0, 0, 0));
-    attachPage(w, 2, std::move(child));
+    w.addInstance(makeRoot(), float4::point(0, 0, 0));
+    attachPage(w, 2, makeChild(100.0f));   // way larger than the expansion node's 0.5
 
-    const Page& attached = TA::pageOf(w, 10);
-    for (uint32_t i = 1; i < attached.nodeCount(); ++i)
-        EXPECT_LE(attached.geometricError[i], 0.5f);
+    // The page bytes are untouched; the clamp lives on the mount.
+    const PageView& attached = TA::pageOf(w, 10);
+    EXPECT_EQ(attached.geometricError[1], 100.0f);
+    EXPECT_EQ(TA::errClampOf(w, 10), 0.5f);
+
+    // Behaviorally the over-erroneous child is indistinguishable from one
+    // authored at the clamp: same cut, same reported errors.
+    World wRef;
+    wRef.addInstance(makeRoot(), float4::point(0, 0, 0));
+    attachPage(wRef, 2, makeChild(0.5f));
+
+    const Outputs got = cutOf(w), want = cutOf(wRef);
+    ASSERT_EQ(got.cut.size(), want.cut.size());
+    ASSERT_FALSE(got.cut.empty());
+    for (size_t i = 0; i < got.cut.size(); ++i)
+    {
+        EXPECT_EQ(got.cut[i].payload, want.cut[i].payload);
+        EXPECT_EQ(got.cut[i].err, want.cut[i].err);
+    }
+    EXPECT_TRUE(cutIds(got).count(10));   // the walk did reach the child
 }
 
 // ---------------------------------------------------------------------------
@@ -256,7 +284,6 @@ TEST(Streaming, GarbageCollection)
 
     // Look INTO the first slab, facing away from all the other slabs, so only
     // level1[0]'s page (plus the root page) is touched by the walk.
-    ViewScratch s;
     const AABB region0 = gen.recipes.at(level1[0]).region;
     const float4 c0 = region0.center();
     const CullView v = makeLookAtView(c0 + float4::vec(60, 0, 0),
@@ -267,7 +294,7 @@ TEST(Streaming, GarbageCollection)
     for (int f = 0; f < 10; ++f)
     {
         w.beginFrame();
-        w.selectCut(v, {0.5f, 0.0f, 0.0f}, s, cut, ideal, reqs);
+        w.selectCut(v, {0.5f, 0.0f}, cut, ideal, reqs);
     }
 
     // Nothing collapses while every page is younger than minAge.
@@ -292,7 +319,7 @@ TEST(Streaming, GarbageCollection)
     for (int f = 0; f < 10; ++f)
     {
         w.beginFrame();
-        w.selectCut(v, {0.5f, 0.0f, 0.0f}, s, cut, ideal, reqs);
+        w.selectCut(v, {0.5f, 0.0f}, cut, ideal, reqs);
         w.collect(0, 3);
     }
     EXPECT_TRUE(isAttached(w, level1[0]));
@@ -380,8 +407,7 @@ TEST(Streaming, GcChurnStress)
     w.addInstance(std::move(root), float4::point(0, 0, 0));
     markAllResident(w, rootIds);
 
-    ViewScratch s;
-    const CutParams p{4.0f, 0.0f, 0.0f};   // h = 0: comparable to the reference
+    const CutParams p{4.0f, 0.0f};
     std::vector<CutEntry> cut;
     std::vector<IdealEntry> ideal;
     std::vector<LoadRequest> reqs;
@@ -396,7 +422,7 @@ TEST(Streaming, GcChurnStress)
             float4::vec(0, 1, 0), 1.0f, 16.0f / 9.0f, 1080.0f, 0.1f, 1.0e9f);
 
         w.beginFrame();
-        w.selectCut(v, p, s, cut, ideal, reqs);
+        w.selectCut(v, p, cut, ideal, reqs);
 
         if (f % 7 == 0)   // spot-check equivalence on the exact same state
         {
@@ -446,14 +472,13 @@ TEST(Streaming, ConvergesToIdealCut)
     World w;
     w.addInstance(std::move(root), float4::point(0, 0, 0));
 
-    ViewScratch s;
     const CullView v = makeLookAtView(float4::point(0, 10, -80), float4::point(0, 0, 0));
-    const CutParams p{4.0f, 0.0f, 0.0f};
+    const CutParams p{4.0f, 0.0f};
 
     Outputs o;
     for (int f = 0; f < 64; ++f)
     {
-        o = frame(w, s, v, p);
+        o = frame(w, v, p);
         bool progress = false;
         for (const auto& r : o.reqs)
         {

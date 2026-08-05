@@ -80,7 +80,11 @@ state).
    repeated moves of one node (experiment K). Instance motion refits TLAS
    lanes and defers restructuring to an escape threshold; rebuilds
    triggered by motion use a Morton build ~5x cheaper than the quality
-   build reserved for structural changes.
+   build reserved for structural changes. **Spawning and removing are
+   incremental too**: an insert descends to the leaf whose box grows least and
+   either takes a free lane or splits that leaf, a removal invalidates a lane,
+   and an edit budget (`tlasEditFraction`) bounds the accumulated quality loss.
+   Nothing about a single instance costs work proportional to the world.
 7. **GC is O(collected).** Pages touch an intrusive LRU once per frame;
    `collect` walks the cold tail only, respects a dwell (`minAge`), a
    budget of *streamed* (non-pinned) pages, and never collects pages with
@@ -422,6 +426,14 @@ found two policy bugs that only continuous churn could expose:
    population moved >20% since the last one; steady churn takes the Morton
    path (~5x cheaper), same as motion escapes. Assembly and mass despawn
    still get the tight tree.
+
+   That fix made the rebuild *cheaper* and left the rebuild in place, which a
+   later audit found was the whole problem: one spawn still cost a full
+   rebuild — 2.1 ms at 20k instances and 9.5 ms at 80k, and exactly the same
+   as five hundred spawns. Add and remove are now applied to the tree in
+   place, in O(depth), and no longer mark it dirty at all. See HANDOFF.md
+   11.1 for the measurement and `tests/test_tlas.cpp` for the invariants an
+   in-place edit has to maintain.
 
 | churn bench (5% out + 5% in, per frame) | before | after |
 | --- | --- | --- |

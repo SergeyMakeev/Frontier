@@ -8,7 +8,7 @@
 #include "helpers.h"
 
 // Cross-cutting API contracts: cut invariants that must hold on any world,
-// determinism, multi-view scratch isolation, instance-slot reuse (ABA),
+// determinism, multi-view damper isolation, instance-slot reuse (ABA),
 // geometric edge cases, and memory budgets.
 
 using namespace hlod;
@@ -24,10 +24,10 @@ struct Outputs
     std::vector<LoadRequest> reqs;
 };
 
-Outputs run(World& w, ViewScratch& s, const CullView& v, const CutParams& p)
+Outputs run(World& w, const CullView& v, const CutParams& p)
 {
     Outputs o;
-    w.selectCut(v, p, s, o.cut, o.ideal, o.reqs);
+    w.selectCut(v, p, o.cut, o.ideal, o.reqs);
     return o;
 }
 
@@ -126,8 +126,7 @@ TEST(Contracts, CutInvariantsHoldOnRandomWorlds)
         for (int frame = 0; frame < 3; ++frame)
         {
             const CullView v = randomView(rng);
-            ViewScratch s;
-            const Outputs o = run(w, s, v, p);
+            const Outputs o = run(w, v, p);
 
             const std::set<UserId> cut = cutIds(o.cut);
             ASSERT_EQ(cut.size(), o.cut.size()) << "duplicate payloads in cut";
@@ -183,18 +182,19 @@ TEST(Contracts, DeterministicAcrossIdenticalWorlds)
     for (uint32_t seed : {7u, 42u, 314u})
     {
         RandomWorld a(seed), b(seed);
-        ViewScratch sa, sb;
+        // Damping on: the camera envelope history must match too.
+        ViewDamper da(4.0f), db(4.0f);
         std::mt19937 rngA(seed * 3), rngB(seed * 3);
-        const CutParams p{6.0f, 0.3f, 0.5f};   // hysteresis on: history must match too
+        const CutParams p{6.0f, 0.5f};
 
         for (int frame = 0; frame < 6; ++frame)
         {
             a.w.beginFrame();
             b.w.beginFrame();
-            const CullView va = randomView(rngA);
-            const CullView vb = randomView(rngB);
-            const Outputs oa = run(a.w, sa, va, p);
-            const Outputs ob = run(b.w, sb, vb, p);
+            const CullView va = da.damp(randomView(rngA));
+            const CullView vb = db.damp(randomView(rngB));
+            const Outputs oa = run(a.w, va, p);
+            const Outputs ob = run(b.w, vb, p);
 
             ASSERT_EQ(oa.cut.size(), ob.cut.size()) << "seed " << seed << " frame " << frame;
             for (size_t i = 0; i < oa.cut.size(); ++i)
@@ -218,11 +218,13 @@ TEST(Contracts, DeterministicAcrossIdenticalWorlds)
 }
 
 // ---------------------------------------------------------------------------
-// Multiple views share the world but not each other's hysteresis history:
-// interleaving view B must not change view A's outputs vs running A alone
-// on an identical world (and vice versa).
+// Multiple damped views share the world but not each other's history: each
+// view's memory lives entirely in its own ViewDamper, and selectCut is a pure
+// read of the World. Interleaving view B must not change view A's outputs vs
+// running A alone on an identical world (and vice versa). This is the
+// regression test for moving hysteresis off the nodes onto the camera.
 // ---------------------------------------------------------------------------
-TEST(Contracts, MultiViewScratchIsolation)
+TEST(Contracts, MultiViewDamperIsolation)
 {
     const uint32_t seed = 99;
     RandomWorld both(seed), onlyA(seed), onlyB(seed);
@@ -234,8 +236,9 @@ TEST(Contracts, MultiViewScratchIsolation)
             markResident(onlyB.w, id);
         }
 
-    ViewScratch sA, sB, sAlone, sBlone;
-    const CutParams p{6.0f, 0.4f, 0.0f};   // heavy hysteresis: history matters
+    // Heavy damping: the envelope history matters.
+    ViewDamper dA(8.0f), dB(8.0f), dAlone(8.0f), dBlone(8.0f);
+    const CutParams p{6.0f, 0.0f};
 
     for (int frame = 0; frame < 8; ++frame)
     {
@@ -250,10 +253,10 @@ TEST(Contracts, MultiViewScratchIsolation)
             float4::point(-std::sin(t) * 90, 25, std::cos(t) * 90), float4::point(30, 0, -20));
 
         std::vector<CutEntry> cutA, cutB, cutAlone, cutBlone;
-        both.w.selectCut(vA, p, sA, cutA);
-        both.w.selectCut(vB, p, sB, cutB);   // interleaved with A every frame
-        onlyA.w.selectCut(vA, p, sAlone, cutAlone);
-        onlyB.w.selectCut(vB, p, sBlone, cutBlone);
+        both.w.selectCut(dA.damp(vA), p, cutA);
+        both.w.selectCut(dB.damp(vB), p, cutB);   // interleaved with A every frame
+        onlyA.w.selectCut(dAlone.damp(vA), p, cutAlone);
+        onlyB.w.selectCut(dBlone.damp(vB), p, cutBlone);
 
         ASSERT_EQ(cutA.size(), cutAlone.size()) << "frame " << frame;
         for (size_t i = 0; i < cutA.size(); ++i)
@@ -290,28 +293,27 @@ TEST(Contracts, StaleInstanceRefIsIgnored)
     ASSERT_NE(refA.generation, refB.generation);
 
     w.beginFrame();
-    ViewScratch s;
     const CullView v = makeLookAtView(float4::point(0, 0, -30), float4::point(0, 0, 0));
     std::vector<CutEntry> cut;
-    w.selectCut(v, {4, 0, 0}, s, cut);
+    w.selectCut(v, {4, 0}, cut);
     ASSERT_FALSE(cut.empty());
 
     // Stale move: B must not teleport.
     w.moveInstance(refA, float4::point(50000, 0, 0));
     cut.clear();
-    w.selectCut(v, {4, 0, 0}, s, cut);
+    w.selectCut(v, {4, 0}, cut);
     EXPECT_FALSE(cut.empty()) << "stale moveInstance displaced the new instance";
 
     // Stale remove: B must survive.
     w.removeInstance(refA);
     cut.clear();
-    w.selectCut(v, {4, 0, 0}, s, cut);
+    w.selectCut(v, {4, 0}, cut);
     EXPECT_FALSE(cut.empty()) << "stale removeInstance killed the new instance";
 
     // The live ref still works.
     w.removeInstance(refB);
     cut.clear();
-    w.selectCut(v, {4, 0, 0}, s, cut);
+    w.selectCut(v, {4, 0}, cut);
     EXPECT_TRUE(cut.empty());
 }
 
@@ -338,10 +340,9 @@ TEST(Contracts, PointLeavesMatchReference)
     markAllResident(w, ids);
     w.beginFrame();
 
-    ViewScratch s;
     const CullView v = makeLookAtView(float4::point(0, 20, -60), float4::point(0, 0, 0));
-    const CutParams p{4.0f, 0.0f, 0.0f};
-    const Outputs o = run(w, s, v, p);
+    const CutParams p{4.0f, 0.0f};
+    const Outputs o = run(w, v, p);
     const RefResult want = TA::referenceCut(w, v, p);
 
     std::set<UserId> wantIds;
@@ -365,10 +366,9 @@ TEST(Contracts, CameraInsideTreeMatchesReference)
     markAllResident(w, ids);
     w.beginFrame();
 
-    ViewScratch s;
     const CullView v = makeLookAtView(float4::point(1, 2, 3), float4::point(40, 0, 40));
-    const CutParams p{4.0f, 0.0f, 0.0f};
-    const Outputs o = run(w, s, v, p);
+    const CutParams p{4.0f, 0.0f};
+    const Outputs o = run(w, v, p);
     const RefResult want = TA::referenceCut(w, v, p);
 
     ASSERT_FALSE(o.cut.empty());
@@ -393,10 +393,9 @@ TEST(Contracts, FarFromOriginMatchesReference)
     markAllResident(w, ids);
     w.beginFrame();
 
-    ViewScratch s;
     const CullView v = makeLookAtView(farPos + float4::vec(0, 30, -80), farPos);
-    const CutParams p{4.0f, 0.0f, 0.0f};
-    const Outputs o = run(w, s, v, p);
+    const CutParams p{4.0f, 0.0f};
+    const Outputs o = run(w, v, p);
     const RefResult want = TA::referenceCut(w, v, p);
 
     std::set<UserId> wantIds;
@@ -420,11 +419,10 @@ TEST(Contracts, ScaledInstanceMatchesReference)
         markAllResident(w, ids);
         w.beginFrame();
 
-        ViewScratch s;
         const CullView v = makeLookAtView(float4::point(0, 10 * scale, -40 * scale),
                                           float4::point(0, 0, 0));
-        const CutParams p{4.0f, 0.0f, 0.0f};
-        const Outputs o = run(w, s, v, p);
+        const CutParams p{4.0f, 0.0f};
+        const Outputs o = run(w, v, p);
         const RefResult want = TA::referenceCut(w, v, p);
 
         std::set<UserId> wantIds;
@@ -446,16 +444,16 @@ TEST(Contracts, NonFiniteBoundsRejected)
 
     const float nan = std::nanf("");
     const float inf = std::numeric_limits<float>::infinity();
-    EXPECT_THROW(w.setNodeBounds(leaf, AABB::fromCenterExtent(
+    EXPECT_THROW(w.setNodeBounds(inst, leaf, AABB::fromCenterExtent(
                      float4::vec(nan, 0, 0), float4::vec(1, 1, 1))), std::logic_error);
-    EXPECT_THROW(w.setNodeBounds(leaf, AABB::fromCenterExtent(
+    EXPECT_THROW(w.setNodeBounds(inst, leaf, AABB::fromCenterExtent(
                      float4::vec(0, 0, 0), float4::vec(nan, 1, 1))), std::logic_error);
-    EXPECT_THROW(w.setNodeBounds(leaf, AABB::fromCenterExtent(
+    EXPECT_THROW(w.setNodeBounds(inst, leaf, AABB::fromCenterExtent(
                      float4::vec(0, 0, 0), float4::vec(inf, 1, 1))), std::logic_error);
-    EXPECT_THROW(w.setNodeBounds(leaf, AABB::empty()), std::logic_error);
+    EXPECT_THROW(w.setNodeBounds(inst, leaf, AABB::empty()), std::logic_error);
 
     // Zero-extent is legal (a point object).
-    EXPECT_NO_THROW(w.setNodeBounds(leaf, AABB::fromCenterExtent(
+    EXPECT_NO_THROW(w.setNodeBounds(inst, leaf, AABB::fromCenterExtent(
                         float4::vec(1, 2, 3), float4::vec(0, 0, 0))));
     w.flushBounds();
 }

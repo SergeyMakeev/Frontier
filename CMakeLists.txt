@@ -8,6 +8,20 @@ option(HLOD_BUILD_TESTS "Build unit tests" ON)
 option(HLOD_BUILD_BENCH "Build performance tests" ON)
 option(HLOD_AVX2 "Enable AVX2 code generation (x86-64 only)" ON)
 option(HLOD_FORCE_SCALAR "Disable SIMD intrinsics; use the portable scalar paths" OFF)
+option(HLOD_OVERLAY_FULL_PAGE
+       "Experiment: on deform, privatise the whole page instead of just its bounds" OFF)
+
+# Carry the eight per-lane plane masks packed in one register instead of a byte
+# array. A real win on its own (~9% on a memory-bound cut) but it adds nothing
+# on top of the reciprocal-sqrt error path, which is always on and relieves the
+# same bottleneck. Off by default; see HANDOFF.md section 9.
+option(HLOD_OPT_MASK64
+       "Cut: carry the eight per-lane plane masks packed in one register" OFF)
+
+# Measurement scaffold: pads WideBlock back to the 288 bytes it occupied before
+# the lane masks moved to a side array, changing nothing else, so the two builds
+# differ only in block stride.
+option(HLOD_WIDE_PAD_288 "A/B scaffold: restore the old 288-byte WideBlock" OFF)
 
 # AVX2 flags only make sense on x86-64; other architectures pick their SIMD
 # path (NEON on arm64, SSE2 baseline on x86) automatically in math.h.
@@ -20,6 +34,8 @@ endif()
 # ---- core library -----------------------------------------------------------
 add_library(hlod STATIC
     src/builder.cpp
+    src/config.cpp
+    src/page.cpp
     src/world.cpp
 )
 target_include_directories(hlod PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -38,6 +54,18 @@ endif()
 
 if(HLOD_FORCE_SCALAR)
     target_compile_definitions(hlod PUBLIC HLOD_FORCE_SCALAR=1)
+endif()
+
+if(HLOD_OVERLAY_FULL_PAGE)
+    target_compile_definitions(hlod PUBLIC HLOD_OVERLAY_FULL_PAGE=1)
+endif()
+
+if(HLOD_OPT_MASK64)
+    target_compile_definitions(hlod PUBLIC HLOD_OPT_MASK64=1)
+endif()
+
+if(HLOD_WIDE_PAD_288)
+    target_compile_definitions(hlod PUBLIC HLOD_WIDE_PAD_288=1)
 endif()
 
 # ---- external deps via FetchContent ------------------------------------------

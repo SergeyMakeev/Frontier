@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <memory>
 #include <queue>
 #include <random>
 #include <vector>
@@ -103,13 +104,17 @@ World::InstanceRef addResidentInstance(World& w, Page pg, float4 pos, float scal
 }
 
 // One fully resident deep tree. depth 6 / fanout 8 is ~300k nodes.
-World makeDeepWorld(uint32_t fanout, uint32_t depth, TreeGen* genOut = nullptr)
+// (unique_ptr because World is neither copyable nor movable: mounts and
+// instances refer to each other by slot, and owned pages point into the
+// World's context.)
+std::unique_ptr<World> makeDeepWorld(uint32_t fanout, uint32_t depth,
+                                     TreeGen* genOut = nullptr)
 {
     TreeGen gen;
     gen.fanout = fanout;
     gen.depth = depth;
-    World w;
-    addResidentInstance(w, gen.makeRootPage(unitRegion(1000.0f), 4096.0f, 0),
+    auto w = std::make_unique<World>();
+    addResidentInstance(*w, gen.makeRootPage(unitRegion(1000.0f), 4096.0f, 0),
                         float4::point(0, 0, 0));
     if (genOut) *genOut = std::move(gen);
     return w;
@@ -122,16 +127,16 @@ World makeDeepWorld(uint32_t fanout, uint32_t depth, TreeGen* genOut = nullptr)
 // ---------------------------------------------------------------------------
 static void BM_DeepTree_StaticCamera(benchmark::State& state)
 {
-    World w = makeDeepWorld(8, uint32_t(state.range(0)));
-    ViewScratch s;
+    const auto wp = makeDeepWorld(8, uint32_t(state.range(0)));
+    World& w = *wp;
     Outputs o;
     const CullView v = orbitView(0.7f, 2500.0f);
-    const CutParams p{4.0f, 0.1f, 0.0f};
+    const CutParams p{4.0f, 0.0f};
 
     for (auto _ : state)
     {
         w.beginFrame();
-        w.selectCut(v, p, s, o.cut, o.ideal, o.reqs);
+        w.selectCut(v, p, o.cut, o.ideal, o.reqs);
         benchmark::DoNotOptimize(o.cut.data());
     }
     state.counters["cut"] = double(o.cut.size());
@@ -143,16 +148,16 @@ BENCHMARK(BM_DeepTree_StaticCamera)->Arg(4)->Arg(5)->Arg(6)->Unit(benchmark::kMi
 // output vector instead of two.
 static void BM_DeepTree_CutOnly(benchmark::State& state)
 {
-    World w = makeDeepWorld(8, uint32_t(state.range(0)));
-    ViewScratch s;
+    const auto wp = makeDeepWorld(8, uint32_t(state.range(0)));
+    World& w = *wp;
     std::vector<CutEntry> cut;
     const CullView v = orbitView(0.7f, 2500.0f);
-    const CutParams p{4.0f, 0.1f, 0.0f};
+    const CutParams p{4.0f, 0.0f};
 
     for (auto _ : state)
     {
         w.beginFrame();
-        w.selectCut(v, p, s, cut);
+        w.selectCut(v, p, cut);
         benchmark::DoNotOptimize(cut.data());
     }
     state.counters["cut"] = double(cut.size());
@@ -160,14 +165,14 @@ static void BM_DeepTree_CutOnly(benchmark::State& state)
 BENCHMARK(BM_DeepTree_CutOnly)->Arg(6)->Unit(benchmark::kMicrosecond);
 
 // ---------------------------------------------------------------------------
-// Deep tree, flying camera: refinement churn, hysteresis, epoch reuse.
+// Deep tree, flying camera: refinement churn, epoch reuse.
 // ---------------------------------------------------------------------------
 static void BM_DeepTree_FlyThrough(benchmark::State& state)
 {
-    World w = makeDeepWorld(8, uint32_t(state.range(0)));
-    ViewScratch s;
+    const auto wp = makeDeepWorld(8, uint32_t(state.range(0)));
+    World& w = *wp;
     Outputs o;
-    const CutParams p{4.0f, 0.1f, 0.0f};
+    const CutParams p{4.0f, 0.0f};
 
     float t = 0.0f;
     size_t cutTotal = 0, frames = 0;
@@ -178,7 +183,7 @@ static void BM_DeepTree_FlyThrough(benchmark::State& state)
         const float dist = 1800.0f + 1500.0f * std::sin(t * 3.1f);
         const CullView v = orbitView(t, dist);
         w.beginFrame();
-        w.selectCut(v, p, s, o.cut, o.ideal, o.reqs);
+        w.selectCut(v, p, o.cut, o.ideal, o.reqs);
         benchmark::DoNotOptimize(o.cut.data());
         cutTotal += o.cut.size();
         ++frames;
@@ -186,6 +191,48 @@ static void BM_DeepTree_FlyThrough(benchmark::State& state)
     state.counters["avg_cut"] = double(cutTotal) / double(frames ? frames : 1);
 }
 BENCHMARK(BM_DeepTree_FlyThrough)->Arg(5)->Arg(6)->Unit(benchmark::kMicrosecond);
+
+// ---------------------------------------------------------------------------
+// LOD damping cost: the camera envelope is conservative, so a damped cut is
+// larger than an undamped one — that growth is the honest price of damping
+// (the cut is output-bound). arg0 = depth, arg1 = damper half-life in frames
+// (0 = envelope collapsed, i.e. off). Compare avg_cut across arg1; time per
+// emitted entry should not move (the damped and undamped walks execute the
+// same instruction sequence).
+// The flight swoops through 30k–90k units, where the refinement boundary of
+// the mid tree levels actually lives (leaf refine distance for this world is
+// ~63k units at 4 px) — the close-in FlyThrough orbit leaves the whole
+// visible tree fully refined, and then damping has nothing to damp.
+// Iterations are FIXED so every variant flies the identical path — avg_cut
+// would otherwise depend on how many iterations the harness happens to pick.
+// ---------------------------------------------------------------------------
+static void BM_DeepTree_FlyThroughDamped(benchmark::State& state)
+{
+    const auto wp = makeDeepWorld(8, uint32_t(state.range(0)));
+    World& w = *wp;
+    Outputs o;
+    const CutParams p{4.0f, 0.0f};
+    ViewDamper damper(float(state.range(1)));
+
+    float t = 0.0f;
+    size_t cutTotal = 0, frames = 0;
+    for (auto _ : state)
+    {
+        t += 0.02f;
+        const float dist = 60000.0f + 30000.0f * std::sin(t * 3.1f);
+        const CullView v = damper.damp(orbitView(t, dist));
+        w.beginFrame();
+        w.selectCut(v, p, o.cut, o.ideal, o.reqs);
+        benchmark::DoNotOptimize(o.cut.data());
+        cutTotal += o.cut.size();
+        ++frames;
+    }
+    state.counters["avg_cut"] = double(cutTotal) / double(frames ? frames : 1);
+}
+BENCHMARK(BM_DeepTree_FlyThroughDamped)
+    ->Args({6, 0})->Args({6, 4})->Args({6, 16})
+    ->Iterations(512)
+    ->Unit(benchmark::kMicrosecond);
 
 // ---------------------------------------------------------------------------
 // Paged "planet": fly in/out while streaming topology and payloads with the
@@ -200,9 +247,8 @@ static void BM_PagedPlanet_StreamingFly(benchmark::State& state)
     addResidentInstance(w, gen.makeRootPage(unitRegion(100000.0f), 1u << 20, 4),
                         float4::point(0, 0, 0));
 
-    ViewScratch s;
     Outputs o;
-    const CutParams p{8.0f, 0.1f, 0.0f};
+    const CutParams p{8.0f, 0.0f};
     const size_t pageBudget = size_t(state.range(0));
 
     float t = 0.0f;
@@ -214,7 +260,7 @@ static void BM_PagedPlanet_StreamingFly(benchmark::State& state)
         const CullView v = orbitView(t * 0.2f, 20000.0f + dist);
 
         w.beginFrame();
-        w.selectCut(v, p, s, o.cut, o.ideal, o.reqs);
+        w.selectCut(v, p, o.cut, o.ideal, o.reqs);
 
         attaches += attachTopByPriority(w, gen, o.ideal, 8);
         for (const auto& r : o.reqs) w.markResident(r.node);
@@ -243,9 +289,8 @@ static void BM_GcStress_FastFlythrough(benchmark::State& state)
     addResidentInstance(w, gen.makeRootPage(unitRegion(half), float(1u << 20), 4),
                         float4::point(0, 0, 0));
 
-    ViewScratch s;
     Outputs o;
-    const CutParams p{8.0f, 0.1f, 1.0f};
+    const CutParams p{8.0f, 1.0f};
     const size_t pageBudget = size_t(state.range(0));
     const uint32_t minAge = 8;
     const float speed = half / 250.0f;   // crosses the whole world in ~500 frames
@@ -261,7 +306,7 @@ static void BM_GcStress_FastFlythrough(benchmark::State& state)
             float4::vec(0, 1, 0), 1.0f, 16.0f / 9.0f, 1080.0f, 0.1f, 1.0e9f);
 
         w.beginFrame();
-        w.selectCut(v, p, s, o.cut, o.ideal, o.reqs);
+        w.selectCut(v, p, o.cut, o.ideal, o.reqs);
 
         attaches += attachTopByPriority(w, gen, o.ideal, 16);
         for (const auto& r : o.reqs) w.markResident(r.node);
@@ -296,9 +341,8 @@ static void BM_ManyShallowTrees(benchmark::State& state)
         addResidentInstance(w, gen.makeRootPage(unitRegion(4.0f), 8.0f, 0),
                             float4::point(uni(rng), 0, uni(rng)));
 
-    ViewScratch s;
     Outputs o;
-    const CutParams p{4.0f, 0.1f, state.range(1) ? 1.0f : 0.0f};
+    const CutParams p{4.0f, state.range(1) ? 1.0f : 0.0f};
 
     float t = 0.0f;
     for (auto _ : state)
@@ -306,7 +350,7 @@ static void BM_ManyShallowTrees(benchmark::State& state)
         t += 0.01f;
         const CullView v = orbitView(t, area * 0.4f);
         w.beginFrame();
-        w.selectCut(v, p, s, o.cut, o.ideal, o.reqs);
+        w.selectCut(v, p, o.cut, o.ideal, o.reqs);
         benchmark::DoNotOptimize(o.cut.data());
     }
     state.counters["cut"] = double(o.cut.size());
@@ -337,9 +381,8 @@ static void BM_MovingInstances(benchmark::State& state)
         insts.push_back(addResidentInstance(w, gen.makeRootPage(unitRegion(4.0f), 8.0f, 0),
                                             float4::point(uni(rng), 0, uni(rng))));
 
-    ViewScratch s;
     Outputs o;
-    const CutParams p{4.0f, 0.1f, 0.0f};
+    const CutParams p{4.0f, 0.0f};
     XorShift32 fast;
 
     float t = 0.0f;
@@ -355,7 +398,7 @@ static void BM_MovingInstances(benchmark::State& state)
         }
         const CullView v = orbitView(t, area * 0.4f);
         w.beginFrame();
-        w.selectCut(v, p, s, o.cut, o.ideal, o.reqs);
+        w.selectCut(v, p, o.cut, o.ideal, o.reqs);
         benchmark::DoNotOptimize(o.cut.data());
     }
 }
@@ -371,27 +414,29 @@ BENCHMARK(BM_MovingInstances)
 struct MoverWorld
 {
     World world;
+    World::InstanceRef      inst;     // setNodeBounds is per instance now
     std::vector<NodeHandle> leaves;   // composed from the attach result
     std::vector<float4>     home;     // original leaf centers
     float half = 2000.0f;
 };
 
-MoverWorld makeMoverWorld()
+// unique_ptr: World (and so MoverWorld) is neither copyable nor movable.
+std::unique_ptr<MoverWorld> makeMoverWorld()
 {
-    MoverWorld mw;
+    auto mw = std::make_unique<MoverWorld>();
     TreeGen gen;
     gen.fanout = 12;   // wide: 12^5 = 248832 leaves, ~271k nodes
     gen.depth = 5;
-    Page pg = gen.makeRootPage(unitRegion(mw.half), 4096.0f, 0);
+    Page pg = gen.makeRootPage(unitRegion(mw->half), 4096.0f, 0);
     std::vector<uint32_t> leafIdx;
     for (uint32_t i = 1; i < pg.nodeCount(); ++i)
     {
         if (pg.childCount(i) != 0) continue;
         leafIdx.push_back(i);
-        mw.home.push_back(pg.bbox[i].center());
+        mw->home.push_back(pg.bbox[i].center());
     }
-    const auto inst = addResidentInstance(mw.world, std::move(pg), float4::point(0, 0, 0));
-    for (uint32_t i : leafIdx) mw.leaves.push_back(nodeAt(inst.rootPage, i));
+    mw->inst = addResidentInstance(mw->world, std::move(pg), float4::point(0, 0, 0));
+    for (uint32_t i : leafIdx) mw->leaves.push_back(nodeAt(mw->inst.rootPage, i));
     return mw;
 }
 
@@ -400,7 +445,8 @@ MoverWorld makeMoverWorld()
 // early-outs at the immediate parent.
 static void BM_LeafRefit_LocalJitter(benchmark::State& state)
 {
-    MoverWorld mw = makeMoverWorld();
+    const auto mwp = makeMoverWorld();
+    MoverWorld& mw = *mwp;
     const int movers = int(state.range(0));
     XorShift32 rng;
     size_t cursor = 0;
@@ -413,7 +459,7 @@ static void BM_LeafRefit_LocalJitter(benchmark::State& state)
                                                       rng.uniform(-1, 1),
                                                       rng.uniform(-1, 1));
             const float e = rng.uniform(0.3f, 1.5f);   // resize as well
-            mw.world.setNodeBounds(mw.leaves[i],
+            mw.world.setNodeBounds(mw.inst, mw.leaves[i],
                                    AABB::fromCenterExtent(c, float4::vec(e, e, e)));
         }
         mw.world.flushBounds();
@@ -427,7 +473,8 @@ BENCHMARK(BM_LeafRefit_LocalJitter)->Arg(10000)->Arg(100000)
 // grow-refits and wide-lane patches high up the tree.
 static void BM_LeafRefit_Teleport(benchmark::State& state)
 {
-    MoverWorld mw = makeMoverWorld();
+    const auto mwp = makeMoverWorld();
+    MoverWorld& mw = *mwp;
     const int movers = int(state.range(0));
     XorShift32 rng;
     size_t cursor = 0;
@@ -440,7 +487,7 @@ static void BM_LeafRefit_Teleport(benchmark::State& state)
             const float4 c = float4::vec(rng.uniform(-r, r), rng.uniform(-r, r),
                                          rng.uniform(-r, r));
             const float e = rng.uniform(0.3f, 3.0f);
-            mw.world.setNodeBounds(mw.leaves[i],
+            mw.world.setNodeBounds(mw.inst, mw.leaves[i],
                                    AABB::fromCenterExtent(c, float4::vec(e, e, e)));
         }
         mw.world.flushBounds();
@@ -456,7 +503,8 @@ BENCHMARK(BM_LeafRefit_Teleport)->Arg(10000)->Arg(100000)
 // fraction of a first move.
 static void BM_LeafRefit_RepeatedMoves(benchmark::State& state)
 {
-    MoverWorld mw = makeMoverWorld();
+    const auto mwp = makeMoverWorld();
+    MoverWorld& mw = *mwp;
     const int distinct = int(state.range(0));
     const int repeats = int(state.range(1));
     XorShift32 rng;
@@ -471,7 +519,7 @@ static void BM_LeafRefit_RepeatedMoves(benchmark::State& state)
                 const float4 c = mw.home[i] + float4::vec(rng.uniform(-1, 1),
                                                           rng.uniform(-1, 1),
                                                           rng.uniform(-1, 1));
-                mw.world.setNodeBounds(mw.leaves[i],
+                mw.world.setNodeBounds(mw.inst, mw.leaves[i],
                                        AABB::fromCenterExtent(c, float4::vec(1, 1, 1)));
             }
         }
@@ -489,12 +537,12 @@ BENCHMARK(BM_LeafRefit_RepeatedMoves)
 // shrink is lazy), so this also measures the cut under worst-case bounds.
 static void BM_LeafMotion_TeleportWithCut(benchmark::State& state)
 {
-    MoverWorld mw = makeMoverWorld();
+    const auto mwp = makeMoverWorld();
+    MoverWorld& mw = *mwp;
     const int movers = int(state.range(0));
     XorShift32 rng;
-    ViewScratch s;
     Outputs o;
-    const CutParams p{16.0f, 0.1f, 0.0f};
+    const CutParams p{16.0f, 0.0f};
 
     float t = 0.0f;
     size_t cursor = 0, cutTotal = 0, frames = 0;
@@ -507,12 +555,12 @@ static void BM_LeafMotion_TeleportWithCut(benchmark::State& state)
             const float r = mw.half * 0.98f;
             const float4 c = float4::vec(rng.uniform(-r, r), rng.uniform(-r, r),
                                          rng.uniform(-r, r));
-            mw.world.setNodeBounds(mw.leaves[i],
+            mw.world.setNodeBounds(mw.inst, mw.leaves[i],
                                    AABB::fromCenterExtent(c, float4::vec(1, 1, 1)));
         }
         const CullView v = orbitView(t, mw.half * 2.0f);
         mw.world.beginFrame();
-        mw.world.selectCut(v, p, s, o.cut, o.ideal, o.reqs);
+        mw.world.selectCut(v, p, o.cut, o.ideal, o.reqs);
         benchmark::DoNotOptimize(o.cut.data());
         cutTotal += o.cut.size();
         ++frames;
@@ -533,22 +581,22 @@ static void BM_MovingLeafNodes(benchmark::State& state)
     gen.fanout = 8;
     gen.depth = 5;
     World w;
+    World::InstanceRef inst;
     std::vector<NodeHandle> leaves;
     {
         Page pg = gen.makeRootPage(unitRegion(1000.0f), 4096.0f, 0);
         std::vector<uint32_t> leafIdx;
         for (uint32_t i = 1; i < pg.nodeCount(); ++i)
             if (pg.childCount(i) == 0) leafIdx.push_back(i);
-        const auto inst = addResidentInstance(w, std::move(pg), float4::point(0, 0, 0));
+        inst = addResidentInstance(w, std::move(pg), float4::point(0, 0, 0));
         for (uint32_t i : leafIdx) leaves.push_back(nodeAt(inst.rootPage, i));
     }
 
     XorShift32 rng;
     const int movers = int(state.range(0));
 
-    ViewScratch s;
     Outputs o;
-    const CutParams p{4.0f, 0.1f, 0.0f};
+    const CutParams p{4.0f, 0.0f};
 
     float t = 0.0f;
     size_t cursor = 0;
@@ -558,15 +606,15 @@ static void BM_MovingLeafNodes(benchmark::State& state)
         for (int m = 0; m < movers; ++m)
         {
             const NodeHandle h = leaves[cursor++ % leaves.size()];
-            w.setNodeBounds(h, AABB::fromCenterExtent(
-                                   float4::vec(rng.uniform(-900, 900),
-                                               rng.uniform(-90, 90),
-                                               rng.uniform(-900, 900)),
-                                   float4::vec(2, 2, 2)));
+            w.setNodeBounds(inst, h, AABB::fromCenterExtent(
+                                         float4::vec(rng.uniform(-900, 900),
+                                                     rng.uniform(-90, 90),
+                                                     rng.uniform(-900, 900)),
+                                         float4::vec(2, 2, 2)));
         }
         const CullView v = orbitView(t, 2500.0f);
         w.beginFrame();
-        w.selectCut(v, p, s, o.cut, o.ideal, o.reqs);
+        w.selectCut(v, p, o.cut, o.ideal, o.reqs);
         benchmark::DoNotOptimize(o.cut.data());
     }
 }
@@ -594,9 +642,8 @@ static void BM_ResidencyChurn(benchmark::State& state)
     std::mt19937 rng(2020);
     const int churn = int(state.range(0));
 
-    ViewScratch s;
     Outputs o;
-    const CutParams p{4.0f, 0.1f, 0.0f};
+    const CutParams p{4.0f, 0.0f};
 
     float t = 0.0f;
     size_t cursor = 0;
@@ -611,7 +658,7 @@ static void BM_ResidencyChurn(benchmark::State& state)
         }
         const CullView v = orbitView(t, 2500.0f);
         w.beginFrame();
-        w.selectCut(v, p, s, o.cut, o.ideal, o.reqs);
+        w.selectCut(v, p, o.cut, o.ideal, o.reqs);
         benchmark::DoNotOptimize(o.cut.data());
     }
 }
@@ -658,6 +705,7 @@ static void BM_Combined_KitchenSink(benchmark::State& state)
     moverGen.fanout = 10;
     moverGen.depth = 4;   // 10^4 = 10k leaves
     moverGen.nextId = 1u << 24;
+    World::InstanceRef moverInst;
     std::vector<NodeHandle> moverLeaves;
     std::vector<float4> moverHome;
     {
@@ -669,13 +717,12 @@ static void BM_Combined_KitchenSink(benchmark::State& state)
             leafIdx.push_back(i);
             moverHome.push_back(pg.bbox[i].center());
         }
-        const auto inst = addResidentInstance(w, std::move(pg), float4::point(0, 500.0f, 0));
-        for (uint32_t i : leafIdx) moverLeaves.push_back(nodeAt(inst.rootPage, i));
+        moverInst = addResidentInstance(w, std::move(pg), float4::point(0, 500.0f, 0));
+        for (uint32_t i : leafIdx) moverLeaves.push_back(nodeAt(moverInst.rootPage, i));
     }
 
-    ViewScratch s;
     Outputs o;
-    const CutParams p{8.0f, 0.1f, 0.5f};
+    const CutParams p{8.0f, 0.5f};
     XorShift32 fast;
 
     float x = -half;
@@ -704,7 +751,7 @@ static void BM_Combined_KitchenSink(benchmark::State& state)
             const float4 c = moverHome[i] + float4::vec(fast.uniform(-2, 2),
                                                         fast.uniform(-2, 2),
                                                         fast.uniform(-2, 2));
-            w.setNodeBounds(moverLeaves[i],
+            w.setNodeBounds(moverInst, moverLeaves[i],
                             AABB::fromCenterExtent(c, float4::vec(1, 1, 1)));
         }
 
@@ -713,7 +760,7 @@ static void BM_Combined_KitchenSink(benchmark::State& state)
             float4::vec(0, 1, 0), 1.0f, 16.0f / 9.0f, 1080.0f, 0.1f, 1.0e9f);
 
         w.beginFrame();
-        w.selectCut(v, p, s, o.cut, o.ideal, o.reqs);
+        w.selectCut(v, p, o.cut, o.ideal, o.reqs);
 
         attaches += attachTopByPriority(w, planetGen, o.ideal, 12);
         for (const auto& r : o.reqs) w.markResident(r.node);
@@ -756,6 +803,7 @@ static void BM_TypicalForest_Breakdown(benchmark::State& state)
     TreeGen gen;
     World w;
     std::vector<NodeHandle> leaves;   // all leaf handles
+    std::vector<World::InstanceRef> leafInst;   // owning instance per leaf
     std::vector<float4>     home;     // leaf home centers, local space
     std::vector<uint32_t>   leafIdx;
     for (int i = 0; i < count; ++i)
@@ -774,16 +822,19 @@ static void BM_TypicalForest_Breakdown(benchmark::State& state)
         }
         const auto inst = addResidentInstance(w, std::move(pg),
                                               float4::point(uni(rng), 0, uni(rng)));
-        for (uint32_t n : leafIdx) leaves.push_back(nodeAt(inst.rootPage, n));
+        for (uint32_t n : leafIdx)
+        {
+            leaves.push_back(nodeAt(inst.rootPage, n));
+            leafInst.push_back(inst);
+        }
     }
 
     // 10% of all leaves are movers, spread across all trees.
     std::vector<uint32_t> movers;
     for (uint32_t i = 0; i < leaves.size(); i += 10) movers.push_back(i);
 
-    ViewScratch s;
     std::vector<CutEntry> cut;
-    const CutParams p{4.0f, 0.1f, 1.0f};
+    const CutParams p{4.0f, 1.0f};
     XorShift32 fast;
 
     double moveNs = 0, refitNs = 0, cutNs = 0;
@@ -800,7 +851,7 @@ static void BM_TypicalForest_Breakdown(benchmark::State& state)
             const float4 c = home[i] + float4::vec(fast.uniform(-0.3f, 0.3f),
                                                    fast.uniform(-0.1f, 0.1f),
                                                    fast.uniform(-0.3f, 0.3f));
-            w.setNodeBounds(leaves[i],
+            w.setNodeBounds(leafInst[i], leaves[i],
                             AABB::fromCenterExtent(c, float4::vec(0.5f, 0.5f, 0.5f)));
         }
         const auto t1 = clock::now();
@@ -810,7 +861,7 @@ static void BM_TypicalForest_Breakdown(benchmark::State& state)
         const CullView v = makePerspectiveView(
             float4::point(x, 1.7f, 0), float4::vec(1.0f, 0.0f, 0.05f),
             float4::vec(0, 1, 0), 1.0f, 16.0f / 9.0f, 1080.0f, 0.1f, 1.0e9f);
-        w.selectCut(v, p, s, cut);
+        w.selectCut(v, p, cut);
         const auto t3 = clock::now();
 
         moveNs += std::chrono::duration<double, std::nano>(t1 - t0).count();
@@ -891,15 +942,14 @@ static void BM_TypicalForest_Churn(benchmark::State& state)
     auto addTree = [&](bool deep, float4 pos)
     {
         const Proto& pr = protos[deep ? 1 : 0];
-        const auto inst = addResidentInstance(w, Page(*pr.page), pos);
+        const auto inst = addResidentInstance(w, pr.page->clone(), pos);
         trees.push_back({inst, inst.rootPage, &pr});
     };
     for (int i = 0; i < count; ++i)
         addTree((i % 5) == 0, float4::point(uni(rng), 0, uni(rng)));
 
-    ViewScratch s;
     std::vector<CutEntry> cut;
-    const CutParams p{4.0f, 0.1f, 1.0f};
+    const CutParams p{4.0f, 1.0f};
     XorShift32 fast;
     const size_t churnN = size_t(count) * size_t(churnPct) / 100;
 
@@ -934,7 +984,7 @@ static void BM_TypicalForest_Churn(benchmark::State& state)
                 const float4 c = pr.home[j] + float4::vec(fast.uniform(-0.3f, 0.3f),
                                                           fast.uniform(-0.1f, 0.1f),
                                                           fast.uniform(-0.3f, 0.3f));
-                w.setNodeBounds(nodeAt(t.page, pr.leafIdx[j]),
+                w.setNodeBounds(t.ref, nodeAt(t.page, pr.leafIdx[j]),
                                 AABB::fromCenterExtent(c, float4::vec(0.5f, 0.5f, 0.5f)));
             }
         }
@@ -945,7 +995,7 @@ static void BM_TypicalForest_Churn(benchmark::State& state)
         const CullView v = makePerspectiveView(
             float4::point(x, 1.7f, 0), float4::vec(1.0f, 0.0f, 0.05f),
             float4::vec(0, 1, 0), 1.0f, 16.0f / 9.0f, 1080.0f, 0.1f, 1.0e9f);
-        w.selectCut(v, p, s, cut);
+        w.selectCut(v, p, cut);
         const auto t4 = clock::now();
 
         churnNs += std::chrono::duration<double, std::nano>(t1 - t0).count();
@@ -1031,16 +1081,16 @@ BENCHMARK(BM_Builder_BuildPage)
 // ---------------------------------------------------------------------------
 static void BM_CutScaling_OutputSensitivity(benchmark::State& state)
 {
-    World w = makeDeepWorld(8, 6);
-    ViewScratch s;
+    const auto wp = makeDeepWorld(8, 6);
+    World& w = *wp;
     std::vector<CutEntry> cut;
     const CullView v = orbitView(0.7f, 2500.0f);
-    const CutParams p{float(state.range(0)), 0.0f, 0.0f};
+    const CutParams p{float(state.range(0)), 0.0f};
 
     for (auto _ : state)
     {
         w.beginFrame();
-        w.selectCut(v, p, s, cut);
+        w.selectCut(v, p, cut);
         benchmark::DoNotOptimize(cut.data());
     }
     state.counters["cut"] = double(cut.size());
@@ -1055,9 +1105,9 @@ BENCHMARK(BM_CutScaling_OutputSensitivity)
 
 // ---------------------------------------------------------------------------
 // Camera teleport: worst-case frame latency when every locality assumption
-// breaks at once — scratch stamps stale, hysteresis history useless, page
-// memory cold. Steady frames orbit smoothly; every 16th frame jumps to a
-// random spot. steady_us vs teleport_us is the spike factor.
+// breaks at once — epoch stamps stale, page memory cold. Steady frames orbit
+// smoothly; every 16th frame jumps to a random spot. steady_us vs teleport_us
+// is the spike factor.
 // ---------------------------------------------------------------------------
 static void BM_CameraTeleport_ColdFrame(benchmark::State& state)
 {
@@ -1080,9 +1130,8 @@ static void BM_CameraTeleport_ColdFrame(benchmark::State& state)
     addResidentInstance(w, deepGen.makeRootPage(unitRegion(800.0f), 2048.0f, 0),
                         float4::point(0, 300.0f, 0));
 
-    ViewScratch s;
     std::vector<CutEntry> cut;
-    const CutParams p{4.0f, 0.1f, 1.0f};
+    const CutParams p{4.0f, 1.0f};
     XorShift32 fast;
 
     double steadyNs = 0, teleportNs = 0;
@@ -1099,7 +1148,7 @@ static void BM_CameraTeleport_ColdFrame(benchmark::State& state)
 
         const auto t0 = clock::now();
         w.beginFrame();
-        w.selectCut(v, p, s, cut);
+        w.selectCut(v, p, cut);
         const auto t1 = clock::now();
         benchmark::DoNotOptimize(cut.data());
 
@@ -1115,8 +1164,8 @@ BENCHMARK(BM_CameraTeleport_ColdFrame)->Unit(benchmark::kMicrosecond);
 
 // ---------------------------------------------------------------------------
 // Multi-view frame: main camera + 3 extra views (shadow cascades, a mirror)
-// against one world, each with its own scratch. The marginal cost of an
-// extra view should be well below the main view (shared world data is hot).
+// against one world. The marginal cost of an extra view should be well below
+// the main view (shared world data is hot).
 // ---------------------------------------------------------------------------
 static void BM_MultiView(benchmark::State& state)
 {
@@ -1139,9 +1188,8 @@ static void BM_MultiView(benchmark::State& state)
     addResidentInstance(w, deepGen.makeRootPage(unitRegion(600.0f), 2048.0f, 0),
                         float4::point(0, 250.0f, 0));
 
-    ViewScratch scr[4];
     std::vector<CutEntry> cut[4];
-    const CutParams p{4.0f, 0.1f, 1.0f};
+    const CutParams p{4.0f, 1.0f};
 
     double mainNs = 0, extraNs = 0;
     size_t frames = 0;
@@ -1153,12 +1201,12 @@ static void BM_MultiView(benchmark::State& state)
         const float4 eye = float4::vec(std::cos(t) * 900.0f, 300.0f, std::sin(t) * 900.0f);
 
         const auto t0 = clock::now();
-        w.selectCut(makeLookAtView(eye, float4::point(0, 0, 0)), p, scr[0], cut[0]);
+        w.selectCut(makeLookAtView(eye, float4::point(0, 0, 0)), p, cut[0]);
         const auto t1 = clock::now();
         // Extra views: same eye, different directions (cascade-style).
-        w.selectCut(makeLookAtView(eye, float4::point(2000, 0, 0)), p, scr[1], cut[1]);
-        w.selectCut(makeLookAtView(eye, float4::point(-1000, 0, 1500)), p, scr[2], cut[2]);
-        w.selectCut(makeLookAtView(eye + float4::vec(0, 1200, 0), eye), p, scr[3], cut[3]);
+        w.selectCut(makeLookAtView(eye, float4::point(2000, 0, 0)), p, cut[1]);
+        w.selectCut(makeLookAtView(eye, float4::point(-1000, 0, 1500)), p, cut[2]);
+        w.selectCut(makeLookAtView(eye + float4::vec(0, 1200, 0), eye), p, cut[3]);
         const auto t2 = clock::now();
 
         for (auto& c : cut) benchmark::DoNotOptimize(c.data());
@@ -1274,9 +1322,8 @@ static void BM_StreamingConvergence(benchmark::State& state)
     addResidentInstance(w, gen.makeRootPage(unitRegion(4000.0f), float(1u << 17), 3),
                         float4::point(0, 0, 0));
 
-    ViewScratch s;
     Outputs o;
-    const CutParams p{4.0f, 0.1f, 0.0f};
+    const CutParams p{4.0f, 0.0f};
     XorShift32 fast;
 
     constexpr int kPeriod = 33;                          // teleport every 33 frames
@@ -1298,7 +1345,7 @@ static void BM_StreamingConvergence(benchmark::State& state)
 
         const CullView v = makeLookAtView(eye, eye + float4::vec(1, -0.15f, 0.3f));
         w.beginFrame();
-        w.selectCut(v, p, s, o.cut, o.ideal, o.reqs);
+        w.selectCut(v, p, o.cut, o.ideal, o.reqs);
 
         // Residual: worst screen error still waiting on an expansion.
         // Clamped: the camera inside a collapsed box saturates err toward
@@ -1357,16 +1404,15 @@ static void BM_TlasScale(benchmark::State& state)
 
     World w;
     for (int i = 0; i < count; ++i)
-        addResidentInstance(w, Page(proto), float4::point(uni(rng), 0, uni(rng)));
+        addResidentInstance(w, proto.clone(), float4::point(uni(rng), 0, uni(rng)));
 
-    ViewScratch s;
     std::vector<CutEntry> cut;
-    const CutParams p{4.0f, 0.1f, 1.0f};
+    const CutParams p{4.0f, 1.0f};
 
     // Level-load burst: the first cut pays the quality TLAS build.
     const auto b0 = clock::now();
     w.beginFrame();
-    w.selectCut(orbitView(0.0f, half * 0.25f), p, s, cut);
+    w.selectCut(orbitView(0.0f, half * 0.25f), p, cut);
     const auto b1 = clock::now();
     const double firstMs = std::chrono::duration<double, std::milli>(b1 - b0).count();
 
@@ -1375,7 +1421,7 @@ static void BM_TlasScale(benchmark::State& state)
     {
         t += 0.01f;
         w.beginFrame();
-        w.selectCut(orbitView(t, half * 0.25f), p, s, cut);
+        w.selectCut(orbitView(t, half * 0.25f), p, cut);
         benchmark::DoNotOptimize(cut.data());
     }
     state.counters["cut"] = double(cut.size());
@@ -1383,6 +1429,464 @@ static void BM_TlasScale(benchmark::State& state)
 }
 BENCHMARK(BM_TlasScale)
     ->Arg(200000)->Arg(500000)
+    ->Unit(benchmark::kMicrosecond);
+
+// ---------------------------------------------------------------------------
+// Asset sharing vs. cloning: the SAME scene and the SAME cut, built two ways.
+// arg0 0 = every instance owns a private copy of the page (N assets, N
+// mounts); arg0 1 = one registered asset instanced N times (1 asset, 1 mount).
+// Positions, geometry and camera are identical, so the cut is identical and
+// the delta is purely the cost of the data layout: cache residency of the page
+// bytes and of the per-mount resident/readyChildren arrays.
+//
+// This is the measurement the sharing design was never given: every other
+// bench here builds a unique page per instance (or proto.clone()s one), so
+// they all model the unshared case.
+// ---------------------------------------------------------------------------
+static void BM_AssetSharing_CutCost(benchmark::State& state)
+{
+    const bool shared = state.range(0) != 0;
+    const int  count  = int(state.range(1));
+
+    TreeGen gen;
+    gen.fanout = 8;
+    gen.depth = 3;
+    const Page proto = gen.makeRootPage(unitRegion(5.0f), 64.0f, 0);
+    const size_t pageBytes = proto.byteSize();
+
+    // Loose grid so every instance is visible at once and fully refines.
+    const int   side  = int(std::ceil(std::sqrt(double(count))));
+    const float pitch = 14.0f;
+    const auto  at = [&](int i) {
+        return float4::point(float(i % side - side / 2) * pitch, 0,
+                             float(i / side - side / 2) * pitch);
+    };
+
+    World w;
+    AssetHandle asset{};
+    if (shared)
+    {
+        asset = w.registerAsset(proto.clone());
+        for (int i = 0; i < count; ++i) w.addInstance(asset, at(i));
+        markAllResident(w, w.assetRootPage(asset), proto.nodeCount());
+    }
+    else
+    {
+        for (int i = 0; i < count; ++i) addResidentInstance(w, proto.clone(), at(i));
+    }
+
+    std::vector<CutEntry> cut;
+    const CutParams p{4.0f, 0.0f};
+    const float span = float(side) * pitch;
+    const CullView v = makeLookAtView(float4::point(0, span * 0.8f, -span * 0.8f),
+                                      float4::point(0, 0, 0));
+
+    for (auto _ : state)
+    {
+        w.beginFrame();
+        w.selectCut(v, p, cut);
+        benchmark::DoNotOptimize(cut.data());
+    }
+    state.counters["cut"] = double(cut.size());
+    state.counters["mounts"] = double(w.attachedPageCount());
+    state.counters["page_KB"] = double(pageBytes) / 1024.0;
+    state.counters["pages_MB"] =
+        double(pageBytes) * (shared ? 1.0 : double(count)) / (1024.0 * 1024.0);
+}
+BENCHMARK(BM_AssetSharing_CutCost)
+    ->Args({0, 100})->Args({1, 100})       // cloned set ~5 MB: fits in L3
+    ->Args({0, 300})->Args({1, 300})       // ~16 MB: half of L3
+    ->Args({0, 600})->Args({1, 600})       // ~32 MB: at L3
+    ->Args({0, 1000})->Args({1, 1000})     // ~52 MB: over L3
+    ->Args({0, 4000})->Args({1, 4000})     // ~207 MB: far over L3
+    ->Unit(benchmark::kMicrosecond);
+
+// ---------------------------------------------------------------------------
+// The deformed CUT path: what an overlay costs the walk, not the refit.
+//
+// One shared asset instanced N times, then arg1 percent of the instances are
+// deformed by rewriting one leaf to the box it ALREADY HAS. applyBoundsChange
+// takes the overlay before it inspects anything, so that allocates the copy
+// without moving any geometry: the cut is identical at every deform fraction
+// and the only variable is where the walk reads bounds from — interleaved in
+// the shared WideBlocks, or packed in a per-instance overlay.
+//
+// Bounds are 192 of a WideBlock's 256 bytes, so a deformed instance stops
+// sharing about two thirds of the hot block and its walk splits into two
+// streams. BM_AssetSharing_CutCost showed that sharing is worth up to 2.6x;
+// this asks how much of that a deformed instance gives back.
+// ---------------------------------------------------------------------------
+static void BM_DeformedCutCost(benchmark::State& state)
+{
+    const int count = int(state.range(0));
+    const int pct   = int(state.range(1));
+
+    TreeGen gen;
+    gen.fanout = 8;
+    gen.depth = 3;
+    const Page proto = gen.makeRootPage(unitRegion(5.0f), 64.0f, 0);
+
+    // Any leaf of the shared page; node indices are identical for all instances.
+    uint32_t leaf = 0;
+    for (uint32_t n = 1; n < proto.nodeCount(); ++n)
+        if (proto.childCount(n) == 0) { leaf = n; break; }
+
+    const int   side  = int(std::ceil(std::sqrt(double(count))));
+    const float pitch = 14.0f;
+
+    World w;
+    const AssetHandle asset = w.registerAsset(proto.clone());
+    std::vector<World::InstanceRef> insts;
+    insts.reserve(size_t(count));
+    for (int i = 0; i < count; ++i)
+        insts.push_back(w.addInstance(
+            asset, float4::point(float(i % side - side / 2) * pitch, 0,
+                                 float(i / side - side / 2) * pitch)));
+    markAllResident(w, w.assetRootPage(asset), proto.nodeCount());
+
+    // Identity rewrite: takes the overlay, moves nothing.
+    const int deform = count * pct / 100;
+    for (int i = 0; i < deform; ++i)
+    {
+        const NodeHandle h = nodeAt(insts[i].rootPage, leaf);
+        w.setNodeBounds(insts[i], h, w.nodeBounds(insts[i], h));
+    }
+    w.flushBounds();
+
+    std::vector<CutEntry> cut;
+    const CutParams p{4.0f, 0.0f};
+    const float span = float(side) * pitch;
+    const CullView v = makeLookAtView(float4::point(0, span * 0.8f, -span * 0.8f),
+                                      float4::point(0, 0, 0));
+
+    for (auto _ : state)
+    {
+        w.beginFrame();
+        w.selectCut(v, p, cut);
+        benchmark::DoNotOptimize(cut.data());
+    }
+    state.counters["cut"] = double(cut.size());
+    state.counters["overlays"] = double(w.overlayCount());
+    state.counters["ov_MB"] = double(w.overlayBytes()) / (1024.0 * 1024.0);
+}
+BENCHMARK(BM_DeformedCutCost)
+    ->Args({1000, 0})->Args({1000, 1})->Args({1000, 10})
+    ->Args({1000, 50})->Args({1000, 100})
+    ->Args({4000, 0})->Args({4000, 10})->Args({4000, 100})
+    ->Unit(benchmark::kMicrosecond);
+
+// ---------------------------------------------------------------------------
+// SelectionContext: what temporal reuse is worth on the workload it targets.
+//
+// A large instanced world seen by a camera that moves continuously and never
+// teleports, with a configurable slice of the instances moving every frame.
+// arg0 = instances, arg1 = 0 stateless / 1 cached, arg2 = percent of instances
+// that move each frame.
+//
+// The stateless and cached arms do the same work per frame from the caller's
+// point of view: same TLAS query, same view, same cut. The difference is that
+// the cached arm skips the per-instance walk wherever it can prove the answer
+// has not moved, and hands back the entries where they already sit instead of
+// rewriting them.
+//
+// reuse% is the number to read alongside the time: it says how much of the
+// population the margin actually covered, and it is the mechanism's own
+// report on whether this world suits it.
+// ---------------------------------------------------------------------------
+static void BM_SelectionContext_FlyThrough(benchmark::State& state)
+{
+    const int count = int(state.range(0));
+    const bool cached = state.range(1) != 0;
+    const int movePct = int(state.range(2));
+
+    // One shared asset, as a real forest or city would be: the cache's records
+    // are per instance, so sharing the asset does not share the records.
+    TreeGen gen;
+    gen.fanout = 4;
+    gen.depth = 3;
+    Page proto = gen.makeRootPage(unitRegion(3.0f), 2.0f, 0);
+    const uint32_t nodes = proto.nodeCount();
+
+    World w;
+    const AssetHandle asset = w.registerAsset(std::move(proto));
+    const float half = 12.0f * std::sqrt(float(count));
+    std::mt19937 rng(4242);
+    std::uniform_real_distribution<float> uni(-half, half);
+    std::vector<World::InstanceRef> insts;
+    std::vector<float4>             home;
+    insts.reserve(count);
+    home.reserve(count);
+    for (int i = 0; i < count; ++i)
+    {
+        home.push_back(float4::point(uni(rng), 0, uni(rng)));
+        insts.push_back(w.addInstance(asset, home.back()));
+    }
+    markAllResident(w, w.assetRootPage(asset), nodes);
+
+    const int movers = count * movePct / 100;
+
+    std::vector<CutEntry> cut;
+    SelectionContext cache;
+    const CutParams p{4.0f, 0.0f};
+    XorShift32 fast;
+
+    // Fixed iteration count, and the camera's path is a function of the frame
+    // index: both arms therefore fly exactly the same route past exactly the
+    // same instances, which is what makes their averages comparable. Letting
+    // Google Benchmark choose the count would let the faster arm sweep a
+    // different part of the map and quietly change what it is averaging.
+    using clock = std::chrono::steady_clock;
+    double cutNs = 0, reuse = 0, entries = 0, visible = 0;
+    size_t frames = 0;
+    for (auto _ : state)
+    {
+        // Continuous motion, no teleports: the camera drifts a little under a
+        // metre per frame and the movers wander about their homes.
+        const float t = float(frames % 600) / 600.0f;
+        const float z = (t * 2.0f - 1.0f) * half * 0.8f;
+        for (int i = 0; i < movers; ++i)
+            w.moveInstance(insts[i], home[i] + float4::vec(fast.uniform(-0.4f, 0.4f), 0,
+                                                           fast.uniform(-0.4f, 0.4f)));
+        const CullView v = makePerspectiveView(
+            float4::point(0, 2.0f, z), float4::vec(0.0f, 0.0f, 1.0f),
+            float4::vec(0, 1, 0), 1.0f, 16.0f / 9.0f, 1080.0f, 0.1f, 1.0e9f);
+        w.beginFrame();
+        w.flushBounds();
+
+        const auto t0 = clock::now();
+        if (cached)
+            w.selectCut(v, p, cache, cut);
+        else
+            w.selectCut(v, p, cut);
+        const auto t1 = clock::now();
+        cutNs += std::chrono::duration<double, std::nano>(t1 - t0).count();
+
+        if (cached)
+        {
+            const double n = double(cache.reused() + cache.walked());
+            reuse += n > 0 ? 100.0 * double(cache.reused()) / n : 0.0;
+            entries += double(cut.size());
+            visible += n;
+            benchmark::DoNotOptimize(cut.data());
+        }
+        else
+        {
+            entries += double(cut.size());
+            benchmark::DoNotOptimize(cut.data());
+        }
+        ++frames;
+    }
+    const double f = double(frames ? frames : 1);
+    state.counters["cut_us"] = cutNs / f / 1000.0;
+    state.counters["reuse%"] = reuse / f;
+    state.counters["avg_cut"] = entries / f;
+    state.counters["cache_MB"] = double(cache.bytes()) / (1024.0 * 1024.0);
+    // Entries per visible instance: how shallow a per-instance cut really is.
+    // At ~1 this is what killed the span-per-instance output -- the descriptor
+    // array came out the same size as the data it described.
+    state.counters["ent_inst"] = visible > 0 ? entries / visible : 0.0;
+}
+BENCHMARK(BM_SelectionContext_FlyThrough)
+    ->Args({20000, 0, 0})->Args({20000, 1, 0})
+    ->Args({20000, 0, 5})->Args({20000, 1, 5})
+    ->Args({20000, 0, 100})->Args({20000, 1, 100})
+    ->Args({80000, 0, 5})->Args({80000, 1, 5})
+    ->Iterations(600)
+    ->Unit(benchmark::kMicrosecond);
+
+// ---------------------------------------------------------------------------
+// The zoom cliff: what a change in k costs a SelectionContext, and how much
+// damping amplifies it.
+//
+// Every recorded margin is a distance to a flip point, and a flip point sits at
+// eff * k / threshold, so a change in k moves all of them and voids the whole
+// cache at once (one epoch bump, no per-record work). That much is by
+// construction and costs exactly one frame.
+//
+// Damping is what makes it interesting. ViewDamper relaxes k toward the current
+// value alongside the envelope, so ONE zoom keystroke produces a DIFFERENT k
+// every frame until the relaxation settles -- and each of those frames voids the
+// cache again. This measures how wide that hole really is.
+//
+// arg0 = damper half-life in frames, arg1 = frames between zoom steps (0 =
+// never). Nothing moves; every instance is otherwise permanently reusable, so
+// what is left in the numbers is the zoom and only the zoom.
+//
+// Read stall_f: frames that reused nothing at all -- the cliff, in frames per
+// 600. Measured, it is 1 per zoom undamped and ~190 per zoom-OUT damped at
+// halfLife 8, because the relaxation stops at float equality rather than at the
+// half-life. Zoom IN is free: kMax_ takes the max, so it arrives at once.
+//
+// Do NOT read Time across different zoom periods. Zooming in narrows the
+// frustum, so fewer instances are visible and the arm is cheaper for a reason
+// that has nothing to do with the cache. Compare within a period, across
+// half-lives: /0/120 against /8/120.
+// ---------------------------------------------------------------------------
+static void BM_SelectionContext_Zoom(benchmark::State& state)
+{
+    const float halfLife = float(state.range(0));
+    const int   zoomEvery = int(state.range(1));
+    const int   count = 20000;
+
+    TreeGen gen;
+    gen.fanout = 4;
+    gen.depth = 3;
+    Page proto = gen.makeRootPage(unitRegion(3.0f), 2.0f, 0);
+    const uint32_t nodes = proto.nodeCount();
+
+    World w;
+    const AssetHandle asset = w.registerAsset(std::move(proto));
+    const float half = 12.0f * std::sqrt(float(count));
+    std::mt19937 rng(4242);
+    std::uniform_real_distribution<float> uni(-half, half);
+    for (int i = 0; i < count; ++i)
+        w.addInstance(asset, float4::point(uni(rng), 0, uni(rng)));
+    markAllResident(w, w.assetRootPage(asset), nodes);
+
+    SelectionContext ctx(halfLife);
+    std::vector<CutEntry> cut;
+    const CutParams p{4.0f, 0.0f};
+
+    using clock = std::chrono::steady_clock;
+    double cutNs = 0, reuse = 0;
+    size_t frames = 0, stalls = 0;
+    for (auto _ : state)
+    {
+        const size_t fi = frames % 600;
+        const float t = float(fi) / 600.0f;
+        const float z = (t * 2.0f - 1.0f) * half * 0.8f;
+        // A discrete zoom step, held until the next one: one keystroke, not a
+        // continuous sweep. Undamped, k is then constant between steps.
+        const bool zoomedIn = zoomEvery > 0 && ((fi / size_t(zoomEvery)) & 1u) != 0;
+        const float fovY = zoomedIn ? 0.5f : 1.0f;
+        const CullView v = makePerspectiveView(
+            float4::point(0, 2.0f, z), float4::vec(0.0f, 0.0f, 1.0f),
+            float4::vec(0, 1, 0), fovY, 16.0f / 9.0f, 1080.0f, 0.1f, 1.0e9f);
+        w.beginFrame();
+
+        const auto t0 = clock::now();
+        w.selectCut(v, p, ctx, cut);
+        const auto t1 = clock::now();
+        cutNs += std::chrono::duration<double, std::nano>(t1 - t0).count();
+
+        const double n = double(ctx.reused() + ctx.walked());
+        reuse += n > 0 ? 100.0 * double(ctx.reused()) / n : 0.0;
+        if (ctx.reused() == 0 && ctx.walked() > 0) ++stalls;
+        benchmark::DoNotOptimize(cut.data());
+        ++frames;
+    }
+    const double f = double(frames ? frames : 1);
+    state.counters["cut_us"] = cutNs / f / 1000.0;
+    state.counters["reuse%"] = reuse / f;
+    state.counters["stall_f"] = double(stalls);
+}
+BENCHMARK(BM_SelectionContext_Zoom)
+    ->Args({0, 0})->Args({0, 120})
+    ->Args({8, 0})->Args({8, 120})
+    // 300 isolates the direction: with this period the run contains exactly one
+    // transition, a zoom IN at frame 300. Zoom in raises k, and kMax_ takes the
+    // max, so it arrives in one frame; only zoom OUT relaxes.
+    ->Args({0, 300})->Args({8, 300})
+    ->Iterations(600)
+    ->Unit(benchmark::kMicrosecond);
+
+// ---------------------------------------------------------------------------
+// What does ONE spawn cost?
+//
+// The stated workload has a small number of instances appearing and
+// disappearing every frame against a large static population. Every existing
+// churn benchmark moves a PERCENTAGE of the world, which never separates the
+// marginal cost of a spawn from the bulk cost of thousands of them.
+//
+// arg0 = population, arg1 = spawns AND removes per frame, as an absolute count.
+// arg1 = 0 is the control: no structural change at all. Read cut_us across the
+// arg1 series -- if one spawn costs what five hundred cost, the cost is not the
+// spawn.
+//
+// arg2 is tlasEditFraction in per-mille, or 0 for the default. It exists to
+// check the trade the budget makes: a smaller budget rebuilds more often
+// (amortised cost up) but keeps the tree tighter (cut down), and only
+// measurement says where the minimum is.
+//
+// The asset is shared, and resident before the loop, so a newly spawned
+// instance needs no streaming: this measures structure, not I/O.
+// ---------------------------------------------------------------------------
+static void BM_Spawn_MarginalCost(benchmark::State& state)
+{
+    using clock = std::chrono::steady_clock;
+    const int count = int(state.range(0));
+    const int churn = int(state.range(1));
+    const int editPerMille = int(state.range(2));   // 0 = library default
+
+    TreeGen gen;
+    gen.fanout = 4;
+    gen.depth = 3;
+    Page proto = gen.makeRootPage(unitRegion(3.0f), 2.0f, 0);
+    const uint32_t nodes = proto.nodeCount();
+
+    WorldConfig cfg;
+    if (editPerMille > 0) cfg.tlasEditFraction = float(editPerMille) / 1000.0f;
+    World w(cfg);
+    const AssetHandle asset = w.registerAsset(std::move(proto));
+    const float half = 12.0f * std::sqrt(float(count));
+    std::mt19937 rng(4242);
+    std::uniform_real_distribution<float> uni(-half, half);
+    std::vector<World::InstanceRef> insts;
+    insts.reserve(size_t(count) + size_t(churn) + 1);
+    for (int i = 0; i < count; ++i)
+        insts.push_back(w.addInstance(asset, float4::point(uni(rng), 0, uni(rng))));
+    markAllResident(w, w.assetRootPage(asset), nodes);
+
+    std::vector<CutEntry> cut;
+    const CutParams p{6.0f, 0.0f};
+    XorShift32 fast;
+    double churnNs = 0, cutNs = 0;
+    size_t frames = 0, cutTotal = 0;
+
+    for (auto _ : state)
+    {
+        const float t = float(frames);
+        const CullView v = makePerspectiveView(
+            float4::point(std::sin(t * 0.01f) * half * 0.5f, 40.0f,
+                          std::cos(t * 0.01f) * half * 0.5f),
+            float4::vec(0, -0.3f, 1), float4::vec(0, 1, 0), 1.1f, 16.0f / 9.0f,
+            1080.0f, 0.1f, 1.0e9f);
+
+        const auto t0 = clock::now();
+        for (int k = 0; k < churn; ++k)
+        {
+            const size_t i = fast.next() % insts.size();
+            w.removeInstance(insts[i]);
+            insts[i] = insts.back();
+            insts.pop_back();
+            insts.push_back(
+                w.addInstance(asset, float4::point(fast.uniform(-half, half), 0,
+                                                   fast.uniform(-half, half))));
+        }
+        const auto t1 = clock::now();
+        w.beginFrame();
+        w.selectCut(v, p, cut);
+        const auto t2 = clock::now();
+
+        churnNs += std::chrono::duration<double, std::nano>(t1 - t0).count();
+        cutNs += std::chrono::duration<double, std::nano>(t2 - t1).count();
+        cutTotal += cut.size();
+        ++frames;
+        benchmark::DoNotOptimize(cut.data());
+    }
+    const double f = double(frames ? frames : 1);
+    state.counters["churn_us"] = churnNs / f / 1000.0;
+    state.counters["cut_us"] = cutNs / f / 1000.0;
+    state.counters["avg_cut"] = double(cutTotal) / f;
+}
+BENCHMARK(BM_Spawn_MarginalCost)
+    ->Args({20000, 0, 0})->Args({20000, 1, 0})->Args({20000, 8, 0})
+    ->Args({20000, 500, 0})
+    ->Args({80000, 0, 0})->Args({80000, 1, 0})->Args({80000, 8, 0})
+    // Edit-budget sweep at the churn rate where degradation is visible.
+    ->Args({20000, 8, 5})->Args({20000, 8, 10})->Args({20000, 8, 25})
+    ->Args({20000, 8, 50})->Args({20000, 8, 100})->Args({20000, 8, 250})
+    ->Iterations(400)
     ->Unit(benchmark::kMicrosecond);
 
 // ---------------------------------------------------------------------------
@@ -1400,19 +1904,18 @@ static void BM_Adversarial_StackedInstances(benchmark::State& state)
     World w;
     XorShift32 fast;
     for (int i = 0; i < 10000; ++i)
-        addResidentInstance(w, Page(proto),
+        addResidentInstance(w, proto.clone(),
                             float4::point(fast.uniform(-0.01f, 0.01f), 0,
                                           fast.uniform(-0.01f, 0.01f)));
 
-    ViewScratch s;
     std::vector<CutEntry> cut;
-    const CutParams p{4.0f, 0.1f, 0.0f};
+    const CutParams p{4.0f, 0.0f};
     const CullView v = makeLookAtView(float4::point(0, 20, -60), float4::point(0, 0, 0));
 
     for (auto _ : state)
     {
         w.beginFrame();
-        w.selectCut(v, p, s, cut);
+        w.selectCut(v, p, cut);
         benchmark::DoNotOptimize(cut.data());
     }
     state.counters["cut"] = double(cut.size());
@@ -1438,16 +1941,15 @@ static void BM_Adversarial_WideNode(benchmark::State& state)
     World w;
     addResidentInstance(w, b.build(), float4::point(0, 0, 0));
 
-    ViewScratch s;
     std::vector<CutEntry> cut;
-    const CutParams p{4.0f, 0.1f, 0.0f};
+    const CutParams p{4.0f, 0.0f};
 
     float t = 0.0f;
     for (auto _ : state)
     {
         t += 0.02f;
         w.beginFrame();
-        w.selectCut(orbitView(t, 300.0f), p, s, cut);
+        w.selectCut(orbitView(t, 300.0f), p, cut);
         benchmark::DoNotOptimize(cut.data());
     }
     state.counters["cut"] = double(cut.size());
@@ -1486,15 +1988,14 @@ static void BM_Adversarial_DeepPageChain(benchmark::State& state)
         ++depth;
     }
 
-    ViewScratch s;
     std::vector<CutEntry> cut;
-    const CutParams p{4.0f, 0.1f, 0.0f};
+    const CutParams p{4.0f, 0.0f};
     const CullView v = makeLookAtView(float4::point(0, 3, -8), float4::point(0, 0, 0));
 
     for (auto _ : state)
     {
         w.beginFrame();
-        w.selectCut(v, p, s, cut);
+        w.selectCut(v, p, cut);
         benchmark::DoNotOptimize(cut.data());
     }
     state.counters["pages"] = double(depth + 1);

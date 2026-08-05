@@ -1,0 +1,1322 @@
+# HLodTree rework — handoff
+
+Status as of 2026-08-04 (second session). This document describes an
+**uncommitted but now complete and verified** rework of HLodTree. The library,
+all tests and the benchmark suite compile and run.
+
+---
+
+## 1. TL;DR for whoever picks this up
+
+| | |
+|---|---|
+| Library (`include/hlod/*`, `src/*`) | **Done, compiles clean** (2 benign C4324 warnings) |
+| `tests/helpers.h` | Done (+ `errClampOf` accessor) |
+| `tests/test_motion.cpp` | Done |
+| `tests/test_cut.cpp` | Done |
+| `tests/test_streaming.cpp` | Done (`AttachClampsChildErrors` rewritten, see §7.2) |
+| `tests/test_contracts.cpp` | Done (`MultiViewDamperIsolation` replaces scratch isolation) |
+| `tests/test_cache.cpp` | New — SelectionContext equivalence, damping, churn, multi-view |
+| `bench/bench_hlod.cpp` | Done (+ `BM_DeepTree_FlyThroughDamped`, `BM_AssetSharing_CutCost`, `BM_DeformedCutCost`, `BM_SelectionContext_FlyThrough`) |
+| Test run | **86/86 green** (pre-rework baseline was 56/56; the rework and the audit added tests) |
+| §8 measurements | **Done**, results below — one real regression found (refit +28%) |
+| Cut-path optimisation | **Done** — five theories A/B tested, one kept (§9) |
+| `WideBlock` 288 -> 256 bytes | **Done** — blob version 2; up to 10% wherever the working set exceeds cache (§9.5) |
+| `SelectionContext` (stateful selection) | **New** — up to 2.9x on a mostly-static world; owns its view's `ViewDamper`; hands back a flat cut (§10) |
+| Known cliff | Zoom out + damping voids the cache for ~24 half-lives. Measured and root-caused, not fixed (§10.7) |
+| Biggest flaw found, fixed | One spawn forced a full TLAS rebuild (+2.1 ms at 20k, +9.5 ms at 80k, same as 500 spawns). Add/remove are now in-place, O(depth): 5.4-5.7x, one spawn is free (§11.1) |
+
+Environment notes: the shell works again (the first session's dead-shell
+warning no longer applies). The repo moved from `C:\git\...` to `C:\Work\...`,
+so the old `build/` cache was stale and was regenerated (now VS 2026).
+`ctest` was not retried; `build\tests\Release\hlod_tests.exe` was run directly.
+
+---
+
+## 2. Why this rework exists
+
+The starting point was a comparison against `tinybvh` (vendored under `_temp_/`).
+That surfaced one structural defect and a pile of ergonomic gaps.
+
+**The defect: despite the name, there was no instancing.** `World::addInstance`
+took a `Page` *by value* and moved it into a private slot. Ten thousand identical
+trees meant ten thousand copies of the page bytes — and, worse, ten thousand
+copies of the *runtime* state: ten thousand residency arrays, ten thousand
+attachment graphs, ten thousand duplicate streaming requests for the same
+content. The benchmark file admitted as much in a comment.
+
+**The ergonomic gaps**, borrowed from tinybvh's API: a host context for
+allocation and task parallelism, a versioned single-blob page format that is
+also the on-disk format, "bring your own vector types", a config struct instead
+of method proliferation, output sinks that can write into caller memory, and
+frustum construction from a view-projection matrix engines already have.
+
+---
+
+## 3. The two design decisions that shaped everything
+
+These were both driven by the repo owner and reversed my initial direction. Do
+not undo them without reading this section.
+
+### 3.1 No "dual mode" — everything is shared, bounds are copy-on-write
+
+My first implementation had two kinds of page: *shared assets* (immutable,
+instanced) and *private pages* (mutable, one instance, deformable). The owner
+challenged it:
+
+> "as long as we can guarantee that the most detailed subtree representation is
+> available we are not wasting any memory (the subtree is shared) and the tree
+> cut can still find the cut efficiently... it seems like the dual mode is not
+> really needed?"
+
+That is correct, and the argument is stronger than it first appears. Only one
+operation forced private mode — `setNodeBounds` — and letting one mutable array
+drag the whole page into private mode reintroduced the exact pathology the work
+was meant to remove: a deformed instance also got private *streaming* state, so
+10,000 swaying trees would produce 10,000 attachment graphs again.
+
+**The resolution.** Decompose a page by what actually mutates:
+
+| Category | Contents | Sharing |
+|---|---|---|
+| Immutable | `parent`, `subtreeSize`, `meta`, `payload`, `geometricError`, and each `WideBlock`'s `error` / `child` / `validMask` / `leafMask` | Always shared |
+| Shared runtime state | residency, `readyChildren`, attachment graph (`expSlot`), LRU, request stamps | Shared per mount |
+| **Copy-on-write** | `bbox[]` and each `WideBlock`'s `bounds` | Per instance, on demand |
+
+Bounds are ~60% of a page (`AABB` is 32 B/node; `WideBounds` is 192 of the 288
+bytes in a `WideBlock`), so a deformed instance saves ~40% versus a full copy —
+but the real win is that it keeps sharing streaming state with the static
+instances. Only the pages on the path from the moved node to the instance root
+are ever privatised; refit promotes overlays as it crosses page boundaries.
+
+**Implementation note that came out better than planned.** I had expected one
+predictable branch per page in the hot loop to ask "does this instance have an
+overlay?". It costs **zero** branches: the two cases differ only in *where* the
+boxes sit, so `WideBoundsRef` (in `page.h`) carries a base pointer and a stride —
+`sizeof(WideBlock)` for the page's interleaved bounds, `sizeof(WideBounds)` for a
+packed overlay. It is resolved once when a page is pushed onto the walk. Shared
+and deformed instances execute the identical instruction sequence.
+
+### 3.2 Hysteresis lives on the camera, not on the nodes
+
+The owner proposed removing per-node hysteresis state by passing the old and new
+camera to `selectCut`. The literal two-camera form does not damp — I showed a
+trace where reconstructing "was this refined last frame?" from the previous
+camera flips *every frame* for a node whose error alternates 4.1 / 3.9 around a
+threshold of 4, which is precisely the popping hysteresis exists to prevent.
+
+**The generalisation that does work: a camera position envelope.** Keep, per
+view, an AABB over where the camera has been recently, and measure LOD distance
+to the *nearest point of that envelope* instead of to a point. Semantically:
+"level this node as if the camera were at the closest place it has been lately."
+
+Why this is the right shape:
+
+- **Free in the hot loop.** Point-to-box separation is
+  `c = max(max(mn - p, p - mx), 0)`; box-to-box is
+  `c = max(max(mn - qmx, qmn - mx), 0)`. Same instruction count, two hoisted
+  broadcasts instead of one. `screenError8` and the frustum test are untouched.
+- **Degenerates exactly.** When the envelope collapses to a point (damping off,
+  or a stationary camera) the expression is *term for term* the old one, so
+  undamped selection is bit-identical to before. There is one implementation,
+  not two.
+- **O(1) state for an arbitrary window**, and the state is one object per camera
+  instead of one bit per materialised node per view.
+- **Correct asymmetry.** The envelope always contains the current position, so
+  approach refines instantly; recede is damped by the decay. Popping in is worse
+  than holding detail a few frames too long.
+- **Frustum culling still uses the current camera only** — visibility is a "now"
+  question. Only the LOD level wants memory.
+
+Accepted costs, which are real and should be watched:
+
+1. The `hysteresis` parameter changed meaning (fraction of threshold → decay
+   half-life in frames), so `CutParams::hysteresis` was **removed** rather than
+   ported, and the old `Cut.Hysteresis` test was rewritten rather than adapted.
+2. The envelope is conservative, so the cut gets slightly **larger** when damping
+   is on. The cut is output-bound, so this needs measuring (§8).
+
+**Consequences elsewhere, all good:** `ViewScratch` was deleted outright, not
+replaced. `selectCut` no longer takes any per-view object. Selection became a
+pure read of the `World`, which removed the `hysteresis == 0` precondition on
+parallel cut selection — there is no shared write set left in the walk.
+
+---
+
+## 4. Public API changes (all breaking)
+
+Backwards compatibility was explicitly waived by the owner.
+
+```cpp
+// ---- selection: no more per-view scratch ----
+- void selectCut(view, params, ViewScratch&, outCut, outIdeal, outRequests);
++ void selectCut(view, params, outCut, outIdeal, outRequests);
+- class ViewScratch { ... };                       // deleted entirely
+
+// ---- damping moved to the camera ----
+- struct CutParams { float threshold, hysteresis, minPix; };
++ struct CutParams { float threshold, minPix; };
++ class ViewDamper { explicit ViewDamper(float halfLifeFrames);
++                    CullView damp(const CullView&); void reset(); };
+
+// ---- stateful selection: one context per view, holds that view's damper ----
++ class SelectionContext { explicit SelectionContext(float halfLifeFrames = 0);
++                          void setHalfLife(float);  float halfLife() const;
++                          uint32_t reused() const, walked() const;
++                          void reset();  size_t bytes() const; };
++ void selectCut(view, params, SelectionContext&, outCut, outIdeal = nullptr, outRequests = nullptr);
++     // ^ same flat outCut as every other overload, and the ONE that takes a RAW
++     //   view: it damps internally, through the context's own damper
++ void Sink::pushRange(const T*, uint32_t);         // bulk append, used by the above
+
+// ---- deformation is per instance ----
+- void setNodeBounds(NodeHandle, const AABB&);
++ void setNodeBounds(InstanceRef, NodeHandle, const AABB&);
++ AABB nodeBounds(InstanceRef, NodeHandle);         // instance's effective bounds
++ size_t overlayCount() const;  size_t overlayBytes() const;
+
+// ---- assets are the unit of sharing ----
++ AssetHandle registerAsset(Page&&);
++ AssetHandle registerAsset(PageView);              // borrowed: mmap a bundle, zero copy
++ void releaseAsset(AssetHandle);
++ PageHandle assetRootPage(AssetHandle) const;
++ InstanceRef addInstance(AssetHandle, const InstanceDesc&);
+  InstanceRef addInstance(Page&&, ...);             // now = register anonymous asset + instance
++ PageHandle attachPage(NodeHandle, AssetHandle);   // attaches for ALL instances at once
+
+// ---- everything else ----
++ struct InstanceDesc { float4 pos; float scale; uint32_t tag; uint32_t mask; };
++ struct CutEntry { UserPayload payload; float err; uint32_t instance; };  // +instance, still 16B
++ struct IdealEntry { ... uint32_t instance; ... };
++ struct WorldConfig { HlodContext context; TlasQuality; SAH costs; drift thresholds;
++                      uint32_t parallelInstanceThreshold; };
++ template<class T> class Sink;                     // vector-backed or fixed caller memory
++ struct CutStats;  const CutStats& lastCutStats(); // behind HLOD_STATS
++ CullView::viewMask;                               // per-view layer culling
++ CullView::envLo / envHi;                          // camera envelope, default 0 = undamped
++ fromViewProj(...), fromPlanes(...);               // Gribb-Hartmann + escape hatch
++ Page is MOVE-ONLY; copies must say clone()
++ PageView (borrowed) vs Page (owned)
+```
+
+Two semantic changes that are not visible in the signatures:
+
+- **`attachPage` no longer grows the owner.** If a child page escapes its
+  expansion node's authored bounds it is now a contract violation
+  (`HLOD_FATAL`), because growing a shared owner would ripple into every
+  instance of the owning asset and turn a streaming event into an O(instances)
+  write. Author conservative expansion bounds. `TreeGen` already satisfies this
+  (its slabs union exactly back to the parent region).
+- **`Page` bytes are never written at runtime.** Invariant (D) across a page
+  boundary used to be established by rewriting the child page's error array at
+  attach time; it is now a per-mount scalar `PageRt::errClamp` folded into the
+  wide test with one `min8`. That is what makes one page attachable under many
+  expansion points, and turns attach from O(nodeCount) into O(1).
+
+---
+
+## 5. File-by-file changes
+
+### New files
+
+| File | Contents |
+|---|---|
+| `include/hlod/config.h` | `HLOD_VERSION_*`, `HLOD_FATAL` / `HLOD_CHECK` / `HLOD_ASSERT`, `HlodContext` (alloc / free / parallelFor / workerCount / user), `defaultContext()` |
+| `src/config.cpp` | `defaultAlloc` (`_aligned_malloc` on Win32, `std::aligned_alloc` elsewhere), `defaultFree`, serial `defaultParallelFor` |
+| `src/page.cpp` | `computeLayout()` — the single definition of the blob layout — plus `PageView::fromBytes` validation and `Page` ownership |
+
+### `include/hlod/math.h`
+
+- `float4` / helpers wrapped in `#ifndef HLOD_USE_CUSTOM_VECTOR_TYPES`, with
+  `static_assert`s on size and alignment.
+- Added `float4x4` with `fromMemory()` / `coeffs()`. The storage convention is
+  deliberately the one DirectXMath (row-vector row-major) and glm/GL
+  (column-vector column-major) **agree on**: in both, the coefficients producing
+  `clip.x` sit at memory indices 0, 4, 8, 12. One `fromMemory()` serves both and
+  there is no convention flag to get wrong.
+- `enum class ClipRange { ZeroToOne, MinusOneToOne }`, `fromViewProj()` (two
+  overloads), `fromPlanes()`. Reverse-Z needs no special handling.
+- `CullView` gained `viewMask`, `envLo`, `envHi`, `queryMin()`, `queryMax()`,
+  `damped()`. The envelope is stored as **non-negative offsets from `pos`** so a
+  hand-built `CullView` defaults to the correct (collapsed) envelope without
+  knowing the fields exist.
+- `distanceToBox` / `distanceToBoxes` converted to box-to-box separation across
+  **all four backends** (AVX2, NEON, SSE2/4.1, scalar), with point-query
+  wrappers that forward `(p, p)`. The point wrapper is provably bit-identical to
+  the old code because the expression reduces term for term.
+- `toLocal()` transforms the envelope (offsets scale by `1/instScale`,
+  translation cancels) and carries `viewMask`.
+- New `ViewDamper` class: `halfLife` in frames, exponential relaxation of the
+  envelope toward the current position, plus a `kMax` envelope so a zoom-out
+  does not drop detail any faster than a move does.
+
+### `include/hlod/page.h` + `src/page.cpp`
+
+- Six `std::vector`s replaced by **one contiguous blob**. The in-memory layout
+  *is* the on-disk format: a streamed page is one read into one aligned buffer,
+  no parsing, no fixups, no per-array allocation.
+- `PageHeader` is exactly 64 bytes (`static_assert`ed), magic `'HLOD'`, version 1.
+  `PageView::fromBytes` validates magic, version, header size, node count, total
+  bytes, recomputes the layout and compares all seven offsets, then checks the
+  sentinel payload. This is the trust boundary for bytes off disk.
+- `PageView` borrows (mmap-friendly, trivially copyable); `Page` owns and is
+  move-only.
+- Added `WideBoundsRef` (base + stride) and `PageView::wideBounds()`. Removed
+  `bboxRw()` / `wideRw()` — the runtime no longer writes into pages at all.
+
+### `include/hlod/world.h` + `src/world.cpp`
+
+The big one. Beyond §3 and §4:
+
+- **Asset registry**: `AssetRt { view, owned, rootMount, generation, mountRefs,
+  instanceRefs, registered }`, refcounted, freed when unreferenced. Every
+  instance of an asset walks the *same* root mount.
+- **Overlays**: `Overlay { slot, generation, bbox[], wide[] }` in a pooled
+  `overlays_` vector with a free list. Each `Instance` holds
+  `std::vector<OverlayRef>` sorted by slot — empty for undeformed instances, so
+  the lookup is one `empty()` check in the common case and a binary search
+  otherwise. Stale overlays (mount detached, slot reused) are retired lazily by
+  generation stamp on lookup; `ensureOverlay` recycles the storage.
+  `ensureOverlay` returns an **index, not a reference**, because refit holds two
+  overlays at once while crossing a page boundary and taking one can reallocate
+  the pool.
+- **Refit** (`applyBoundsChange`) writes the submitted node exactly, then
+  propagates grow-only up the ancestor chain, patching wide lanes in the overlay
+  (lane identity is read from the shared page — it is immutable authored data),
+  crossing page boundaries by promoting the owner's overlay, and finally
+  refreshing the instance world box into the TLAS.
+- **TLAS**: binned SAH (16 bins × 3 axes, config-driven costs) replacing median
+  split for structural rebuilds; Morton for motion rebuilds. Added a
+  surface-area drift trigger (`tlasBaseArea_` / `tlasGrownArea_`) that catches
+  bloat a steady instance population hides from the count-drift trigger. Lanes
+  carry `laneMask` (union of instance masks) for view-mask culling.
+- **Request dedup**: per-node `reqStamp` = `(epoch << 32) | outputIndex`, written
+  through `std::atomic_ref` so the parallel path is race-free. Thousands of
+  instances of one asset collapse to one request, keeping the highest priority
+  any of them asked for.
+- **Parallel `selectCut`** via `context.parallelFor`, each worker filling its own
+  buffers over a contiguous run of visible instances, concatenated in worker
+  order — bit-identical to serial. LRU touches are deferred to after the join.
+
+### `CMakeLists.txt`
+
+Added `src/config.cpp` and `src/page.cpp` to the `hlod` target.
+
+### `tests/helpers.h` (done)
+
+- `TestAccess::pageOf` now returns `PageView`.
+- The brute-force `referenceCut` reads bounds **through the instance**
+  (`w.boundsFor(inst, slot, rt)`), uses the camera envelope
+  (`distanceToBox(box, view.queryMin(), view.queryMax())`), applies
+  `rt.errClamp` (which the old reference did not need, because attach used to
+  rewrite the page's errors), and fills the new `instance` field on entries.
+- New accessors: `overlaysOf`, `bboxOf`, `wideOf`, `instanceWorldBox`,
+  `mountStateOf`.
+- `setNodeBounds` / `nodeBounds` wrappers take an `InstanceRef`.
+
+### `tests/test_motion.cpp` (rewritten, not compiled)
+
+`verifyConservativeBounds` now reads through the instance — this is a *semantic*
+change, not a mechanical one: after a deform, the page still holds the authored
+bounds, so any test that inspects `page.bbox[...]` to observe motion is now
+wrong by construction. New test `Motion.DeformingOneInstanceLeavesSiblingsAlone`
+asserts the core claim: deform one of three instances of an asset; the other two
+still see authored bounds, `overlayCount() == 1`, and all three still share one
+mount (`attachedPageCount() == 1`, same `PageRt` address).
+
+### `tests/test_cut.cpp` (partially migrated)
+
+`run()` helper updated. `Cut.Hysteresis` replaced by four tests:
+
+- `Cut.DampingSurvivesJitter` — a camera oscillating around the threshold flips
+  every frame undamped and never flips damped. This is the property the whole
+  mechanism exists for.
+- `Cut.DampingIsAsymmetric` — refines on the first frame of approach; still
+  refined immediately after receding past the threshold; collapses within ~20
+  frames as the envelope relaxes.
+- `Cut.DampingOffIsExact` — `halfLife == 0` leaves the envelope collapsed and
+  produces the same decisions as an undamped view.
+- `Cut.DamperResetForgetsTheWindow` — `reset()` across a teleport.
+
+---
+
+## 6. Build state
+
+**The library compiles clean.** Verified by reading the build log of the one
+successful invocation:
+
+```
+hlod.vcxproj -> C:\git\GitHub\HLod-tree\build\Release\hlod.lib
+```
+
+Two warnings, both benign and both new:
+
+```
+include/hlod/math.h(707): warning C4324: 'hlod::CullView': structure was padded due to alignment specifier
+include/hlod/math.h(986): warning C4324: 'hlod::ViewDamper': structure was padded due to alignment specifier
+```
+
+These are MSVC noting tail padding caused by `alignas(16)` on `float4`. Harmless.
+If you want them gone, reorder members so the scalars sit between the vectors
+rather than after them. Do **not** silence them globally.
+
+Everything else fails to compile, with exactly three error shapes:
+
+1. `error C2065: 'ViewScratch': undeclared identifier` — the type is gone.
+2. `error C2078: too many initializers` — `CutParams` went from 3 fields to 2,
+   so every `{4.0f, 0.0f, 0.0f}` brace initialiser is one too long.
+3. `error C2660: 'setNodeBounds': function does not take 2 arguments` — it takes
+   an `InstanceRef` first now.
+
+Plus one structural error in the bench only (see §7).
+
+---
+
+## 7. What was left (now done)
+
+All migration items below are complete; the suite builds and runs green
+(60/60). Kept here as a record of what changed and why.
+
+### 7.1 `tests/test_cut.cpp` — done
+
+Dropped all `ViewScratch` declarations and `run(w, s, ...)` sites, trimmed the
+three-element `CutParams` braces to two, and removed the stray
+`p.hysteresis = 0.0f;` in the randomised reference-comparison test. The four
+damping tests (§3.2) already lived here from the first session.
+
+### 7.2 `tests/test_streaming.cpp` — done, one test rewritten
+
+Mechanical `ViewScratch` / `CutParams` / `selectCut` fixes throughout. One test
+needed real thought: `Streaming.AttachClampsChildErrors` used to read the
+child page's rewritten error array (`TA::pageOf(...).geometricError[...]`), but
+page bytes are immutable now and the clamp is a per-mount scalar. It is
+rewritten to assert (a) the page still carries its authored error and
+`TA::errClampOf` holds the expansion node's error, and (b) an over-erroneous
+child produces a *behaviourally identical* cut to one authored at the clamp.
+A new `TestAccess::errClampOf` accessor (in `helpers.h`) exposes the scalar.
+
+### 7.3 `tests/test_contracts.cpp` — done
+
+`MultiViewScratchIsolation` was rewritten as `MultiViewDamperIsolation`: two
+independent `ViewDamper`s over one world, asserting interleaved damped views
+match each run alone — the recommended stronger claim, and the natural
+regression test for §3.2. The determinism test's `CutParams{6, 0.3, 0.5}` +
+sticky history became two `ViewDamper(4)`s so it still exercises damped
+selection. Everything else was mechanical (`CutParams` braces, `selectCut`
+sites, `setNodeBounds(inst, ...)`).
+
+### 7.4 `bench/bench_hlod.cpp` — done, structural fix applied
+
+Both factories that returned a `World` by value now return
+`std::unique_ptr<World>` / `std::unique_ptr<MoverWorld>` (World is
+non-movable). `MoverWorld` stores its `InstanceRef`; every `setNodeBounds` call
+takes it. Prototype-page copies say `page.clone()` (Page is move-only). Added
+`BM_DeepTree_FlyThroughDamped` for the §8.3 measurement.
+
+### 7.5 Ran it
+
+**60/60 green.** `build\tests\Release\hlod_tests.exe` run directly (the
+pre-rework baseline was 56/56; the rework added four damping tests and the
+deform-isolation test). `ctest` was not retried; the direct exe works. The old
+`build/` cache pointed at the former `C:\git\...` path and was regenerated.
+
+---
+
+## 8. Measurements the owner asked for (done)
+
+Machine: 64-thread, single-threaded runs, Release/AVX2, VS 2026. Cross-run
+noise on this box is high (see ARCHITECTURE.md's honesty note), so only large,
+repetition-confirmed deltas are treated as real. New = this rework; Old =
+current committed HEAD (`c9db9b3`) built in a sibling worktree.
+
+### 8.1 Refit A/B — a real regression, as predicted for the single-instance case
+
+| bench | Old | New | delta |
+|---|---|---|---|
+| `LeafRefit_LocalJitter/100000` | ~2.95 ms (33.9 M/s) | ~3.65 ms (27.4 M/s) | **+24%** |
+| `LeafRefit_Teleport/100000` | ~2.97 ms (33.7 M/s) | ~3.85 ms (26.1 M/s) | **+28%** |
+
+Confirmed with interleaved 2 s runs (old 2.97/2.99 ms vs new 3.80/3.90 ms), so
+this is above the noise band, not a mirage.
+
+These benches deform the **one and only** instance, so every refit now pays the
+copy-on-write overlay indirection (resolve `boundsFor`/`wideBoundsFor`, read
+lane identity from the shared page, write the overlay) with **none** of the
+sharing benefit that motivates it. This is the honest floor of §3.1's tradeoff:
+a scene where the deformed instance is not shared pays for the overlay layer and
+gets nothing back. The win only appears when many instances share an asset and a
+few deform. The baseline-to-beat (3.1 ms) was itself the direct-write path this
+replaced. **Flagged for the owner** — if single-instance deform is a real
+workload, the overlay could be skipped when `asset.instanceRefs == 1`.
+
+### 8.2 Overlay stride in the hot loop — no measurable penalty
+
+| bench (undeformed) | Old | New |
+|---|---|---|
+| `DeepTree_StaticCamera/6` (260k cut) | 4.70 ms | 3.57 ms |
+| `DeepTree_CutOnly/6` (260k cut) | 2.65 ms | 1.75 ms |
+
+The strided bounds read (`WideBoundsRef` base+stride, resolved once per page
+push) replaced a direct read even when no overlay exists. The undeformed cut
+path did not regress — it got faster — so there is no evidence of a stride cost.
+(This is not a clean isolation: the comparison also carries every other rework
+change, so read it as "the stride did not cost us anything visible", not "the
+stride is free and everything else is unchanged".)
+
+### 8.3 Cut size under damping — the honest cost of §3.2
+
+`BM_DeepTree_FlyThroughDamped`, fixed 512-frame path swooping through the mid
+tree's refinement boundary (a close orbit leaves everything fully refined and
+damping has nothing to do). Same threshold, only the damper half-life varies:
+
+| half-life (frames) | avg cut | frame time | ns / entry |
+|---|---|---|---|
+| 0 (off) | 23.4k | 456 µs | 19.5 |
+| 4 | 32.2k | 590 µs | 18.3 |
+| 16 | 57.0k | 941 µs | 16.5 |
+
+The conservative envelope grows the cut ~38% at a 4-frame half-life and ~2.4x
+at 16 frames. Crucially the **per-entry** cost is flat (16–20 ns) across all
+three, so the damped and undamped walks execute the same work per output — the
+"zero branches" claim in §3.1 holds, and the cost is purely the larger cut, as
+predicted. Keep the default half-life in the single-digit-frames range; 16 is
+already expensive on a scene parked on the boundary.
+
+---
+### 8.4 Asset sharing on the cut path - the benefit, finally measured
+
+`BM_AssetSharing_CutCost` (new). Until now nothing in this suite exercised
+sharing at all: every other bench builds a unique page per instance or
+`proto.clone()`s one, so they all model the UNSHARED case, and the payoff that
+motivates §3.1 was argued but never measured.
+
+Same scene and same cut built two ways - N private clones (N assets, N mounts)
+against one registered asset instanced N times (1 asset, 1 mount). Identical
+entry count in both modes, so the delta is purely data layout. 8-wide depth-3
+page of 52.9 KB; this box has 1 MB L2 and 32 MB L3. Medians of 3.
+
+| instances | cloned footprint | cloned | shared | speedup |
+|---|---|---|---|---|
+| 100 | 5.2 MB | 323 us | 291 us | 1.11x |
+| 300 | 15.5 MB | 1005 us | 869 us | 1.16x |
+| 600 | 31.0 MB | 2720 us | 1758 us | 1.55x |
+| 1000 | 51.7 MB | 6667 us | 2946 us | 2.26x |
+| 4000 | 206.8 MB | 31620 us | 12058 us | 2.62x |
+
+The knee is exactly at 600 instances, where the cloned working set (31 MB)
+meets L3 (32 MB). A fixed per-mount overhead would show a constant ratio; this
+is a cache-capacity curve.
+
+Per cut entry the point is sharper. Shared holds 5.68 / 5.66 / 5.72 / 5.75 /
+5.89 ns per entry across a 40x range of scene size - flat. Cloned goes 6.31 /
+6.54 / 8.85 / 13.02 / 15.44 - a 2.4x degradation. **Sharing is what makes cut
+cost proportional to output**; without it the walk degrades with total scene
+size no matter how little it emits. That is a performance argument for §3.1,
+not the memory-footprint argument the design was sold on.
+
+Caveats: the clones are allocated back-to-back with no churn, which is the best
+case for cloning, so 2.6x is a lower bound. The benefit scales with
+instances-per-asset, not instance count - a scene of 50 species x 80 instances
+each lands near the 80-instance row, and at one instance per asset there is no
+benefit at all.
+
+### 8.5 The deformed cut path - free until most instances deform
+
+`BM_DeformedCutCost` (new). §8.1 measured what the overlay costs a REFIT; this
+measures what it costs the WALK. One shared asset, N instances, then a varying
+fraction deformed by rewriting one leaf to the box it already has -
+`applyBoundsChange` takes the overlay before it inspects anything, so the copy
+is allocated with no geometry moved and the cut stays identical at every
+fraction. Medians of 3.
+
+| instances | deformed | overlays | overlay MB | median | vs 0% |
+|---|---|---|---|---|---|
+| 1000 | 0% | 0 | 0 | 2938 us | - |
+| 1000 | 1% | 10 | 0.3 | 2953 us | 1.005x |
+| 1000 | 10% | 100 | 3.1 | 2981 us | 1.015x |
+| 1000 | 50% | 500 | 15.7 | 3208 us | 1.09x |
+| 1000 | 100% | 1000 | 31.4 | 3740 us | 1.27x |
+| 4000 | 0% | 0 | 0 | 12080 us | - |
+| 4000 | 10% | 400 | 12.6 | 12846 us | 1.06x |
+| 4000 | 100% | 4000 | 125.7 | 22422 us | 1.86x |
+
+At the deform fractions the design is actually for, this is free: +0.5% at 1%
+deformed (inside the +/-0.5-0.7% run-to-run spread) and +1.5% at 10%. The
+penalty only bites when half or more of the instances deform.
+
+A deformed instance stops sharing `bounds`, which is 192 of a WideBlock's 288
+bytes, so the naive prediction is that it forfeits ~2/3 of §8.4's benefit. It
+gives back less: 22% at 1000 instances, 53% at 4000. The reason is in the
+layout - the page stores bounds INTERLEAVED (192 of every 288 bytes) while the
+overlay stores them PACKED (192 contiguous), so the overlay's bounds stream is
+denser than the page's and partly pays for the extra stream. That is a second
+benefit of the `WideBoundsRef` stride design that page.h does not claim.
+
+Per entry at 4000 instances: shared undeformed 5.90 ns, shared but fully
+deformed 10.95 ns, fully cloned 15.44 ns. A deformed instance sits between the
+two, as the mechanism predicts.
+
+---
+### 8.6 Private-copy-on-deform: built, measured, rejected
+
+Hypothesis coming out of §8.1: the refit regression is caused by the overlay
+splitting hot bounds away from the page's contiguous blob, so privatising the
+WHOLE page on first deform (topology and bounds back in one allocation, only
+streaming state still shared) should recover it - and per §8.5 should cost
+almost nothing on the cut at realistic deform fractions.
+
+Built behind `-DHLOD_OVERLAY_FULL_PAGE=ON`: `Overlay` holds a `Page` instead of
+`bbox[]` / `wide[]`, refit reads topology from the private copy, and
+`patchParentLane` writes through a strided `MutWideBoundsRef` so one code path
+serves both layouts. 60/60 tests pass in both configurations, including
+`Motion.DeformingOneInstanceLeavesSiblingsAlone`, so the variant is
+semantically equivalent.
+
+**Both halves of the hypothesis were wrong.**
+
+Refit, medians of 3:
+
+| bench | bounds-only | full page | gain |
+|---|---|---|---|
+| `LeafRefit_LocalJitter/100000` | 3874 us | 3646 us | 5.9% |
+| `LeafRefit_Teleport/100000` | 4026 us | 3723 us | 7.5% |
+
+That recovers only about a quarter of the §8.1 gap. The split layout is
+therefore NOT the main cost of the regression, and anyone trying to close §8.1
+should look elsewhere: the per-call `ensureOverlay` lookup, the widened
+`pendingMoves_` record (it now carries instance id + generation), or the
+`resolveInstance` / `resolve` pair in `setNodeBounds`.
+
+Deformed cut, normalised to each build's own 0%-deformed baseline. (The two
+builds sit ~4% apart at 0 overlays, where they run identical code, so treat
+that as build-to-build drift and compare the ratios, not the absolutes.)
+
+| instances | deformed | bounds-only | full page |
+|---|---|---|---|
+| 1000 | 1% | 1.008x | 0.992x |
+| 1000 | 10% | 1.021x | 1.019x |
+| 1000 | 50% | 1.100x | 1.203x |
+| 1000 | 100% | 1.249x | 1.844x |
+| 4000 | 10% | 1.049x | 1.132x |
+| 4000 | 100% | 1.793x | 2.726x |
+
+At 4000 instances and a realistic 10% deformed, the private copy already costs
+2.7x more than the bounds-only overlay (13.2% vs 4.9% over baseline). At 100%
+it is 58% slower in absolute terms (34517 us vs 21849 us) - worse even than the
+fully cloned scene in §8.4 (31620 us), which is exactly what it converges to,
+plus the overlay lookup. It also uses 64% more overlay memory (51.7 MB vs
+31.4 MB at 1000/100%) because it copies the topology it stops sharing.
+
+**Conclusion: the bounds-only overlay is the right design.** It preserves far
+more of §8.4's sharing benefit than a private copy does, and a private copy
+only partly avoids the refit cost anyway. §8.1's regression is real, but it
+should be attacked directly rather than by giving up sharing.
+
+---
+## 9. Cut-path optimisation: five theories, A/B tested
+
+The owner's brief: the tree cut is the top priority, expand/collapse and
+spawn/remove and moving nodes rank equally behind it, and the target workload is
+tens of thousands of instances -- some sharing an asset, some unique -- mostly
+static, a minority in continuous (never teleporting) motion, with a trickle of
+subtrees appearing, vanishing, collapsing and expanding. Simplicity preferred.
+
+Five theories were formed by reading the hot loop against `_temp_/tinybvh`,
+implemented behind independent CMake switches, and measured. One was kept.
+
+### 9.1 The measurement problem, first
+
+The first attempt compared each variant to a baseline measured in a different
+batch. It produced confident-looking numbers that were all noise: the host
+(32-core, 64-thread, 2.4 GHz, 4x32 MB L3) drifts up to **16% between batches**
+minutes apart. Worse, whole-binary code layout is worth **4-5% on code paths
+that were never edited** -- `BM_TlasScale/500000`, whose path none of these
+theories touch, moved 1.046x in the final run.
+
+So the harness (`bench_results/ab_cut.ps1`) does three things:
+
+- Builds every variant to **its own binary first**, then **interleaves** the
+  runs round by round, scoring each variant against the *same round's* baseline.
+  Shared drift cancels in the ratio.
+- Reports **how many rounds the variant won**, not just the median ratio. A null
+  effect lands near half the rounds however its median falls; 14/15 does not
+  happen by chance (p ~ 0.001).
+- Always includes a **control benchmark** on untouched code. If the control
+  moves as much as the subject, nothing was measured.
+
+Only two benchmarks resolve better than this host's noise floor:
+`BM_AssetSharing_CutCost/{0,1}/4000`. Each emits ~2M cut entries per iteration,
+so a single iteration averages over enough work to sit near 1%. `/0/4000` is
+4000 unique assets (207 MB of pages, memory-bound); `/1/4000` is 4000 instances
+of one 53 KB asset (cache-resident, compute-bound). Between them they bracket
+the target workload. Everything shallower is noise-limited here.
+
+### 9.2 The five theories
+
+**T1 -- Reciprocal square root instead of square root then divide. KEPT.**
+
+The walk wants `geometricError * k / distance`. It was computing a
+full-precision `vsqrtps` on the squared distance and then a full-precision
+`vdivps` -- the two longest-latency instructions in the inner loop, back to back
+on one dependency chain. Both collapse into a single reciprocal square root:
+`err = e * k * rsqrt(d2)`. The 12-bit hardware `rsqrt` plus one Newton-Raphson
+step lands within an ulp or two, and a `min` reproduces the old
+`max(distance, 1e-30)` floor exactly, including `d2 == 0`. New:
+`distanceToBoxesSq` and `screenErrorFromSq8` in `math.h`; the exact
+`distanceToBoxes`/`screenError8` stay, still used by the TLAS and the tests.
+
+**T2 -- Decide refine-vs-emit in the wide pass. REJECTED.**
+
+A node whose error is already under the bar is a cut entry, not something to
+descend into, yet it was pushed on the node stack only to be popped and emitted.
+Hoisting that test into the wide pass removes a push, a pop, and a second read
+of `payload[]`. It measured **1.027x-1.049x slower** -- consistently worse on
+both AssetSharing sizes. The stack round trip was never the cost; the extra
+unpredictable branch inside the survivor peel, and the duplicated emit body
+inflating the loop, cost more than the round trip saved.
+
+**T3 -- Per-lane plane masks packed in one register. REJECTED (kept switchable).**
+
+`testWideAabb` is SIMD except for its output: for each of six planes it peels the
+inside-lane bitmask and does a dependent byte load-modify-store per lane, up to
+48 of them per block. `testWideAabbPacked` keeps all eight lane masks as eight
+bytes of one `uint64` and clears plane `p` across a lane set with one expand and
+one AND. On its own this is a genuine win -- **0.906x on the memory-bound cut,
+faster in 9/9 rounds**. But stacked on T1 it gave 0.894x, *worse* than T1's
+0.876x alone, and on the cache-resident cut it was neutral (1.009x, 3/9). It
+relieves the same bottleneck T1 already relieved, so it earns nothing on top.
+Left behind `HLOD_OPT_MASK64` (default off) since it may matter on hosts where
+the byte peel is relatively more expensive.
+
+(The first implementation used `_pdep_u64`, which is one fast op on some x86
+generations and microcoded on others; `laneBytes` now uses plain ALU. Never put
+`pdep` in an inner loop that has to be portable.)
+
+**T4 -- Prefetch the next wide block. REJECTED.**
+
+Blocks are 288 bytes and a block test is only a few dozen instructions, so the
+hardware streamer looked like it had little room to run ahead. It has enough:
+1.004x-1.009x, i.e. nothing, on both AssetSharing sizes. The block scan is
+already sequential and the streamer handles sequential perfectly.
+
+**T5 -- Prefetch the next stacked node's metadata. REJECTED.**
+
+The descent is a real pointer chase -- pop, read `meta`, read the wide offset,
+then touch the block -- and the node under the stack top is known early enough
+to start its lines. Measured 1.020x *slower* on the cache-resident cut and
+neutral (0.996x) on the memory-bound one. The stack top is usually already hot,
+so this mostly spent issue slots.
+
+### 9.3 Result
+
+Shipped default = T1 only, unconditional. Rejected code removed; T3 retained
+behind a default-off switch. **60/60 tests green** in every variant built,
+including `Cut.MatchesBruteForceReference` and the four
+`Contracts.*MatchesReference` cases -- so the reciprocal-sqrt approximation does
+not move the cut on any tested world.
+
+Decisive run, 15 interleaved rounds, shipped vs original:
+
+| benchmark | base | shipped | ratio | rounds won |
+|---|---|---|---|---|
+| `AssetSharing_CutCost/0/4000` (unique, memory-bound) | 33,637 us | 31,208 us | **0.927x** | **14/15** |
+| `AssetSharing_CutCost/1/4000` (shared, cache-resident) | 12,210 us | 11,877 us | **0.977x** | **13/15** |
+| `DeepTree_CutOnly/6` | 1,750 us | 1,765 us | 0.988x | 9/15 |
+| `ManyShallowTrees/50000/0` | 3,367 us | 3,393 us | 1.043x | 5/15 |
+| `TlasScale/500000` (control, untouched path) | 7,798 us | 7,930 us | 1.046x | 5/15 |
+
+Read that bottom pair together: `ManyShallowTrees` and the untouched control
+moved by the same amount with the same 5/15 win rate, so the apparent
+shallow-tree regression is layout bias, not the change. Only the two
+AssetSharing rows clear the noise floor, and both are wins. A wider 7-round pass
+also showed no regression in the second-priority paths
+(`TypicalForest_Churn` cut 0.962x, moves 0.959x, refit 0.991x;
+`ResidencyChurn` 0.979x in 7/7 rounds).
+
+**7.3% on the memory-bound cut versus 2.3% on the cache-resident one is the
+interesting part.** Removing arithmetic should help the compute-bound case more.
+It goes the other way because the win is not the arithmetic: shortening the
+per-block dependency chain lets the out-of-order window advance further into the
+block scan and keep more cache misses outstanding. It buys memory-level
+parallelism, which is worth most exactly where memory is the constraint -- and
+memory is the constraint in the target workload's unique-asset half.
+
+### 9.4 Where the remaining headroom is
+
+The cut walk is memory-bound, so the honest next step is footprint, not
+instructions. `WideBlock` is 288 bytes -- 192 bounds + 32 error + 32 child + two
+8-bit masks stored as two `uint32` + 8 pad -- which is 4.5 cache lines and
+straddles them irregularly. Moving `validMask`/`leafMask` into a parallel
+`uint32`-per-block side array (dense, sequential, effectively free) leaves
+exactly 256 bytes: 4 cache lines, 11% less hot data per block, no precision loss
+and no change to the cut. Given that 8.4 measured a 2.62x swing from cache
+residency alone, this is worth more than anything in 9.2. Done -- see 9.5.
+
+Beyond that, CWBVH-style quantised bounds (tinybvh compresses 8 children to 80
+bytes) would cut the hot footprint ~2.5x. Conservative outward rounding keeps
+culling sound and only over-refines slightly, but it *does* change the cut, so
+the reference-comparison contracts would need a tolerance -- a deliberate
+loosening of the section 10 guarantees, not a free win.
+
+The one thing not measured here that is not an instruction-level tweak: for a
+mostly-static world with a continuously moving camera, the cut is nearly
+identical frame to frame, and nothing exploits that yet. A per-instance validity
+envelope -- the range of camera positions over which an instance's cut cannot
+change -- would let most instances be skipped entirely rather than re-walked.
+That is a far larger prize than any percentage above, and a far larger change:
+it makes selection stateful, which section 3 deliberately avoided.
+
+### 9.5 WideBlock at 256 bytes: the footprint win, measured
+
+Done, and it is the largest single win in this section.
+
+The block was `WideBounds bounds` (192) + `float8 error` (32) + `uint32 child[8]`
+(32) + `validMask` (4) + `leafMask` (4) + 8 pad = 272, which the 32-byte cadence
+rounded to **288**. Two 8-bit masks were therefore costing 32 bytes, and 288 is
+4.5 cache lines: block `b` started at byte 288b, so its offset within a line
+alternated 0 / 32 and it touched **five lines either way** -- 320 bytes of line
+traffic to read 272 bytes of data.
+
+The masks now live in `PageView::blockMask`, one `uint32` per block, used lanes
+in the low 8 bits and plain-leaf lanes in the next 8. The walk reads that word
+once and masks it twice; because `survivors` is never wider than 8 bits,
+`survivors & blockMask[b]` selects the valid lanes with no shift, and the leaf
+lanes ride along in the same load. The side array is 4 bytes per block, sixteen
+blocks to a line, far cheaper than the padding it replaced. `WideBlock` is now
+**exactly 256 bytes**, and since the blob puts the wide array first (after a
+64-byte header) every block is 64-byte aligned: four lines, never five.
+
+Blob format went to **version 2** (`maskOffset` added to the header, taken from
+`reserved`). Not backward compatible; `PageView::fromBytes` rejects v1.
+
+A/B was run with a scaffold (`HLOD_WIDE_PAD_288`) that pads the struct back to
+288 bytes and changes nothing else, so block stride is the only variable. Eleven
+interleaved rounds:
+
+| benchmark | 288 B | 256 B | ratio | rounds won |
+|---|---|---|---|---|
+| `DeepTree_StaticCamera/6` | 3,861 us | 3,446 us | **0.899x** | **11/11** |
+| `AssetSharing_CutCost/0/4000` (unique, 207 MB) | 33,630 us | 30,907 us | **0.933x** | 10/11 |
+| `DeepTree_CutOnly/6` | 1,878 us | 1,620 us | **0.929x** | 9/11 |
+| `TypicalForest_Breakdown/50000` | 29,779 us | 30,369 us | 0.978x | 6/11 |
+| `AssetSharing_CutCost/1/4000` (shared, 53 KB) | 12,033 us | 11,895 us | 0.997x | 8/11 |
+
+The last row is the important one. A 53 KB page is fully cache-resident either
+way, so line count cannot matter there -- and it doesn't: 0.997x, 8/11, nothing.
+Every benchmark whose working set exceeds cache gains 7-10%; the one that fits
+gains zero. That contrast is the mechanism confirming itself, and it is why this
+beat all five of the instruction-level theories in 9.2 put together.
+
+Note that `TlasScale/500000`, used as the noise control in 9.3, is *not* a valid
+control for this experiment (it moved 0.957x): it emits cuts too, so block stride
+reaches it. A control has to be chosen per experiment, not once.
+
+---
+## 10. Stateful selection: SelectionContext
+
+The one item in section 9 that was not a micro-optimisation. The world is mostly
+static and the camera moves continuously, so the cut is nearly identical frame
+to frame, and until now nothing exploited that: every instance was re-walked
+from scratch to re-derive an answer that had not moved.
+
+`SelectionContext` is one object per view, owned by the caller. That is the whole
+API constraint: querying several cameras per frame (main view, shadow cascades,
+a reflection probe) means several contexts, and the World stays a pure read
+during selection exactly as it does without one, so they cannot interfere.
+
+It also **contains this view's `ViewDamper`**, and that is not merely tidy. The
+two are one mechanism read two ways: the damper turns a camera position into a
+query envelope, and the reuse test is driven by how far that same envelope has
+travelled, never by the camera. Held separately the caller had to pair the right
+damper with the right context by hand every frame, and pairing the main view's
+damper with a shadow cascade's cache compiled perfectly well. So this overload
+— alone among the `selectCut` overloads — takes the **raw** view and damps it
+internally, and one `reset()` covers the discontinuity for both halves.
+
+Each half stays optional and free when unused: `halfLife` 0 makes the arithmetic
+bit-identical to an undamped query (`Cache.UndampedByDefault` pins that), and the
+storage is empty until the first call. A fully dynamic world wants the damper
+and not the reuse; a shadow cascade often wants the reverse.
+
+```cpp
+SelectionContext mainCtx(6.0f), shadowCtx;       // per view, halfLife in frames
+std::vector<CutEntry> cut;                       // reusable, cleared per call
+world.selectCut(rawMainView, params, mainCtx, cut);   // RAW view: damped inside
+for (const CutEntry& e : cut) draw(e);           // identical to the stateless form
+```
+
+Composition rather than fusion: `ViewDamper` stays in `math.h` with no dependency
+on the `World`, independently testable, and usable by hand with the other
+overloads. Only the ownership moved.
+
+Worth recording that this rework earlier **deleted** `ViewScratch`, a per-view
+object that was pure scratch memory pretending to be API (§4). A context is not
+that, and the line is worth keeping sharp: scratch must not affect results and
+may be discarded freely, whereas hysteresis *changes* results and reuse state
+must stay correct across frames. The constraint carries over -- if this class
+ever acquires a member that exists only to hold an allocation, it has become
+`ViewScratch` again.
+
+### 10.1 Why it is sound
+
+Inside one instance the only camera-dependent decision is the screen-error test,
+`geomError * k / distance > threshold`, which flips when the distance reaches
+`geomError * k / threshold`. The walk records the smallest gap between the two
+over every node it tested: the **validity margin**, a distance. A camera
+translation of d changes every distance by at most d, so moving less than the
+margin cannot flip any decision -- and if no decision flips, the same nodes are
+visited, so the argument closes by induction over the walk.
+
+Frustum decisions would break that, because rotating a camera moves the clip
+planes much further than it moves the eye. So only instances that were **wholly
+inside** the frustum are cached: no plane was tested anywhere inside them, and
+their cut is a pure function of camera position. Instances straddling the
+frustum edge are always re-walked, and there are few of those -- they are a
+shell, not a volume.
+
+Everything that is not the camera is a version check, and each is granular
+enough not to invalidate more than it must:
+
+| change | mechanism |
+|---|---|
+| instance moved, rescaled or deformed | `Instance::cutVersion`; a deform privatises bounds into that instance's overlay, so it can never reach another instance |
+| page attached, detached, payload resident or not | `PageRt::contentVersion`, recorded per page the walk touched -- so one shared asset streaming in invalidates every instance of it with no per-instance work |
+| page slot detached and recycled | `contentVersion` is bumped on attach too, so one word identifies a page's state and no `(generation, version)` pair is needed |
+| projection scale or threshold | one cache-wide epoch |
+| camera moved | the travel odometer below |
+
+### 10.2 Why the margin is large exactly where it needs to be
+
+This is what makes the idea work rather than merely be correct. A distant
+instance sits far past every flip point, so its margin is roughly its own
+distance and it stays valid for many frames. A near instance with a deep cut has
+some node sitting right at the threshold, so its margin is tiny and it is
+re-walked every frame. That is the correct division of labour, not a limitation:
+the population is dominated by distant instances, and those are precisely where
+the per-instance fixed cost -- resolve the instance, transform the view, touch
+the root page -- was being paid over and over for an answer that never moved.
+
+A consequence worth knowing: a few instances survive even a teleport, because
+their margin genuinely exceeds the jump. `Cache.TeleportRewalksAndStaysCorrect`
+asserts that and then checks the output anyway.
+
+### 10.3 The record is 48 bytes, and that is the whole engineering story
+
+The first working version was correct and reused 93% of instances at 80k
+instances -- and was **1.39x slower** than no cache at all. The record was 128
+bytes holding a camera envelope, `k`, the threshold and a `(slot, generation,
+version)` triple per dependency. It is read once per visible instance, indexed
+by instance id, so it is a random access per instance: the one new memory stream
+the cache introduces. And the walk it replaces is *cheap*, because with a shared
+asset every instance walks the same bytes and the page sits in L1. At 20k
+instances the records fit in L3 and the cache won 2.09x; at 80k they did not and
+it lost.
+
+So everything that could be a scalar became one, or left:
+
+- **no camera envelope per record.** The cache keeps one odometer, `travel_`,
+  accumulating how far the query envelope has moved since the cache was created.
+  A record taken at travel `t` with margin `m` is good while `travel_ < t + m`:
+  path length bounds displacement from any earlier position, which is all the
+  margin argument needs. That replaces 32 bytes and a `toLocal` on the hit path
+  with one float compare. It is conservative for a camera that doubles back, and
+  a teleport is just a large step -- correctly invalidating nearly everything.
+- **no `k` or threshold per record.** Per-call constants; held once on the cache,
+  and a change bumps an epoch.
+- **no page generations.** `contentVersion` bumped on attach makes a single word
+  sufficient.
+
+48 bytes, `static_assert`ed. That change alone took the static-camera case from
+2.09x to 6.3x and turned the 80k regression into a win.
+
+### 10.4 Measured
+
+`BM_SelectionContext_FlyThrough`: one shared asset, instances scattered over a
+map, a camera flying a fixed path, and a configurable slice of instances moving
+every frame. Fixed iteration count and the camera path is a function of the
+frame index, so both arms fly the same route past the same instances -- the
+identical `avg_cut` in both columns is the check on that. Times are `cut_us`,
+the `selectCut` call alone.
+
+| instances | moving/frame | stateless | cached | speedup | reuse |
+|---|---|---|---|---|---|
+| 20,000 | 0% | 477 us | **163 us** | **2.92x** | 94.8% |
+| 20,000 | 5% | 755 us | **498 us** | **1.51x** | 89.1% |
+| 20,000 | 100% | 2,287 us | 2,441 us | 0.94x | 0% |
+| 80,000 | 5% | 3,347 us | **2,500 us** | **1.34x** | 92.4% |
+
+Read the reuse column with the time. At 100% movement nothing is reusable and
+the cache is 8% of pure overhead -- correct, cheap, and the counter says so, but
+a fully dynamic world should not use one. The 5% cases are the realistic ones,
+and note that 89% reuse buys 1.61x rather than 9x: the instances that *are*
+walked are the near ones with deep cuts, which is where the time was. The cache
+removes the cost of the many cheap instances, not of the few expensive ones.
+
+At 80k the remaining cost is increasingly the TLAS query, which the cache does
+not touch at all -- that is the next lever, not more reuse.
+
+### 10.5 The output is a flat array, and that was not the first answer
+
+The first version handed back a CutSpan per visible instance -- a pointer into
+the context's slab -- on the theory that a reused instance should cost nothing at
+all, not even a copy. It was wrong, and the number that says so is **entries per
+visible instance: 1.56 at 20k, 1.14 at 80k**.
+
+Per-instance cuts are SHALLOW. The population is dominated by distant instances
+that collapse to a node or two, so at 80k the descriptor array was 21,919 spans
+(350 KB) describing 24,986 entries (400 KB) -- a description as large as the data
+-- and it had to be rewritten every frame regardless, including for the 92% of
+instances that were reused and cost nothing else. Copying those entries instead is
+about 40 us of sequential write against a 2.7 ms call.
+
+Fusing adjacent spans was tried, since CutEntry already carries its own instance
+tag and neighbouring runs merge freely. It works perfectly on a stationary camera
+(36 instances, one span) and does nothing whatsoever in a fly-through: eleven
+interleaved rounds against a HLOD_SPAN_NOCOALESCE scaffold moved the span count
+not at all -- 5,496 at 20k and 21,919 at 80k, fused or not -- and the timings sat
+in the noise (0.99x, 0.99x, 1.01x, 0.94x; wins 7/11, 7/11, 3/11, 7/11).
+
+The root cause is worth keeping: **the slab is ordered by first-walk, the caller
+iterates in TLAS order, and the two coincide only on the first frame.** A reused
+instance keeps whatever slab position it got when it first became visible, so
+once the visible set has turned over, adjacency is gone for good.
+
+The table above is the flat version and it is within noise of the span version,
+which is the real lesson: what buys 1.3-2.9x is skipping the WALK. Skipping the
+copy was never where the money was. The context is also 9-11% smaller without the
+span arrays (2.91 MB against 3.19 at 20k), and the cached overload now differs
+from the stateless one only by taking a context.
+
+Two designs were considered and rejected as premature rather than wrong, and both
+would matter if the copy ever did show up in a profile:
+
+- **Re-lay-out the slab in visit order**, amortised, triggered by span count
+  rather than by garbage. Two instances' relative TLAS order does not depend on
+  camera position, so visit order is stable and fusing would then hold for many
+  frames.
+- **Size-class pools.** Fixed-size blocks per pool, so freeing by swap-with-last
+  never splits a run, every pool stays dense, and a reused instance writes
+  literally nothing. Note the trap: a persistent output array means an instance
+  leaving the frustum must free its block, which needs a visible-set diff against
+  last frame (O(visible)), not a sweep over every record (O(world)).
+
+The naive form of the second -- one dense array, fill gaps from the end -- does
+not work. A record is (begin, count), so an instance's entries must stay
+contiguous, and entries taken from the end belong to another instance whose run
+would be split. Dense single array, contiguous reusable runs, O(changed) update:
+pick two.
+### 10.6 Limits, both checked rather than assumed
+
+- An instance is cacheable only once it has **converged**: its walk emitted no
+  load requests and asked for no expansions. Streaming in progress therefore
+  just means those instances keep being walked, which is what you want while
+  their answer is still changing.
+- Asking for the **ideal cut** bypasses reuse for that call, because ideal
+  entries carry node handles the record does not keep. Requests are fine
+  (a converged instance emits none). Storing 8 more bytes per entry would lift
+  this; it was not worth doubling the slab for a first version.
+- Reuse is **serial**. Parallel selection and the cache have not been combined.
+- **Zooming out with damping on voids the cache for ~24 half-lives.** Measured,
+  root-caused, not fixed; see 10.7. Prefer `halfLife` 0 on views that zoom.
+- `CutEntry::err` on a reused entry is the value from the recorded camera
+  position, stale by at most the margin. The **node set is exact**; `err` is
+  not. `tests/test_cache.cpp` compares `(payload, instance)` multisets against
+  the stateless path every frame for 120 frames of continuous flight, under
+  damping, and through streaming and instance churn -- and deliberately does not
+  compare `err`.
+
+### 10.7 The zoom cliff: measured, root-caused, not fixed
+
+Merging the damper into the context made one interaction visible that was
+invisible while they were two objects, and it is worse than it looks from either
+class alone. A flip point sits at `eff * k / threshold`, so **any** change in `k`
+moves all of them and voids every recorded margin at once. That is one epoch
+bump, no per-record work, and by construction it costs exactly one frame.
+
+Damping is what turns it into a cliff. `ViewDamper` relaxes `k` toward the
+current value alongside the envelope, and `kMax_ = max(kRelaxed, v.k)`, so the
+two directions are wildly asymmetric: a zoom **in** raises `k` and arrives in one
+frame, while a zoom **out** relaxes multiplicatively and only stops when the gap
+underflows float equality. That is ~24 half-lives, not one: for a 2x zoom the
+gap must shrink by ~1e-8 relative, and 0.917^n reaches that at n ≈ 190 frames
+for `halfLife` 8. Every one of those frames is a different `k`, hence a fresh
+epoch, hence a total cache miss.
+
+`BM_SelectionContext_Zoom`, 20k instances, nothing moving, so what is left in the
+numbers is the zoom and only the zoom. `stall_f` counts frames that reused
+nothing at all, out of 600:
+
+| halfLife | zoom every | cut_us | reuse% | stall_f |
+|---|---|---|---|---|
+| 0 | never | 151.6 | 94.79 | 1 |
+| 8 | never | 149.1 | 94.79 | 1 |
+| 0 | 120 frames | 135.3 | 92.84 | 5 |
+| 8 | 120 frames | **234.5** | **56.52** | **243** |
+| 0 | 300 frames | 157.7 | 92.96 | 2 |
+| 8 | 300 frames | 143.4 | 92.96 | 2 |
+
+The 300-frame rows isolate the direction and confirm the mechanism rather than
+just the symptom: with that period the run contains exactly one transition, a
+zoom **in** at frame 300, and damped and undamped are then identical to three
+digits. Only zoom-out relaxes. The 120-frame rows contain two zoom-outs, and
+`stall_f` 243 ≈ 2 x 120 says each one saturates the entire interval before the
+next arrives -- the 190-frame tail never finishes. Cost: 1.57x on the cut, reuse
+94.8% -> 56.5%.
+
+Do not read Time across zoom periods: zooming in narrows the frustum, so fewer
+instances are visible and that arm is cheaper for reasons unrelated to the cache.
+Compare within a period, across half-lives.
+
+**Why it is sound anyway.** A smaller `k` moves every flip point inward, so
+decisions genuinely can flip, and `k` genuinely is different on each of those
+frames. The cache is being conservative and correct; it is throwing away work it
+would have been wrong to keep. `Cache.MatchesStatelessUnderDamping` drives an
+external `ViewDamper` over the same raw views and compares node sets every frame,
+so correctness here is pinned, not argued.
+
+**What is actually wrong is the granularity.** Position hysteresis relaxes
+asymptotically too, and it costs nothing: the odometer absorbs its tiny
+per-frame steps into a **budget**, and margins keep covering them. `k` has only
+an all-or-nothing **epoch**. Two ways to close the gap, neither done:
+
+- *Give `k` a budget too.* The flip point moves by `flipAt * |dk| / k`, so
+  bounding the shift needs a per-record bound on `flipAt` -- 4 more bytes, and
+  `Rec` is 48 with the next step at 56. That is the constraint 10.3 exists to
+  protect, so this is not obviously worth it.
+- *Quantise the damped `k`* to, say, 1% steps. `k` is already a quality knob and
+  1% of it is immaterial, but during a 2x relaxation it would change ~70 times
+  instead of ~190, and be **constant in between** -- so most frames reuse
+  normally. No new state, no change to `Rec`. It does change the stateless path's
+  output slightly, which the contract tests would need to be checked against.
+
+The second looks right. It was left alone because it is a change to LOD output
+for a cache's benefit, which is the owner's call, not a mechanical one.
+
+---
+
+---
+
+## 11. Audit: five more wrong assumptions, ranked by measurement
+
+A review pass in the spirit of §10.5, looking for other places where a design
+rested on an unmeasured belief. Ordered by measured cost, not by how interesting
+they are.
+
+### 11.1 ONE SPAWN COST A FULL TLAS REBUILD (5.4x) -- FIXED
+
+`addInstance` and `removeInstance` both call `markTlasStructuralChange()`, which
+sets `tlasDirty_`; the next `tlasQuery` throws the whole TLAS away and rebuilds it
+over every live instance. There is no incremental insert. So the marginal cost of
+the first spawn in a frame is O(N log N), and every spawn after it in that frame
+is free.
+
+`BM_Spawn_MarginalCost`, shared resident asset, spawns AND removes per frame as an
+absolute count so the marginal cost is visible:
+
+| population | spawns/frame | cut_us |
+|---|---|---|
+| 20,000 | 0 | 481 us |
+| 20,000 | 1 | **2,582 us** |
+| 20,000 | 8 | 2,590 us |
+| 20,000 | 500 | 2,397 us |
+| 80,000 | 0 | 2,173 us |
+| 80,000 | 1 | **11,705 us** |
+| 80,000 | 8 | 11,733 us |
+
+One spawn costs the same as five hundred, which is the signature: the cost is not
+the spawn. At 80k a single appearing instance adds **9.5 ms** to the frame.
+
+Note also where the cost lands. `churn_us` for one spawn is **0.31 us** -- the
+rebuild is deferred into `selectCut`, so a profiler blames selection and
+`addInstance` looks free. That is probably why this survived: the accounting hides
+it.
+
+**The fix.** Add and remove now edit the tree in place and do not mark it dirty
+at all. `markTlasStructuralChange` no longer sets `tlasDirty_`; it only promotes
+the next rebuild to the quality tier when the POPULATION really moved, which is
+still what assembly and mass despawn want.
+
+- **Insert** descends from the root taking the lane whose box grows least, until
+  it reaches a node holding instances. If that node has a free lane it takes it.
+  Otherwise it SPLITS: a new node takes the full leaf's place in its parent and
+  adopts both the leaf and the new instance. Splitting always succeeds, which is
+  why there is no "the tree is full, give up and rebuild" case -- the obvious
+  alternative, hunting up the chain for a free lane, fails immediately on a tree
+  that was just built full, which is every tree right after a rebuild.
+- **Remove** clears the lane's valid bit and unlinks any node that empties,
+  cascading upward, with emptied nodes recycled through a free list. Boxes are
+  left loose, the same grow-only discipline motion already uses.
+- Both then walk `tlasGrowUp`, which motion refit now shares. Insert needs one
+  thing motion does not: an ancestor's `laneMask` must be a superset of its
+  subtree's layer masks, or `tlasQuery`'s layer filter culls a visible instance.
+- `tlasEditFraction` (default 0.05) bounds the accumulated quality loss.
+
+Results, same benchmark:
+
+| population | spawns/frame | before | after | |
+|---|---|---|---|---|
+| 20,000 | 0 | 481 us | 477 us | control |
+| 20,000 | 1 | 2,582 us | **479 us** | **5.4x** |
+| 20,000 | 8 | 2,590 us | **600 us** | **4.3x** |
+| 20,000 | 500 | 2,397 us | **1,446 us** | 1.66x |
+| 80,000 | 0 | 2,173 us | 2,078 us | control |
+| 80,000 | 1 | 11,705 us | **2,041 us** | **5.7x** |
+| 80,000 | 8 | 11,733 us | **2,168 us** | **5.4x** |
+
+One spawn per frame is now free: 479 us against a 477 us control at 20k, 2,041
+against 2,078 at 80k. At eight per frame the cut runs ~25% above the control,
+which is the accumulated degradation the edit budget exists to bound. Sweeping
+that budget at 20k with 8 spawns/frame: 836 us at 0.005, 722 at 0.01, 623 at
+0.025, 580 at 0.05, 607 at 0.10, 534 at 0.25.
+
+The curve is flat past 0.05, and the apparent win at 0.25 is not trustworthy:
+0.25 of 20k is 5,000 edits, which at 16 edits/frame is 312 frames, so a 400-frame
+run contains about one rebuild and never reaches the steady state it is being
+credited with. 0.05 is the largest value whose steady state the measurement
+actually reaches, so that is the default.
+
+**Correctness.** A rebuilt tree is right by construction; an edited one is right
+only if every edit maintains what the query relies on. `tests/test_tlas.cpp`
+(12 tests) audits the structure directly through `TAX::tlasValidate` -- lane
+boxes containing their contents, lane masks covering their subtree, parent links,
+every live instance present exactly once -- and separately requires that a
+churned tree produce the same cut as the same world after a forced rebuild.
+
+Two things that bit while writing those tests, both worth knowing:
+
+- `kAutoTag` echoes the `InstanceId`, and ids are recycled through a free list,
+  so a respawned instance inherits the tag of whatever was removed before it.
+  "The instance I removed is gone" is unprovable with auto tags and passes
+  vacuously. These tests assign explicit unique tags.
+- The three rebuild triggers overlap. A test meaning to exercise an in-place edit
+  silently measures a rebuild instead unless the others are put out of reach, so
+  the fixture takes a `WorldConfig`.
+
+One deliberate behaviour worth calling out: a spawn far outside the current root
+extent grows lane areas enough to trip `tlasAreaDrift`, and rebuilds. That is
+right -- a tree whose root just grew by a factor is a bad fit -- but it does mean
+a spawn is only cheap when it lands somewhere the tree already covers.
+
+### 11.2 Confining Instance's hot fields to one cache line buys NOTHING
+
+The cut path reads `pos`, `scale`, `rootSlot`, `tag`, `overlays.empty()`, and for
+the reuse check `generation` and `cutVersion`: 60 bytes of a 128-byte record,
+split across both of its cache lines, with a prefetch that reaches only the
+first. That looks like a free win. It was tried -- fields reordered, `alignas(64)`
+to guarantee the split -- and 11 interleaved rounds said no:
+
+| benchmark | old order | hot-first | ratio | wins |
+|---|---|---|---|---|
+| 20k static, stateless | 467 us | 457 us | 0.98x | 9/11 |
+| 20k static, cached | 162 us | 163 us | 1.00x | 5/11 |
+| 20k 5% moving, cached | 499 us | 493 us | 0.99x | 5/11 |
+| 80k 5% moving, stateless | 3,472 us | 3,505 us | 1.01x | 2/11 |
+| 80k 5% moving, cached | 2,785 us | 2,849 us | 1.02x | 6/11 |
+
+Reverted. The reason is the useful part: the two lines of a 128-byte aligned
+record are an **adjacent pair**, and the L2 adjacent-line prefetcher fetches the
+buddy of any line it fetches. The second line arrives whether the layout wants it
+or not, so confining the hot fields to the first one cannot save a fetch.
+
+The lesson generalises past this struct: **on this class of hardware, splitting a
+128-byte record into hot and cold halves is not an optimisation -- getting it
+under 64 bytes is.** For `Instance` that means moving `worldBox`, `maxErrWorld`,
+`mask`, `asset` and the two TLAS lane back-pointers (53 bytes, touched only by
+TLAS build and refit, which walk different instances in a different order) into a
+parallel array. That halves the bytes the instance loop pulls in. Not done.
+
+### 11.3 The margin tracker does a scalar sqrt and divide per inner node
+
+`wideVisit` is otherwise disciplined about this: it computes squared distances
+and uses one reciprocal square root, never a `sqrt` and never a divide
+(`screenErrorFromSq8`). The margin tracking added for `SelectionContext` then does
+exactly both, per surviving inner lane, inside that loop:
+
+```cpp
+const float flipAt = eff.v[l] * local.k / w.bar;
+const float d = std::sqrt(d2.v[l]);
+```
+
+It can be vectorised away entirely. Since `errs == eff * k / d`, the flip distance
+is `errs * d / bar`, so
+
+    slack = |d - errs*d/bar| = d * |bar - errs| / bar
+
+`bar` is constant for the whole walk, so track the minimum of `d * |bar - errs|`
+and divide once at the end. That is one `sqrt8` (or the `rsqrt` already computed),
+a subtract, an `abs`, a multiply and a masked `min8` per BLOCK, replacing up to
+eight scalar sqrt-plus-divide pairs. Unmeasured, but it is the leading suspect for
+the ~7% the context costs when reuse is 0% (`FT/20000/1/100`: 2,441 us against
+2,287 us stateless).
+
+### 11.4 The parallel path emits duplicate load requests
+
+Request dedup stamps a node with the pass epoch, which correctly collapses the
+thousands of identical requests that thousands of instances of one shared asset
+produce. But each worker gets its OWN epoch:
+
+```cpp
+w.epoch = selectEpoch_ * workerCount + k;
+```
+
+so a node reached from two chunks is stamped twice and requested twice -- up to
+`workerCount` copies of the same `LoadRequest`. The invariant stated a few lines
+above ("the cut is bit-identical whether or not this path runs") holds for the cut
+and not for the requests, and §12 states it without that exception. Either dedup
+across workers on the merge, or write the exception down.
+
+### 11.5 Small, confirmed
+
+- **`PageView` was documented as 64 bytes and is 88.** It is embedded in every
+  `PageRt`, so it sets the residency table's stride. Now pinned by a
+  `static_assert` so the comment cannot drift again.
+- **`tlasQuery` uses `sqrt` and a divide** (`distanceToBoxes` + `screenError8`) for
+  its `minPix` test, while the page walk deliberately uses neither
+  (`distanceToBoxesSq` + `screenErrorFromSq8`). The same substitution applies.
+- **Rebuild enumerates `instances_.size()`, not the live count**, twice in the
+  Morton path. After heavy churn the dead slots are scanned every rebuild.
+- **`PageView`'s field comments call `payload` cold**; it is read in the innermost
+  emission loop.
+---
+
+## 12. Open questions
+
+1. **`addInstance` naming.** `addInstance(AssetHandle, ...)` shares;
+   `addInstance(Page&&, ...)` registers an anonymous asset and instances it.
+   Both are called `addInstance`. Consider renaming the second to make the
+   ownership transfer obvious.
+2. **Should the overlay cover both `bbox[]` and `wide[].bounds`, or collapse
+   them?** `bbox[i]` is arguably redundant with the corresponding lane in the
+   parent's wide block; the duplication exists so refit reads a compact scalar
+   array instead of 288-byte blocks. I kept both. Worth revisiting only if
+   overlay memory shows up in a profile.
+3. **Attach-growth policy.** Currently a hard error (§4). If real content turns
+   out to need it, the alternative is to grow the *overlay* of every instance of
+   the owning asset, which is O(instances) — probably still wrong, but it is the
+   only correct option if the error proves too strict.
+4. Never built from the original plan: `examples/`, a "hello world" snippet in
+   the README, and a single-header amalgamation script plus CI wiring.
+
+---
+
+## 13. Invariants a new agent must not break
+
+- **(A)** `parent[i] < i`; **(B)** a subtree is contiguous
+  `[i, i + subtreeSize[i])`; **(C)** a parent's bbox contains its children's;
+  **(D)** geometric error is monotone non-increasing down the tree. The builder
+  verifies all four in its final pass.
+- **Page bytes are immutable at runtime.** If you find yourself wanting to write
+  into a `PageView`, you want an overlay instead.
+- **Serial and parallel `selectCut` must stay bit-identical.** Workers take
+  contiguous instance runs and are concatenated in worker order. Do not
+  introduce work stealing without changing the contract.
+- **Scalar and wide paths must stay bit-identical.** `hlod::fmadd` fuses exactly
+  when the active SIMD backend fuses (plain SSE without FMA uses `mul+add` on
+  both sides). Tests rely on this. If you touch `distanceToBox*`, `testAabb*` or
+  `screenError*`, change all four backends together.
+- **No hash maps in the runtime.** The API is handle-only by design; the World
+  keeps no id index. `tests/helpers.h` uses brute-force scans for readability —
+  that is for tests only.
+- **Handles are validated by generation stamp.** Mutating calls on a stale handle
+  are quiet no-ops; queries report absent. This is the normal race between
+  streaming completion and GC, not an error.

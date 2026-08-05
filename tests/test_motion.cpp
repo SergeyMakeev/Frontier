@@ -19,11 +19,11 @@ struct Outputs
     std::vector<LoadRequest> reqs;
 };
 
-Outputs frame(World& w, ViewScratch& s, const CullView& v, const CutParams& p)
+Outputs frame(World& w, const CullView& v, const CutParams& p)
 {
     w.beginFrame();
     Outputs o;
-    w.selectCut(v, p, s, o.cut, o.ideal, o.reqs);
+    w.selectCut(v, p, o.cut, o.ideal, o.reqs);
     return o;
 }
 
@@ -36,23 +36,34 @@ std::set<UserId> cutIds(const Outputs& o)
 
 // Verifies invariant (C) conservatively for a page reachable from `anyId`,
 // and that the wide lanes mirror bbox[] exactly.
-void verifyConservativeBounds(World& w, UserId anyId)
+//
+// Both are read THROUGH THE INSTANCE: pages are immutable and shared, so a
+// deformation lands in that instance's copy-on-write overlay, and reading the
+// page directly would only ever show the authored bounds.
+void verifyConservativeBounds(World& w, World::InstanceRef inst, UserId anyId)
 {
-    const Page& pg = TA::pageOf(w, anyId);
+    const NodeHandle h = handleOf(w, anyId);
+    const PageView& pg = TA::pageOf(w, anyId);
+    const AABB* bbox = TA::bboxOf(w, inst, h.slot);
+    const WideBoundsRef wide = TA::wideOf(w, inst, h.slot);
+    ASSERT_NE(bbox, nullptr);
+    ASSERT_TRUE(wide.valid());
+
     for (uint32_t i = 1; i < pg.nodeCount(); ++i)
-        EXPECT_TRUE(pg.bbox[pg.parent[i]].contains(pg.bbox[i])) << "node " << i;
+        EXPECT_TRUE(bbox[pg.parent[i]].contains(bbox[i])) << "node " << i;
     for (uint32_t i = 0; i < pg.nodeCount(); ++i)
     {
         const uint32_t cc = pg.childCount(i);
         uint32_t b = pg.wideOffset(i);
         for (uint32_t base = 0; base < cc; base += kWide, ++b)
         {
+            const WideBounds& wb = wide[b];
             const WideBlock& blk = pg.wide[b];
             for (uint32_t l = 0; l < kWide; ++l)
             {
-                if (!(blk.validMask & (1u << l))) continue;
-                const AABB lane = blk.bounds.lane(l);
-                const AABB& cold = pg.bbox[blk.child[l]];
+                if (!(pg.validLanes(b) & (1u << l))) continue;
+                const AABB lane = wb.lane(l);
+                const AABB& cold = bbox[blk.child[l]];
                 EXPECT_EQ(lane.mn.x, cold.mn.x);
                 EXPECT_EQ(lane.mn.y, cold.mn.y);
                 EXPECT_EQ(lane.mn.z, cold.mn.z);
@@ -62,6 +73,18 @@ void verifyConservativeBounds(World& w, UserId anyId)
             }
         }
     }
+}
+
+// Bounds of one payload as `inst` sees them.
+AABB boundsOf(World& w, World::InstanceRef inst, UserId id)
+{
+    return w.nodeBounds(inst, handleOf(w, id));
+}
+
+// Bounds of a page's sentinel (node 0) as `inst` sees them.
+AABB rootBoundsOf(World& w, World::InstanceRef inst, UserId anyIdInPage)
+{
+    return TA::bboxOf(w, inst, handleOf(w, anyIdInPage).slot)[0];
 }
 
 } // namespace
@@ -82,35 +105,33 @@ TEST(Motion, LeafMoveRefitsAncestors)
     const auto ids = pageIds(pg);
 
     World w;
-    w.addInstance(std::move(pg), float4::point(0, 0, 0));
+    const auto inst = w.addInstance(std::move(pg), float4::point(0, 0, 0));
     markAllResident(w, ids);
     w.beginFrame();
 
     // Move wall 11 far outside every ancestor box.
     const AABB newBox = AABB::fromCenterExtent(float4::vec(200, 50, 0), float4::vec(1, 1, 1));
-    setNodeBounds(w, 11, newBox);
+    setNodeBounds(w, inst, 11, newBox);
     w.flushBounds();
 
-    verifyConservativeBounds(w, 11);
-    const Page& page = TA::pageOf(w, 11);
-    EXPECT_TRUE(page.bbox[0].contains(newBox));   // grew all the way to the sentinel
+    verifyConservativeBounds(w, inst, 11);
+    EXPECT_TRUE(rootBoundsOf(w, inst, 11).contains(newBox));   // grew to the sentinel
 
     // A camera looking only at the new position sees exactly that wall.
-    ViewScratch s;
     const CullView vNew = makeLookAtView(float4::point(200, 50, -30), float4::point(200, 50, 0));
-    auto o = frame(w, s, vNew, {4.0f, 0.0f, 0.0f});
+    auto o = frame(w, vNew, {4.0f, 0.0f});
     EXPECT_TRUE(cutIds(o).count(11));
 
     // A camera at the old position no longer draws it.
-    ViewScratch s2;
     const CullView vOld = makeLookAtView(float4::point(4, 0, -10), float4::point(4, 0, 0));
-    o = frame(w, s2, vOld, {4.0f, 0.0f, 0.0f});
+    o = frame(w, vOld, {4.0f, 0.0f});
     EXPECT_FALSE(cutIds(o).count(11));
 }
 
 // ---------------------------------------------------------------------------
 // Motion across a page boundary: a leaf inside an attached child page grows
-// the owning expansion node in the parent page and the instance bounds.
+// the owning expansion node in the parent page and the instance bounds. The
+// overlay is promoted across the boundary as the growth propagates.
 // ---------------------------------------------------------------------------
 TEST(Motion, CrossPagePropagation)
 {
@@ -121,7 +142,7 @@ TEST(Motion, CrossPagePropagation)
     const auto rootIds = pageIds(root);
 
     World w;
-    w.addInstance(std::move(root), float4::point(0, 0, 0));
+    const auto inst = w.addInstance(std::move(root), float4::point(0, 0, 0));
     markAllResident(w, rootIds);
 
     const UserId expId = gen.recipes.begin()->first;
@@ -134,25 +155,84 @@ TEST(Motion, CrossPagePropagation)
     // Move a leaf of the child page way outside the whole tree.
     const UserId movedId = childIds.back();
     const AABB newBox = AABB::fromCenterExtent(float4::vec(500, 0, 0), float4::vec(1, 1, 1));
-    setNodeBounds(w, movedId, newBox);
+    setNodeBounds(w, inst, movedId, newBox);
     w.flushBounds();
 
-    verifyConservativeBounds(w, movedId);
-    verifyConservativeBounds(w, rootIds.front());
+    verifyConservativeBounds(w, inst, movedId);
+    verifyConservativeBounds(w, inst, rootIds.front());
+
+    // Both pages on the path were privatised, and only those two.
+    EXPECT_EQ(TA::overlaysOf(w, inst), 2u);
 
     // The expansion node in the parent page now contains the new position.
-    const Page& rootPage = TA::pageOf(w, expId);
-    uint32_t expIdx = 0;
-    for (uint32_t i = 1; i < rootPage.nodeCount(); ++i)
-        if (rootPage.payload[i] == expId) expIdx = i;
-    ASSERT_NE(expIdx, 0u);
-    EXPECT_TRUE(rootPage.bbox[expIdx].contains(newBox));
+    EXPECT_TRUE(boundsOf(w, inst, expId).contains(newBox));
 
     // And the cut can actually find the moved leaf out there.
-    ViewScratch s;
     const CullView v = makeLookAtView(float4::point(500, 0, -20), float4::point(500, 0, 0));
-    const auto o = frame(w, s, v, {1.0f, 0.0f, 0.0f});
+    const auto o = frame(w, v, {1.0f, 0.0f});
     EXPECT_TRUE(cutIds(o).count(movedId));
+}
+
+// ---------------------------------------------------------------------------
+// Deforming one instance must not disturb its siblings, and must not fork the
+// runtime state they share. This is the whole point of copy-on-write bounds.
+// ---------------------------------------------------------------------------
+TEST(Motion, DeformingOneInstanceLeavesSiblingsAlone)
+{
+    TreeGen gen;
+    gen.fanout = 3;
+    gen.depth = 2;
+    Page pg = gen.makeRootPage(unitRegion(5.0f), 16.0f, 0);
+    const auto ids = pageIds(pg);
+
+    World w;
+    const AssetHandle asset = w.registerAsset(std::move(pg));
+    const auto a = w.addInstance(asset, float4::point(0, 0, 0));
+    const auto bInst = w.addInstance(asset, float4::point(100, 0, 0));
+    const auto c = w.addInstance(asset, float4::point(200, 0, 0));
+    markAllResident(w, ids);
+
+    // One tree, three placements: one page, one mount, one residency array.
+    EXPECT_EQ(w.attachedPageCount(), 1u);
+    EXPECT_EQ(w.overlayCount(), 0u);
+    const void* sharedMount = TA::mountStateOf(w, ids.front());
+
+    const UserId leaf = ids.back();
+    const AABB before = boundsOf(w, bInst, leaf);
+    const AABB moved =
+        AABB::fromCenterExtent(float4::vec(3, 40, 0), float4::vec(0.5f, 0.5f, 0.5f));
+    setNodeBounds(w, a, leaf, moved);
+    w.flushBounds();
+
+    // Only the deformed instance took a copy...
+    EXPECT_EQ(w.overlayCount(), 1u);
+    EXPECT_EQ(TA::overlaysOf(w, a), 1u);
+    EXPECT_EQ(TA::overlaysOf(w, bInst), 0u);
+    EXPECT_EQ(TA::overlaysOf(w, c), 0u);
+
+    // ...its siblings still see the authored bounds...
+    const AABB stillB = boundsOf(w, bInst, leaf);
+    EXPECT_EQ(stillB.mn.x, before.mn.x);
+    EXPECT_EQ(stillB.mx.y, before.mx.y);
+    EXPECT_FALSE(stillB.contains(moved));
+    EXPECT_TRUE(boundsOf(w, a, leaf).contains(moved));
+
+    // ...and everything except the bounds is still one shared object.
+    EXPECT_EQ(w.attachedPageCount(), 1u);
+    EXPECT_EQ(TA::mountStateOf(w, ids.front()), sharedMount);
+
+    // The deformed instance's world box grew; its siblings' did not.
+    EXPECT_TRUE(TA::instanceWorldBox(w, a).contains(toWorld(moved, float4::point(0, 0, 0), 1.0f)));
+    EXPECT_FALSE(TA::instanceWorldBox(w, bInst)
+                     .contains(toWorld(moved, float4::point(100, 0, 0), 1.0f)));
+
+    verifyConservativeBounds(w, a, leaf);
+    verifyConservativeBounds(w, bInst, leaf);
+
+    // Removing the deformed instance returns its overlay to the pool.
+    w.removeInstance(a);
+    EXPECT_EQ(w.overlayCount(), 0u);
+    EXPECT_EQ(w.overlayBytes(), 0u);
 }
 
 // ---------------------------------------------------------------------------
@@ -170,17 +250,14 @@ TEST(Motion, InstanceMove)
     markAllResident(w, ids);
     w.beginFrame();
 
-    ViewScratch s;
     const CullView vOrigin = makeLookAtView(float4::point(0, 0, -30), float4::point(0, 0, 0));
-    EXPECT_FALSE(cutIds(frame(w, s, vOrigin, {4, 0, 0})).empty());
+    EXPECT_FALSE(cutIds(frame(w, vOrigin, {4, 0})).empty());
 
     w.moveInstance(inst, float4::point(10000, 0, 0), 2.0f);
-    ViewScratch s2;
-    EXPECT_TRUE(cutIds(frame(w, s2, vOrigin, {4, 0, 0})).empty());
+    EXPECT_TRUE(cutIds(frame(w, vOrigin, {4, 0})).empty());
 
     const CullView vThere = makeLookAtView(float4::point(10000, 0, -60), float4::point(10000, 0, 0));
-    ViewScratch s3;
-    EXPECT_FALSE(cutIds(frame(w, s3, vThere, {4, 0, 0})).empty());
+    EXPECT_FALSE(cutIds(frame(w, vThere, {4, 0})).empty());
 }
 
 // ---------------------------------------------------------------------------
@@ -241,8 +318,7 @@ TEST(Motion, ManyMovesStayCorrect)
         markAllResident(w, ids);
     }
 
-    ViewScratch s;
-    const CutParams p{4.0f, 0.0f, 0.0f};
+    const CutParams p{4.0f, 0.0f};
     for (int f = 0; f < 12; ++f)
     {
         for (size_t i = 0; i < insts.size(); i += 3)
@@ -251,7 +327,7 @@ TEST(Motion, ManyMovesStayCorrect)
 
         const CullView v = makeLookAtView(float4::point(uni(rng), 200, -800), float4::point(0, 0, 0));
         Outputs o;
-        w.selectCut(v, p, s, o.cut, o.ideal, o.reqs);
+        w.selectCut(v, p, o.cut, &o.ideal, &o.reqs);
         const RefResult want = TA::referenceCut(w, v, p);
 
         std::set<UserId> gotIds, wantIds;
@@ -265,7 +341,7 @@ TEST(Motion, ManyMovesStayCorrect)
 // Dynamic instance churn: every frame some trees are removed and new ones
 // added while leaves keep moving. The cut must stay equivalent to the
 // brute-force reference, and pending moves against removed trees (stale
-// handles) must be dropped harmlessly.
+// instance refs and stale handles alike) must be dropped harmlessly.
 // ---------------------------------------------------------------------------
 TEST(Motion, InstanceChurnStaysCorrect)
 {
@@ -297,14 +373,14 @@ TEST(Motion, InstanceChurnStaysCorrect)
     };
     for (int i = 0; i < 40; ++i) addTree(float4::point(uni(rng), 0, uni(rng)));
 
-    ViewScratch s;
-    const CutParams p{4.0f, 0.0f, 0.0f};
+    const CutParams p{4.0f, 0.0f};
     for (int f = 0; f < 10; ++f)
     {
         // Move one leaf of every tree, then remove 20% and add replacements.
         // The removed trees' submissions become stale before the flush.
         for (const Tree& t : trees)
-            w.setNodeBounds(nodeAt(t.page, t.leafIdx[size_t(f) % t.leafIdx.size()]),
+            w.setNodeBounds(t.ref,
+                            nodeAt(t.page, t.leafIdx[size_t(f) % t.leafIdx.size()]),
                             AABB::fromCenterExtent(float4::vec(uni(rng) * 0.01f, 0, 0),
                                                    float4::vec(0.5f, 0.5f, 0.5f)));
         for (int k = 0; k < 8; ++k)
@@ -320,7 +396,7 @@ TEST(Motion, InstanceChurnStaysCorrect)
         const CullView v = makeLookAtView(float4::point(uni(rng), 300, -900),
                                           float4::point(0, 0, 0));
         std::vector<CutEntry> cut;
-        w.selectCut(v, p, s, cut);
+        w.selectCut(v, p, cut);
         const RefResult want = TA::referenceCut(w, v, p);
 
         std::multiset<UserId> gotIds, wantIds;
@@ -347,27 +423,26 @@ TEST(Motion, ManyLeafMovesStayConservative)
     const auto ids = pageIds(pg);
 
     World w;
-    w.addInstance(std::move(pg), float4::point(0, 0, 0));
+    const auto inst = w.addInstance(std::move(pg), float4::point(0, 0, 0));
     markAllResident(w, ids);
 
     // Collect the leaves (deepest generated ids are leaves of the page).
     std::vector<UserId> leaves;
     {
-        const Page& page = TA::pageOf(w, ids.front());
+        const PageView& page = TA::pageOf(w, ids.front());
         for (uint32_t i = 1; i < page.nodeCount(); ++i)
             if (page.childCount(i) == 0) leaves.push_back(page.payload[i]);
     }
     ASSERT_GT(leaves.size(), 10u);
 
-    ViewScratch s;
     for (int f = 0; f < 8; ++f)
     {
         for (size_t k = 0; k < leaves.size(); k += 5)
-            setNodeBounds(w, leaves[k],
+            setNodeBounds(w, inst, leaves[k],
                           AABB::fromCenterExtent(float4::vec(uni(rng), uni(rng), uni(rng)),
                                                  float4::vec(0.5f, 0.5f, 0.5f)));
         w.flushBounds();
-        verifyConservativeBounds(w, ids.front());
+        verifyConservativeBounds(w, inst, ids.front());
     }
 }
 
@@ -377,7 +452,7 @@ TEST(Motion, ManyLeafMovesStayConservative)
 // ---------------------------------------------------------------------------
 TEST(Motion, HandleMovesMatchIdMoves)
 {
-    auto makeWorld = []
+    auto makeWorld = [](std::unique_ptr<World>& w) -> World::InstanceRef
     {
         HLodBuilder b;
         const auto root = b.createRoot(1, 32.0f);
@@ -387,36 +462,39 @@ TEST(Motion, HandleMovesMatchIdMoves)
         b.createNode(root, 3, 8.0f, AABB::fromCenterExtent(float4::vec(-8, 0, 0), float4::vec(1, 1, 1)));
         Page pg = b.build();
         const auto ids = pageIds(pg);
-        auto w = std::make_unique<World>();
-        w->addInstance(std::move(pg), float4::point(0, 0, 0));
+        w = std::make_unique<World>();
+        const auto inst = w->addInstance(std::move(pg), float4::point(0, 0, 0));
         markAllResident(*w, ids);
         w->beginFrame();
-        return w;
+        return inst;
     };
 
-    auto byId = makeWorld();
-    auto byHandle = makeWorld();
+    std::unique_ptr<World> byId, byHandle;
+    const auto instId = makeWorld(byId);
+    const auto instH = makeWorld(byHandle);
     const NodeHandle h = handleOf(*byHandle, 11);
     EXPECT_TRUE(h.valid());
 
     const AABB newBox = AABB::fromCenterExtent(float4::vec(200, 50, 0), float4::vec(1, 1, 1));
-    setNodeBounds(*byId, 11, newBox);
-    byHandle->setNodeBounds(h, newBox);
+    setNodeBounds(*byId, instId, 11, newBox);
+    byHandle->setNodeBounds(instH, h, newBox);
     byId->flushBounds();
     byHandle->flushBounds();
 
-    verifyConservativeBounds(*byHandle, 11);
-    const Page& a = TA::pageOf(*byId, 11);
-    const Page& b = TA::pageOf(*byHandle, 11);
-    for (uint32_t i = 0; i < a.nodeCount(); ++i)
+    verifyConservativeBounds(*byHandle, instH, 11);
+    const uint32_t slotA = handleOf(*byId, 11).slot;
+    const uint32_t slotB = h.slot;
+    const AABB* a = TA::bboxOf(*byId, instId, slotA);
+    const AABB* b = TA::bboxOf(*byHandle, instH, slotB);
+    const uint32_t n = TA::pageOf(*byId, 11).nodeCount();
+    for (uint32_t i = 0; i < n; ++i)
     {
-        EXPECT_EQ(a.bbox[i].mn.x, b.bbox[i].mn.x) << "node " << i;
-        EXPECT_EQ(a.bbox[i].mx.x, b.bbox[i].mx.x) << "node " << i;
+        EXPECT_EQ(a[i].mn.x, b[i].mn.x) << "node " << i;
+        EXPECT_EQ(a[i].mx.x, b[i].mx.x) << "node " << i;
     }
 
-    ViewScratch s;
     const CullView v = makeLookAtView(float4::point(200, 50, -30), float4::point(200, 50, 0));
-    auto o = frame(*byHandle, s, v, {4.0f, 0.0f, 0.0f});
+    auto o = frame(*byHandle, v, {4.0f, 0.0f});
     EXPECT_TRUE(cutIds(o).count(11));
 }
 
@@ -441,31 +519,33 @@ TEST(Motion, StaleHandleIgnoredAfterDetach)
                                  AABB::fromCenterExtent(float4::vec(0, 0, 0), float4::vec(4, 4, 4)));
     rb.markExpansion(e);
     World w;
-    w.addInstance(rb.build(), float4::point(0, 0, 0));
+    const auto inst = w.addInstance(rb.build(), float4::point(0, 0, 0));
 
     attachPage(w, 2, makeChild());
     const NodeHandle stale = handleOf(w, 11);
-    const AABB before = TA::pageOf(w, 11).bbox[stale.index];
+    const AABB before = boundsOf(w, inst, 11);
     detachPage(w, 2);
 
     // Stale submission is dropped at flush — no crash, no effect.
-    w.setNodeBounds(stale, AABB::fromCenterExtent(float4::vec(500, 0, 0), float4::vec(1, 1, 1)));
+    w.setNodeBounds(inst, stale,
+                    AABB::fromCenterExtent(float4::vec(500, 0, 0), float4::vec(1, 1, 1)));
     w.flushBounds();
+    EXPECT_EQ(w.overlayCount(), 0u);
 
     // Re-attach: same ids, new slot generation. The stale handle must still
     // be ignored; a freshly resolved one must work.
     attachPage(w, 2, makeChild());
-    w.setNodeBounds(stale, AABB::fromCenterExtent(float4::vec(500, 0, 0), float4::vec(1, 1, 1)));
+    w.setNodeBounds(inst, stale,
+                    AABB::fromCenterExtent(float4::vec(500, 0, 0), float4::vec(1, 1, 1)));
     w.flushBounds();
-    const Page& pg = TA::pageOf(w, 11);
-    EXPECT_EQ(pg.bbox[stale.index].mn.x, before.mn.x);   // untouched
+    EXPECT_EQ(boundsOf(w, inst, 11).mn.x, before.mn.x);   // untouched
 
     const NodeHandle fresh = handleOf(w, 11);
     const AABB moved = AABB::fromCenterExtent(float4::vec(7, 0, 0), float4::vec(1, 1, 1));
-    w.setNodeBounds(fresh, moved);
+    w.setNodeBounds(inst, fresh, moved);
     w.flushBounds();
-    EXPECT_TRUE(TA::pageOf(w, 11).bbox[fresh.index].contains(moved));
-    verifyConservativeBounds(w, 11);
+    EXPECT_TRUE(boundsOf(w, inst, 11).contains(moved));
+    verifyConservativeBounds(w, inst, 11);
 }
 
 TEST(Motion, HandleOfUnknownIdThrows)
@@ -492,24 +572,27 @@ TEST(Motion, RepeatedMovesLastWins)
     const auto ids = pageIds(pg);
 
     World w;
-    w.addInstance(std::move(pg), float4::point(0, 0, 0));
+    const auto inst = w.addInstance(std::move(pg), float4::point(0, 0, 0));
     markAllResident(w, ids);
 
     // Thrash node 11 across the map; only the final position may matter.
     for (int i = 0; i < 100; ++i)
-        setNodeBounds(w, 11,
+        setNodeBounds(w, inst, 11,
                       AABB::fromCenterExtent(float4::vec(float(i * 37 % 900 - 450), 0, 0),
                                              float4::vec(1, 1, 1)));
     const AABB last = AABB::fromCenterExtent(float4::vec(50, 0, 0), float4::vec(1, 1, 1));
-    setNodeBounds(w, 11, last);
+    setNodeBounds(w, inst, 11, last);
     w.flushBounds();
 
-    verifyConservativeBounds(w, 11);
-    const Page& page = TA::pageOf(w, 11);
-    const NodeHandle h = handleOf(w, 11);
-    EXPECT_EQ(page.bbox[h.index].mn.x, last.mn.x);   // last write won
-    EXPECT_EQ(page.bbox[h.index].mx.x, last.mx.x);
-    EXPECT_TRUE(page.bbox[0].contains(last));
+    verifyConservativeBounds(w, inst, 11);
+    const AABB got = boundsOf(w, inst, 11);
+    EXPECT_EQ(got.mn.x, last.mn.x);   // last write won
+    EXPECT_EQ(got.mx.x, last.mx.x);
+    EXPECT_TRUE(rootBoundsOf(w, inst, 11).contains(last));
+
+    // One page on the path, so exactly one copy was taken no matter how many
+    // times the node moved.
+    EXPECT_EQ(w.overlayCount(), 1u);
 }
 
 TEST(Motion, NoFlushNeededBeforeSelectCut)
@@ -522,19 +605,19 @@ TEST(Motion, NoFlushNeededBeforeSelectCut)
     const auto ids = pageIds(pg);
 
     World w;
-    w.addInstance(std::move(pg), float4::point(0, 0, 0));
+    const auto inst = w.addInstance(std::move(pg), float4::point(0, 0, 0));
     markAllResident(w, ids);
 
     // Move and cut with no beginFrame/flushBounds in between.
-    setNodeBounds(w, 11, AABB::fromCenterExtent(float4::vec(300, 0, 0), float4::vec(1, 1, 1)));
-    ViewScratch s;
+    setNodeBounds(w, inst, 11,
+                  AABB::fromCenterExtent(float4::vec(300, 0, 0), float4::vec(1, 1, 1)));
     const CullView v = makeLookAtView(float4::point(300, 0, -20), float4::point(300, 0, 0));
     Outputs o;
-    w.selectCut(v, {2.0f, 0.0f, 0.0f}, s, o.cut, nullptr, nullptr);
+    w.selectCut(v, {2.0f, 0.0f}, o.cut, nullptr, nullptr);
     std::set<UserId> got;
     for (const auto& e : o.cut) got.insert(e.payload);
     EXPECT_TRUE(got.count(11));
-    verifyConservativeBounds(w, 11);
+    verifyConservativeBounds(w, inst, 11);
 }
 
 TEST(Motion, SharedAncestorsRefitOnce)
@@ -556,17 +639,17 @@ TEST(Motion, SharedAncestorsRefitOnce)
     const auto ids = pageIds(pg);
 
     World w;
-    w.addInstance(std::move(pg), float4::point(0, 0, 0));
+    const auto inst = w.addInstance(std::move(pg), float4::point(0, 0, 0));
     markAllResident(w, ids);
 
     for (size_t i = 0; i < leaves.size(); ++i)
-        setNodeBounds(w, leaves[i],
+        setNodeBounds(w, inst, leaves[i],
                       AABB::fromCenterExtent(float4::vec(700 + float(i), 3, 0),
                                              float4::vec(0.5f, 0.5f, 0.5f)));
     w.flushBounds();
-    verifyConservativeBounds(w, ids.front());
+    verifyConservativeBounds(w, inst, ids.front());
 
-    const Page& page = TA::pageOf(w, ids.front());
-    EXPECT_TRUE(page.bbox[0].contains(
-        AABB::fromCenterExtent(float4::vec(711, 3, 0), float4::vec(0.5f, 0.5f, 0.5f))));
+    EXPECT_TRUE(rootBoundsOf(w, inst, ids.front())
+                    .contains(AABB::fromCenterExtent(float4::vec(711, 3, 0),
+                                                     float4::vec(0.5f, 0.5f, 0.5f))));
 }

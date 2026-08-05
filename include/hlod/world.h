@@ -1,17 +1,35 @@
 #pragma once
 // Runtime side of HLodTree (hlod_design.md §1, §3-§8):
-//  - instances of immutable page trees over a wide dynamic top-level BVH
+//  - assets: immutable page trees, registered once, shared by every instance
+//    and every attachment that names them
+//  - instances of those assets over a wide dynamic top-level BVH
 //  - topology streaming (attach/detach pages under expansion points)
 //  - payload residency with O(1) all-or-nothing refinement tests
-//  - single-pass pruned cut selection with epoch-stamped per-view scratch
+//  - single-pass pruned cut selection, no per-view scratch at all
 //  - LRU garbage collection of cold pages
 //  - sublinear conservative bounds refit for moving nodes and instances
 //
+// EVERYTHING IS SHARED
+// --------------------
+// A page is registered once and instanced many times. Every instance of an
+// asset walks the same bytes AND the same runtime state: one residency array,
+// one attachment graph, one set of streaming requests. Ten thousand copies of
+// a tree cost one tree, and a streamer that attaches a page under a shared
+// expansion point attaches it for all ten thousand at once.
+//
+// Deformation does not break that. Bounds are the only part of a page the
+// runtime rewrites, so an instance that is deformed with setNodeBounds gets a
+// private copy of just its bounds (a copy-on-write overlay, roughly 60% of a
+// page) and keeps sharing topology, payloads, errors, residency and streaming
+// with every other instance. There is no "private page" mode: the thing that
+// would actually hurt at scale is ten thousand duplicated *streaming graphs*,
+// not ten thousand duplicated boxes, and duplicating the page duplicates both.
+//
 // THE API IS FULLY HANDLE-BASED — the World keeps no id index at all (no
 // hash maps anywhere). Handles are the only currency:
-//  - addInstance / attachPage return a PageHandle {slot, generation};
-//    node handles are composed from it plus the node's page-local index,
-//    which is immutable authored data (nodeAt below).
+//  - registerAsset returns an AssetHandle; addInstance / attachPage return a
+//    PageHandle {slot, generation}; node handles are composed from it plus
+//    the node's page-local index, which is immutable authored data.
 //  - selectCut outputs carry a NodeHandle wherever the caller might act on
 //    the entry (load requests, expansion requests).
 //  - the 64-bit UserPayload is opaque: echoed in outputs, never interpreted.
@@ -19,19 +37,34 @@
 // detected by the generation stamp: mutating calls ignore them, queries
 // report them absent — the normal race between streaming completion and GC.
 //
-// Single-threaded by design in this version; one World per thread, one
-// ViewScratch per view.
+// Single-threaded by default. selectCut can fan out across instances through
+// the context's parallelFor (see WorldConfig::parallelInstanceThreshold);
+// everything else is single-writer by construction. selectCut itself is a
+// pure read of the World — LOD damping lives in the CullView (see ViewDamper
+// in math.h), not in per-node history — so there is no per-view object to
+// allocate, thread through, or keep in sync with page lifetimes.
 
 #include <cstdint>
+#include <cstring>
 #include <vector>
 
+#include "config.h"
 #include "math.h"
 #include "page.h"
 
 namespace hlod {
 
-// Attached page: returned by addInstance/attachPage. Compose node handles
-// with nodeAt(); node indices are page-local, fixed at build time.
+// Registered page asset: the unit of sharing. Returned by registerAsset().
+struct AssetHandle
+{
+    uint32_t slot = kInvalidIndex;
+    uint32_t generation = 0;
+    bool valid() const { return slot != kInvalidIndex; }
+};
+
+// Attached page (a "mount"): one placement of an asset in the world. Returned
+// by addInstance/attachPage. Compose node handles with nodeAt(); node indices
+// are page-local, fixed at build time.
 struct PageHandle
 {
     uint32_t slot = kInvalidIndex;
@@ -53,10 +86,15 @@ inline NodeHandle nodeAt(PageHandle page, uint32_t index)
     return NodeHandle{page.slot, index, page.generation};
 }
 
+// `instance` is the caller's tag from InstanceDesc — with shared assets the
+// payload alone no longer says which placement emitted the entry, and this is
+// how you get back to a transform or an entity id. It costs nothing: the
+// struct was already padded to 16 bytes.
 struct CutEntry
 {
     UserPayload payload;
-    float       err;     // projected screen error in pixels
+    float       err;        // projected screen error in pixels
+    uint32_t    instance;   // InstanceDesc::tag of the emitting instance
 };
 
 enum class IdealTag : uint8_t
@@ -68,11 +106,16 @@ enum class IdealTag : uint8_t
 struct IdealEntry
 {
     UserPayload payload;
-    NodeHandle  node;    // pass to attachPage() for NeedsExpansion entries
+    NodeHandle  node;       // pass to attachPage() for NeedsExpansion entries
     float       err;
+    uint32_t    instance;
     IdealTag    tag;
 };
 
+// Load requests carry no instance tag on purpose: content is keyed by
+// payload, so with a shared asset the request belongs to the asset, not to
+// any one of the thousands of placements that want it. selectCut deduplicates
+// them per call for exactly that reason.
 struct LoadRequest
 {
     UserPayload payload;   // load this node's payload (content is keyed by it)
@@ -82,45 +125,426 @@ struct LoadRequest
 
 struct CutParams
 {
-    float threshold  = 4.0f;   // refine when screen error exceeds this (px)
-    float hysteresis = 0.0f;   // (1 +- h) split of the threshold
-    float minPix     = 0.0f;   // contribution culling at the top level; 0 = off
+    float threshold = 4.0f;   // refine when screen error exceeds this (px)
+    float minPix    = 0.0f;   // contribution culling at the top level; 0 = off
 };
 
 using InstanceId = uint32_t;
 
-// Per-view working set, used only for hysteresis history. Epoch-stamped: no
-// per-frame clears, memory is one word per materialized interior node,
-// reclaimed as pages detach. All other traversal state (screen error,
-// undecided planes, refine-chain liveness) is carried on the walk's explicit
-// stack instead of being scattered through memory.
-class ViewScratch
+// InstanceDesc::tag sentinel: echo the World's own InstanceId in CutEntry.
+inline constexpr uint32_t kAutoTag = kInvalidIndex;
+
+struct InstanceDesc
+{
+    float4   pos{};
+    float    scale = 1.0f;
+
+    // Echoed in CutEntry::instance / IdealEntry::instance. Whatever the
+    // caller wants it to mean: a transform index, an entity id, a draw-list
+    // slot. kAutoTag echoes the InstanceId instead.
+    uint32_t tag = kAutoTag;
+
+    // ANDed against CullView::viewMask; a zero result culls the instance at
+    // the top level. Cheap layer visibility: shadow-only props, editor-only
+    // gizmos, per-view opt-outs.
+    uint32_t mask = ~0u;
+};
+
+// ---------------------------------------------------------------------------
+// Output sinks
+//
+// selectCut writes through a Sink so the same out-of-line traversal can fill
+// either a std::vector (grows, never drops) or caller memory (fixed, reports
+// what did not fit). Engines that write straight into a draw list or a mapped
+// instance buffer want the second one.
+// ---------------------------------------------------------------------------
+
+template <class T>
+class Sink
 {
 public:
-    void reset()
+    Sink() = default;
+
+    // Growable: appends to `v`, which is cleared first. Never drops.
+    explicit Sink(std::vector<T>& v) : vec_(&v) { v.clear(); }
+
+    // Fixed: writes into caller memory, counting (not writing) the overflow.
+    Sink(T* data, uint32_t capacity) : data_(data), capacity_(capacity) {}
+
+    void push(const T& v)
     {
-        pages_.clear();
-        frame_ = 0;
+        if (vec_)
+        {
+            vec_->push_back(v);
+            return;
+        }
+        if (count_ < capacity_)
+            data_[count_++] = v;
+        else
+            ++dropped_;
+    }
+
+    // Append n contiguous values. Same result as n pushes, one bulk copy: this
+    // is how a SelectionContext hands back an instance's recorded cut.
+    void pushRange(const T* p, uint32_t n)
+    {
+        if (n == 0) return;
+        if (vec_)
+        {
+            vec_->insert(vec_->end(), p, p + n);
+            return;
+        }
+        const uint32_t fits = count_ < capacity_ ? capacity_ - count_ : 0;
+        const uint32_t take = n < fits ? n : fits;
+        if (take) std::memcpy(data_ + count_, p, size_t(take) * sizeof(T));
+        count_ += take;
+        dropped_ += n - take;
+    }
+
+    uint32_t count() const { return vec_ ? uint32_t(vec_->size()) : count_; }
+    uint32_t dropped() const { return dropped_; }
+    bool     overflowed() const { return dropped_ != 0; }
+
+    // Entry i, or nullptr if it was dropped. Used to raise the priority of an
+    // already-emitted load request rather than emitting a duplicate.
+    T* at(uint32_t i)
+    {
+        if (vec_) return i < vec_->size() ? &(*vec_)[i] : nullptr;
+        return i < count_ ? &data_[i] : nullptr;
     }
 
 private:
+    std::vector<T>* vec_ = nullptr;
+    T*              data_ = nullptr;
+    uint32_t        capacity_ = 0;
+    uint32_t        count_ = 0;
+    uint32_t        dropped_ = 0;
+};
+
+using CutSink     = Sink<CutEntry>;
+using IdealSink   = Sink<IdealEntry>;
+using RequestSink = Sink<LoadRequest>;
+
+// ---------------------------------------------------------------------------
+// SelectionContext — everything selection remembers about one view
+//
+// A world that is mostly static, seen by a camera that moves continuously,
+// produces a cut that is nearly identical frame to frame. This exploits that:
+// an instance whose cut provably cannot have changed is not walked at all, and
+// its entries are handed back where they already lie.
+//
+// THE STATE IS ALL HERE, NOT IN THE WORLD. Querying several cameras per frame
+// (main view, shadow cascades, a reflection probe) means several contexts, and
+// they cannot interfere: the World stays a pure read during selection, exactly
+// as it is without one.
+//
+// It also OWNS THE VIEW DAMPER for its view, and that is not merely tidy. The
+// two are one mechanism read two ways: the damper turns a camera position into
+// a query envelope, and the reuse test below is driven by how far that same
+// envelope has travelled, not by the camera. Held separately, the caller has to
+// pair the right damper with the right context by hand every frame, and pairing
+// the main view's damper with a shadow cascade's cache compiles perfectly well.
+// So selectCut takes the RAW view and damps it internally, one reset() covers
+// the discontinuity for both halves, and the pairing cannot be got wrong.
+//
+// It also makes one coupling visible instead of hidden, which is the other
+// reason to keep them together. The damper relaxes k as well as position, and a
+// change in k voids every recorded margin at once (see epoch_), so:
+//
+//   ZOOMING OUT WITH DAMPING ON COSTS THE WHOLE CACHE FOR ~24 HALF-LIVES.
+//
+// Not one frame, and not one half-life. kMax_ takes the max of the relaxed and
+// current k, so a zoom IN arrives in a single frame and costs a single frame.
+// A zoom OUT relaxes multiplicatively and only STOPS when the gap underflows
+// float equality, which for a 2x zoom is ~24 half-lives -- ~190 frames at
+// halfLife 8, every one of them a different k and therefore a fresh epoch.
+// Measured (BM_SelectionContext_Zoom, 20k instances, nothing moving): reuse
+// 94.8% -> 56.5% and the cut 1.57x slower, at one zoom-out per 120 frames.
+//
+// This is honest as far as it goes -- k really is different on each of those
+// frames, and a smaller k moves every flip point inward, so decisions really
+// can flip. What is wrong is the granularity: position hysteresis relaxes
+// asymptotically too, but the odometer absorbs its tiny per-frame steps into a
+// budget, while k has only an all-or-nothing epoch. Giving k a budget as well
+// needs a per-record bound on the flip distance, which does not fit in 48
+// bytes; quantising the damped k would fix it without new state. Neither is
+// done. Until one is, prefer halfLife 0 on views that zoom, or accept the loss.
+//
+// Damping and reuse each stay optional and free when unused: halfLife 0 makes
+// the arithmetic bit-identical to an undamped query, and the storage below is
+// empty until the first call. A fully dynamic world wants the damper and not
+// the reuse, and pays ~8% for the reuse it cannot use; a shadow cascade often
+// wants the reverse.
+//
+// WHY IT IS SOUND, AND WHY IT WINS
+// --------------------------------
+// Inside one instance the only camera-dependent decision is the screen-error
+// test, `geomError * k / distance > threshold`, which flips when the distance
+// reaches `geomError * k / threshold`. During a walk this records the smallest
+// gap between the two over every node that was tested -- the VALIDITY MARGIN,
+// a distance. Moving the camera by less than that margin cannot flip any
+// decision, because a translation of d changes every distance by at most d.
+//
+// Frustum decisions would spoil that argument, since rotating a camera moves
+// the planes much further than it moves the eye. So only instances that were
+// ENTIRELY INSIDE the frustum are cached: no plane was tested anywhere inside
+// them, and their cut is therefore a pure function of camera position. An
+// instance straddling the frustum edge is always re-walked, and there are few
+// of those -- they are a shell, not a volume.
+//
+// The margin is large exactly where it needs to be. A distant instance sits
+// far past every flip point, so its margin is roughly its own distance and it
+// stays valid for many frames; a near instance with a deep cut has some node
+// sitting right at the threshold, so its margin is tiny and it is re-walked
+// every frame. That is the correct division of labour rather than a
+// limitation: the population is dominated by distant instances, which is where
+// the per-instance fixed cost (resolve the instance, transform the view, touch
+// the root page) was being paid over and over for an answer that never moved.
+//
+// THE OUTPUT IS A FLAT ARRAY, AND THAT WAS NOT THE FIRST ANSWER
+// -------------------------------------------------------------
+// This overload writes the same contiguous CutEntry sequence as every other
+// one, so the only difference at the call site is the context argument. The
+// first version instead handed back a span per visible instance, pointing into
+// the storage below, on the theory that a reused instance should cost nothing
+// at all -- not even a copy.
+//
+// That was measured and abandoned. Cuts are SHALLOW per instance: 1.56 entries
+// per instance at 20k, 1.14 at 80k, because the population is dominated by
+// distant instances that collapse to a node or two. So the descriptor array was
+// as large as the data it described -- 350 KB of spans for 400 KB of entries at
+// 80k -- and had to be rewritten every frame anyway, including for the 92% of
+// instances that were reused. Copying those entries instead is ~40 us against a
+// 2.7 ms cut, about 1.5%.
+//
+// Fusing adjacent spans was tried and does not rescue it: the storage is
+// ordered by first-walk, the caller iterates in TLAS order, and the two coincide
+// only on the first frame. Measured, span count did not budge (21,919 of them,
+// fused or not) outside a stationary camera. What buys 1.3-3.0x is skipping the
+// WALK; skipping the copy was never where the money was.
+//
+// WHAT IS EXACT AND WHAT IS NOT
+// -----------------------------
+// The set of emitted nodes is exactly what a stateless selectCut would emit.
+// CutEntry::err is not: it is the value from the recorded camera position, so
+// it is stale by at most the margin expressed in error units. Use it for
+// prioritisation and dithering, which is what it is for; do not expect it to
+// be bit-identical to the stateless path.
+//
+// Two limits in this version, both checked rather than assumed:
+//  - an instance is cacheable only once it has CONVERGED (its walk emitted no
+//    load requests and asked for no expansions), so streaming in progress
+//    simply means those instances keep being walked;
+//  - asking for the ideal cut bypasses the cache for that call, because the
+//    ideal cut carries node handles this does not record.
+// ---------------------------------------------------------------------------
+
+class SelectionContext
+{
+public:
+    SelectionContext() = default;
+    explicit SelectionContext(float halfLifeFrames) : damper_(halfLifeFrames) {}
+
+    // LOD hysteresis for this view, in frames; 0 disables it exactly. See
+    // ViewDamper in math.h for what the envelope does.
+    float halfLife() const { return damper_.halfLife(); }
+    void  setHalfLife(float frames) { damper_.setHalfLife(frames); }
+
+    // Instances served from the cache, and re-walked, in the last call.
+    uint32_t reused() const { return reused_; }
+    uint32_t walked() const { return walked_; }
+
+    // Forget everything: the damping window and every record. Call it on a
+    // teleport or camera cut. Reuse never *requires* this -- every record
+    // carries the stamps and the travel budget that invalidate it -- but
+    // damping does, or the envelope stretches across the discontinuity and
+    // over-refines everything between the two positions. One call so that
+    // cannot be half-done.
+    void reset();
+
+    size_t bytes() const;
+
+private:
     friend class World;
-    struct PageScratch
+
+    // Pages whose state this instance's cut depended on. Two covers an
+    // instance root plus one attachment; a walk that touches more is simply
+    // not cached, which costs nothing, because an instance that deep is
+    // usually still streaming and being re-walked anyway.
+    static constexpr uint32_t kMaxDeps = 2;
+
+    // EXACTLY 48 BYTES, and that is the whole design constraint.
+    //
+    // This record is read for every visible instance, indexed by instance id,
+    // so it is a random access per instance -- the one new memory stream the
+    // cache introduces. It has to be cheaper than the walk it replaces, and
+    // the walk it usually replaces is cheap: with a shared asset the page is
+    // the same bytes for every instance and sits in L1. A first version of
+    // this record was 128 bytes and lost 1.4x at 80k instances while reusing
+    // 93% of them, purely on its own footprint. Everything here is therefore
+    // either a scalar or absent:
+    //  - no camera envelope: validity is a single scalar budget against the
+    //    view's accumulated travel (see travel_);
+    //  - no k / threshold: those are per-call, held once on the context, and a
+    //    change bumps epoch_ instead of being stored per instance;
+    //  - no page generations: contentVersion is bumped on attach too, so it
+    //    alone distinguishes a recycled slot.
+    struct Rec
     {
-        uint32_t generation = 0;
-        // (frame of last visit << 1) | last ideal decision. The frame stamp
-        // validates freshness, so nothing is ever cleared per frame.
-        std::vector<uint32_t> seenSticky;
+        // Reusable while the view's travel has not passed this. Set to
+        // travel + margin when recorded; 0 means no usable record.
+        float    validUntil = 0.0f;
+        uint32_t epoch = 0;          // cache epoch (k / threshold generation)
+        uint32_t generation = 0;     // instance generation when recorded
+        uint32_t cutVersion = 0;     // instance transform/deform version
+        uint32_t begin = 0;          // block in store_
+        uint32_t count = 0;
+        uint32_t capacity = 0;
+        uint32_t depSlot[kMaxDeps]{};
+        uint32_t depVersion[kMaxDeps]{};
+        uint32_t depCount = 0;
     };
-    std::vector<PageScratch> pages_;   // by page slot
-    uint32_t                 frame_ = 0;
+    static_assert(sizeof(Rec) == 48, "SelectionContext::Rec must stay 48 bytes");
+
+    void compact();
+
+    // This view's hysteresis. selectCut damps through it, so the odometer
+    // below measures the envelope it produces.
+    ViewDamper damper_;
+
+    std::vector<Rec>      rec_;      // by InstanceId
+    std::vector<CutEntry> store_;    // slab of recorded runs
+    uint32_t              used_ = 0;
+    uint32_t              garbage_ = 0;
+
+    // Distance the damped query envelope has travelled since this context was
+    // created, accumulated per call. A record taken at travel t with margin m
+    // is good while travel < t + m: the path length bounds the displacement
+    // from any earlier position, which is what the margin argument needs. It
+    // is conservative for a camera that doubles back, and it replaces storing
+    // a position per instance with a single compare -- the reason the record
+    // fits in 48 bytes. A teleport simply adds a large step and invalidates
+    // everything, which is the correct answer.
+    float    travel_ = 0.0f;
+    float4   lastQmn_{}, lastQmx_{};
+    bool     primed_ = false;
+    // Bumped when the projection scale or the error threshold changes, which
+    // invalidates every record at once without touching any of them.
+    uint32_t epoch_ = 1;
+    float    k_ = 0.0f, bar_ = 0.0f;
+    uint32_t reused_ = 0;
+    uint32_t walked_ = 0;
+};
+
+// ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
+
+enum class TlasQuality : uint8_t
+{
+    Morton,     // one sort, contiguous groups of kWide — cheapest, loosest
+    Median,     // recursive longest-axis median split
+    BinnedSAH,  // binned surface-area-heuristic split; best traversal cost
+};
+
+struct WorldConfig
+{
+    // Allocation and task parallelism. Must outlive the World: pages the
+    // World owns free themselves through it.
+    HlodContext context{};
+
+    // Quality tier of the top-level BVH. Motion-triggered rebuilds always
+    // take the Morton path regardless; this is what structural rebuilds use.
+    TlasQuality tlasQuality = TlasQuality::BinnedSAH;
+
+    // SAH cost constants (BinnedSAH only): cost of visiting a node vs testing
+    // an instance. Raising intersect cost builds deeper, tighter trees.
+    float tlasTraversalCost = 1.0f;
+    float tlasIntersectCost = 1.0f;
+
+    // Fraction of the instance population that must appear or disappear
+    // before the next rebuild is promoted to the quality tier.
+    float tlasCountDrift = 0.2f;
+
+    // Fraction of the top-level BVH's original lane area that motion may add
+    // through grow-only refit before a quality rebuild is forced. Catches the
+    // bloat that a steady population hides from tlasCountDrift.
+    float tlasAreaDrift = 0.5f;
+
+    // Fraction of leaves that may escape their lane before a rebuild.
+    float tlasEscapeFraction = 0.25f;
+
+    // Fraction of the population that may be spawned or removed INCREMENTALLY
+    // before the tree is rebuilt. An incremental insert descends to the leaf
+    // whose box grows least and either takes a free lane or splits the leaf,
+    // which deepens that subtree by one; a removal invalidates a lane and
+    // leaves its box loose. Both are O(depth) and both cost a little quality,
+    // so this bounds how much of it accumulates.
+    //
+    // Do not read this as a tuning knob of last resort: before it existed,
+    // every add or remove marked the whole TLAS dirty, so ONE spawn cost a full
+    // rebuild -- 2.1 ms at 20k instances and 9.5 ms at 80k, the same as five
+    // hundred spawns. See HANDOFF.md 11.1.
+    float tlasEditFraction = 0.05f;
+
+    // Minimum number of visible instances before selectCut fans out across
+    // context.parallelFor. 0 disables parallel cut selection entirely.
+    // Also requires context.workerCount > 1.
+    //
+    // There is no correctness caveat attached to this: selection reads the
+    // World and writes only per-worker buffers, which are concatenated in
+    // instance order, so a parallel cut is bit-identical to a serial one.
+    uint32_t parallelInstanceThreshold = 0;
+};
+
+// Traversal counters, filled only when the library is built with HLOD_STATS.
+struct CutStats
+{
+    uint64_t instancesVisited = 0;
+    uint64_t pagesVisited = 0;
+    uint64_t nodesVisited = 0;
+    uint64_t wideBlocksTested = 0;
+    uint64_t lanesSurvived = 0;
 };
 
 class World
 {
 public:
+    explicit World(const WorldConfig& config = WorldConfig{});
+    ~World();
+
+    // Non-copyable and non-movable: pages the World owns hold a pointer to
+    // config_.context, and instances/mounts refer to each other by slot.
+    World(const World&) = delete;
+    World& operator=(const World&) = delete;
+    World(World&&) = delete;
+    World& operator=(World&&) = delete;
+
+    const WorldConfig& config() const { return config_; }
+
+    // ---- assets ------------------------------------------------------------
+    // Publish a page for sharing. The World allocates ONE runtime state for
+    // it (residency, attachment links) no matter how many instances name it,
+    // and its root mount stays alive until releaseAsset().
+    //
+    // The borrowed overload does not copy: point it at a memory-mapped bundle
+    // and the page costs nothing but address space. The bytes must outlive
+    // the asset.
+    AssetHandle registerAsset(Page&& page);
+    AssetHandle registerAsset(PageView borrowedPage);
+
+    // Drops the World's own reference. Contract violation if instances still
+    // reference the asset. Detaches its whole page tree.
+    void   releaseAsset(AssetHandle asset);
+    bool   isAsset(AssetHandle asset) const;
+    size_t assetCount() const { return liveAssets_; }
+
+    // The asset's root mount, for composing node handles into shared pages
+    // (marking residency, attaching children) without a selectCut round-trip.
+    PageHandle assetRootPage(AssetHandle asset) const;
+
     // ---- world assembly ----------------------------------------------------
-    // The instance's root page is pinned: attached forever, roots' payloads
+    // An instance's root page is pinned: attached forever, roots' payloads
     // implicitly resident, never garbage-collected.
     //
     // InstanceRef carries a generation stamp, like NodeHandle: instance slots
@@ -134,18 +558,39 @@ public:
         PageHandle rootPage;
         bool valid() const { return id != kInvalidIndex; }
     };
-    InstanceRef addInstance(Page rootPage, float4 pos, float scale = 1.0f);
-    void        removeInstance(InstanceRef ref);                          // no-op if stale
-    void        moveInstance(InstanceRef ref, float4 pos, float scale = 1.0f);   // no-op if stale
+
+    // O(1); allocates nothing beyond the instance record.
+    InstanceRef addInstance(AssetHandle asset, const InstanceDesc& desc);
+    InstanceRef addInstance(AssetHandle asset, float4 pos, float scale = 1.0f);
+
+    // Convenience for one-off content: registers the page as an anonymous
+    // asset owned by the World and instances it. The asset is freed when its
+    // last instance goes away. Instancing the same tree more than once should
+    // go through registerAsset so the two instances share it.
+    InstanceRef addInstance(Page&& page, const InstanceDesc& desc);
+    InstanceRef addInstance(Page&& page, float4 pos, float scale = 1.0f);
+
+    void removeInstance(InstanceRef ref);                                    // no-op if stale
+    void moveInstance(InstanceRef ref, float4 pos, float scale = 1.0f);      // no-op if stale
 
     // ---- topology streaming -------------------------------------------------
     // The expansion handle comes from an IdealEntry{NeedsExpansion} (or is
     // composed via nodeAt). attachPage returns an invalid PageHandle if the
     // expansion handle went stale while the page was being built (its parent
-    // page was detached/collected) — drop the page in that case. It throws
-    // only on true contract violations (not an expansion point, already
-    // attached, empty page).
-    PageHandle attachPage(NodeHandle expansionNode, Page page);
+    // page was detached/collected) — drop the page in that case. It fires
+    // HLOD_FATAL only on true contract violations (not an expansion point,
+    // already attached, empty page).
+    //
+    // Attaching under an asset attaches for every instance of it at once —
+    // that is the point, and it is why one streamer no longer does the same
+    // work ten thousand times.
+    //
+    // The child page must fit inside the expansion node's authored bounds.
+    // Growing the owner here would ripple into every instance of the owning
+    // asset, so it is a contract violation rather than a silent refit: write
+    // conservative expansion bounds at build time.
+    PageHandle attachPage(NodeHandle expansionNode, AssetHandle asset);
+    PageHandle attachPage(NodeHandle expansionNode, Page&& page);
     void       detachPage(NodeHandle expansionNode);   // no-op if stale
     bool       isAttached(NodeHandle expansionNode) const;
 
@@ -158,21 +603,32 @@ public:
     bool isResident(NodeHandle h) const;
 
     // ---- motion --------------------------------------------------------------
-    // Record new local-space bounds for a node: ~16 ns, a bounds check and a
-    // queue push — call it as often as you like, whenever you like. The
-    // refit runs LAZILY: the tree is guaranteed up to date only where that
-    // matters — at the next selectCut (which flushes internally) or an
-    // explicit flushBounds(). A node moved many times between cuts ends at
+    // Record new local-space bounds for one node OF ONE INSTANCE: ~16 ns, a
+    // bounds check and a queue push — call it as often as you like, whenever
+    // you like. The refit runs LAZILY: the tree is guaranteed up to date only
+    // where that matters — at the next selectCut (which flushes internally) or
+    // an explicit flushBounds(). A node moved many times between cuts ends at
     // exactly the last submitted box; the repeat applications hit hot cache
-    // lines and early-out at the already-grown parent, so they cost a
-    // fraction of a first move (~30 ns measured at 1M submissions/frame).
-    // Stale handles are dropped at flush time via the generation stamp.
-    void setNodeBounds(NodeHandle h, const AABB& localBounds);
+    // lines and early-out at the already-grown parent, so they cost a fraction
+    // of a first move. Stale handles are dropped at flush time via the
+    // generation stamps.
+    //
+    // The first deformation of a given (instance, page) pair copies that
+    // page's bounds into a per-instance overlay; everything else about the
+    // page stays shared. Subsequent moves write straight into the overlay.
+    // Propagation up the ancestor chain promotes overlays as it crosses page
+    // boundaries, so only the pages on the path from the moved node to the
+    // instance root are ever privatised.
+    void setNodeBounds(InstanceRef inst, NodeHandle h, const AABB& localBounds);
 
     // Force pending bounds refits now (conservative grow-only propagation up
     // the tree, across page boundaries, and into the top-level BVH). Only
     // needed by callers that read bounds between cuts — tools, tests.
     void flushBounds();
+
+    // Bounds of one node as this instance sees them: the overlay if it has
+    // one, the shared page otherwise. Flushes pending moves first.
+    AABB nodeBounds(InstanceRef inst, NodeHandle h);
 
     // ---- per frame ------------------------------------------------------------
     void beginFrame();   // advances the world clock (GC aging, LRU touch)
@@ -180,18 +636,45 @@ public:
     // outIdealCut / outRequests are optional: pass nullptr to skip them and
     // their emission cost entirely. A static fully-resident scene (no
     // streaming) then pays for exactly one output: the actual cut.
-    void selectCut(const CullView& view, const CutParams& params, ViewScratch& scratch,
+    //
+    // For LOD damping, run the view through a ViewDamper (math.h) first.
+    void selectCut(const CullView& view, const CutParams& params,
                    std::vector<CutEntry>&    outCut,
                    std::vector<IdealEntry>*  outIdealCut = nullptr,
                    std::vector<LoadRequest>* outRequests = nullptr);
 
-    void selectCut(const CullView& view, const CutParams& params, ViewScratch& scratch,
+    void selectCut(const CullView& view, const CutParams& params,
                    std::vector<CutEntry>&    outCut,
                    std::vector<IdealEntry>&  outIdealCut,
                    std::vector<LoadRequest>& outRequests)
     {
-        selectCut(view, params, scratch, outCut, &outIdealCut, &outRequests);
+        selectCut(view, params, outCut, &outIdealCut, &outRequests);
     }
+
+    // Sink form: write straight into caller memory. Check Sink::dropped() to
+    // find out whether the buffers were big enough.
+    void selectCut(const CullView& view, const CutParams& params,
+                   CutSink& outCut, IdealSink* outIdealCut, RequestSink* outRequests);
+
+    // Contextual form: same output as the overloads above, but an instance whose
+    // cut provably cannot have changed is not walked -- its recorded entries are
+    // copied out instead. One context per view.
+    //
+    // Two things differ from the stateless overloads, both deliberate:
+    //  - pass the RAW view. This is the only overload that damps internally,
+    //    through the context's own ViewDamper.
+    //  - CutEntry::err on a reused entry is stale within the proven margin. The
+    //    node set is exact; see the notes on SelectionContext.
+    //
+    // Passing outIdealCut bypasses reuse for that call.
+    void selectCut(const CullView& view, const CutParams& params,
+                   SelectionContext& ctx, CutSink& outCut,
+                   IdealSink* outIdealCut, RequestSink* outRequests);
+
+    void selectCut(const CullView& view, const CutParams& params,
+                   SelectionContext& ctx, std::vector<CutEntry>& outCut,
+                   std::vector<IdealEntry>*  outIdealCut = nullptr,
+                   std::vector<LoadRequest>* outRequests = nullptr);
 
     // ---- garbage collection ----------------------------------------------------
     // Detaches cold pages from the LRU tail until streamedPageCount() <=
@@ -208,6 +691,14 @@ public:
     size_t   streamedPageCount() const { return attachedPages_ - pinnedPages_; }
     uint32_t frame() const { return frame_; }
 
+    // Number of live copy-on-write bounds overlays, and the bytes they hold.
+    // Both stay zero for a scene that never calls setNodeBounds.
+    size_t overlayCount() const { return liveOverlays_; }
+    size_t overlayBytes() const;
+
+    // Filled by the last selectCut. All zero unless built with HLOD_STATS.
+    const CutStats& lastCutStats() const { return stats_; }
+
     struct TestAccess;   // defined by tests; full access to internals
 
 private:
@@ -220,37 +711,143 @@ private:
         bool valid() const { return slot != kInvalidIndex; }
     };
 
+    // A registered page: the immutable bytes plus the bookkeeping that keeps
+    // them alive. `owned` is empty for borrowed pages.
+    struct AssetRt
+    {
+        PageView view;
+        Page     owned;
+        uint32_t rootMount = kInvalidIndex;
+        uint32_t generation = 0;
+        uint32_t mountRefs = 0;      // PageRt entries referencing these bytes
+        uint32_t instanceRefs = 0;   // Instances rooted at rootMount
+        bool     registered = false; // user holds an AssetHandle
+        bool     inUse = false;
+    };
+
+    // A mount: one placement of an asset's bytes, with the mutable state that
+    // placement needs. There is exactly one mount per (asset, attachment
+    // point) no matter how many instances walk it.
     struct PageRt
     {
-        Page                  page;
+        PageView              page;           // borrowed from the asset
+        uint32_t              asset = kInvalidIndex;
+        // Effective error ceiling for every node in this page: the owning
+        // expansion node's effective error, or FLT_MAX for a root page.
+        //
+        // Invariant (D) across a page boundary used to be established by
+        // REWRITING the child page's error array at attach time. It is a
+        // per-attachment scalar instead, folded into the wide test with one
+        // min8. That is what lets a single page back many attachments — and
+        // it turns attach from an O(nodeCount) write pass into O(1).
+        float                 errClamp = FLT_MAX;
         std::vector<uint8_t>  resident;       // payload loaded
         std::vector<uint32_t> readyChildren;  // resident children per node
-        uint32_t   generation = 0;            // bumped per attach; invalidates handles/scratch
+        // Per-node (selectCut epoch << 32 | output index) for LoadRequest
+        // dedup. Allocated on the page's first emitted request.
+        std::vector<uint64_t> reqStamp;
+        // Bumped by anything that can change what a walk of this page emits:
+        // a child attaching or detaching, a payload becoming resident or
+        // ceasing to be, a new error clamp. A SelectionContext records this per
+        // page it walked, which is what lets one shared asset streaming in
+        // invalidate every instance of it without any per-instance work.
+        uint32_t   contentVersion = 0;
+        uint32_t   generation = 0;            // bumped per attach; invalidates handles
         uint32_t   lastTouched = 0;           // world frame of last walk touch
         uint32_t   lruPrev = kInvalidIndex, lruNext = kInvalidIndex;
         uint32_t   attachedChildPages = 0;
         bool       pinned = false;
         bool       inUse  = false;
-        InstanceId instance = kInvalidIndex;
         NodeRef    owner;                     // expansion node above; invalid for root pages
         // Attached child slot per expansion node, kInvalidIndex when
         // collapsed. Allocated on the page's first child attach; this IS the
         // expansion link — there is no by-id index.
         std::vector<uint32_t> expSlot;
-
     };
 
+    // Copy-on-write bounds for one (instance, mount) pair: the only part of a
+    // page a deformed instance stops sharing. Allocated on that instance's
+    // first setNodeBounds touching the mount, and on any ancestor mount that
+    // the resulting growth propagates into.
+    struct Overlay
+    {
+        uint32_t slot = kInvalidIndex;   // mount this shadows
+        uint32_t generation = 0;         // that mount's generation when taken
+#ifdef HLOD_OVERLAY_FULL_PAGE
+        // Experiment: privatise the WHOLE page on first deform rather than
+        // only its bounds. Topology and boxes land back in one contiguous
+        // blob, so refit walks a single region again — at the cost of the
+        // instance dropping out of sharing entirely. A/B it with
+        // BM_LeafRefit_* and BM_DeformedCutCost.
+        Page page;
+#else
+        std::vector<AABB>       bbox;    // nodeCount
+        std::vector<WideBounds> wide;    // wideCount (bounds only; the rest of
+                                         // each WideBlock stays shared)
+#endif
+        bool inUse = false;
+    };
+
+    // (mount slot -> overlay index), kept sorted by slot on each instance so
+    // the traversal can binary search it. Empty for undeformed instances,
+    // which is the case the hot path is tuned for.
+    struct OverlayRef
+    {
+        uint32_t slot;
+        uint32_t index;
+    };
+
+    // 128 bytes, and deliberately SPLIT DOWN THE MIDDLE: everything the
+    // per-instance walk and the reuse check read lives in the first 64, and
+    // nothing else does. `alignas` is what makes that a promise rather than a
+    // hope -- at 16-byte alignment a 128-byte record starts anywhere in a line,
+    // so the hot half would straddle two lines about as often as not.
+    //
+    // The walk reads pos, scale, rootSlot, tag and `overlays.empty()`; the
+    // SelectionContext check reads generation and cutVersion, and nothing else,
+    // for every visible instance. That is 60 bytes. worldBox, maxErrWorld,
+    // mask, asset and the TLAS lane back-pointers are touched by the TLAS build
+    // and refit only, which walk different instances in a different order and
+    // do not care.
+    //
+    // This matters because the instance loop is a chain of dependent loads and
+    // the prefetch in selectCut can only reach the first line of the record.
+    // 128 bytes. Reordering this so that everything the cut path reads (pos,
+    // scale, rootSlot, tag, overlays.empty(), and generation/cutVersion for the
+    // reuse check -- 60 bytes in total) sits in the first cache line, with
+    // alignas(64) to guarantee it, was measured and bought NOTHING: 11
+    // interleaved rounds gave 0.98x on one configuration and 1.01-1.02x at 80k,
+    // with the win counts saying drift.
+    //
+    // The reason is worth knowing before trying it again: the two lines of a
+    // 128-byte aligned record are an adjacent pair, and the L2 adjacent-line
+    // prefetcher fetches the buddy of any line it fetches. The second line
+    // arrives whether the layout needs it or not. Confining the hot fields to
+    // one line cannot help while the record is 128 bytes -- the fix would be to
+    // get the record UNDER 64 bytes, which means moving worldBox, maxErrWorld,
+    // mask, asset and the TLAS lane back-pointers (53 bytes, all touched only by
+    // TLAS build and refit) into a parallel array. That halves the bytes the
+    // instance loop pulls in; a reorder moves them around inside the same fetch.
     struct Instance
     {
         float4   pos{};
         float    scale = 1.0f;
         uint32_t rootSlot = kInvalidIndex;
+        uint32_t asset = kInvalidIndex;
+        uint32_t tag = 0;
+        uint32_t mask = ~0u;
         AABB     worldBox;
         float    maxErrWorld = 0.0f;
         bool     alive = false;
         uint32_t generation = 0;   // stamps InstanceRefs; bumped per reuse
+        // Bumped when this instance moves, is rescaled, or is deformed. A
+        // deform always privatises bounds into this instance's own overlay, so
+        // geometry changes never reach past the instance that caused them and
+        // this one counter covers all of them.
+        uint32_t cutVersion = 0;
         uint32_t tlasNode = kInvalidIndex;
         uint32_t tlasLane = 0;
+        std::vector<OverlayRef> overlays;   // sorted by slot; usually empty
     };
 
     // nullptr when the ref is stale (slot recycled) or invalid.
@@ -262,15 +859,20 @@ private:
         WideBounds bounds;
         float8     maxErr{};
         int32_t    child[kWide];   // >= 0: node index; < 0: instance ~child
+        uint32_t   laneMask[kWide];// union of the lane subtree's instance masks
         uint32_t   validMask = 0;
         int32_t    parent = -1;
     };
 
+    // One page queued on an instance walk. Which bounds this instance sees is
+    // resolved once, when the page is pushed, so the inner loop never asks
+    // whether there is an overlay — it just reads through a stride.
     struct WorkItem
     {
-        uint32_t slot;
-        uint8_t  alive;
-        uint8_t  mask;
+        uint32_t      slot;
+        WideBoundsRef wide;   // page's (interleaved) or overlay's (packed)
+        uint8_t       alive;
+        uint8_t       mask;
     };
 
     // Node visit carried on the walk's explicit DFS stack; err and planes are
@@ -283,6 +885,37 @@ private:
         uint8_t  alive;
     };
 
+    // Everything one instance walk needs. Serial selection uses slot 0; a
+    // parallel selection gives each worker its own, then concatenates in
+    // instance order so results stay bit-identical either way.
+    struct Worker
+    {
+        std::vector<WorkItem> work;
+        std::vector<NodeItem> nodeStack;
+
+        // Backing storage for the parallel path, where each worker collects
+        // into its own vectors; the serial path points the sinks straight at
+        // the caller's output instead.
+        std::vector<CutEntry>    cutBuf;
+        std::vector<IdealEntry>  idealBuf;
+        std::vector<LoadRequest> reqBuf;
+
+        CutSink     cut;
+        IdealSink   ideal;
+        RequestSink requests;
+
+        std::vector<uint32_t> touched;      // slots to LRU-touch afterwards
+        bool     deferTouch = false;        // parallel: touch after the join
+        uint32_t epoch = 0;                 // request-dedup stamp for this pass
+        CutStats stats;
+
+        // Validity-margin tracking for SelectionContext. Off for every ordinary
+        // selection, and the branch is invariant for a whole call.
+        bool  trackMargin = false;
+        float margin = FLT_MAX;   // min distance to a decision flip so far
+        float bar = 0.0f;         // params.threshold, for the margin arithmetic
+    };
+
     // ---- helpers ----
     // Live PageRt for a handle, or nullptr if the handle is stale/foreign.
     const PageRt* resolve(NodeHandle h) const;
@@ -291,38 +924,85 @@ private:
         return const_cast<PageRt*>(static_cast<const World*>(this)->resolve(h));
     }
 
+    uint32_t allocAsset();
+    uint32_t createAsset(Page&& owned, PageView borrowed, bool registered);
+    void     destroyAssetIfUnused(uint32_t asset);
+    const AssetRt* resolveAsset(AssetHandle h) const;
+
     uint32_t allocSlot();
-    uint32_t registerPage(Page&& page, InstanceId instance, NodeRef owner, bool pinned);
+    uint32_t registerPage(uint32_t asset, NodeRef owner, bool pinned);
     void     detachSlot(uint32_t slot, std::vector<UserPayload>* freedPayloads);
+    void     detachMountTree(uint32_t rootSlot, std::vector<UserPayload>* freedPayloads);
+    void     pinRootPayloads(uint32_t slot);
 
     void lruUnlink(uint32_t slot);
     void lruPushFront(uint32_t slot);
     void lruTouch(uint32_t slot);
 
-    void applyBoundsChange(uint32_t slot, uint32_t index, const AABB& box);
-    void patchParentLane(PageRt& rt, uint32_t index);
+    // ---- copy-on-write bounds ----
+    // Live overlay for (instance, slot), or nullptr. Stale overlays (the
+    // mount was detached and its slot reused) report as absent.
+    const Overlay* findOverlay(const Instance& inst, uint32_t slot) const;
+    // Same, but takes the copy if it is not there yet. Returns an INDEX, not a
+    // reference: taking one overlay can reallocate the pool and invalidate a
+    // reference to another, and refit holds two at a time as it crosses a page
+    // boundary.
+    uint32_t       ensureOverlay(Instance& inst, uint32_t slot);
+    void           initOverlay(Overlay& ov, const PageRt& rt);
+    void           freeOverlays(Instance& inst);
+    // Effective bounds for a walk of `slot` by `inst`.
+    const AABB*    boundsFor(const Instance& inst, uint32_t slot, const PageRt& rt) const;
+    WideBoundsRef  wideBoundsFor(const Instance& inst, uint32_t slot, const PageRt& rt) const;
+    // Debug-only: is `slot` reachable from this instance's root mount?
+    bool mountBelongsTo(const Instance& inst, uint32_t slot) const;
+
+    void applyBoundsChange(InstanceId id, uint32_t slot, uint32_t index, const AABB& box);
+    void patchParentLane(const PageView& pg, AABB* bbox, MutWideBoundsRef wide,
+                         uint32_t index);
     void refreshInstanceBounds(InstanceId id);
+
+    InstanceRef addInstanceInternal(uint32_t asset, const InstanceDesc& desc);
 
     void markTlasStructuralChange();
     void tlasRebuild();
     int32_t tlasBuildRange(std::vector<uint32_t>& items, int lo, int hi, int32_t parent);
+    int  tlasSplit(std::vector<uint32_t>& items, int lo, int hi);
     void tlasQuery(const CullView& view, float minPix,
                    std::vector<std::pair<uint32_t, uint8_t>>& outVisible);
+    void recomputeInstanceBounds(InstanceId id);
     void tlasOnInstanceMoved(InstanceId id);
+    void tlasNoteGrowth(float addedArea);
 
-    ViewScratch::PageScratch& ensureScratch(ViewScratch& scratch, uint32_t slot,
-                                            const PageRt& rt) const;
-    void runPage(const WorkItem& item, const CullView& local, const CutParams& params,
-                 ViewScratch& scratch,
-                 std::vector<CutEntry>& outCut, std::vector<IdealEntry>* outIdeal,
-                 std::vector<LoadRequest>* outRequests);
-    void wideVisit(const Page& pg, uint32_t slot, uint32_t gen, uint32_t node,
-                   uint8_t mask, uint8_t aliveKids, const CullView& local,
-                   std::vector<CutEntry>& outCut, std::vector<IdealEntry>* outIdeal);
-    void pushLoadRequests(const PageRt& rt, uint32_t slot, uint32_t node, float priority,
-                          std::vector<LoadRequest>& out) const;
+    // Incremental structural edits, so that spawning or removing one instance
+    // costs O(tree depth) instead of a full rebuild. Both no-op when a rebuild
+    // is already pending, since it will see the change anyway.
+    void tlasInsert(InstanceId id);
+    void tlasRemove(InstanceId id);
+    // Grow a lane box up the parent chain, stopping as soon as an ancestor
+    // already covers it. Returns the lane area added, for the drift trigger.
+    float tlasGrowUp(uint32_t nodeIdx, const AABB& box, float maxErr, uint32_t laneMask);
+    int32_t tlasAllocNode();
+    // Union of a node's valid lanes, which is what its parent's lane must hold.
+    AABB tlasNodeExtent(const TlasNode& n, float& maxErr, uint32_t& laneMask) const;
+    void tlasNoteEdit();
+
+    void runInstance(uint32_t instIdx, const CullView& view, const CutParams& params,
+                     uint8_t mask, Worker& w, bool wantIdeal, bool wantRequests);
+    void runPage(const WorkItem& item, const Instance& inst, const CullView& local,
+                 const CutParams& params, Worker& w, bool wantIdeal, bool wantRequests);
+    void wideVisit(const WorkItem& item, const PageView& pg, float errClamp,
+                   uint32_t gen, uint32_t tag, uint32_t node, uint8_t mask,
+                   uint8_t aliveKids, const CullView& local, Worker& w, bool wantIdeal);
+    void pushLoadRequests(PageRt& rt, uint32_t slot, uint32_t node, float priority,
+                          Worker& w);
 
     // ---- state ----
+    WorldConfig config_;
+
+    std::vector<AssetRt>  assets_;
+    std::vector<uint32_t> freeAssets_;
+    size_t                liveAssets_ = 0;
+
     std::vector<PageRt>   slots_;
     std::vector<uint32_t> freeSlots_;
     size_t                attachedPages_ = 0;
@@ -332,36 +1012,48 @@ private:
     std::vector<Instance> instances_;
     std::vector<uint32_t> freeInstances_;
 
+    std::vector<Overlay>  overlays_;
+    std::vector<uint32_t> freeOverlays_;
+    size_t                liveOverlays_ = 0;
+
     std::vector<TlasNode> tlasNodes_;
     int32_t               tlasRoot_ = -1;
     bool                  tlasDirty_ = true;
-    bool                  tlasQualityBuild_ = true;   // median split vs Morton
+    bool                  tlasQualityBuild_ = true;   // quality tier vs Morton
     uint32_t              tlasEscapes_ = 0;
+    uint32_t              tlasEdits_ = 0;           // incremental inserts + removes
+    std::vector<int32_t>  tlasFreeNodes_;           // nodes emptied by removal
     uint32_t              tlasLeafCount_ = 0;
     uint32_t              tlasQualityCount_ = 0;   // leaves at last quality build
+    float                 tlasBaseArea_ = 0.0f;    // lane area at last quality build
+    float                 tlasGrownArea_ = 0.0f;   // area added by grow-only refit
 
     uint32_t lruHead_ = kInvalidIndex, lruTail_ = kInvalidIndex;
     uint32_t frame_ = 0;
+    uint32_t selectEpoch_ = 0;   // bumped per selectCut; stamps request dedup
 
-    // Submitted bounds in submission order. The generation stamp makes
-    // entries self-invalidating: if the page detached (or the slot was
+    CutStats stats_;
+
+    // Submitted bounds in submission order. The generation stamps make
+    // entries self-invalidating: if the page detached (or either slot was
     // reused) before the flush, the entry is skipped instead of applying to
-    // the wrong page.
+    // the wrong page or the wrong instance.
     struct PendingMove
     {
-        uint32_t slot, index, generation;
+        uint32_t instance, instGeneration;
+        uint32_t slot, generation, index;
         AABB     box;
     };
     std::vector<PendingMove> pendingMoves_;
 
     // per-call scratch (kept to avoid reallocation)
     struct TlasItem { int32_t node; uint8_t mask; };
-    std::vector<WorkItem>                      work_;
-    std::vector<NodeItem>                      nodeStack_;
+    std::vector<Worker>                        workers_;
     std::vector<std::pair<uint32_t, uint8_t>>  visibleTmp_;
     std::vector<TlasItem>                      tlasStack_;
     std::vector<std::pair<uint64_t, uint32_t>> tlasKeys_;
     std::vector<int32_t>                       tlasLevelTmp_;
+    std::vector<uint32_t>                      tlasItemsTmp_;
 };
 
 } // namespace hlod
