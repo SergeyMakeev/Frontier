@@ -30,7 +30,7 @@ The library is deliberately external to rendering. A node stores an opaque
 `uint64_t UserPayload`; selection echoes it without interpreting or indexing
 it. It can be a mesh-table index, an entity key, a pointer-sized token, or any
 other value. Duplicate payloads are legal. Every node must nevertheless have a
-renderable representation because any node can become part of the actual cut.
+renderable representation because any node can become part of the current cut.
 
 The projected error test is conceptually:
 
@@ -64,14 +64,14 @@ An asynchronous completion using a handle whose page was collected is an
 expected race: mutating calls ignore it and queries report it absent.
 
 The `World` keeps no payload-to-node index and no hash map. Persistent systems
-should retain handles from `LoadRequest`, `IdealEntry`, `InstanceRef::rootPage`,
-or `attachPage`. If a content pipeline needs a payload-to-packed-index table,
-it owns that table outside the library.
+should retain handles from `CutEntry`, `InstanceRef::rootPage`, or
+`attachPage`. If a content pipeline needs a payload-to-packed-index table, it
+owns that table outside the library.
 
 `InstanceDesc` contains:
 
 - `pos` and positive uniform `scale`;
-- `tag`, echoed as `CutEntry::instance` and `IdealEntry::instance`; and
+- `tag`, echoed as `CutEntry::instance`; and
 - `mask`, ANDed with `CullView::viewMask` for cheap layer filtering.
 
 Rotation and non-uniform scale are not represented by `InstanceDesc`. Bake
@@ -94,28 +94,33 @@ desc.tag = entityIndex;
 World::InstanceRef instance = world.addInstance(tree, desc);
 
 std::vector<CutEntry> cut;
-std::vector<IdealEntry> ideal;
-std::vector<LoadRequest> requests;
 SelectionContext selection;       // one per view
-PageUsageContext primaryUsage;    // only views that influence residency need one
+PageUsageContext primaryUsage;    // only retention-relevant views need one
 
 world.applyUpdates();              // apply changes and publish the read-only world
 const World& published = world;
 published.selectCut(view, CutParams{4.0f, 0.0f}, selection, primaryUsage,
-                    cut, &ideal, &requests);
+                    cut);
 
-for (const LoadRequest& request : requests)
-    if (payloadFinishedLoading(request.payload))
-        world.markResident(request.node);
-
-for (const IdealEntry& entry : ideal)
-    if (entry.tag == IdealTag::NeedsExpansion)
+for (const CutEntry& entry : cut)
+{
+    if (!inIdealCut(entry))
+        continue;
+    if (entry.tag == CutTag::NeedsExpansion && !world.isAttached(entry.node))
         world.attachPage(entry.node, loadChildPage(entry.payload));
+    else if (!world.isResident(entry.node) &&
+             payloadFinishedLoading(entry.payload))
+        world.markResident(entry.node);
+}
 
 world.collect(primaryUsage, pageBudget, minPageAge);
 ```
 
 In a real asynchronous streamer, completions normally arrive in later frames.
+It normally deduplicates payload ids and applies IO/page budgets before
+scheduling work; `World` deliberately does neither. The loop above shows the
+state transitions, not a production scheduler.
+
 The generation check is why no extra page-lifetime lock is needed at completion
 time. A stale `attachPage` returns an invalid `PageHandle` and leaves the caller
 free to discard or cache the loaded page.
@@ -135,7 +140,7 @@ The blob begins with a 64-byte `PageHeader` and contains aligned arrays for:
 
 Index zero is a sentinel representing the page owner. Real page roots begin at
 index one. The sentinel gives the runtime one uniform root-child block and one
-readiness counter for both instance roots and attached pages.
+coverage summary for both instance roots and attached pages.
 
 The current blob version is 2. It is little-endian and deliberately versioned;
 version 1 is not compatible because lane masks moved out of `WideBlock`.
@@ -189,7 +194,7 @@ it ten thousand times.
 
 Reusing an asset at unrelated attachment sites can create separate mounts.
 Those mounts share immutable bytes but have separate placement-dependent
-runtime state such as owner link, error ceiling, residency counters, and LRU
+runtime state such as owner link, error ceiling, residency coverage, and LRU
 position. Instances of the same root asset share the same root mount and all
 descendants attached beneath it.
 
@@ -205,24 +210,38 @@ when their last mount and instance reference disappear.
 
 Each mounted page has compact runtime arrays parallel to its nodes:
 
-- `resident[i]` says the caller has the payload available; and
-- `readyChildren[i]` counts resident immediate children.
+- `resident[i]` says the caller has the payload available;
+- `covered[i]` says either that payload is resident or its descendants provide
+  a complete resident structural cover; and
+- `coveredChildren[i]` incrementally maintains that summary from immediate
+  children, including attached child pages.
 
-The actual cut uses all-or-nothing refinement. A node refines only when its
-children exist and all immediate child payloads are resident. Otherwise that
-node remains in the actual cut and missing children are requested. This avoids
-both holes and parent/child overlap.
+Residency changes propagate coverage toward the root. A current-cut node may
+refine whenever more detailed resident nodes completely cover the region
+selection needs. The intermediate proxy itself need not be resident: if a
+parent `P` and leaf descendants `L` are resident while an intermediate `C` is
+not, selection may emit `L` directly. If any needed branch lacks a resident
+cover, the nearest resident ancestor remains as `CurrentOnly`. This preserves
+replace-only selection without holes or parent/child overlap.
+
+The structural summary is an O(1) early exit. A node entirely inside the
+frustum needs full structural coverage; a node crossing a frustum plane may
+ignore missing branches that are outside the view, so selection recursively
+checks only surviving uncovered branches. Those pages count as used for
+optional `PageUsageContext` feedback. Instances touching a frustum plane are
+re-walked rather than cached by `SelectionContext`.
 
 An expansion point is a renderable collapsed proxy whose children live in a
 different page. If its error is acceptable it remains a normal ideal-cut entry.
 If it is too coarse and no child page is attached, it is emitted as
-`IdealTag::NeedsExpansion`. Attaching a child page makes traversal able to cross
+`CutTag::NeedsExpansion`. Attaching a child page makes traversal able to cross
 the boundary on the next cut.
 
 Instance-root payloads are pinned resident. This is the base case for the
 runtime invariant:
 
-> A node that is drawn, or refined through, is resident and materialized.
+> Every node drawn by the current cut is resident, and every region refined
+> through has a complete resident descendant cover.
 
 Payload residency, page attachment, instance updates, and collection are
 single-writer operations. Finish them before `applyUpdates`, then treat the
@@ -232,7 +251,7 @@ published World as read-only until every contextual selection has joined.
 
 Output order is traversal-defined. It is stable for a given state but is not a
 priority order. An attach budget must choose `NeedsExpansion` entries by
-descending `IdealEntry::err`, not by vector position.
+descending ideal-side `CutEntry::err`, not by vector position.
 
 Pure discovery can add one frame of latency per missing page level. A streamer
 that owns page metadata can use the observed error to look ahead:
@@ -250,21 +269,26 @@ in [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## 6. Selection outputs and traversal
 
-`selectCut` can fill three sinks in one traversal:
+`selectCut` fills one unified sequence of
+`CutEntry{payload, node, err, instance, membership, tag}`. Membership makes the
+two cuts additive:
 
-- `CutEntry{payload, err, instance}` is the actual cut to draw now.
-- `IdealEntry{payload, node, err, instance, tag}` is the cut if all payloads in
-  known topology were resident. `NeedsExpansion` stands in for unknown
-  descendants.
-- `LoadRequest{payload, node, priority}` names missing immediate-frontier
-  payloads. Requests have no instance tag because shared-asset residency is not
-  instance-specific.
+- `Shared` belongs to both the current and ideal cuts;
+- `CurrentOnly` is a resident fallback needed only by the current cut; and
+- `IdealOnly` belongs only to the fully-resident ideal cut.
 
-The ideal cut and request sink are optional. If they are null, no entries are
-emitted for them. `Sink<T>` can target a growable `std::vector` or fixed caller
-memory; a fixed sink reports dropped entries, so the caller can grow its
-capacity without an allocation inside the traversal. Vector-backed sinks may
-grow like any vector.
+Thus `CurrentOnly + Shared` is the hole-free render cut, while
+`IdealOnly + Shared` is the cut known topology would choose if every payload
+were resident. `inCurrentCut` and `inIdealCut` are convenience filters. A
+`Direct` ideal-side entry names a known payload; `NeedsExpansion` represents
+unknown descendants below a collapsed page boundary.
+
+There is no request output. The caller inspects ideal-side entries, tests
+residency, deduplicates whatever it considers the same content, and applies its
+own IO priorities and budgets. `Sink<CutEntry>` can target a growable
+`std::vector` or fixed caller memory; a fixed sink reports dropped entries, so
+the caller can grow its capacity without an allocation inside the traversal.
+Vector-backed sinks may grow like any vector.
 
 `applyUpdates` first flushes queued bounds and performs any requested TLAS
 build or repair. Selection then proceeds against that stable snapshot:
@@ -272,24 +296,26 @@ build or repair. Selection then proceeds against that stable snapshot:
 1. Walk the wide TLAS with tri-state frustum and optional `minPix` contribution
    culling.
 2. Transform the view into each surviving instance's local space.
-3. Walk attached pages with an explicit DFS stack, descending only while the
-   ideal decision wants refinement.
+3. Walk attached pages with an explicit DFS stack, carrying current- and
+   ideal-cut liveness together. Propagated coverage answers most current-cut
+   descent decisions in O(1); only partially visible uncovered regions need a
+   recursive visible-coverage probe.
 4. Test up to eight children together. Fully outside lanes disappear; fully
    inside lanes clear their remaining plane masks; partial lanes carry only
    undecided planes.
 5. Emit plain leaves directly from their parent's wide test. Interior and
-   expansion nodes carry error, plane mask, and actual-cut liveness on the DFS
-   stack.
+   expansion nodes carry error, plane mask, and both membership paths on the
+   DFS stack. Shared nodes are emitted once.
 
 There is no required per-node per-view scratch and no per-frame clear over all
-materialized nodes. Work is bounded by the visible ideal-cut region rather than
-the full authored hierarchy:
+materialized nodes. Work is bounded by the visible unified-cut region rather
+than the full authored hierarchy:
 
 ```text
-O(TLAS query + visible instances + visible ideal-cut region + output size)
+O(TLAS query + visible instances + visible unified-cut region + output size)
 ```
 
-The more compact shorthand `O(log R + hits + ideal-cut region)` assumes a
+The more compact shorthand `O(log R + hits + unified-cut region)` assumes a
 reasonably separating TLAS. In the adversarial case where all R instances
 overlap, the TLAS must report all R and the query is necessarily O(R). No
 algorithm can cost less than the output it must emit.
@@ -314,9 +340,9 @@ Important limits are explicit:
 
 - An instance crossing a frustum plane is always walked because camera
   rotation can change culling independently of camera translation.
-- An instance with pending streaming requests or more than two page
-  dependencies is not cached.
-- Requesting the ideal cut bypasses reuse for that call.
+- An instance with more than two distinct page dependencies is not cached.
+  Streaming does not otherwise disable reuse: residency and topology versions
+  invalidate records that depend on changed pages.
 - The emitted node set matches stateless selection exactly. `CutEntry::err` on
   a reused entry is the recorded value and can be stale within the proven
   margin; use it for prioritization or dithering, not bit-exact comparison.
@@ -340,8 +366,8 @@ threads is a caller error. `selectCut` mutates only those caller-owned objects.
 
 After all view tasks join, the caller may resume World mutation and call
 `collect`. Passing only important cameras' `PageUsageContext` objects lets a
-primary view influence residency without giving the same weight to shadow or
-probe views.
+primary view influence page retention without giving the same weight to shadow
+or probe views.
 
 For one stateless view, `HlodContext` supplies aligned allocation and an
 optional blocking `parallelFor`. Set `workerCount > 1` and
@@ -349,10 +375,9 @@ optional blocking `parallelFor`. Set `workerCount > 1` and
 visible instance count reaches the threshold.
 
 The runtime gives each worker a contiguous visible-instance range and private
-output buffers. It concatenates ranges in serial order, then deduplicates load
-requests while preserving the first occurrence and maximum priority. Serial
-and parallel cuts, ideal cuts, and request ordering are intended to match for
-the same backend and input.
+output buffers, then concatenates ranges in serial order. Serial and parallel
+unified cuts are intended to match entry-for-entry for the same backend and
+input.
 
 `parallelFor` may run task indices in any order but must return only after all
 tasks finish. Stateless selection remains externally serial because its
@@ -449,9 +474,9 @@ candidates examined, and pages detached; it does not scan the entire world.
 
 | Operation | Expected cost |
 |---|---|
-| Stateless `selectCut` | TLAS query + visible ideal-cut region + outputs |
+| Stateless `selectCut` | TLAS query + visible unified-cut region + outputs |
 | Context hit | TLAS query + record validation + copied cut entries |
-| `markResident` / `markNonResident` | O(1) |
+| `markResident` / `markNonResident` | O(changed coverage path to the mount root), with early-out |
 | `attachPage` | O(page nodes) runtime-state initialization |
 | `detachPage` | O(detached mount state); child mounts must be detached first |
 | Incremental add / move / remove instance | O(TLAS depth), excluding asset teardown |

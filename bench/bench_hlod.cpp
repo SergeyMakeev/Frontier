@@ -10,7 +10,7 @@
 //   - output-sensitivity scaling (cost vs cut size at fixed world size)
 //   - camera teleport (cold-frame latency spike)
 //   - multi-view frames (marginal cost of extra views)
-//   - streaming convergence latency (frames to ideal == actual)
+//   - streaming convergence latency (frames to ideal == current)
 //   - TLAS at 200k-500k instances + level-load burst
 //   - adversarial shapes (stacked instances, max-width node, deep page chain)
 //
@@ -41,9 +41,7 @@ namespace {
 
 struct Outputs
 {
-    std::vector<CutEntry>    cut;
-    std::vector<IdealEntry>  ideal;
-    std::vector<LoadRequest> reqs;
+    std::vector<CutEntry> cut;
 };
 
 CullView orbitView(float t, float dist, float4 center = float4::point(0, 0, 0))
@@ -76,26 +74,42 @@ struct XorShift32
 // attach set depend on walk order and over-refines wherever the walk went
 // deep first (measurably worse: the hot set churns instead of converging).
 size_t attachTopByPriority(World& w, TreeGen& gen,
-                           const std::vector<IdealEntry>& ideal, size_t budget)
+                           const std::vector<CutEntry>& cut, size_t budget)
 {
     static std::vector<uint32_t> idx;
     idx.clear();
-    for (uint32_t i = 0; i < ideal.size(); ++i)
-        if (ideal[i].tag == IdealTag::NeedsExpansion && gen.recipes.count(ideal[i].payload))
+    for (uint32_t i = 0; i < cut.size(); ++i)
+        if (inIdealCut(cut[i]) && cut[i].tag == CutTag::NeedsExpansion &&
+            gen.recipes.count(cut[i].payload))
             idx.push_back(i);
     const size_t take = idx.size() < budget ? idx.size() : budget;
     std::partial_sort(idx.begin(), idx.begin() + ptrdiff_t(take), idx.end(),
-                      [&](uint32_t a, uint32_t b) { return ideal[a].err > ideal[b].err; });
+                      [&](uint32_t a, uint32_t b) { return cut[a].err > cut[b].err; });
     for (size_t j = 0; j < take; ++j)
     {
         // Production flow: content is keyed by payload, attach by handle.
-        const IdealEntry& e = ideal[idx[j]];
+        const CutEntry& e = cut[idx[j]];
         Page child = gen.makeChildPage(e.payload);
         const uint32_t n = child.nodeCount();
         const PageHandle ph = w.attachPage(e.node, std::move(child));
         if (ph.valid()) markAllResident(w, ph, n);   // payload streaming is instant
     }
     return take;
+}
+
+// Example streaming policy: make every direct ideal-cut payload resident.
+// A production streamer would normally deduplicate shared payload ids, apply
+// priorities/budgets, and complete these calls asynchronously.
+size_t makeIdealResident(World& w, const std::vector<CutEntry>& cut)
+{
+    size_t currentCount = 0;
+    for (const CutEntry& e : cut)
+    {
+        currentCount += size_t(inCurrentCut(e));
+        if (inIdealCut(e) && e.tag == CutTag::Direct && !w.isResident(e.node))
+            w.markResident(e.node);
+    }
+    return currentCount;
 }
 
 // Add a root page and mark every node resident (handles composed from the
@@ -141,16 +155,15 @@ static void BM_DeepTree_StaticCamera(benchmark::State& state)
     for (auto _ : state)
     {
         w.applyUpdates();
-        w.selectCut(v, p, o.cut, o.ideal, o.reqs);
+        w.selectCut(v, p, o.cut);
         benchmark::DoNotOptimize(o.cut.data());
     }
     state.counters["cut"] = double(o.cut.size());
 }
 BENCHMARK(BM_DeepTree_StaticCamera)->Arg(4)->Arg(5)->Arg(6)->Unit(benchmark::kMicrosecond);
 
-// Same scene, but the caller opts out of the ideal cut and load requests
-// (nullptr outputs) — the fully-resident static case pays for exactly one
-// output vector instead of two.
+// Same scene through the direct vector overload. The fully resident result is
+// entirely Shared.
 static void BM_DeepTree_CutOnly(benchmark::State& state)
 {
     const auto wp = makeDeepWorld(8, uint32_t(state.range(0)));
@@ -188,7 +201,7 @@ static void BM_DeepTree_FlyThrough(benchmark::State& state)
         const float dist = 1800.0f + 1500.0f * std::sin(t * 3.1f);
         const CullView v = orbitView(t, dist);
         w.applyUpdates();
-        w.selectCut(v, p, o.cut, o.ideal, o.reqs);
+        w.selectCut(v, p, o.cut);
         benchmark::DoNotOptimize(o.cut.data());
         cutTotal += o.cut.size();
         ++frames;
@@ -227,7 +240,7 @@ static void BM_DeepTree_FlyThroughDamped(benchmark::State& state)
         const float dist = 60000.0f + 30000.0f * std::sin(t * 3.1f);
         const CullView v = damper.damp(orbitView(t, dist));
         w.applyUpdates();
-        w.selectCut(v, p, o.cut, o.ideal, o.reqs);
+        w.selectCut(v, p, o.cut);
         benchmark::DoNotOptimize(o.cut.data());
         cutTotal += o.cut.size();
         ++frames;
@@ -266,10 +279,10 @@ static void BM_PagedPlanet_StreamingFly(benchmark::State& state)
         const CullView v = orbitView(t * 0.2f, 20000.0f + dist);
 
         w.applyUpdates();
-        w.selectCut(v, p, usage, o.cut, &o.ideal, &o.reqs);
+        w.selectCut(v, p, usage, o.cut);
 
-        attaches += attachTopByPriority(w, gen, o.ideal, 8);
-        for (const auto& r : o.reqs) w.markResident(r.node);
+        attaches += attachTopByPriority(w, gen, o.cut, 8);
+        makeIdealResident(w, o.cut);
         w.collect(usage, pageBudget, 16);
         benchmark::DoNotOptimize(o.cut.data());
     }
@@ -313,13 +326,13 @@ static void BM_GcStress_FastFlythrough(benchmark::State& state)
             float4::vec(0, 1, 0), 1.0f, 16.0f / 9.0f, 1080.0f, 0.1f, 1.0e9f);
 
         w.applyUpdates();
-        w.selectCut(v, p, usage, o.cut, &o.ideal, &o.reqs);
+        w.selectCut(v, p, usage, o.cut);
 
-        attaches += attachTopByPriority(w, gen, o.ideal, 16);
-        for (const auto& r : o.reqs) w.markResident(r.node);
+        attaches += attachTopByPriority(w, gen, o.cut, 16);
+        const size_t currentCount = makeIdealResident(w, o.cut);
         collected += w.collect(usage, pageBudget, minAge);
 
-        cutTotal += o.cut.size();
+        cutTotal += currentCount;
         ++frames;
         benchmark::DoNotOptimize(o.cut.data());
     }
@@ -357,7 +370,7 @@ static void BM_ManyShallowTrees(benchmark::State& state)
         t += 0.01f;
         const CullView v = orbitView(t, area * 0.4f);
         w.applyUpdates();
-        w.selectCut(v, p, o.cut, o.ideal, o.reqs);
+        w.selectCut(v, p, o.cut);
         benchmark::DoNotOptimize(o.cut.data());
     }
     state.counters["cut"] = double(o.cut.size());
@@ -405,7 +418,7 @@ static void BM_MovingInstances(benchmark::State& state)
         }
         const CullView v = orbitView(t, area * 0.4f);
         w.applyUpdates();
-        w.selectCut(v, p, o.cut, o.ideal, o.reqs);
+        w.selectCut(v, p, o.cut);
         benchmark::DoNotOptimize(o.cut.data());
     }
 }
@@ -567,7 +580,7 @@ static void BM_LeafMotion_TeleportWithCut(benchmark::State& state)
         }
         const CullView v = orbitView(t, mw.half * 2.0f);
         mw.world.applyUpdates();
-        mw.world.selectCut(v, p, o.cut, o.ideal, o.reqs);
+        mw.world.selectCut(v, p, o.cut);
         benchmark::DoNotOptimize(o.cut.data());
         cutTotal += o.cut.size();
         ++frames;
@@ -621,7 +634,7 @@ static void BM_MovingLeafNodes(benchmark::State& state)
         }
         const CullView v = orbitView(t, 2500.0f);
         w.applyUpdates();
-        w.selectCut(v, p, o.cut, o.ideal, o.reqs);
+        w.selectCut(v, p, o.cut);
         benchmark::DoNotOptimize(o.cut.data());
     }
 }
@@ -665,7 +678,7 @@ static void BM_ResidencyChurn(benchmark::State& state)
         }
         const CullView v = orbitView(t, 2500.0f);
         w.applyUpdates();
-        w.selectCut(v, p, o.cut, o.ideal, o.reqs);
+        w.selectCut(v, p, o.cut);
         benchmark::DoNotOptimize(o.cut.data());
     }
 }
@@ -768,13 +781,13 @@ static void BM_Combined_KitchenSink(benchmark::State& state)
             float4::vec(0, 1, 0), 1.0f, 16.0f / 9.0f, 1080.0f, 0.1f, 1.0e9f);
 
         w.applyUpdates();
-        w.selectCut(v, p, usage, o.cut, &o.ideal, &o.reqs);
+        w.selectCut(v, p, usage, o.cut);
 
-        attaches += attachTopByPriority(w, planetGen, o.ideal, 12);
-        for (const auto& r : o.reqs) w.markResident(r.node);
+        attaches += attachTopByPriority(w, planetGen, o.cut, 12);
+        const size_t currentCount = makeIdealResident(w, o.cut);
         collected += w.collect(usage, 300, 8);
 
-        cutTotal += o.cut.size();
+        cutTotal += currentCount;
         ++frames;
         benchmark::DoNotOptimize(o.cut.data());
     }
@@ -1262,7 +1275,7 @@ namespace {
 
 // One frame of the predictive policy, entirely content-side (the streamer
 // owns the page data and the recipes; the World only sees attachPage).
-void predictiveAttachFrame(World& w, TreeGen& gen, const std::vector<IdealEntry>& ideal,
+void predictiveAttachFrame(World& w, TreeGen& gen, const std::vector<CutEntry>& cut,
                            const CullView& view, float threshold, size_t budget)
 {
     struct Cand
@@ -1275,8 +1288,9 @@ void predictiveAttachFrame(World& w, TreeGen& gen, const std::vector<IdealEntry>
     static std::priority_queue<Cand> heap;   // max-heap by (estimated) error
     while (!heap.empty()) heap.pop();
 
-    for (const IdealEntry& e : ideal)
-        if (e.tag == IdealTag::NeedsExpansion && gen.recipes.count(e.payload))
+    for (const CutEntry& e : cut)
+        if (inIdealCut(e) && e.tag == CutTag::NeedsExpansion &&
+            gen.recipes.count(e.payload))
             heap.push({e.err, e.payload, e.node});
 
     while (budget != 0 && !heap.empty())
@@ -1352,15 +1366,15 @@ static void BM_StreamingConvergence(benchmark::State& state)
 
         const CullView v = makeLookAtView(eye, eye + float4::vec(1, -0.15f, 0.3f));
         w.applyUpdates();
-        w.selectCut(v, p, usage, o.cut, &o.ideal, &o.reqs);
+        w.selectCut(v, p, usage, o.cut);
 
         // Residual: worst screen error still waiting on an expansion.
         // Clamped: the camera inside a collapsed box saturates err toward
         // 1e33+ (distance 0), and one such frame would swamp the average —
         // 1e6 px already means "the box you are standing in is unexpanded".
         float worst = 0.0f;
-        for (const auto& e : o.ideal)
-            if (e.tag == IdealTag::NeedsExpansion && e.err > worst &&
+        for (const auto& e : o.cut)
+            if (inIdealCut(e) && e.tag == CutTag::NeedsExpansion && e.err > worst &&
                 gen.recipes.count(e.payload))
                 worst = e.err;
         worst = worst < 1.0e6f ? worst : 1.0e6f;
@@ -1372,10 +1386,10 @@ static void BM_StreamingConvergence(benchmark::State& state)
             }
 
         if (predictive)
-            predictiveAttachFrame(w, gen, o.ideal, v, p.threshold, attachBudget);
+            predictiveAttachFrame(w, gen, o.cut, v, p.threshold, attachBudget);
         else
-            attachTopByPriority(w, gen, o.ideal, attachBudget);
-        for (const auto& r : o.reqs) w.markResident(r.node);
+            attachTopByPriority(w, gen, o.cut, attachBudget);
+        makeIdealResident(w, o.cut);
         w.collect(usage, 20000, 30);
         benchmark::DoNotOptimize(o.cut.data());
     }
@@ -1556,7 +1570,7 @@ BENCHMARK(BM_TlasSparseRebuild)->Arg(100000)->Unit(benchmark::kMicrosecond);
 // mounts); arg0 1 = one registered asset instanced N times (1 asset, 1 mount).
 // Positions, geometry and camera are identical, so the cut is identical and
 // the delta is purely the cost of the data layout: cache residency of the page
-// bytes and of the per-mount resident/readyChildren arrays.
+// bytes and of the per-mount residency/coverage arrays.
 //
 // This is the measurement the sharing design was never given: every other
 // bench here builds a unique page per instance (or proto.clone()s one), so

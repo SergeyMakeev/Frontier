@@ -4,7 +4,7 @@
 //    and every attachment that names them
 //  - instances of those assets over a wide dynamic top-level BVH
 //  - topology streaming (attach/detach pages under expansion points)
-//  - payload residency with O(1) all-or-nothing refinement tests
+//  - payload residency with incrementally propagated subtree coverage
 //  - single-pass pruned cut selection, with no required per-node view scratch
 //  - LRU garbage collection of cold pages
 //  - sublinear conservative bounds refit for moving nodes and instances
@@ -13,7 +13,7 @@
 // --------------------
 // A page is registered once and instanced many times. Every instance of an
 // asset walks the same bytes AND the same runtime state: one residency array,
-// one attachment graph, one set of streaming requests. Ten thousand copies of
+// one attachment graph, one residency state. Ten thousand copies of
 // a tree cost one tree, and a streamer that attaches a page under a shared
 // expansion point attaches it for all ten thousand at once.
 //
@@ -32,7 +32,7 @@
 //    Node handles are composed from a page handle plus the packed page-local
 //    index, which is immutable after build.
 //  - selectCut outputs carry a NodeHandle wherever the caller might act on
-//    the entry (load requests, expansion requests).
+//    the entry (payload residency or topology expansion).
 //  - the 64-bit UserPayload is opaque: echoed in outputs, never interpreted.
 // A handle dies with its page (detachPage / collect). Stale handles are
 // detected by the generation stamp: mutating calls ignore them, queries
@@ -57,7 +57,6 @@
 namespace hlod {
 
 class World;
-struct SelectionWorker;
 struct SelectionScratch;
 
 // Registered page asset: the unit of sharing. Returned by registerAsset().
@@ -92,42 +91,44 @@ inline NodeHandle nodeAt(PageHandle page, uint32_t index)
     return NodeHandle{page.slot, index, page.generation};
 }
 
-// `instance` is the caller's tag from InstanceDesc — with shared assets the
-// payload alone no longer says which placement emitted the entry, and this is
-// how you get back to a transform or an entity id. It costs nothing: the
-// struct was already padded to 16 bytes.
-struct CutEntry
+// Every entry belongs to the current render cut, the fully-resident ideal cut,
+// or both. Shared entries are emitted once, so filtering CurrentOnly|Shared
+// yields the current cut and IdealOnly|Shared yields the ideal cut.
+enum class CutMembership : uint8_t
 {
-    UserPayload payload;
-    float       err;        // projected screen error in pixels
-    uint32_t    instance;   // InstanceDesc::tag of the emitting instance
+    CurrentOnly,
+    IdealOnly,
+    Shared,
 };
 
-enum class IdealTag : uint8_t
+enum class CutTag : uint8_t
 {
-    Direct,          // render as-is; the error test is satisfied
+    Direct,          // concrete node in known topology
     NeedsExpansion,  // collapsed and too coarse; this tag IS the expansion request
 };
 
-struct IdealEntry
+// `instance` is the caller's tag from InstanceDesc. A result is associated
+// with both its shared node and its instance placement; payloads and caller
+// tags are opaque values and may be duplicated.
+struct CutEntry
 {
     UserPayload payload;
-    NodeHandle  node;       // pass to attachPage() for NeedsExpansion entries
+    NodeHandle  node;
     float       err;
     uint32_t    instance;
-    IdealTag    tag;
+    CutMembership membership;
+    CutTag        tag;
 };
 
-// Load requests carry no instance tag on purpose: content is keyed by
-// payload, so with a shared asset the request belongs to the asset, not to
-// any one of the thousands of placements that want it. selectCut deduplicates
-// them per call for exactly that reason.
-struct LoadRequest
+inline bool inCurrentCut(const CutEntry& entry)
 {
-    UserPayload payload;   // load this node's payload (content is keyed by it)
-    NodeHandle  node;      // pass to markResident() when the load completes
-    float       priority;  // parent's screen error: how badly it is needed
-};
+    return entry.membership != CutMembership::IdealOnly;
+}
+
+inline bool inIdealCut(const CutEntry& entry)
+{
+    return entry.membership != CutMembership::CurrentOnly;
+}
 
 struct CutParams
 {
@@ -145,7 +146,7 @@ struct InstanceDesc
     float4   pos{};
     float    scale = 1.0f;
 
-    // Echoed in CutEntry::instance / IdealEntry::instance. Whatever the
+    // Echoed in CutEntry::instance. Whatever the
     // caller wants it to mean: a transform index, an entity id, a draw-list
     // slot. kAutoTag echoes the InstanceId instead.
     uint32_t tag = kAutoTag;
@@ -219,14 +220,6 @@ public:
     uint32_t dropped() const { return dropped_; }
     bool     overflowed() const { return dropped_ != 0; }
 
-    // Entry i, or nullptr if it was dropped. Used to raise the priority of an
-    // already-emitted load request rather than emitting a duplicate.
-    T* at(uint32_t i)
-    {
-        if (vec_) return i < vec_->size() ? &(*vec_)[i] : nullptr;
-        return i < count_ ? &data_[i] : nullptr;
-    }
-
 private:
     std::vector<T>* vec_ = nullptr;
     T*              data_ = nullptr;
@@ -236,8 +229,6 @@ private:
 };
 
 using CutSink     = Sink<CutEntry>;
-using IdealSink   = Sink<IdealEntry>;
-using RequestSink = Sink<LoadRequest>;
 
 // Traversal counters, filled only when the library is built with HLOD_STATS.
 struct CutStats
@@ -250,10 +241,10 @@ struct CutStats
 };
 
 // Optional per-camera page-use feedback. Passing one to selectCut records the
-// pages that camera needed; omitting it makes selection pay no residency-touch
-// cost. The World consumes feedback only when collect() is called, so callers
-// choose which cameras influence residency (for example, the primary camera
-// but not shadow cascades).
+// pages that camera needed; omitting it makes selection pay no page-use
+// recording cost. The World consumes feedback only when collect() is called,
+// so callers choose which cameras influence page retention (for example, the
+// primary camera but not shadow cascades).
 //
 // A context may accumulate observations across many update epochs. Like
 // SelectionContext, it belongs to one view and must not be used concurrently
@@ -354,28 +345,12 @@ private:
 // the per-instance fixed cost (resolve the instance, transform the view, touch
 // the root page) was being paid over and over for an answer that never moved.
 //
-// THE OUTPUT IS A FLAT ARRAY, AND THAT WAS NOT THE FIRST ANSWER
-// -------------------------------------------------------------
+// FLAT OUTPUT
+// -----------
 // This overload writes the same contiguous CutEntry sequence as every other
-// one, so the only difference at the call site is the context argument. The
-// first version instead handed back a span per visible instance, pointing into
-// the storage below, on the theory that a reused instance should cost nothing
-// at all -- not even a copy.
-//
-// That was measured and abandoned. Cuts are SHALLOW per instance: 1.56 entries
-// per instance at 20k, 1.14 at 80k, because the population is dominated by
-// distant instances that collapse to a node or two. So the descriptor array was
-// as large as the data it described -- 350 KB of spans for 400 KB of entries at
-// 80k -- and had to be rewritten every frame anyway, including for the 92% of
-// instances that were reused. Copying the shallow entries into one caller-owned
-// array remains cheaper than constructing and consuming almost as many spans;
-// the dominant one-entry case takes the sink's direct push path.
-//
-// Fusing adjacent spans was tried and does not rescue it: the storage is
-// ordered by first-walk, the caller iterates in TLAS order, and the two coincide
-// only on the first frame. Measured, span count did not budge (21,919 of them,
-// fused or not) outside a stationary camera. Skipping the WALK remains the
-// useful saving; replacing the flat output does not.
+// one, so the only difference at the call site is the context argument.
+// Reused entries are copied from context-owned storage into the caller's flat
+// output; no World-owned mutable query state is involved.
 //
 // WHAT IS EXACT AND WHAT IS NOT
 // -----------------------------
@@ -385,12 +360,10 @@ private:
 // prioritisation and dithering, which is what it is for; do not expect it to
 // be bit-identical to the stateless path.
 //
-// Two limits in this version, both checked rather than assumed:
-//  - an instance is cacheable only once it has CONVERGED (its walk emitted no
-//    load requests and asked for no expansions), so streaming in progress
-//    simply means those instances keep being walked;
-//  - asking for the ideal cut bypasses the cache for that call, because the
-//    ideal cut carries node handles this does not record.
+// Streaming and residency are part of the recorded unified cut. Page content
+// versions invalidate a record when any page it depended on changes. Instances
+// that cross more page dependencies than the compact record can hold are
+// simply re-walked.
 // ---------------------------------------------------------------------------
 
 class SelectionContext
@@ -501,7 +474,7 @@ private:
     uint32_t walked_ = 0;
     CutStats stats_{};
 
-    // Mutable query scratch and request-dedup state. Opaque so traversal
+    // Mutable query scratch. Opaque so traversal
     // implementation details do not become part of the public API.
     std::unique_ptr<SelectionScratch> scratch_;
 };
@@ -640,7 +613,7 @@ public:
     void moveInstance(InstanceRef ref, float4 pos, float scale = 1.0f);      // no-op if stale
 
     // ---- topology streaming -------------------------------------------------
-    // The expansion handle comes from an IdealEntry{NeedsExpansion} (or is
+    // The expansion handle comes from a CutEntry{NeedsExpansion} (or is
     // composed via nodeAt). attachPage returns an invalid PageHandle if the
     // expansion handle went stale while the page was being built (its parent
     // page was detached/collected) — drop the page in that case. It fires
@@ -661,9 +634,10 @@ public:
     bool       isAttached(NodeHandle expansionNode) const;
 
     // ---- payload residency --------------------------------------------------
-    // Handles come from LoadRequest::node. Stale handles are ignored (the
-    // page was collected while the payload was loading); isResident reports
-    // false for them.
+    // Handles come from ideal-side CutEntry values. Stale handles are ignored
+    // (the page was collected while the payload was loading); isResident
+    // reports false for them. Residency changes incrementally propagate
+    // complete-subtree coverage toward the root.
     void markResident(NodeHandle h);
     void markNonResident(NodeHandle h);
     bool isResident(NodeHandle h) const;
@@ -703,41 +677,28 @@ public:
     // contextual selection using this snapshot has completed.
     void applyUpdates();
 
-    // outIdealCut / outRequests are optional: pass nullptr to skip them and
-    // their emission cost entirely. A static fully-resident scene (no
-    // streaming) then pays for exactly one output: the actual cut.
+    // The single output is the union of the current and ideal cuts. Shared
+    // entries appear once; CutMembership identifies the two additive deltas.
+    // NeedsExpansion entries expose topology that is not attached yet. The
+    // caller owns residency policy: inspect ideal-side entries, query
+    // isResident(), deduplicate shared node ids as desired, and schedule IO.
     //
     // For LOD damping, run the view through a ViewDamper (math.h) first.
     // Stateless overloads retain World-owned scratch and aggregate stats; do
     // not call them concurrently. Use SelectionContext overloads for
     // concurrent views.
     void selectCut(const CullView& view, const CutParams& params,
-                   std::vector<CutEntry>&    outCut,
-                   std::vector<IdealEntry>*  outIdealCut = nullptr,
-                   std::vector<LoadRequest>* outRequests = nullptr);
+                   std::vector<CutEntry>& outCut);
 
     void selectCut(const CullView& view, const CutParams& params,
-                   PageUsageContext& usage,
-                   std::vector<CutEntry>&    outCut,
-                   std::vector<IdealEntry>*  outIdealCut = nullptr,
-                   std::vector<LoadRequest>* outRequests = nullptr);
-
-    void selectCut(const CullView& view, const CutParams& params,
-                   std::vector<CutEntry>&    outCut,
-                   std::vector<IdealEntry>&  outIdealCut,
-                   std::vector<LoadRequest>& outRequests)
-    {
-        selectCut(view, params, outCut, &outIdealCut, &outRequests);
-    }
+                   PageUsageContext& usage, std::vector<CutEntry>& outCut);
 
     // Sink form: write straight into caller memory. Check Sink::dropped() to
     // find out whether the buffers were big enough.
-    void selectCut(const CullView& view, const CutParams& params,
-                   CutSink& outCut, IdealSink* outIdealCut, RequestSink* outRequests);
+    void selectCut(const CullView& view, const CutParams& params, CutSink& outCut);
 
     void selectCut(const CullView& view, const CutParams& params,
-                   PageUsageContext& usage, CutSink& outCut,
-                   IdealSink* outIdealCut, RequestSink* outRequests);
+                   PageUsageContext& usage, CutSink& outCut);
 
     // Contextual form: same output as the overloads above, but an instance whose
     // cut provably cannot have changed is not walked -- its recorded entries are
@@ -749,31 +710,24 @@ public:
     //  - CutEntry::err on a reused entry is stale within the proven margin. The
     //    node set is exact; see the notes on SelectionContext.
     //
-    // Passing outIdealCut bypasses reuse for that call.
-    //
     // These overloads are const and may run concurrently after applyUpdates().
     // Each in-flight call must use distinct SelectionContext, optional
     // PageUsageContext, and output objects. The same context is not internally
     // synchronized.
     void selectCut(const CullView& view, const CutParams& params,
-                   SelectionContext& ctx, CutSink& outCut,
-                   IdealSink* outIdealCut, RequestSink* outRequests) const;
+                   SelectionContext& ctx, CutSink& outCut) const;
 
     void selectCut(const CullView& view, const CutParams& params,
                    SelectionContext& ctx, PageUsageContext& usage,
-                   CutSink& outCut, IdealSink* outIdealCut,
-                   RequestSink* outRequests) const;
+                   CutSink& outCut) const;
 
     void selectCut(const CullView& view, const CutParams& params,
-                   SelectionContext& ctx, std::vector<CutEntry>& outCut,
-                   std::vector<IdealEntry>*  outIdealCut = nullptr,
-                   std::vector<LoadRequest>* outRequests = nullptr) const;
+                   SelectionContext& ctx,
+                   std::vector<CutEntry>& outCut) const;
 
     void selectCut(const CullView& view, const CutParams& params,
                    SelectionContext& ctx, PageUsageContext& usage,
-                   std::vector<CutEntry>& outCut,
-                   std::vector<IdealEntry>*  outIdealCut = nullptr,
-                   std::vector<LoadRequest>* outRequests = nullptr) const;
+                   std::vector<CutEntry>& outCut) const;
 
     // ---- garbage collection ----------------------------------------------------
     // Detaches cold pages from the LRU tail until streamedPageCount() <=
@@ -783,7 +737,7 @@ public:
     // detached; freedPayloads (if given) receives the payloads whose content
     // became unreachable (they were resident). Overloads taking page-usage
     // contexts consume their accumulated feedback before examining the tail;
-    // omitted views do not influence residency.
+    // omitted views do not influence page retention.
     size_t collect(size_t maxAttachedPages, uint32_t minAge,
                    std::vector<UserPayload>* freedPayloads = nullptr);
     size_t collect(PageUsageContext& usage, size_t maxAttachedPages,
@@ -850,8 +804,9 @@ private:
         // min8. That is what lets a single page back many attachments — and
         // it turns attach from an O(nodeCount) write pass into O(1).
         float                 errClamp = FLT_MAX;
-        std::vector<uint8_t>  resident;       // payload loaded
-        std::vector<uint32_t> readyChildren;  // resident children per node
+        std::vector<uint8_t>  resident;        // this node's payload is loaded
+        std::vector<uint8_t>  covered;         // self or a complete resident descendant cut
+        std::vector<uint32_t> coveredChildren; // covered immediate children
         // Bumped by anything that can change what a walk of this page emits:
         // a child attaching or detaching, a payload becoming resident or
         // ceasing to be, a new error clamp. A SelectionContext records this per
@@ -967,18 +922,21 @@ private:
     {
         uint32_t      slot;
         WideBoundsRef wide;   // page's (interleaved) or overlay's (packed)
-        uint8_t       alive;
+        uint8_t       current;
+        uint8_t       ideal;
         uint8_t       mask;
     };
 
     // Node visit carried on the walk's explicit DFS stack; err and planes are
-    // computed by the parent's wide test, alive by the parent's visit.
+    // computed by the parent's wide test; current/ideal identify which walks
+    // still contain the node.
     struct NodeItem
     {
         uint32_t node;
         float    err;
         uint8_t  planes;
-        uint8_t  alive;
+        uint8_t  current;
+        uint8_t  ideal;
     };
 
     // Everything one instance walk needs. Serial selection uses slot 0; a
@@ -992,23 +950,13 @@ private:
         // Backing storage for the parallel path, where each worker collects
         // into its own vectors; the serial path points the sinks straight at
         // the caller's output instead.
-        std::vector<CutEntry>    cutBuf;
-        std::vector<IdealEntry>  idealBuf;
-        std::vector<LoadRequest> reqBuf;
+        std::vector<CutEntry> cutBuf;
 
-        CutSink     cut;
-        IdealSink   ideal;
-        RequestSink requests;
+        CutSink cut;
 
         std::vector<uint32_t> touched;      // page dependencies / optional usage
         bool trackTouches = false;
-        uint32_t epoch = 0;                 // local request-dedup epoch
-        struct RequestPage
-        {
-            uint32_t generation = 0;
-            std::vector<uint64_t> stamp;
-        };
-        std::vector<RequestPage> requestPages;
+        bool uniqueTouches = false;         // SelectionContext dependency list
         CutStats stats;
 
         // Validity-margin tracking for SelectionContext. Off for every ordinary
@@ -1037,6 +985,9 @@ private:
     void     detachSlot(uint32_t slot, std::vector<UserPayload>* freedPayloads);
     void     detachMountTree(uint32_t rootSlot, std::vector<UserPayload>* freedPayloads);
     void     pinRootPayloads(uint32_t slot);
+    bool     descendantsCovered(uint32_t slot, uint32_t node) const;
+    bool     computeCovered(uint32_t slot, uint32_t node) const;
+    void     propagateCoverage(uint32_t slot, uint32_t node);
 
     void lruUnlink(uint32_t slot);
     void lruPushFront(uint32_t slot);
@@ -1092,25 +1043,24 @@ private:
     AABB tlasNodeExtent(const TlasNode& n, float& maxErr, uint32_t& laneMask) const;
     void tlasNoteEdit();
 
+    bool visibleDescendantsCovered(uint32_t slot, uint32_t node, uint8_t mask,
+                                   const Instance& inst,
+                                   const CullView& local,
+                                   std::vector<uint32_t>* touched = nullptr,
+                                   bool uniqueTouches = true) const;
     void runInstance(uint32_t instIdx, const CullView& view, const CutParams& params,
-                     uint8_t mask, Worker& w, bool wantIdeal,
-                     bool wantRequests) const;
+                     uint8_t mask, Worker& w) const;
     void runPage(const WorkItem& item, const Instance& inst, const CullView& local,
-                 const CutParams& params, Worker& w, bool wantIdeal,
-                 bool wantRequests) const;
+                 const CutParams& params, Worker& w) const;
     void wideVisit(const WorkItem& item, const PageView& pg, float errClamp,
                    uint32_t gen, uint32_t tag, uint32_t node, uint8_t mask,
-                   uint8_t aliveKids, const CullView& local, Worker& w,
-                   bool wantIdeal) const;
-    void pushLoadRequests(const PageRt& rt, uint32_t slot, uint32_t node,
-                          float priority, Worker& w) const;
+                   uint8_t currentKids, uint8_t idealKids,
+                   const CullView& local, Worker& w) const;
     void selectCutContext(const CullView& view, const CutParams& params,
                           SelectionContext& ctx, PageUsageContext* usage,
-                          CutSink& outCut, IdealSink* outIdealCut,
-                          RequestSink* outRequests) const;
+                          CutSink& outCut) const;
     void selectCutStateless(const CullView& view, const CutParams& params,
-                            PageUsageContext* usage, CutSink& outCut,
-                            IdealSink* outIdealCut, RequestSink* outRequests);
+                            PageUsageContext* usage, CutSink& outCut);
     void recordPageUsage(PageUsageContext& usage, uint32_t slot) const;
 
     // ---- state ----
@@ -1149,8 +1099,6 @@ private:
 
     uint32_t lruHead_ = kInvalidIndex, lruTail_ = kInvalidIndex;
     uint32_t frame_ = 0;
-    uint32_t selectEpoch_ = 0;   // stateless worker request-dedup epochs
-
     CutStats stats_;
 
     // Submitted bounds in submission order. The generation stamps make

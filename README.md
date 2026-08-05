@@ -4,8 +4,8 @@
 
 HLodTree is a C++20 library that chooses a view-dependent hierarchical-LOD
 cut. You give it a hierarchy whose nodes are renderable proxies, tell it which
-payloads and topology pages are resident, and receive the opaque 64-bit
-payloads to draw.
+payloads and topology pages are resident, and receive one unified result that
+identifies what to draw now and what fuller residency would select.
 
 It exists for scenes where per-object LOD is not enough. Replacing every wall
 with a cheaper wall still leaves a distant town with thousands of submissions;
@@ -15,13 +15,17 @@ library owns no meshes, materials, jobs, or renderer state, so it can sit in
 front of an existing asset and rendering system.
 
 Streaming has two independent dimensions. **Residency** says whether a known
-node's render payload is loaded. A parent remains in the actual cut until every
-child needed to replace it is resident, so partial loads never create holes or
-parent/child overlap. **Expansion and collapse** control whether deeper topology
-is known at all: a collapsed expansion point is a renderable coarse proxy;
+node's render payload is loaded. The nearest resident fallback remains in the
+current cut until more detailed resident nodes completely cover the visible
+region; intermediate proxies need not be resident, and partial loads never
+create holes or parent/child overlap. **Expansion and collapse** control
+whether deeper topology is known at all: a collapsed expansion point is a
+renderable coarse proxy;
 attaching a child page expands that branch, while explicit detach or cold-page
-garbage collection collapses it again. The ideal cut and load requests tell the
-host what to expand and load next without forcing HLodTree to own an IO system.
+garbage collection collapses it again. One unified result describes both what
+can be drawn now and what would be selected with complete residency, so the
+host can choose what to expand or load without forcing HLodTree to own an IO
+system.
 
 ## Minimal example
 
@@ -61,6 +65,8 @@ int main()
 
     for (const CutEntry& entry : cut)
     {
+        if (!inCurrentCut(entry))
+            continue;
         const UserPayload payloadToDraw = entry.payload;
         (void)payloadToDraw; // submit through your renderer
     }
@@ -77,8 +83,9 @@ The representative workload resembles a forest, city, or prop field:
 
 - 80,000 instances share one fully resident 85-node asset and are spread over
   a roughly 6.8 km square.
-- A per-view `SelectionContext` is always used. Selection requests only the
-  actual render cut, with a 4-pixel error threshold and `minPix=0`.
+- A per-view `SelectionContext` is always used. Selection returns the unified
+  current/ideal cut with a 4-pixel error threshold and `minPix=0`; because this
+  workload is fully resident, every entry is `Shared`.
 - Moving-camera cases use the same continuous 600-frame fly-through at 1080p
   and 16:9, with no camera cuts or teleports.
 - Moving-object cases update 5% of the population (4,000 transforms) every
@@ -96,8 +103,8 @@ algorithm's uncontended cost; real frame time can be higher under host load.
 
 | Operation | Time | Included work |
 |---|---:|---|
-| Create the world | 10.4-11.4 ms | Build and register the shared asset, add 80,000 instances, and mark its payloads resident |
-| First published selection cycle | 50-55 ms | `applyUpdates` builds the initial quality TLAS; `selectCut` queries it, produces the first cut, and populates the `SelectionContext` |
+| Create the world | 10.5-10.9 ms | Build and register the shared asset, add 80,000 instances, and mark its payloads resident |
+| First published selection cycle | 50.1-55.9 ms | `applyUpdates` builds the initial quality TLAS; `selectCut` queries it, produces the first unified cut, and populates the `SelectionContext` |
 
 World creation does not force the initial quality TLAS build; the first
 `applyUpdates` performs it before publishing the read-only snapshot. Treat the
@@ -109,14 +116,14 @@ first published selection cycle as level warm-up rather than steady latency.
 |---|---:|---:|---:|
 | Apply transform updates and maintain the TLAS | 0.15 ms | 0.14 ms | n/a |
 | Publish queued node-bound changes with `applyUpdates` | <0.001 ms | <0.001 ms | <0.001 ms |
-| `selectCut` | 0.50 ms | 0.40 ms | 0.40 ms |
-| **Total HLodTree frame work** | **0.65 ms** | **0.54 ms** | **0.40 ms** |
+| `selectCut` | 0.55 ms | 0.41 ms | 0.48 ms |
+| **Total HLodTree frame work** | **0.70 ms** | **0.56 ms** | **0.48 ms** |
 
 The moving-camera cases average about 21,919 visible instances and a
 24,986-entry render cut. With objects moving, the context reuses 92.6% of
 visible instance cuts; with static objects it reuses 97.6%. The fixed-camera
 case averages 19,602 visible instances, a 22,872-entry cut, and 94.1% reuse.
-The context occupies 8.13 MiB after the fly-through and 4.37 MiB for the fixed
+The context occupies 12.13 MiB after the fly-through and 4.87 MiB for the fixed
 view.
 
 Bounded motion of the same 5% cohort stays on the grow-only refit path in this
@@ -131,21 +138,21 @@ The smaller test uses 10,000 instances spread over a roughly 2.4 km square.
 They draw from 700 separately registered, fully resident 85-node assets with
 maximum depth 3, instead of sharing one asset across the entire world. The
 moving-object cases update exactly 1,000 instances per frame. Creating and
-populating this world takes 12.5-13.8 ms; its first published selection cycle,
+populating this world takes 12.9-13.0 ms; its first published selection cycle,
 including the initial quality TLAS build and context population, takes
-5.3-6.4 ms.
+5.3-6.2 ms.
 
 | HLodTree work per frame | Camera and 1,000 objects moving | Static camera, 1,000 objects moving | Moving camera, static objects |
 |---|---:|---:|---:|
 | Apply transform updates and maintain the TLAS | 34 µs | 33 µs | n/a |
 | Publish queued node-bound changes with `applyUpdates` | <0.1 µs | <0.1 µs | <0.1 µs |
-| `selectCut` | 121 µs | 105 µs | 80 µs |
-| **Total HLodTree frame work** | **155 µs** | **139 µs** | **80 µs** |
+| `selectCut` | 126 µs | 108 µs | 82 µs |
+| **Total HLodTree frame work** | **160 µs** | **141 µs** | **82 µs** |
 
 The moving-camera cases average about 2,782 visible instances (27.8% of the
 world) and a 5,920-entry cut. Reuse is 82.4% with 1,000 movers and 93.3% with
-static objects; the context occupies 2.52 MiB. The fixed-camera case averages
-2,501 visible instances (25.0%), a 5,792-entry cut, 85.8% reuse, and a 0.61 MiB
+static objects; the context occupies 4.52 MiB. The fixed-camera case averages
+2,501 visible instances (25.0%), a 5,792-entry cut, 85.8% reuse, and a 0.73 MiB
 context.
 
 ### Multiple views
@@ -156,13 +163,13 @@ six selections is:
 
 | Execution | Static objects | 4,000 moving objects |
 |---|---:|---:|
-| Six views, serial | 3.75 ms | 4.23 ms |
-| Six views, concurrent | 0.94 ms | 1.08 ms |
-| **Speedup** | **4.0×** | **3.9×** |
+| Six views, serial | 3.77 ms | 4.26 ms |
+| Six views, concurrent | 0.97 ms | 1.15 ms |
+| **Speedup** | **3.9×** | **3.7×** |
 
 Object transforms are applied once before these selections and are not included
 in the table. The concurrent arms use six persistent worker threads; thread
-creation is excluded. Six contexts occupy about 49 MiB. Scaling is below 6×
+creation is excluded. Six contexts occupy about 73 MiB. Scaling is below 6×
 because the views share memory bandwidth and cache capacity, but the read-only
 selection phase removes serialization between them.
 
@@ -174,16 +181,24 @@ than platform promises; selection remains output-sensitive. See
 
 ## What selection returns
 
-One traversal can produce three outputs:
+One traversal returns one `std::vector<CutEntry>`. `CutMembership` partitions
+it into three disjoint groups:
 
-- `CutEntry`: the hole-free actual cut to draw with current residency.
-- `IdealEntry`: the cut within known topology if every payload were resident.
-  `IdealTag::NeedsExpansion` is also a topology request.
-- `LoadRequest`: payloads missing at the actual cut's refinement frontier.
+- `Shared`: selected in both the current render cut and fully-resident ideal
+  cut;
+- `CurrentOnly`: a resident fallback selected only because some more detailed
+  ideal entries are not resident; and
+- `IdealOnly`: selected only by the fully-resident ideal cut.
 
-The ideal cut and requests are optional. Pass `nullptr` for a static,
-fully-resident world to avoid their emission cost. Output order is defined by
-traversal and is not a priority order; stream the largest screen errors first.
+Filter `CurrentOnly | Shared` to render and `IdealOnly | Shared` to inspect the
+ideal cut; the helpers `inCurrentCut` and `inIdealCut` do exactly that. A
+`CutTag::Direct` ideal entry names a known payload the host may choose to load.
+`CutTag::NeedsExpansion` means the ideal traversal reached a collapsed page
+boundary whose deeper topology is not yet known. There is deliberately no load
+request type or built-in deduplication: shared assets can produce the same
+payload in many instances, and the host owns IO priority, budgets, and payload
+identity. Output order is traversal-defined, not a priority order; stream the
+largest screen errors first.
 
 Payloads are values, not identities. Duplicates are legal and the `World`
 never indexes them. Operations use generation-stamped `AssetHandle`,
@@ -198,8 +213,11 @@ mutations using it become safe no-ops.
   sharing page bytes, residency, and its attachment graph.
 - A dynamic wide TLAS owns instance placement, layer masks, coarse frustum and
   contribution culling, and incremental spawn/remove edits.
-- Expansion points connect independently streamed pages. All-or-nothing child
-  readiness keeps the actual cut free of holes and parent/child overlap.
+- Expansion points connect independently streamed pages. Residency changes
+  propagate complete descendant coverage upward. Selection can therefore skip
+  a missing intermediate proxy when resident descendants cover the visible
+  region, while retaining the nearest resident fallback wherever they do not;
+  the current cut stays free of holes and parent/child overlap.
 - `setNodeBounds(instance, node, bounds)` creates bounds-only copy-on-write
   overlays for the affected instance. Refits are queued and published by
   `applyUpdates`.
@@ -212,8 +230,8 @@ mutations using it become safe no-ops.
   and must happen outside that selection phase.
 - `PageUsageContext` is optional per view. It records page-use feedback without
   touching the World; `collect` later consumes only the contexts the caller
-  chooses, so a primary camera can influence residency while shadow cameras do
-  not.
+  chooses, so a primary camera can influence page retention while shadow
+  cameras do not.
 - Stateless selection can fan out over visible instances through a host
   `parallelFor`; it remains an externally serial compatibility path.
 
@@ -262,7 +280,7 @@ Normal configuration options:
 
 | Option | Default | Meaning |
 |---|---:|---|
-| `HLOD_BUILD_TESTS` | `ON` | Build the 91-test correctness suite |
+| `HLOD_BUILD_TESTS` | `ON` | Build the 93-test correctness suite |
 | `HLOD_BUILD_BENCH` | `ON` | Build the Google Benchmark suite |
 | `HLOD_AVX2` | `ON` | Use AVX2/FMA on x86-64 when available |
 | `HLOD_FORCE_SCALAR` | `OFF` | Disable intrinsic implementations |

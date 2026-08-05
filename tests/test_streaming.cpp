@@ -13,23 +13,22 @@ namespace {
 
 struct Outputs
 {
-    std::vector<CutEntry>    cut;
-    std::vector<IdealEntry>  ideal;
-    std::vector<LoadRequest> reqs;
+    std::vector<CutEntry> cut;
 };
 
 Outputs frame(World& w, const CullView& v, const CutParams& p)
 {
     w.applyUpdates();
     Outputs o;
-    w.selectCut(v, p, o.cut, o.ideal, o.reqs);
+    w.selectCut(v, p, o.cut);
     return o;
 }
 
 std::set<UserId> cutIds(const Outputs& o)
 {
     std::set<UserId> ids;
-    for (const auto& e : o.cut) ids.insert(e.payload);
+    for (const auto& e : o.cut)
+        if (inCurrentCut(e)) ids.insert(e.payload);
     return ids;
 }
 
@@ -37,7 +36,7 @@ std::set<UserId> cutIds(const Outputs& o)
 
 // ---------------------------------------------------------------------------
 // All-or-nothing refinement: a parent refines only when EVERY child is
-// resident; missing children are requested with the parent's error as priority.
+// covered by resident cuts; ideal-only entries expose what the caller may load.
 // ---------------------------------------------------------------------------
 TEST(Streaming, AllOrNothingRefinement)
 {
@@ -57,37 +56,103 @@ TEST(Streaming, AllOrNothingRefinement)
 
     auto o = frame(w, v, p);
     EXPECT_EQ(cutIds(o), std::set<UserId>{1});                    // parent draws
-    EXPECT_EQ(o.reqs.size(), 3u);                                 // wants all three
+    EXPECT_EQ(std::count_if(o.cut.begin(), o.cut.end(), [](const CutEntry& e) {
+                  return inIdealCut(e) && !inCurrentCut(e);
+              }), 3);
 
     markResident(w, 10);
     markResident(w, 11);
     o = frame(w, v, p);
     EXPECT_EQ(cutIds(o), std::set<UserId>{1});                    // still all-or-nothing
-    ASSERT_EQ(o.reqs.size(), 1u);
-    EXPECT_EQ(o.reqs[0].payload, 12u);                            // only the missing one
+    auto missing = std::find_if(o.cut.begin(), o.cut.end(), [&](const CutEntry& e) {
+        return inIdealCut(e) && !w.isResident(e.node);
+    });
+    ASSERT_NE(missing, o.cut.end());
+    EXPECT_EQ(missing->payload, 12u);                             // only the missing one
 
-    // The production flow: complete the load via the request's handle.
-    w.markResident(o.reqs[0].node);
+    // The production flow: the caller chooses an ideal entry and completes
+    // the load through its node handle.
+    w.markResident(missing->node);
     o = frame(w, v, p);
     EXPECT_EQ(cutIds(o), (std::set<UserId>{10, 11, 12}));         // refined
-    EXPECT_TRUE(o.reqs.empty());
 
     // Invariant F: everything drawn is resident.
-    for (const auto& e : o.cut) EXPECT_TRUE(isResident(w, e.payload));
+    for (const auto& e : o.cut)
+        if (inCurrentCut(e)) EXPECT_TRUE(isResident(w, e.payload));
 
     // Eviction: parent falls back next frame, no holes.
     markNonResident(w, 11);
     o = frame(w, v, p);
     EXPECT_EQ(cutIds(o), std::set<UserId>{1});
-    ASSERT_EQ(o.reqs.size(), 1u);
-    EXPECT_EQ(o.reqs[0].payload, 11u);
+    missing = std::find_if(o.cut.begin(), o.cut.end(), [&](const CutEntry& e) {
+        return inIdealCut(e) && !w.isResident(e.node);
+    });
+    ASSERT_NE(missing, o.cut.end());
+    EXPECT_EQ(missing->payload, 11u);
+}
+
+TEST(Streaming, ResidentDescendantsBypassMissingIntermediateProxies)
+{
+    HLodBuilder builder;
+    const auto root = builder.createRoot(
+        1, 64.0f,
+        AABB::fromCenterExtent(float4::point(0, 0, 0), float4::vec(8, 8, 8)));
+    const auto intermediate = builder.createNode(
+        root, 2, 16.0f,
+        AABB::fromCenterExtent(float4::point(0, 0, 0), float4::vec(4, 4, 4)));
+    builder.createNode(
+        intermediate, 3, 0.0f,
+        AABB::fromCenterExtent(float4::point(0, 0, 0), float4::vec(1, 1, 1)));
+
+    World world;
+    world.addInstance(builder.build(), float4::point(0, 0, 0));
+    markResident(world, 3);   // payload 2 deliberately remains non-resident
+
+    const CullView view =
+        makeLookAtView(float4::point(0, 0, -12), float4::point(0, 0, 0));
+    const Outputs output = frame(world, view, {4.0f, 0.0f});
+
+    EXPECT_FALSE(isResident(world, 2));
+    EXPECT_EQ(cutIds(output), std::set<UserId>{3});
+    ASSERT_EQ(output.cut.size(), 1u);
+    EXPECT_EQ(output.cut[0].membership, CutMembership::Shared);
+}
+
+TEST(Streaming, InvisibleMissingBranchDoesNotBlockResidentCover)
+{
+    HLodBuilder builder;
+    const auto root = builder.createRoot(1, 128.0f);
+    const auto visible = builder.createNode(
+        root, 2, 32.0f,
+        AABB::fromCenterExtent(float4::point(0, 0, 0), float4::vec(2, 2, 2)));
+    builder.createNode(
+        visible, 3, 0.0f,
+        AABB::fromCenterExtent(float4::point(0, 0, 0), float4::vec(1, 1, 1)));
+    const auto hidden = builder.createNode(
+        root, 4, 32.0f,
+        AABB::fromCenterExtent(float4::point(100, 0, 0), float4::vec(2, 2, 2)));
+    builder.createNode(
+        hidden, 5, 0.0f,
+        AABB::fromCenterExtent(float4::point(100, 0, 0), float4::vec(1, 1, 1)));
+
+    World world;
+    world.addInstance(builder.build(), float4::point(0, 0, 0));
+    markResident(world, 3);   // the off-screen branch remains entirely missing
+
+    const CullView view =
+        makeLookAtView(float4::point(0, 0, -20), float4::point(0, 0, 0));
+    const Outputs output = frame(world, view, {4.0f, 0.0f});
+
+    EXPECT_EQ(cutIds(output), std::set<UserId>{3});
+    ASSERT_EQ(output.cut.size(), 1u);
+    EXPECT_EQ(output.cut[0].membership, CutMembership::Shared);
 }
 
 // ---------------------------------------------------------------------------
-// The ideal cut: nodes below the actual cut appear as DIRECT entries; the
+// The ideal cut: nodes below the current cut appear as DIRECT entries; the
 // difference between the cuts is the prefetch target.
 // ---------------------------------------------------------------------------
-TEST(Streaming, IdealCutLeadsActualCut)
+TEST(Streaming, IdealCutLeadsCurrentCut)
 {
     TreeGen gen;
     gen.fanout = 2;
@@ -102,12 +167,13 @@ TEST(Streaming, IdealCutLeadsActualCut)
     const CullView v = makeLookAtView(float4::point(0, 0, -50), float4::point(0, 0, 0));
     const auto o = frame(w, v, {4.0f, 0.0f});
 
-    // Actual cut: the root proxy only. Ideal cut: deeper, all DIRECT.
+    // Current cut: the root proxy only. Ideal cut: deeper, all DIRECT.
     EXPECT_EQ(cutIds(o), std::set<UserId>{ids.front()});
-    EXPECT_GT(o.ideal.size(), 1u);
-    for (const auto& e : o.ideal)
+    EXPECT_GT(idealCutSize(o.cut), 1u);
+    for (const auto& e : o.cut)
     {
-        EXPECT_EQ(int(e.tag), int(IdealTag::Direct));
+        if (!inIdealCut(e)) continue;
+        EXPECT_EQ(int(e.tag), int(CutTag::Direct));
         EXPECT_NE(e.payload, ids.front());   // the root itself refines in the ideal cut
     }
 }
@@ -136,7 +202,8 @@ TEST(Streaming, ExpansionLifeCycle)
     {
         const CullView far = makeLookAtView(float4::point(0, 0, -100000), float4::point(0, 0, 0));
         const auto o = frame(w, far, p);
-        for (const auto& e : o.ideal) EXPECT_EQ(int(e.tag), int(IdealTag::Direct));
+        for (const auto& e : o.cut)
+            if (inIdealCut(e)) EXPECT_EQ(int(e.tag), int(CutTag::Direct));
     }
 
     // Close: the expansion points are too coarse -> NEEDS_EXPANSION, no
@@ -145,16 +212,17 @@ TEST(Streaming, ExpansionLifeCycle)
     std::vector<UserId> needed;
     {
         const auto o = frame(w, near, p);
-        for (const auto& e : o.ideal)
-            if (e.tag == IdealTag::NeedsExpansion) needed.push_back(e.payload);
+        for (const auto& e : o.cut)
+            if (inIdealCut(e) && e.tag == CutTag::NeedsExpansion)
+                needed.push_back(e.payload);
         ASSERT_FALSE(needed.empty());
-        EXPECT_TRUE(o.reqs.empty());   // expansion requests live in the ideal cut
         // Collapsed nodes still draw (they are leaves for now).
         const auto ids = cutIds(o);
         for (UserId id : needed) EXPECT_TRUE(ids.count(id));
     }
 
-    // Attach the pages: next frame the walk reaches them and requests roots.
+    // Attach the pages: the caller can load the final ideal nodes directly;
+    // intermediate proxy payloads are not required.
     for (UserId id : needed)
     {
         Page child = gen.makeChildPage(id);
@@ -163,8 +231,15 @@ TEST(Streaming, ExpansionLifeCycle)
     }
     {
         const auto o = frame(w, near, p);
-        EXPECT_FALSE(o.reqs.empty());               // root payloads wanted now
-        for (const auto& r : o.reqs) w.markResident(r.node);
+        bool loaded = false;
+        for (const CutEntry& entry : o.cut)
+            if (inIdealCut(entry) && entry.tag == CutTag::Direct &&
+                !w.isResident(entry.node))
+            {
+                w.markResident(entry.node);
+                loaded = true;
+            }
+        EXPECT_TRUE(loaded);
     }
     {
         const auto o = frame(w, near, p);
@@ -420,8 +495,6 @@ TEST(Streaming, GcChurnStress)
 
     const CutParams p{4.0f, 0.0f};
     std::vector<CutEntry> cut;
-    std::vector<IdealEntry> ideal;
-    std::vector<LoadRequest> reqs;
     PageUsageContext usage;
 
     size_t attaches = 0, collected = 0;
@@ -434,7 +507,7 @@ TEST(Streaming, GcChurnStress)
             float4::vec(0, 1, 0), 1.0f, 16.0f / 9.0f, 1080.0f, 0.1f, 1.0e9f);
 
         w.applyUpdates();
-        w.selectCut(v, p, usage, cut, &ideal, &reqs);
+        w.selectCut(v, p, usage, cut);
 
         if (f % 7 == 0)   // spot-check equivalence on the exact same state
         {
@@ -446,9 +519,10 @@ TEST(Streaming, GcChurnStress)
         }
 
         int budget = 8;
-        for (const auto& e : ideal)
+        for (const auto& e : cut)
         {
-            if (e.tag != IdealTag::NeedsExpansion || budget <= 0) continue;
+            if (!inIdealCut(e) || e.tag != CutTag::NeedsExpansion || budget <= 0)
+                continue;
             // Production flow: content keyed by payload, attach by handle.
             Page child = gen.makeChildPage(e.payload);
             const uint32_t n = child.nodeCount();
@@ -458,7 +532,10 @@ TEST(Streaming, GcChurnStress)
             --budget;
             ++attaches;
         }
-        for (const auto& r : reqs) w.markResident(r.node);
+        for (const CutEntry& entry : cut)
+            if (inIdealCut(entry) && entry.tag == CutTag::Direct &&
+                !w.isResident(entry.node))
+                w.markResident(entry.node);
         collected += w.collect(usage, 6, 2);
     }
 
@@ -471,8 +548,8 @@ TEST(Streaming, GcChurnStress)
 }
 
 // ---------------------------------------------------------------------------
-// Streaming loop toward the ideal cut: consuming requests frame by frame
-// converges, and the ideal cut equals the actual cut at the fixed point.
+// Streaming loop toward the ideal cut: consuming ideal entries frame by frame
+// converges, and the ideal cut equals the current cut at the fixed point.
 // ---------------------------------------------------------------------------
 TEST(Streaming, ConvergesToIdealCut)
 {
@@ -492,30 +569,34 @@ TEST(Streaming, ConvergesToIdealCut)
     {
         o = frame(w, v, p);
         bool progress = false;
-        for (const auto& r : o.reqs)
+        for (const CutEntry& entry : o.cut)
         {
-            w.markResident(r.node);
-            progress = true;
-        }
-        for (const auto& e : o.ideal)
-        {
-            if (e.tag != IdealTag::NeedsExpansion) continue;
-            Page child = gen.makeChildPage(e.payload);
-            w.attachPage(e.node, std::move(child));
-            progress = true;
+            if (!inIdealCut(entry)) continue;
+            if (entry.tag == CutTag::NeedsExpansion)
+            {
+                Page child = gen.makeChildPage(entry.payload);
+                w.attachPage(entry.node, std::move(child));
+                progress = true;
+            }
+            else if (!w.isResident(entry.node))
+            {
+                w.markResident(entry.node);
+                progress = true;
+            }
         }
         if (!progress) break;
     }
 
-    // Fixed point: no requests, no expansion tags, ideal == actual.
-    EXPECT_TRUE(o.reqs.empty());
-    std::set<UserId> ideal, actual = cutIds(o);
-    for (const auto& e : o.ideal)
+    // Fixed point: no missing ideal payloads or expansion tags; ideal == current.
+    std::set<UserId> ideal, current = cutIds(o);
+    for (const auto& e : o.cut)
     {
-        EXPECT_EQ(int(e.tag), int(IdealTag::Direct));
+        if (!inIdealCut(e)) continue;
+        EXPECT_EQ(int(e.tag), int(CutTag::Direct));
+        EXPECT_TRUE(w.isResident(e.node));
         ideal.insert(e.payload);
     }
-    EXPECT_EQ(ideal, actual);
+    EXPECT_EQ(ideal, current);
 }
 
 // ---------------------------------------------------------------------------

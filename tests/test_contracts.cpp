@@ -19,22 +19,21 @@ namespace {
 
 struct Outputs
 {
-    std::vector<CutEntry>    cut;
-    std::vector<IdealEntry>  ideal;
-    std::vector<LoadRequest> reqs;
+    std::vector<CutEntry> cut;
 };
 
 Outputs run(World& w, const CullView& v, const CutParams& p)
 {
     Outputs o;
-    w.selectCut(v, p, o.cut, o.ideal, o.reqs);
+    w.selectCut(v, p, o.cut);
     return o;
 }
 
 std::set<UserId> cutIds(const std::vector<CutEntry>& v)
 {
     std::set<UserId> s;
-    for (const auto& e : v) s.insert(e.payload);
+    for (const auto& e : v)
+        if (inCurrentCut(e)) s.insert(e.payload);
     return s;
 }
 
@@ -104,11 +103,11 @@ CullView randomView(std::mt19937& rng)
 
 // ---------------------------------------------------------------------------
 // Structural invariants that must hold for ANY world and ANY camera:
-//   - the actual cut is an antichain (no entry is an ancestor of another)
+//   - the current cut is an antichain (no entry is an ancestor of another)
 //     and every entry is resident;
 //   - the ideal cut is an antichain; NeedsExpansion entries are unattached
 //     expansion points and their handles are live;
-//   - every load request targets a non-resident node with a live handle.
+//   - every entry carries a live node handle and correct membership.
 // ---------------------------------------------------------------------------
 TEST(Contracts, CutInvariantsHoldOnRandomWorlds)
 {
@@ -129,11 +128,13 @@ TEST(Contracts, CutInvariantsHoldOnRandomWorlds)
             const Outputs o = run(w, v, p);
 
             const std::set<UserId> cut = cutIds(o.cut);
-            ASSERT_EQ(cut.size(), o.cut.size()) << "duplicate payloads in cut";
+            ASSERT_EQ(cut.size(), currentCutSize(o.cut))
+                << "duplicate payloads in current cut";
             for (const auto& e : o.cut)
             {
-                EXPECT_TRUE(w.isResident(handleOf(w, e.payload)))
-                    << "cut entry " << e.payload << " not resident";
+                if (!inCurrentCut(e)) continue;
+                EXPECT_TRUE(w.isResident(e.node))
+                    << "current entry " << e.payload << " not resident";
                 EXPECT_FALSE(std::isnan(e.err));
                 for (UserId anc : TA::ancestorIds(w, e.payload))
                     EXPECT_EQ(cut.count(anc), 0u)
@@ -141,10 +142,13 @@ TEST(Contracts, CutInvariantsHoldOnRandomWorlds)
             }
 
             std::set<UserId> ideal;
-            for (const auto& e : o.ideal) ideal.insert(e.payload);
-            ASSERT_EQ(ideal.size(), o.ideal.size()) << "duplicate payloads in ideal";
-            for (const auto& e : o.ideal)
+            for (const auto& e : o.cut)
+                if (inIdealCut(e)) ideal.insert(e.payload);
+            ASSERT_EQ(ideal.size(), idealCutSize(o.cut))
+                << "duplicate payloads in ideal";
+            for (const auto& e : o.cut)
             {
+                if (!inIdealCut(e)) continue;
                 for (UserId anc : TA::ancestorIds(w, e.payload))
                     EXPECT_EQ(ideal.count(anc), 0u)
                         << "ideal contains ancestor " << anc << " of " << e.payload;
@@ -152,20 +156,11 @@ TEST(Contracts, CutInvariantsHoldOnRandomWorlds)
                 const NodeHandle found = TA::requireByScan(w, e.payload);
                 EXPECT_EQ(found.slot, e.node.slot);
                 EXPECT_EQ(found.index, e.node.index);
-                if (e.tag == IdealTag::NeedsExpansion)
+                if (e.tag == CutTag::NeedsExpansion)
                 {
                     EXPECT_TRUE(TA::pageOf(w, e.payload).isExpansion(found.index));
                     EXPECT_FALSE(w.isAttached(e.node));
                 }
-            }
-
-            for (const auto& r : o.reqs)
-            {
-                const NodeHandle found = TA::requireByScan(w, r.payload);
-                EXPECT_EQ(found.slot, r.node.slot);
-                EXPECT_EQ(found.index, r.node.index);
-                EXPECT_FALSE(w.isResident(r.node))
-                    << "request for already-resident " << r.payload;
             }
         }
     }
@@ -173,7 +168,7 @@ TEST(Contracts, CutInvariantsHoldOnRandomWorlds)
 
 // ---------------------------------------------------------------------------
 // Identical inputs must give byte-identical outputs: same world construction
-// + same camera path => same cut/ideal/request sequences, in the same order,
+// + same camera path => the same unified sequence, in the same order,
 // with bit-equal errors. (No unordered containers or pointers may leak into
 // the traversal order.)
 // ---------------------------------------------------------------------------
@@ -201,26 +196,17 @@ TEST(Contracts, DeterministicAcrossIdenticalWorlds)
             {
                 EXPECT_EQ(oa.cut[i].payload, ob.cut[i].payload) << "pos " << i;
                 EXPECT_EQ(oa.cut[i].err, ob.cut[i].err) << "pos " << i;   // bit-equal
+                EXPECT_EQ(oa.cut[i].membership, ob.cut[i].membership);
+                EXPECT_EQ(oa.cut[i].tag, ob.cut[i].tag);
+                EXPECT_EQ(oa.cut[i].node.slot, ob.cut[i].node.slot);
+                EXPECT_EQ(oa.cut[i].node.index, ob.cut[i].node.index);
             }
-            ASSERT_EQ(oa.ideal.size(), ob.ideal.size());
-            for (size_t i = 0; i < oa.ideal.size(); ++i)
-            {
-                EXPECT_EQ(oa.ideal[i].payload, ob.ideal[i].payload);
-                EXPECT_EQ(int(oa.ideal[i].tag), int(ob.ideal[i].tag));
-                EXPECT_EQ(oa.ideal[i].node.slot, ob.ideal[i].node.slot);
-                EXPECT_EQ(oa.ideal[i].node.index, ob.ideal[i].node.index);
-            }
-            ASSERT_EQ(oa.reqs.size(), ob.reqs.size());
-            for (size_t i = 0; i < oa.reqs.size(); ++i)
-                EXPECT_EQ(oa.reqs[i].payload, ob.reqs[i].payload);
         }
     }
 }
 
-// Parallel workers deduplicate requests locally while walking shared page
-// state. The merge must also collapse requests reached by different chunks,
-// preserving the serial order and the highest priority.
-TEST(Contracts, ParallelSelectionMatchesSerialRequests)
+// Parallel workers preserve the exact unified-cut order and classifications.
+TEST(Contracts, ParallelSelectionMatchesSerialUnifiedCut)
 {
     TreeGen gen;
     gen.fanout = 4;
@@ -251,13 +237,14 @@ TEST(Contracts, ParallelSelectionMatchesSerialRequests)
     const Outputs a = run(serial, view, params);
     const Outputs b = run(parallel, view, params);
 
-    ASSERT_FALSE(a.reqs.empty());
-    ASSERT_EQ(b.reqs.size(), a.reqs.size());
-    for (size_t i = 0; i < a.reqs.size(); ++i)
+    ASSERT_FALSE(a.cut.empty());
+    ASSERT_EQ(b.cut.size(), a.cut.size());
+    for (size_t i = 0; i < a.cut.size(); ++i)
     {
-        EXPECT_EQ(b.reqs[i].payload, a.reqs[i].payload);
-        EXPECT_EQ(b.reqs[i].node.index, a.reqs[i].node.index);
-        EXPECT_EQ(b.reqs[i].priority, a.reqs[i].priority);
+        EXPECT_EQ(b.cut[i].payload, a.cut[i].payload);
+        EXPECT_EQ(b.cut[i].node.index, a.cut[i].node.index);
+        EXPECT_EQ(b.cut[i].membership, a.cut[i].membership);
+        EXPECT_EQ(b.cut[i].tag, a.cut[i].tag);
     }
 }
 
@@ -390,7 +377,8 @@ TEST(Contracts, PointLeavesMatchReference)
     const RefResult want = TA::referenceCut(w, v, p);
 
     std::set<UserId> wantIds;
-    for (const auto& e : want.cut) wantIds.insert(e.payload);
+    for (const auto& e : want.cut)
+        if (inCurrentCut(e)) wantIds.insert(e.payload);
     EXPECT_EQ(cutIds(o.cut), wantIds);
     EXPECT_FALSE(o.cut.empty());
 }
@@ -419,7 +407,8 @@ TEST(Contracts, CameraInsideTreeMatchesReference)
     for (const auto& e : o.cut) EXPECT_FALSE(std::isnan(e.err)) << e.payload;
 
     std::set<UserId> wantIds;
-    for (const auto& e : want.cut) wantIds.insert(e.payload);
+    for (const auto& e : want.cut)
+        if (inCurrentCut(e)) wantIds.insert(e.payload);
     EXPECT_EQ(cutIds(o.cut), wantIds);
 }
 
@@ -443,7 +432,8 @@ TEST(Contracts, FarFromOriginMatchesReference)
     const RefResult want = TA::referenceCut(w, v, p);
 
     std::set<UserId> wantIds;
-    for (const auto& e : want.cut) wantIds.insert(e.payload);
+    for (const auto& e : want.cut)
+        if (inCurrentCut(e)) wantIds.insert(e.payload);
     EXPECT_EQ(cutIds(o.cut), wantIds);
     EXPECT_FALSE(o.cut.empty());
 }
@@ -470,7 +460,8 @@ TEST(Contracts, ScaledInstanceMatchesReference)
         const RefResult want = TA::referenceCut(w, v, p);
 
         std::set<UserId> wantIds;
-        for (const auto& e : want.cut) wantIds.insert(e.payload);
+        for (const auto& e : want.cut)
+            if (inCurrentCut(e)) wantIds.insert(e.payload);
         EXPECT_EQ(cutIds(o.cut), wantIds) << "scale " << scale;
         EXPECT_FALSE(o.cut.empty()) << "scale " << scale;
     }

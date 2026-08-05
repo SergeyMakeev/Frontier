@@ -20,19 +20,21 @@ split:
   incremental insert/remove. Initial and repair builds can use a quality
   splitter; frequent motion/edit rebuilds use a cheaper Morton hierarchy.
 
-`selectCut` queries the TLAS, walks only surviving page regions, and can emit
-the actual cut, ideal cut, and load requests in one pass. The latter two are
-optional. `SelectionContext` adds per-view damping and conservative cut reuse;
-after `applyUpdates` publishes a stable snapshot, different contextual calls
+`selectCut` queries the TLAS, walks only surviving page regions, and emits one
+unified current/ideal cut. Membership marks entries shared by both cuts and the
+two additive deltas; `NeedsExpansion` marks unknown topology. The caller derives
+IO work from ideal-side entries. `SelectionContext` adds per-view damping and
+conservative cut reuse. After `applyUpdates` publishes a stable snapshot,
+different contextual calls
 read only the World and can run concurrently. Stateless selection can instead
 fan one call out over visible instances through the host's blocking
 `parallelFor`.
 
 ### Why it is fast
 
-1. **Output-sensitive descent.** An explicit DFS stops at the ideal cut and
-   carries error, undecided frustum planes, and actual-cut liveness on its
-   stack. Nothing below the cut, outside the frustum, or behind unattached
+1. **Output-sensitive descent.** An explicit DFS carries error, undecided
+   frustum planes, and current/ideal liveness together. Nothing below either
+   cut, outside the frustum, or behind unattached
    topology is visited, and no all-nodes per-frame clear exists.
 2. **Eight-lane layout on every backend.** A parent tests eight child bounds and
    errors from one 256-byte `WideBlock`. AVX2 handles eight lanes directly;
@@ -47,11 +49,13 @@ fan one call out over visible instances through the host's blocking
    prefetches the next instance and root page; contextual selection pipelines
    its spatially ordered random instance/context reads eight entries ahead.
 5. **Handle-only mutation.** The world has no payload index or node hash table.
-   Requests already carry generation-stamped handles; stale asynchronous
+   Cut entries carry generation-stamped handles; stale asynchronous
    completions fail one generation check and are ignored.
-6. **O(1) readiness decisions.** Residency changes maintain immediate-child
-   counters, so the all-or-nothing refine check is one comparison within and
-   across pages.
+6. **Propagated resident coverage.** Residency changes maintain a complete
+   descendant-cover summary through local and attached-page ancestors. Fully
+   covered subtrees pass in O(1); partially visible uncovered subtrees inspect
+   only surviving branches, allowing resident descendants to bypass a missing
+   intermediate proxy without opening a hole.
 7. **Lazy, bounded updates.** Bounds edits queue until `applyUpdates` and grow
    ancestors only until containment permits an early-out. Instance adds/removes
    edit the TLAS in O(depth); configured edit/escape/area budgets decide when a
@@ -62,8 +66,9 @@ fan one call out over visible instances through the host's blocking
    passes required by key variation. A dense live-id list avoids scanning dead
    historical slots.
 9. **Frame-coherent reuse.** A 48-byte `SelectionContext` record proves when a
-   fully-inside, converged instance's cut cannot change under camera-envelope or
-   projection-scale travel. Reused entries are copied without rewalking pages.
+   fully-inside instance's unified cut cannot change under camera-envelope or
+   projection-scale travel. Page versions cover topology and residency changes;
+   reused entries are copied without rewalking pages.
 10. **Deferred, camera-selective GC feedback.** Optional `PageUsageContext`
     objects collect page touches without writing the World. `collect` consumes
     only the important cameras chosen by the caller, updates the intrusive LRU,
@@ -75,32 +80,26 @@ Point estimates below were rerun on 2026-08-05 with MSVC 19.51, Release
 `/O2 /arch:AVX2`, on a noisy shared 64-hardware-thread 2.4 GHz EPYC.
 Single-view cases use one benchmark thread; the concurrent six-view cases use
 six persistent workers. Values are the best recurring repeat, which estimates
-uncontended algorithm cost. Google Benchmark used a 0.2 s minimum for ordinary
-benchmarks; fixed-trajectory `SelectionContext` cases use 600 iterations.
+uncontended algorithm cost. Every fixed-trajectory case uses 600 frames and at
+least ten repetitions.
 
 | Scenario | Current time | Relevant output/state |
 |---|---:|---|
-| `DeepTree_CutOnly/6` | 1.72 ms | 2.4M nodes authored; 259,933 cut entries |
-| `SelectionContext_FlyThrough/20000`, stateless | 0.486 ms selection | 8,587 average cut entries |
-| Same 20k case, contextual | 0.121 ms selection | 94.8% instances reused; 2.91 MiB context |
-| 10k instances, 700 assets, moving camera / 1k moving | 0.118 ms selection | 82.4% reused; 27.8% visible; 5,920-entry cut |
-| 80k instances, moving camera / static objects | 0.40 ms selection | 97.6% reused; 24,986-entry cut |
-| 80k instances, moving camera / 5% moving | 0.50 ms selection | 92.6% reused; 24,986-entry cut |
-| Same 80k cases, six nearby views, serial | 3.75 / 4.23 ms wall time | static / 5% moving; one context per view |
-| Same six views, concurrent | 0.94 / 1.08 ms wall time | 4.0× / 3.9× speedup on six persistent workers |
-| `TlasScale`, 200k / 500k steady | 5.48 / 6.14 ms | 34,573 / 30,975 cut entries |
-| `TlasScale`, first quality build + cut | 134 / 417 ms | level-load cost, not steady frame cost |
-| Forced Morton rebuild + cut, 100k / 500k | 7.88 / 44.5 ms | random centroids |
-| Sparse rebuild after 100k peak, 10k live | 0.741 ms rebuild | steady follow-up selection 0.254 ms |
-| 4k cloned / shared 51 KiB assets | 35.4 / 12.9 ms | identical 2.048M-entry cut |
-| Immutable page bytes in that cloned / shared case | 199 MiB / 51 KiB | 4,000 mounts / 1 mount |
+| 10k instances, 700 assets, moving camera / 1k moving | 0.126 ms selection | 82.4% reused; 27.8% visible; 5,920-entry unified cut |
+| Same 10k world, static camera / 1k moving | 0.108 ms selection | 85.8% reused; 25.0% visible; 5,792 entries |
+| Same 10k world, moving camera / static objects | 0.082 ms selection | 93.3% reused; 5,920 entries |
+| 80k instances, moving camera / 5% moving | 0.55 ms selection | 92.6% reused; 24,986 entries |
+| Same 80k world, static camera / 5% moving | 0.41 ms selection | 94.1% reused; 22,872 entries |
+| Same 80k world, moving camera / static objects | 0.48 ms selection | 97.6% reused; 24,986 entries |
+| Six 80k views, static objects, serial / concurrent | 3.77 / 0.97 ms wall time | 3.9× on six persistent workers |
+| Six 80k views, 5% moving, serial / concurrent | 4.26 / 1.15 ms wall time | 3.7× on six persistent workers |
 
 These are scale indicators, not guarantees. Output size and cache locality can
 dominate population size, and contended runs on this host can be much slower.
 Optimization claims in the historical journal use interleaved baselines,
 medians, win counts, and controls; headline current costs use the best recurring
-repeat to show the speed-of-light floor. The final radix A/B measured 36.2%
-lower end-to-end rebuild cost at 100k random instances and 42.0% at 500k.
+repeat to show the speed-of-light floor. The README gives the full operation
+breakdown and startup cost for these two representative worlds.
 
 ---
 
@@ -247,7 +246,7 @@ Also: the TLAS query stack became a reused member (it heap-allocated per
 Result: MovingInstances/50000/1000 9.2 → 6.2 ms (−33%, CV 2.7%), static
 forest quality unchanged (ManyShallowTrees/50000/1 back at ~431 µs). Kept.
 
-### G. Optional outputs — KEPT
+### G. Optional outputs — KEPT AT THE TIME, SUPERSEDED BY THE UNIFIED CUT
 
 A fully-resident static scene emits an ideal cut identical to the actual cut:
 pure wasted bandwidth, and at 260k entries per frame the outputs *are* a
@@ -587,10 +586,11 @@ bisection — the refit code is byte-identical across those commits and all
 variants sit inside the same noisy band. Only deltas well above 20%, or ones
 confirmed with repetitions and low CV, are treated as real in this journal.
 
-### O. Follow-up hot-path audit -- KEPT
+### O. Follow-up hot-path audit -- KEPT, OUTPUT PATH LATER SUPERSEDED
 
-The 2026-08-05 audit tightened the architecture without changing its external
-model:
+The 2026-08-05 audit tightened the architecture that existed at that revision.
+The request-deduplication and separate-output details below were later replaced
+by the unified cut; the other listed mechanisms remain:
 
 - `Instance` is now one 64-byte cut-path cache line. Bounds, masks, asset id and
   TLAS back-pointers occupy a parallel 64-byte `InstanceTlas` stream, so a cut
@@ -606,9 +606,10 @@ model:
 - TLAS contribution culling now uses squared box distance and
   `screenErrorFromSq8`, matching the page walk's reciprocal-square-root path and
   improving the focused 50k-200k cases by 3.0-3.5%.
-- Request deduplication now lives in per-selection scratch rather than mutable
-  page state. Parallel stateless workers merge their private request sets;
-  concurrent contextual views cannot overwrite one another's epochs.
+- Request deduplication at that revision lived in per-selection scratch rather
+  than mutable page state. Parallel stateless workers merge their private
+  request sets; concurrent contextual views cannot overwrite one another's
+  epochs.
 - `SelectionContext` budgets both camera-envelope travel and projection-scale
   travel. Each 48-byte record stores a conservative flip-point slope, avoiding
   the old all-cache invalidation throughout damped zoom-out. The affected 20k
@@ -616,7 +617,7 @@ model:
   selection 21.9%.
 - Contextual selection prefetches its spatially ordered random instance and
   record reads eight entries ahead, and the output sink directly pushes its
-  dominant one-entry runs. The current 20k fly-through reaches 0.121 ms.
+  dominant one-entry runs. The then-current 20k fly-through reached 0.121 ms.
 - Contextual TLAS stacks, visible lists, traversal workers, request stamps, and
   statistics are owned by each `SelectionContext`. `applyUpdates` performs the
   serial refit/rebuild work first; the contextual overload is then const and
@@ -627,9 +628,30 @@ model:
 - The TLAS escape budget now counts each escaped instance once per rebuild,
   rather than counting every later growth of the same lane. A bounded 5% moving
   cohort therefore stays on incremental refit instead of periodically charging
-  a repair to a view; `applyUpdates` owns any repair. The representative 80k
-  selection is 0.50 ms. Six nearby moving-object views measure 4.23 ms serial
-  and 1.08 ms on six persistent workers.
+  a repair to a view; `applyUpdates` owns any repair. At that revision the
+  representative 80k selection was 0.50 ms, and six nearby moving-object views
+  measured 4.23 ms serial and 1.08 ms on six persistent workers.
+
+### P. Unified cut and recursive resident cover — KEPT
+
+Selection now emits one sequence instead of separate current, ideal, and load
+request streams. `Shared` entries occur once; `CurrentOnly` and `IdealOnly` are
+the two additive differences. `Direct` versus `NeedsExpansion` distinguishes a
+known payload from unknown topology. The caller derives IO work from the ideal
+side and owns content deduplication, priority, and budgets.
+
+Residency is no longer restricted to resident immediate children. Each mount
+propagates complete descendant coverage upward, so a resident detailed node can
+replace an unavailable intermediate proxy. The propagated bit is the common
+O(1) decision. At a frustum boundary, an uncovered branch outside the view need
+not block refinement, so selection recursively validates only visible branches
+and records every inspected page for optional page-use feedback. Frustum-edge
+instances are deliberately not retained by `SelectionContext`.
+
+The resulting traversal carries current and ideal liveness together, preserves
+the replace-only antichain for both cuts, and lets contextual calls keep their
+read-only multi-view behavior. Current representative measurements are in
+section 1 and the README; older output-path timings above are historical.
 
 The archived [2026-08-05 handoff](docs/archive/HANDOFF-2026-08-05.md), section
 14, preserves the interleaved A/B tables, rejected margin vectorization,
@@ -641,8 +663,8 @@ guidance.
 ## 3. Current constraints and possible follow-up
 
 - **Parallelism is across contextual views, not within one contextual walk.**
-  Six representative 80k views fall from 3.75-4.23 ms serial to 0.94-1.08 ms
-  on six persistent workers and occupy about 49 MiB of context state. Stateless
+  Six representative 80k views fall from 3.77-4.26 ms serial to 0.97-1.15 ms
+  on six persistent workers and occupy about 73 MiB of context state. Stateless
   selection can still parallelize one call across visible instances. Combining
   both forms would add nested scheduling and merge costs; profile a production
   need before doing so.
@@ -650,10 +672,10 @@ guidance.
   large teleports can loosen page ancestors. This costs culling efficiency, not
   correctness; TLAS rebuilds retighten only the top level. A budgeted bottom-up
   overlay pass is the remaining mechanism if real content exhibits degradation.
-- **Ideal-cut-free streaming mode.** `NeedsExpansion` entries could be emitted
-  into a dedicated small sink so a streamer can request topology without a full
-  ideal-cut vector. The current API emits them as tagged ideal entries; add a
-  fourth mode only for a measured consumer need.
+- **The unified cut carries node handles.** This makes the result self-sufficient
+  for rendering, residency, and topology decisions, at the cost of a larger
+  entry than the former render-only record. Shared entries are emitted once;
+  callers should retain vector capacity and filter in place.
 - **Transform scope.** Instances support translation and uniform positive scale.
   Rotation and non-uniform scale need authored baking or an integration-layer
   representation; adding them directly would change bound transforms and hot

@@ -14,23 +14,22 @@ namespace {
 
 struct Outputs
 {
-    std::vector<CutEntry>    cut;
-    std::vector<IdealEntry>  ideal;
-    std::vector<LoadRequest> reqs;
+    std::vector<CutEntry> cut;
 };
 
 Outputs frame(World& w, const CullView& v, const CutParams& p)
 {
     w.applyUpdates();
     Outputs o;
-    w.selectCut(v, p, o.cut, o.ideal, o.reqs);
+    w.selectCut(v, p, o.cut);
     return o;
 }
 
 std::set<UserId> cutIds(const Outputs& o)
 {
     std::set<UserId> ids;
-    for (const auto& e : o.cut) ids.insert(e.payload);
+    for (const auto& e : o.cut)
+        if (inCurrentCut(e)) ids.insert(e.payload);
     return ids;
 }
 
@@ -328,12 +327,14 @@ TEST(Motion, ManyMovesStayCorrect)
 
         const CullView v = makeLookAtView(float4::point(uni(rng), 200, -800), float4::point(0, 0, 0));
         Outputs o;
-        w.selectCut(v, p, o.cut, &o.ideal, &o.reqs);
+        w.selectCut(v, p, o.cut);
         const RefResult want = TA::referenceCut(w, v, p);
 
         std::set<UserId> gotIds, wantIds;
-        for (const auto& e : o.cut) gotIds.insert(e.payload);
-        for (const auto& e : want.cut) wantIds.insert(e.payload);
+        for (const auto& e : o.cut)
+            if (inCurrentCut(e)) gotIds.insert(e.payload);
+        for (const auto& e : want.cut)
+            if (inCurrentCut(e)) wantIds.insert(e.payload);
         EXPECT_EQ(gotIds, wantIds) << "frame " << f;
     }
 }
@@ -402,7 +403,8 @@ TEST(Motion, InstanceChurnStaysCorrect)
 
         std::multiset<UserId> gotIds, wantIds;
         for (const auto& e : cut) gotIds.insert(e.payload);
-        for (const auto& e : want.cut) wantIds.insert(e.payload);
+        for (const auto& e : want.cut)
+            if (inCurrentCut(e)) wantIds.insert(e.payload);
         EXPECT_EQ(gotIds, wantIds) << "frame " << f;
     }
     EXPECT_EQ(trees.size(), 40u);
@@ -615,9 +617,10 @@ TEST(Motion, ApplyUpdatesFlushesPendingBounds)
     w.applyUpdates();
     const CullView v = makeLookAtView(float4::point(300, 0, -20), float4::point(300, 0, 0));
     Outputs o;
-    w.selectCut(v, {2.0f, 0.0f}, o.cut, nullptr, nullptr);
+    w.selectCut(v, {2.0f, 0.0f}, o.cut);
     std::set<UserId> got;
-    for (const auto& e : o.cut) got.insert(e.payload);
+    for (const auto& e : o.cut)
+        if (inCurrentCut(e)) got.insert(e.payload);
     EXPECT_TRUE(got.count(11));
     verifyConservativeBounds(w, inst, 11);
 }

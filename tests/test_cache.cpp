@@ -13,6 +13,7 @@
 #include <exception>
 #include <random>
 #include <thread>
+#include <tuple>
 
 #include <gtest/gtest.h>
 
@@ -22,15 +23,18 @@ using namespace hlodtest;
 
 namespace {
 
-// (payload, instance tag) pairs, sorted: the cut as a multiset, with err and
-// emission order deliberately dropped.
-using Keys = std::vector<std::pair<UserPayload, uint32_t>>;
+// Unified entry identities, sorted as a multiset; only the intentionally stale
+// cached error and emission order are dropped.
+using Keys = std::vector<
+    std::tuple<UserPayload, uint32_t, uint32_t, uint32_t, CutMembership, CutTag>>;
 
 Keys keysOf(const std::vector<CutEntry>& cut)
 {
     Keys k;
     k.reserve(cut.size());
-    for (const CutEntry& e : cut) k.push_back({e.payload, e.instance});
+    for (const CutEntry& e : cut)
+        k.push_back({e.payload, e.instance, e.node.slot, e.node.index,
+                     e.membership, e.tag});
     std::sort(k.begin(), k.end());
     return k;
 }
@@ -381,21 +385,21 @@ TEST(Cache, SurvivesStreamingAndInstanceChurn)
     {
         const CullView v = viewAt(float4::vec(float(f) * 2.0f, float(f), float(f) * 8.0f));
 
-        std::vector<CutEntry>    ref;
-        std::vector<IdealEntry>  ideal;
-        std::vector<LoadRequest> reqs;
-        world.selectCut(v, p, ref, &ideal, &reqs);
+        std::vector<CutEntry> ref;
+        world.selectCut(v, p, ref);
 
-        std::vector<LoadRequest> cachedReqs;
-        world.selectCut(v, p, cache, cut, nullptr, &cachedReqs);
+        world.selectCut(v, p, cache, cut);
         ASSERT_EQ(keysOf(cut), keysOf(ref)) << "frame " << f;
         reused += cache.reused();
 
         // Act on streaming the way a real frame would.
-        for (const LoadRequest& r : cachedReqs) world.markResident(r.node);
+        for (const CutEntry& entry : cut)
+            if (inIdealCut(entry) && entry.tag == CutTag::Direct &&
+                !world.isResident(entry.node))
+                world.markResident(entry.node);
         if (f % 4 == 0)
-            for (const IdealEntry& e : ideal)
-                if (e.tag == IdealTag::NeedsExpansion && attached < 8)
+            for (const CutEntry& e : cut)
+                if (inIdealCut(e) && e.tag == CutTag::NeedsExpansion && attached < 8)
                 {
                     const UserId id = e.payload;
                     if (gen.recipes.count(id))
@@ -500,7 +504,7 @@ TEST(Cache, SixViewsSelectConcurrentlyFromOnePublishedWorld)
     }
 }
 
-TEST(Cache, ConcurrentViewsDeduplicateRequestsIndependently)
+TEST(Cache, ConcurrentViewsClassifyUnifiedCutsIndependently)
 {
     constexpr size_t kViews = 6;
     TreeGen gen;
@@ -519,36 +523,25 @@ TEST(Cache, ConcurrentViewsDeduplicateRequestsIndependently)
 
     const CutParams params{0.25f, 0.0f};
     std::array<CullView, kViews> views;
-    std::array<std::vector<LoadRequest>, kViews> serialRequests, parallelRequests;
     std::array<std::vector<CutEntry>, kViews> serialCut, parallelCut;
     std::array<SelectionContext, kViews> contexts;
     for (size_t v = 0; v < kViews; ++v)
     {
         views[v] = viewAt(float4::vec((float(v) - 2.5f) * 10.0f, 0.0f, 0.0f));
-        world.selectCut(views[v], params, serialCut[v], nullptr, &serialRequests[v]);
+        world.selectCut(views[v], params, serialCut[v]);
     }
 
     std::array<std::thread, kViews> threads;
     for (size_t v = 0; v < kViews; ++v)
         threads[v] = std::thread([&, v]
         {
-            published.selectCut(views[v], params, contexts[v], parallelCut[v],
-                                nullptr, &parallelRequests[v]);
+            published.selectCut(views[v], params, contexts[v], parallelCut[v]);
         });
     for (std::thread& thread : threads) thread.join();
 
     for (size_t v = 0; v < kViews; ++v)
     {
-        ASSERT_EQ(parallelRequests[v].size(), serialRequests[v].size());
-        for (size_t i = 0; i < serialRequests[v].size(); ++i)
-        {
-            EXPECT_EQ(parallelRequests[v][i].node.slot,
-                      serialRequests[v][i].node.slot);
-            EXPECT_EQ(parallelRequests[v][i].node.index,
-                      serialRequests[v][i].node.index);
-            EXPECT_FLOAT_EQ(parallelRequests[v][i].priority,
-                            serialRequests[v][i].priority);
-        }
+        EXPECT_EQ(keysOf(parallelCut[v]), keysOf(serialCut[v]));
     }
 }
 

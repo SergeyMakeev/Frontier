@@ -16,9 +16,7 @@ namespace hlod {
 
 struct RefResult
 {
-    std::vector<CutEntry>    cut;
-    std::vector<IdealEntry>  ideal;
-    std::vector<LoadRequest> requests;
+    std::vector<CutEntry> cut;
 };
 
 // Full access to World internals plus a straightforward recursive scalar
@@ -244,27 +242,29 @@ struct World::TestAccess
                 if (e < p.minPix) continue;
             }
             const CullView local = toLocal(view, inst.pos, inst.scale);
-            refChildren(w, inst, inst.rootSlot, 0, true, local, p, out);
+            refChildren(w, inst, inst.rootSlot, 0, true, true, local, p, out);
         }
         return out;
     }
 
 private:
     static void refChildren(World& w, const Instance& inst, uint32_t slot,
-                            uint32_t node, bool alive, const CullView& local,
+                            uint32_t node, bool current, bool ideal,
+                            const CullView& local,
                             const CutParams& p, RefResult& out)
     {
         const PageView& pg = w.slots_[slot].page;
         uint32_t c = node + 1;
         for (uint32_t k = 0; k < pg.childCount(node); ++k)
         {
-            refNode(w, inst, slot, c, alive, local, p, out);
+            refNode(w, inst, slot, c, current, ideal, local, p, out);
             c += pg.subtreeSize[c];
         }
     }
 
     static void refNode(World& w, const Instance& inst, uint32_t slot, uint32_t i,
-                        bool alive, const CullView& local, const CutParams& p,
+                        bool current, bool ideal, const CullView& local,
+                        const CutParams& p,
                         RefResult& out)
     {
         const PageRt& rt = w.slots_[slot];
@@ -281,58 +281,64 @@ private:
             distanceToBox(bbox[i], local.queryMin(), local.queryMax()));
         const uint32_t cc = pg.childCount(i);
         const bool exp = pg.isExpansion(i);
-        const bool wants = (cc > 0 || exp) && err > p.threshold;
+        const bool wants = ideal && (cc > 0 || exp) && err > p.threshold;
 
         const NodeHandle here{slot, i, rt.generation};
-        if (!wants)
+        const auto member = [](bool inCurrent, bool inIdeal)
         {
-            if (alive) out.cut.push_back({pg.payload[i], err, inst.tag});
-            out.ideal.push_back({pg.payload[i], here, err, inst.tag, IdealTag::Direct});
-            return;
+            return inCurrent
+                       ? (inIdeal ? CutMembership::Shared : CutMembership::CurrentOnly)
+                       : CutMembership::IdealOnly;
+        };
+
+        if (!ideal)
+        {
+            if (rt.resident[i])
+            {
+                out.cut.push_back({pg.payload[i], here, err, inst.tag,
+                                   CutMembership::CurrentOnly, CutTag::Direct});
+                return;
+            }
+        }
+        else if (!wants)
+        {
+            const bool shared = current && rt.resident[i];
+            out.cut.push_back({pg.payload[i], here, err, inst.tag,
+                               shared ? CutMembership::Shared
+                                      : CutMembership::IdealOnly,
+                               CutTag::Direct});
+            if (!current || shared) return;
         }
 
         const uint32_t childSlot =
             (exp && !rt.expSlot.empty()) ? rt.expSlot[i] : kInvalidIndex;
-        if (exp && childSlot == kInvalidIndex)
+        if (ideal && wants && exp && childSlot == kInvalidIndex)
         {
-            if (alive) out.cut.push_back({pg.payload[i], err, inst.tag});
-            out.ideal.push_back(
-                {pg.payload[i], here, err, inst.tag, IdealTag::NeedsExpansion});
+            out.cut.push_back({pg.payload[i], here, err, inst.tag,
+                               member(current, true), CutTag::NeedsExpansion});
             return;
         }
 
-        bool ready;
-        if (exp)
+        bool nextCurrent = current;
+        bool nextIdeal = false;
+        if (ideal && wants)
         {
-            const PageRt& crt = w.slots_[childSlot];
-            ready = crt.readyChildren[0] == crt.page.childCount(0);
-        }
-        else
-        {
-            ready = rt.readyChildren[i] == cc;
-        }
-
-        if (!ready && alive)
-        {
-            out.cut.push_back({pg.payload[i], err, inst.tag});
-            const PageRt& target = exp ? w.slots_[childSlot] : rt;
-            const uint32_t ts = exp ? childSlot : slot;
-            const uint32_t tn = exp ? 0u : i;
-            uint32_t c = tn + 1;
-            for (uint32_t k = 0; k < target.page.childCount(tn); ++k)
+            const bool canDescend =
+                !current || w.visibleDescendantsCovered(slot, i, mask, inst, local);
+            if (current && !canDescend)
             {
-                if (!target.resident[c])
-                    out.requests.push_back({target.page.payload[c],
-                                            NodeHandle{ts, c, target.generation}, err});
-                c += target.page.subtreeSize[c];
+                out.cut.push_back({pg.payload[i], here, err, inst.tag,
+                                   CutMembership::CurrentOnly, CutTag::Direct});
             }
+            nextCurrent = current && canDescend;
+            nextIdeal = true;
         }
 
-        const bool a2 = alive && ready;
         if (exp)
-            refChildren(w, inst, childSlot, 0, a2, local, p, out);
+            refChildren(w, inst, childSlot, 0, nextCurrent, nextIdeal, local, p,
+                        out);
         else
-            refChildren(w, inst, slot, i, a2, local, p, out);
+            refChildren(w, inst, slot, i, nextCurrent, nextIdeal, local, p, out);
     }
 };
 
@@ -346,6 +352,32 @@ using TAX = World::TestAccess;
 // Tests key their content by numeric ids; those ids travel as the opaque
 // payload. The alias keeps test code reading naturally.
 using UserId = UserPayload;
+
+inline std::vector<CutEntry> currentCut(const std::vector<CutEntry>& unified)
+{
+    std::vector<CutEntry> out;
+    for (const CutEntry& entry : unified)
+        if (inCurrentCut(entry)) out.push_back(entry);
+    return out;
+}
+
+inline std::vector<CutEntry> idealCut(const std::vector<CutEntry>& unified)
+{
+    std::vector<CutEntry> out;
+    for (const CutEntry& entry : unified)
+        if (inIdealCut(entry)) out.push_back(entry);
+    return out;
+}
+
+inline size_t currentCutSize(const std::vector<CutEntry>& unified)
+{
+    return size_t(std::count_if(unified.begin(), unified.end(), inCurrentCut));
+}
+
+inline size_t idealCutSize(const std::vector<CutEntry>& unified)
+{
+    return size_t(std::count_if(unified.begin(), unified.end(), inIdealCut));
+}
 
 inline std::vector<UserPayload> pageIds(const PageView& pg)
 {
