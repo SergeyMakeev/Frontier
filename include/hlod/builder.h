@@ -1,7 +1,7 @@
 #pragma once
 // Authoring-time builder. Insertion order arbitrary, nothing perf-sensitive.
 // Builds ONE page; the content pipeline decides where to split the full tree
-// into pages and marks expansion points. See hlod_design.md §9.
+// into pages and marks expansion points. See hlod_design.md §3.
 
 #include <cstdint>
 #include <vector>

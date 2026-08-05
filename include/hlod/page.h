@@ -1,7 +1,7 @@
 #pragma once
 // Immutable flat page: preorder SoA arrays + BVH8-style wide child blocks,
 // laid out as ONE contiguous blob. Produced by HLodBuilder::build();
-// see hlod_design.md §2.
+// see hlod_design.md §3.
 //
 // The in-memory layout IS the on-disk format. A streamed page is one read
 // into one aligned buffer with no parsing, no fixups and no per-array
@@ -79,8 +79,8 @@ inline uint32_t blockLeafLanes(uint32_t m) { return m >> kBlockLeafShift; }
 
 // Strided handle onto a run of WideBounds.
 //
-// Bounds are the only part of a page the runtime ever rewrites, so a deformed
-// instance gets a private copy of just those (a per-instance overlay) while
+// Bounds are the only per-instance mutable page data. A deformed instance gets
+// a private copy of just those (a per-instance overlay) while
 // still sharing the page's topology, payloads and errors with every other
 // instance. The two cases differ only in where the boxes sit: interleaved
 // inside the page's WideBlocks, or packed in the overlay. Carrying the stride

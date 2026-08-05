@@ -14,7 +14,7 @@ option(HLOD_OVERLAY_FULL_PAGE
 # Carry the eight per-lane plane masks packed in one register instead of a byte
 # array. A real win on its own (~9% on a memory-bound cut) but it adds nothing
 # on top of the reciprocal-sqrt error path, which is always on and relieves the
-# same bottleneck. Off by default; see HANDOFF.md section 9.
+# same bottleneck. Off by default; see docs/archive/HANDOFF-2026-08-05.md section 9.
 option(HLOD_OPT_MASK64
        "Cut: carry the eight per-lane plane masks packed in one register" OFF)
 

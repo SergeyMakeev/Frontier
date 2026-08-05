@@ -1,131 +1,104 @@
-# HLodTree — implementation architecture & performance journal
+# HLodTree implementation architecture and performance journal
 
-This document describes the implemented architecture (see `hlod_design.md` for
-the full design rationale), explains why it is fast, and keeps an honest
-journal of every optimization experiment — including the ones that did NOT
-work and were reverted.
+This document explains the current implementation and records the optimization
+experiments that produced it. See [README.md](README.md) first for the overview,
+minimal example, and headline scale; see [hlod_design.md](hlod_design.md) for
+the current API contract and lifecycle rules.
 
-Measurement setup: MSVC 19.51 `/O2 /arch:AVX2`, 64-core EPYC @ 2.4 GHz,
-single-threaded, Google Benchmark `--benchmark_min_time=0.4s`.
+## 1. Current architecture
 
----
+The runtime has two spatial levels, analogous to a ray tracer's BLAS/TLAS
+split:
 
-## 1. Architecture overview
+- **Immutable page assets.** `HLodBuilder` emits a versioned blob containing
+  preorder arrays and 8-lane child blocks. Expansion points connect separately
+  streamed pages. Instances of one registered root asset share its page bytes,
+  residency, and attachment graph. Deformed instances keep sharing those bytes
+  and acquire bounds-only copy-on-write overlays.
+- **Dynamic wide TLAS.** An 8-wide BVH over translated, uniformly scaled root
+  instances handles coarse frustum/layer/contribution culling, motion, and
+  incremental insert/remove. Initial and repair builds can use a quality
+  splitter; frequent motion/edit rebuilds use a cheaper Morton hierarchy.
 
-Two levels, in the spirit of a ray tracer's TLAS/BLAS split:
-
-- **Pages (bottom level).** The tree is a forest of immutable, flat,
-  SoA **pages** — preorder node arrays built offline by `HLodBuilder`,
-  loaded as one blob. Every node's children are mirrored into
-  BVH8-style **wide blocks** (`WideBlock`: 8 child bounds, errors, indices,
-  a valid mask and a leaf mask, SoA-transposed), which is what the walk
-  actually reads. Pages link to child pages through **expansion points**;
-  attaching/detaching pages is how planet-scale topology streams in and out.
-- **TLAS (top level).** A small dynamic wide BVH over root instances
-  (position + uniform scale). It owns multi-root worlds, instance motion and
-  coarse culling, including error-based contribution culling (`minPix`).
-
-One call — `selectCut` — walks the TLAS with tri-state frustum culling, then
-runs one pruned pass per surviving instance and emits three outputs in a
-single walk: the **actual cut** (what to draw now), the **ideal cut** (what
-would be drawn if everything were resident; `NEEDS_EXPANSION` entries double
-as topology requests), and **load requests** (payload residency wanted at the
-actual cut's frontier). The ideal cut and requests are optional — callers
-that don't stream pass nullptr and don't pay for them.
+`selectCut` queries the TLAS, walks only surviving page regions, and can emit
+the actual cut, ideal cut, and load requests in one pass. The latter two are
+optional. `SelectionContext` adds per-view damping and conservative cut reuse;
+stateless selection can instead fan out over visible instances through the
+host's blocking `parallelFor`.
 
 ### Why it is fast
 
-Everything below follows two principles the design was steered by:
-**group work** (test 8 things per instruction, stream over flat arrays,
-one walk for all outputs) and **be lazy** (touch nothing outside the output
-region, apply updates only when a cut needs them, never clear per-frame
-state).
+1. **Output-sensitive descent.** An explicit DFS stops at the ideal cut and
+   carries error, undecided frustum planes, and actual-cut liveness on its
+   stack. Nothing below the cut, outside the frustum, or behind unattached
+   topology is visited, and no all-nodes per-frame clear exists.
+2. **Eight-lane layout on every backend.** A parent tests eight child bounds and
+   errors from one 256-byte `WideBlock`. AVX2 handles eight lanes directly;
+   SSE2 and NEON use two four-lane halves; scalar builds retain the same blob
+   layout. The TLAS uses the same logical width.
+3. **Leaf fast path.** A side-array mask identifies plain leaves, which are
+   emitted directly from the parent's wide test without a metadata read or DFS
+   stack round trip. At fanout eight, most authored nodes are leaves.
+4. **Shared immutable working sets.** Thousands of identical instances can walk
+   one hot page. The cut-path `Instance` record is one cache line, while TLAS
+   maintenance state occupies a separate cache line. The serial forest loop
+   prefetches the next instance and root page.
+5. **Handle-only mutation.** The world has no payload index or node hash table.
+   Requests already carry generation-stamped handles; stale asynchronous
+   completions fail one generation check and are ignored.
+6. **O(1) readiness decisions.** Residency changes maintain immediate-child
+   counters, so the all-or-nothing refine check is one comparison within and
+   across pages.
+7. **Lazy, bounded updates.** Bounds edits queue until a cut needs them and grow
+   ancestors only until containment permits an early-out. Instance adds/removes
+   edit the TLAS in O(depth); configured edit/escape/area budgets decide when a
+   rebuild earns its cost.
+8. **Cheap Morton repair builds.** 63-bit keys use a stable LSD radix sort for
+   populations of at least 1,024, with retained scratch and only the 11-bit
+   passes required by key variation. A dense live-id list avoids scanning dead
+   historical slots.
+9. **Frame-coherent reuse.** A 48-byte `SelectionContext` record proves when a
+   fully-inside, converged instance's cut cannot change under camera-envelope or
+   projection-scale travel. Reused entries are copied without rewalking pages.
+10. **Cold-tail GC.** Non-pinned mounts touch an intrusive LRU at most once per
+    frame. Collection examines the cold tail and detaches only aged leaf mounts;
+    pinned roots are outside the budget and list.
 
-1. **Output-sensitive traversal.** The walk descends only while a node wants
-   to refine *in the ideal sense*; everything below the ideal cut and
-   everything outside the frustum is never touched. Cost is
-   `O(log R + visible instances + ideal-cut region)`, independent of total
-   node count. There are no per-frame O(N) clears anywhere — per-view state
-   is epoch-stamped, and traversal state is *carried* on an explicit DFS
-   stack (`node, err, planes, alive`) instead of being scattered through
-   memory by one pass and gathered by another.
-2. **Wide everything.** A parent tests all its children with one AVX2 issue:
-   masked tri-state frustum test (early-reject / early-accept per plane, so
-   interior nodes of a mostly-visible scene test almost no planes), then
-   8-wide distance and screen error. The TLAS uses the same wide layout and
-   the same kernels.
-3. **Leaves never get visited.** Wide blocks carry a `leafMask`; surviving
-   plain-leaf lanes are emitted into the cuts directly from the parent's
-   SIMD test. In a fanout-8 tree that's ~87% of all nodes skipping the
-   visit machinery (no metadata reads, no stack traffic, no scratch).
-4. **No hashes anywhere — the API is handle-only.** The World keeps no id
-   index at all (experiment J): every entry point takes a
-   `NodeHandle{slot, index, generation}`, composed from attach results plus
-   authored node indices or emitted by `selectCut` itself; the 64-bit
-   per-node payload is opaque and merely echoed in outputs. The walk runs
-   on page-local indices, a per-page expansion-slot array, and slot
-   indices; the forest walk software-prefetches the next instances'
-   records to hide the one unavoidable dependent-load chain. Stale handles
-   (page detached or collected since) fail a generation check and are
-   safely ignored — the normal streaming-completion-vs-GC race.
-5. **All-or-nothing refinement is O(1).** Every node keeps a
-   `readyChildren` counter maintained by residency changes; "can I refine"
-   is one compare, both within a page and across a page boundary.
-6. **Motion is sublinear and lazy.** `setNodeBounds` is a ~16 ns queue
-   push, callable any number of times per node per frame; the queue is
-   applied only when the tree actually has to be current — inside the next
-   `selectCut` (or an explicit `flushBounds()`). Each refit walks up only
-   until an ancestor already contains the new box (grow-only; shrink is
-   lazy) — that early-out is also what dedups movers sharing ancestors and
-   repeated moves of one node (experiment K). Instance motion refits TLAS
-   lanes and defers restructuring to an escape threshold; rebuilds
-   triggered by motion use a Morton build ~5x cheaper than the quality
-   build reserved for structural changes. **Spawning and removing are
-   incremental too**: an insert descends to the leaf whose box grows least and
-   either takes a free lane or splits that leaf, a removal invalidates a lane,
-   and an edit budget (`tlasEditFraction`) bounds the accumulated quality loss.
-   Nothing about a single instance costs work proportional to the world.
-7. **GC is O(collected).** Pages touch an intrusive LRU once per frame;
-   `collect` walks the cold tail only, respects a dwell (`minAge`), a
-   budget of *streamed* (non-pinned) pages, and never collects pages with
-   attached children — collapse is leaf-pages-first, and pinned pages don't
-   even live in the list.
+### Current measurements
 
-### Final numbers (this machine, single thread)
+Point estimates below were rerun on 2026-08-05 with MSVC 19.51, Release
+`/O2 /arch:AVX2`, one benchmark thread, on a 64-hardware-thread 2.4 GHz EPYC.
+Google Benchmark used a 0.2 s minimum for the ordinary benchmarks; fixed-trajectory
+`SelectionContext` cases use 600 iterations.
 
-| Scenario | Baseline | Final | Notes |
-|---|---|---|---|
-| Deep tree 2.4M nodes, 260k-entry cut | 5.2 ms | 3.1 ms (cut-only) / 4.6 ms (all outputs) | ~12 ns per emitted entry |
-| Deep tree fly-through (210k cut) | 4.4 ms | 3.6 ms | hysteresis + churn |
-| GC stress (16 attach + 15 collect/frame) | 2.0 ms* | 1.4 ms* | *policy-corrected trajectory, see B2 |
-| 50k shallow instances, no minPix | 9.6 ms | 3.2–4.1 ms | 21k-entry cut |
-| 50k shallow instances, minPix | 0.68 ms | 0.41 ms | |
-| 50k instances, 1000 teleports/frame | 15.1 ms | 6.2–7.5 ms | TLAS two-tier rebuild |
-| 100k leaf refits/frame | 10.5 ms | 3.1 ms | ~32 M refits/s after experiments I + J + K |
-| 1M move submissions/frame (100k nodes × 10) | — | 30 ms | ~30 ns per submission, lazy flush (K) |
-| Kitchen sink (streaming + GC + 500 instance moves + 2000 leaf refits + 38k cut) | — | 2.9–3.6 ms | |
-| Typical forest: 10k trees (80% shallow / 20% deep), 16k swaying leaves, running camera | 1.88 ms | 1.3–1.4 ms | 0.25 move + 0.78 refit + 0.34 cut |
-| Typical forest at 50k trees, 80k movers | 28.8 ms | 16.5 ms | 1.3 move + 11.7 refit + 3.4 cut |
-| Typical forest 10k + 5%/frame spawn-despawn churn | 21.6 ms | 4.0 ms | experiment L; ~1.3 µs per spawn/despawn |
-| Builder: compose a page at runtime | — | 1.5 µs (5 nodes) / 0.55 ms (4681 nodes) | ~8 M nodes/s, experiment L |
-| Output sensitivity (2.4M nodes, 60k → 260k cut) | — | 1.1 ms → 3.1 ms | ~11–19 ns/entry, flat; experiment M |
-| Camera teleport into cold region (20k props + deep tree) | — | 1.05 ms steady / 1.36 ms spike | worst frame is 1.3× steady |
-| Multi-view: main + 3 extra views | — | 1.45 ms + 0.84 ms/extra | extra view ≈ 0.6× main (hot shared data) |
-| Teleport residual error, 2 frames after (budget 32/frame) | 97,000 px (discovery) | 800 px (predictive descent) | experiment N; both ~280 px by frame 4 |
-| TLAS at 200k / 500k instances | — | 10 ms steady (34k cut), 121 / 416 ms level-load first cut | steady cost is output-bound, not N-bound |
-| Adversarial: 10k fully stacked instances | — | 1.5 ms (40k cut) | TLAS gives zero separation; the floor |
-| Adversarial: 511-child node / 26-page chain per 1-entry cut | — | 4.7 µs / 4.3 µs | ~170 ns per page crossing |
+| Scenario | Current time | Relevant output/state |
+|---|---:|---|
+| `DeepTree_CutOnly/6` | 1.72 ms | 2.4M nodes authored; 259,933 cut entries |
+| `SelectionContext_FlyThrough/20000`, stateless | 0.538 ms selection | 8,587 average cut entries |
+| Same 20k case, contextual | 0.152 ms selection | 94.8% instances reused; 2.91 MiB context |
+| 80k instances, 5% moving, stateless / contextual | 2.62 / 2.03 ms selection | 92.4% reused in contextual arm |
+| `TlasScale`, 200k / 500k steady | 5.48 / 6.14 ms | 34,573 / 30,975 cut entries |
+| `TlasScale`, first quality build + cut | 134 / 417 ms | level-load cost, not steady frame cost |
+| Forced Morton rebuild + cut, 100k / 500k | 7.88 / 44.5 ms | random centroids |
+| Sparse rebuild after 100k peak, 10k live | 0.741 ms rebuild | steady follow-up selection 0.254 ms |
+| 4k cloned / shared 51 KiB assets | 35.4 / 12.9 ms | identical 2.048M-entry cut |
+| Immutable page bytes in that cloned / shared case | 199 MiB / 51 KiB | 4,000 mounts / 1 mount |
 
-`BM_TypicalForest_Breakdown` reports per-phase counters (`move_us`,
-`refit_us`, `cut_us`); movers are addressed by cached `NodeHandle`s, the
-production pattern.
-
-Cross-run absolute numbers on this box drift up to ±20% (see the honesty
-note); per-experiment deltas below were validated with controlled A/B runs.
+These are scale indicators, not guarantees. Output size and cache locality can
+dominate population size, and absolute results on this host have moved by up to
+20% between runs. Optimization claims in the journal use interleaved baselines,
+medians, win counts, and controls rather than unrelated absolute runs. The
+final radix A/B measured 36.2% lower end-to-end rebuild cost at 100k random
+instances and 42.0% at 500k.
 
 ---
 
-## 2. Experiment log
+## 2. Historical experiment log
+
+The entries below are chronological evidence. Names such as `UserId`,
+`ViewScratch`, or an older timing describe the revision under test, not the
+current API. Later entries explicitly supersede earlier mechanisms. Sections 1
+and 3, the README, and the design document are the current sources of truth.
 
 One entry per experiment; kept/reverted and why.
 
@@ -431,22 +404,23 @@ found two policy bugs that only continuous churn could expose:
    later audit found was the whole problem: one spawn still cost a full
    rebuild — 2.1 ms at 20k instances and 9.5 ms at 80k, and exactly the same
    as five hundred spawns. Add and remove are now applied to the tree in
-   place, in O(depth), and no longer mark it dirty at all. See HANDOFF.md
-   11.1 for the measurement and `tests/test_tlas.cpp` for the invariants an
-   in-place edit has to maintain.
+   place, in O(depth), and no longer mark it dirty immediately. An edit budget
+   still requests a repair rebuild after enough accumulated changes. See the
+   archived [handoff, section 11.1](docs/archive/HANDOFF-2026-08-05.md)
+   for the measurement and `tests/test_tlas.cpp` for the invariants an in-place
+   edit has to maintain.
 
-| churn bench (5% out + 5% in, per frame) | before | after |
+| churn bench at this experiment's revision (5% out + 5% in/frame) | before | after |
 | --- | --- | --- |
 | 10k trees (500+500 churn/frame) | 21.6 ms | 4.0 ms (0.8 churn + 0.25 move + 1.8 refit + 1.2 cut) |
 | 50k trees (2500+2500 churn/frame) | not viable (seconds) | 31.5 ms (6.4 churn + 1.4 move + 16.9 refit + 6.8 cut) |
 
-Non-churn scenarios are unchanged (the threshold keeps the same behavior
-for assembly-time adds). Reading the after-numbers: a spawn or despawn
-costs ~1.3 µs all-in (page copy, registration, residency, TLAS share);
-refit and cut run a little hotter than the static forest because fresh
-pages are cache-cold and the TLAS re-sorts every frame under churn. The
-5%/frame rate is deliberately brutal — at a realistic 0.1–0.5%/frame the
-churn phase is tens of microseconds.
+At that revision, non-churn scenarios were unchanged and a spawn or despawn
+cost ~1.3 µs all-in (page copy, registration, residency, TLAS share). Fresh
+pages made refit and cut a little hotter, and the TLAS re-sorted every frame
+under 5% churn. The later incremental-edit change removed the remaining
+single-spawn rebuild cliff; use the current `BM_Spawn_MarginalCost` rather than
+this historical churn table for production budgeting.
 
 **Builder cost** (`BM_Builder_BuildPage`), for composing trees at runtime —
 createRoot/createNode per node plus `build()` (preorder layout, wide-block
@@ -488,8 +462,9 @@ submissions/s).
 
 **New unit tests** (`test_contracts.cpp` + additions elsewhere, 14 total):
 cut/ideal antichain + residency invariants fuzzed over random paged worlds;
-byte-identical determinism across identically built worlds (hysteresis on);
-multi-view scratch isolation (interleaving view B must not perturb view A);
+byte-identical determinism across identically built worlds (the then-current
+hysteresis path); multi-view state isolation (originally scratch, now covered
+by independent dampers and `SelectionContext` objects);
 `collect()` minAge boundary and exact `freedPayloads` accounting;
 `screenError8` and degenerate-box (zero-extent, camera-inside, far-off-axis)
 wide-vs-scalar equivalence; camera-inside-tree, point leaves, 1e6-offset
@@ -627,25 +602,34 @@ model:
   benchmark improved 38.9%. Reset retains warm storage, improving reset+cold
   selection 21.9%.
 
-See `HANDOFF.md` section 14 for the interleaved A/B methodology, rejected margin
-vectorization, radix-sort tradeoffs, and detailed measurements.
+The archived [2026-08-05 handoff](docs/archive/HANDOFF-2026-08-05.md), section
+14, preserves the interleaved A/B tables, rejected margin vectorization,
+radix-sort tradeoffs, and full measurements. It is historical evidence, not API
+guidance.
 
 ---
 
-## 3. Ideas considered and left for later
+## 3. Current constraints and possible follow-up
 
-- **Parallelism.** The whole design is single-writer by construction, but
-  `selectCut` is embarrassingly parallel across instances (forest case) and
-  across independent subtrees (deep case): the DFS stack is already the
-  natural work-stealing unit, and outputs could be emitted per-worker and
-  concatenated. Left out to keep this version simple; nothing in the data
-  layout blocks it.
-- **Lazy shrink of grown bounds.** Grow-only refit means long-running
-  teleport chaos degrades ancestor boxes toward the whole region (visible in
-  `LeafMotion_TeleportWithCut`, where the cut stops shrinking). A trickle
-  "re-tighten K nodes per frame" pass (bottom-up, budgeted) would restore
-  tightness without a spike. The wide-lane mirror makes this a
-  straightforward addition.
-- **Ideal-cut-free streaming mode.** `NEEDS_EXPANSION` entries could be
-  emitted into a dedicated small vector (they are rare) so streamers could
-  skip the full ideal cut too. Cheap; do it when a real consumer appears.
+- **Context reuse and parallel selection are separate paths.** Stateless
+  selection already parallelizes across visible instances and preserves serial
+  output/request order. `SelectionContext` remains serial because reuse records,
+  the cut slab, and dependency validation are optimized as one compact stream.
+  Combine them only if a production profile shows a net win after per-worker
+  merge and record-write costs.
+- **Internal overlay bounds do not shrink.** Grow-only refit means long-running
+  large teleports can loosen page ancestors. This costs culling efficiency, not
+  correctness; TLAS rebuilds retighten only the top level. A budgeted bottom-up
+  overlay pass is the remaining mechanism if real content exhibits degradation.
+- **Ideal-cut-free streaming mode.** `NeedsExpansion` entries could be emitted
+  into a dedicated small sink so a streamer can request topology without a full
+  ideal-cut vector. The current API emits them as tagged ideal entries; add a
+  fourth mode only for a measured consumer need.
+- **Transform scope.** Instances support translation and uniform positive scale.
+  Rotation and non-uniform scale need authored baking or an integration-layer
+  representation; adding them directly would change bound transforms and hot
+  instance state.
+- **Host policy remains host policy.** Page size, GC watermarks/dwell, attach
+  budget, predictive lookahead, and whether to retain a `SelectionContext` are
+  content- and IO-dependent decisions. The benchmark suite supplies the
+  mechanisms' scale but cannot choose production values.

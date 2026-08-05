@@ -1,11 +1,11 @@
 #pragma once
-// Runtime side of HLodTree (hlod_design.md §1, §3-§8):
+// Runtime side of HLodTree (see hlod_design.md):
 //  - assets: immutable page trees, registered once, shared by every instance
 //    and every attachment that names them
 //  - instances of those assets over a wide dynamic top-level BVH
 //  - topology streaming (attach/detach pages under expansion points)
 //  - payload residency with O(1) all-or-nothing refinement tests
-//  - single-pass pruned cut selection, no per-view scratch at all
+//  - single-pass pruned cut selection, with no required per-node view scratch
 //  - LRU garbage collection of cold pages
 //  - sublinear conservative bounds refit for moving nodes and instances
 //
@@ -27,9 +27,10 @@
 //
 // THE API IS FULLY HANDLE-BASED — the World keeps no id index at all (no
 // hash maps anywhere). Handles are the only currency:
-//  - registerAsset returns an AssetHandle; addInstance / attachPage return a
-//    PageHandle {slot, generation}; node handles are composed from it plus
-//    the node's page-local index, which is immutable authored data.
+//  - registerAsset returns an AssetHandle; addInstance returns an InstanceRef
+//    containing its root PageHandle, and attachPage returns a PageHandle.
+//    Node handles are composed from a page handle plus the packed page-local
+//    index, which is immutable after build.
 //  - selectCut outputs carry a NodeHandle wherever the caller might act on
 //    the entry (load requests, expansion requests).
 //  - the 64-bit UserPayload is opaque: echoed in outputs, never interpreted.
@@ -37,12 +38,12 @@
 // detected by the generation stamp: mutating calls ignore them, queries
 // report them absent — the normal race between streaming completion and GC.
 //
-// Single-threaded by default. selectCut can fan out across instances through
-// the context's parallelFor (see WorldConfig::parallelInstanceThreshold);
-// everything else is single-writer by construction. selectCut itself is a
-// pure read of the World — LOD damping lives in the CullView (see ViewDamper
-// in math.h), not in per-node history — so there is no per-view object to
-// allocate, thread through, or keep in sync with page lifetimes.
+// Single-writer by construction. Stateless selectCut can fan out across
+// instances through the context's parallelFor (see
+// WorldConfig::parallelInstanceThreshold), but one calling thread owns and
+// joins that work; public operations and selections must not run concurrently
+// on the same World. LOD damping lives in the CullView (ViewDamper) or in an
+// optional per-view SelectionContext, never as per-node World state.
 
 #include <cstdint>
 #include <cstring>
@@ -443,12 +444,13 @@ enum class TlasQuality : uint8_t
 
 struct WorldConfig
 {
-    // Allocation and task parallelism. Must outlive the World: pages the
-    // World owns free themselves through it.
+    // Allocation and task parallelism. Copied into the World; callback code
+    // and anything referenced by `user` must remain valid for its lifetime.
     HlodContext context{};
 
-    // Quality tier of the top-level BVH. Motion-triggered rebuilds always
-    // take the Morton path regardless; this is what structural rebuilds use.
+    // Quality tier of the top-level BVH. Initial builds, large population
+    // drift, and area-drift repair use this tier. Escape/edit-budget repairs
+    // use the cheaper Morton path unless another trigger promotes the build.
     TlasQuality tlasQuality = TlasQuality::BinnedSAH;
 
     // SAH cost constants (BinnedSAH only): cost of visiting a node vs testing
@@ -478,7 +480,7 @@ struct WorldConfig
     // Do not read this as a tuning knob of last resort: before it existed,
     // every add or remove marked the whole TLAS dirty, so ONE spawn cost a full
     // rebuild -- 2.1 ms at 20k instances and 9.5 ms at 80k, the same as five
-    // hundred spawns. See HANDOFF.md 11.1.
+    // hundred spawns. See ARCHITECTURE.md, experiment L.
     float tlasEditFraction = 0.05f;
 
     // Minimum number of visible instances before selectCut fans out across
@@ -533,8 +535,10 @@ public:
     bool   isAsset(AssetHandle asset) const;
     size_t assetCount() const { return liveAssets_; }
 
-    // The asset's root mount, for composing node handles into shared pages
+    // The asset's shared instance-root mount, for composing node handles
     // (marking residency, attaching children) without a selectCut round-trip.
+    // Invalid until addInstance has materialized that root. Mounts created by
+    // attaching the asset elsewhere are independent and returned by attachPage.
     PageHandle assetRootPage(AssetHandle asset) const;
 
     // ---- world assembly ----------------------------------------------------
@@ -553,7 +557,9 @@ public:
         bool valid() const { return id != kInvalidIndex; }
     };
 
-    // O(1); allocates nothing beyond the instance record.
+    // During initial assembly, additions are accumulated for the first build.
+    // Once a TLAS exists, insertion is O(depth) and may allocate a TLAS node
+    // when a full leaf splits; it never scans the whole instance population.
     InstanceRef addInstance(AssetHandle asset, const InstanceDesc& desc);
     InstanceRef addInstance(AssetHandle asset, float4 pos, float scale = 1.0f);
 
@@ -597,9 +603,9 @@ public:
     bool isResident(NodeHandle h) const;
 
     // ---- motion --------------------------------------------------------------
-    // Record new local-space bounds for one node OF ONE INSTANCE: ~16 ns, a
-    // bounds check and a queue push — call it as often as you like, whenever
-    // you like. The refit runs LAZILY: the tree is guaranteed up to date only
+    // Record new local-space bounds for one node OF ONE INSTANCE: a bounds
+    // check and a queue push. Call it as often as needed; the refit runs
+    // LAZILY, so the tree is guaranteed up to date only
     // where that matters — at the next selectCut (which flushes internally) or
     // an explicit flushBounds(). A node moved many times between cuts ends at
     // exactly the last submitted box; the repeat applications hit hot cache

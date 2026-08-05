@@ -2,8 +2,8 @@
 //
 // Spawning or removing an instance used to mark the whole TLAS dirty, so the
 // next cut rebuilt it from scratch: one spawn cost 2.1 ms at 20k instances and
-// 9.5 ms at 80k, the same as five hundred spawns (HANDOFF.md 11.1). Both are
-// now applied in place in O(depth).
+// 9.5 ms at 80k, the same as five hundred spawns (ARCHITECTURE.md, experiment
+// L). Both operations are now applied in place in O(depth).
 //
 // That trades a guarantee for speed. A rebuilt tree is correct by construction;
 // an edited one is correct only if every edit maintains the invariants the query
