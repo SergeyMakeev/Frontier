@@ -59,10 +59,10 @@ struct Outputs
     std::vector<CutEntry> cut;
 };
 
-Outputs run(World& w, const CullView& v, const CutParams& p)
+Outputs run(World& w, const Camera& v, const CutParams& p)
 {
     Outputs o;
-    w.selectCut(v, p, o.cut);
+    selectCutUncached(w, v, p, o.cut);
     return o;
 }
 
@@ -90,7 +90,7 @@ TEST(Cut, TownExample)
 
     // Both buildings on screen; A close enough to refine into walls, the
     // walls themselves fine at this distance, B drawn as one proxy.
-    const CullView v = makeLookAtView(float4::point(250, 0, -600), float4::point(250, 0, 0));
+    const Camera v = makeLookAtCamera(float4::point(250, 0, -600), float4::point(250, 0, 0));
     const auto o = run(w, v, {4.0f, 0.0f});
 
     std::set<UserId> got;
@@ -124,7 +124,7 @@ TEST(Cut, CoarsensWithDistance)
     size_t lastSize = SIZE_MAX;
     for (float d : {80.0f, 300.0f, 1500.0f, 30000.0f})
     {
-        const CullView v = makeLookAtView(float4::point(0, 0, -d), float4::point(0, 0, 0));
+        const Camera v = makeLookAtCamera(float4::point(0, 0, -d), float4::point(0, 0, 0));
         const auto o = run(w, v, {4.0f, 0.0f});
         ASSERT_FALSE(o.cut.empty()) << "distance " << d;
         EXPECT_LE(currentCutSize(o.cut), lastSize) << "distance " << d;
@@ -161,7 +161,7 @@ TEST(Cut, IsAntichain)
     }
     w.applyUpdates();
 
-    const CullView v = makeLookAtView(float4::point(10, 20, -100), float4::point(0, 0, 0));
+    const Camera v = makeLookAtCamera(float4::point(10, 20, -100), float4::point(0, 0, 0));
     const auto o = run(w, v, {6.0f, 0.0f});
 
     std::set<UserId> inCut;
@@ -238,7 +238,7 @@ TEST(Cut, MatchesBruteForceReference)
         const float4 camPos = float4::point(uni(rng) * 800 - 400, uni(rng) * 300 - 150,
                                             uni(rng) * 800 - 400);
         const float4 camTgt = float4::point(uni(rng) * 200 - 100, 0, uni(rng) * 200 - 100);
-        const CullView v = makeLookAtView(camPos, camTgt);
+        const Camera v = makeLookAtCamera(camPos, camTgt);
 
         const auto got = run(w, v, p);
         const RefResult want = TA::referenceCut(w, v, p);
@@ -263,7 +263,7 @@ TEST(Cut, StableAcrossFrames)
     w.addInstance(std::move(pg), float4::point(0, 0, 0));
     markAllResident(w, ids);
 
-    const CullView v = makeLookAtView(float4::point(20, 10, -90), float4::point(0, 0, 0));
+    const Camera v = makeLookAtCamera(float4::point(20, 10, -90), float4::point(0, 0, 0));
     w.applyUpdates();
     const auto first = run(w, v, {5.0f, 0.0f});
     for (int f = 0; f < 5; ++f)
@@ -302,18 +302,18 @@ struct DampFixture
         const auto ids = pageIds(pg);
         w.addInstance(std::move(pg), float4::point(0, 0, 0));
         markAllResident(w, ids);
-        k = makeLookAtView(float4::point(0, 0, -1), float4::point(0, 0, 0)).k;
+        k = makeLookAtCamera(float4::point(0, 0, -1), float4::point(0, 0, 0)).k;
     }
 
     // A camera placed so the root projects to `errTarget` pixels.
-    CullView camAtErr(float errTarget) const
+    Camera camAtErr(float errTarget) const
     {
         const float dist = 1.0f * k / errTarget;
-        return makeLookAtView(float4::point(0, 0, -(dist + 0.01f)),
+        return makeLookAtCamera(float4::point(0, 0, -(dist + 0.01f)),
                               float4::point(0, 0, 0));
     }
 
-    bool coarse(const CullView& v, const CutParams& p)
+    bool coarse(const Camera& v, const CutParams& p)
     {
         w.applyUpdates();
         const Outputs o = run(w, v, p);
@@ -333,7 +333,7 @@ TEST(Cut, DampingSurvivesJitter)
 
     {
         DampFixture f;
-        ViewDamper none(0.0f);
+        CameraDamper none(0.0f);
         std::vector<bool> flips;
         for (int i = 0; i < 6; ++i)
             flips.push_back(f.coarse(none.damp(f.camAtErr(i % 2 ? 9.5f : 10.5f)), p));
@@ -343,7 +343,7 @@ TEST(Cut, DampingSurvivesJitter)
     }
     {
         DampFixture f;
-        ViewDamper damper(4.0f);
+        CameraDamper damper(4.0f);
         std::vector<bool> flips;
         for (int i = 0; i < 6; ++i)
             flips.push_back(f.coarse(damper.damp(f.camAtErr(i % 2 ? 9.5f : 10.5f)), p));
@@ -362,7 +362,7 @@ TEST(Cut, DampingIsAsymmetric)
 {
     const CutParams p{10.0f, 0.0f};
     DampFixture f;
-    ViewDamper damper(4.0f);
+    CameraDamper damper(4.0f);
 
     // Settle far away and coarse.
     for (int i = 0; i < 12; ++i) EXPECT_TRUE(f.coarse(damper.damp(f.camAtErr(7.0f)), p));
@@ -385,12 +385,12 @@ TEST(Cut, DampingOffIsExact)
 {
     const CutParams p{10.0f, 0.0f};
     DampFixture f;
-    ViewDamper off(0.0f);
+    CameraDamper off(0.0f);
 
     for (float err : {11.0f, 9.0f, 13.0f, 7.0f, 10.001f})
     {
-        const CullView raw = f.camAtErr(err);
-        const CullView damped = off.damp(raw);
+        const Camera raw = f.camAtErr(err);
+        const Camera damped = off.damp(raw);
         EXPECT_EQ(damped.envLo.x, 0.0f);
         EXPECT_EQ(damped.envHi.x, 0.0f);
         EXPECT_FALSE(damped.damped());
@@ -407,7 +407,7 @@ TEST(Cut, DamperResetForgetsTheWindow)
 {
     const CutParams p{10.0f, 0.0f};
     DampFixture f;
-    ViewDamper damper(8.0f);
+    CameraDamper damper(8.0f);
 
     for (int i = 0; i < 8; ++i) f.coarse(damper.damp(f.camAtErr(20.0f)), p);
     EXPECT_FALSE(f.coarse(damper.damp(f.camAtErr(3.0f)), p));   // envelope holds detail
@@ -436,7 +436,7 @@ TEST(Cut, ContributionCulling)
     markAllResident(w, farIds);
     w.applyUpdates();
 
-    const CullView v = makeLookAtView(float4::point(0, 5, -60), float4::point(0, 0, 100));
+    const Camera v = makeLookAtCamera(float4::point(0, 5, -60), float4::point(0, 0, 100));
 
     const auto without = run(w, v, {4.0f, 0.0f});
     const auto with = run(w, v, {4.0f, 0.5f});
@@ -472,8 +472,8 @@ TEST(Cut, MultiViewIndependence)
     w.addInstance(std::move(pg), float4::point(0, 0, 0));
     markAllResident(w, ids);
 
-    const CullView vNear = makeLookAtView(float4::point(0, 0, -70), float4::point(0, 0, 0));
-    const CullView vFar = makeLookAtView(float4::point(0, 0, -20000), float4::point(0, 0, 0));
+    const Camera vNear = makeLookAtCamera(float4::point(0, 0, -70), float4::point(0, 0, 0));
+    const Camera vFar = makeLookAtCamera(float4::point(0, 0, -20000), float4::point(0, 0, 0));
 
     for (int f = 0; f < 3; ++f)
     {

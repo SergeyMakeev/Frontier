@@ -22,10 +22,10 @@ struct Outputs
     std::vector<CutEntry> cut;
 };
 
-Outputs run(World& w, const CullView& v, const CutParams& p)
+Outputs run(World& w, const Camera& v, const CutParams& p)
 {
     Outputs o;
-    w.selectCut(v, p, o.cut);
+    selectCutUncached(w, v, p, o.cut);
     return o;
 }
 
@@ -90,13 +90,13 @@ struct RandomWorld
     }
 };
 
-CullView randomView(std::mt19937& rng)
+Camera randomView(std::mt19937& rng)
 {
     std::uniform_real_distribution<float> uni(0.0f, 1.0f);
     const float4 pos = float4::point(uni(rng) * 800 - 400, uni(rng) * 300 - 150,
                                      uni(rng) * 800 - 400);
     const float4 tgt = float4::point(uni(rng) * 200 - 100, 0, uni(rng) * 200 - 100);
-    return makeLookAtView(pos, tgt);
+    return makeLookAtCamera(pos, tgt);
 }
 
 } // namespace
@@ -124,7 +124,7 @@ TEST(Contracts, CutInvariantsHoldOnRandomWorlds)
 
         for (int frame = 0; frame < 3; ++frame)
         {
-            const CullView v = randomView(rng);
+            const Camera v = randomView(rng);
             const Outputs o = run(w, v, p);
 
             const std::set<UserId> cut = cutIds(o.cut);
@@ -178,7 +178,7 @@ TEST(Contracts, DeterministicAcrossIdenticalWorlds)
     {
         RandomWorld a(seed), b(seed);
         // Damping on: the camera envelope history must match too.
-        ViewDamper da(4.0f), db(4.0f);
+        CameraDamper da(4.0f), db(4.0f);
         std::mt19937 rngA(seed * 3), rngB(seed * 3);
         const CutParams p{6.0f, 0.5f};
 
@@ -186,8 +186,8 @@ TEST(Contracts, DeterministicAcrossIdenticalWorlds)
         {
             a.w.applyUpdates();
             b.w.applyUpdates();
-            const CullView va = da.damp(randomView(rngA));
-            const CullView vb = db.damp(randomView(rngB));
+            const Camera va = da.damp(randomView(rngA));
+            const Camera vb = db.damp(randomView(rngB));
             const Outputs oa = run(a.w, va, p);
             const Outputs ob = run(b.w, vb, p);
 
@@ -231,7 +231,7 @@ TEST(Contracts, ParallelSelectionMatchesSerialUnifiedCut)
 
     serial.applyUpdates();
     parallel.applyUpdates();
-    const CullView view = makeLookAtView(float4::point(3, 8, -40),
+    const Camera view = makeLookAtCamera(float4::point(3, 8, -40),
                                          float4::point(3, 0, 3));
     const CutParams params{0.25f, 0.0f};
     const Outputs a = run(serial, view, params);
@@ -248,14 +248,50 @@ TEST(Contracts, ParallelSelectionMatchesSerialUnifiedCut)
     }
 }
 
+TEST(Contracts, ViewBindsToOneWorldUntilReset)
+{
+    World first, second;
+    first.applyUpdates();
+    second.applyUpdates();
+
+    const World& publishedFirst = first;
+    const World& publishedSecond = second;
+    const Camera camera = makeLookAtCamera(float4::point(0, 0, -10),
+                                           float4::point(0, 0, 0));
+    const CutParams params{4.0f, 0.0f};
+    std::vector<CutEntry> cut;
+    View view;
+
+    EXPECT_NO_THROW(view.selectCut(publishedFirst, camera, params, cut));
+    EXPECT_THROW(view.selectCut(publishedSecond, camera, params, cut),
+                 std::logic_error);
+
+    view.reset();
+    EXPECT_NO_THROW(view.selectCut(publishedSecond, camera, params, cut));
+}
+
+TEST(Contracts, ViewRequiresPublishedWorld)
+{
+    World world;
+    View view;
+    const Camera camera = makeLookAtCamera(float4::point(0, 0, -10),
+                                           float4::point(0, 0, 0));
+    const CutParams params{4.0f, 0.0f};
+    std::vector<CutEntry> cut;
+
+    EXPECT_THROW(view.selectCut(world, camera, params, cut), std::logic_error);
+    world.applyUpdates();
+    EXPECT_NO_THROW(view.selectCut(world, camera, params, cut));
+}
+
 // ---------------------------------------------------------------------------
 // Multiple damped views share the world but not each other's history: each
-// view's memory lives entirely in its own ViewDamper, and selectCut is a pure
+// view's memory lives entirely in its own CameraDamper, and selectCut is a pure
 // read of the World. Interleaving view B must not change view A's outputs vs
 // running A alone on an identical world (and vice versa). This is the
 // regression test for moving hysteresis off the nodes onto the camera.
 // ---------------------------------------------------------------------------
-TEST(Contracts, MultiViewDamperIsolation)
+TEST(Contracts, MultiCameraDamperIsolation)
 {
     const uint32_t seed = 99;
     RandomWorld both(seed), onlyA(seed), onlyB(seed);
@@ -268,7 +304,7 @@ TEST(Contracts, MultiViewDamperIsolation)
         }
 
     // Heavy damping: the envelope history matters.
-    ViewDamper dA(8.0f), dB(8.0f), dAlone(8.0f), dBlone(8.0f);
+    CameraDamper dA(8.0f), dB(8.0f), dAlone(8.0f), dBlone(8.0f);
     const CutParams p{6.0f, 0.0f};
 
     for (int frame = 0; frame < 8; ++frame)
@@ -278,16 +314,16 @@ TEST(Contracts, MultiViewDamperIsolation)
         onlyB.w.applyUpdates();
 
         const float t = float(frame) * 0.35f;
-        const CullView vA = makeLookAtView(
+        const Camera vA = makeLookAtCamera(
             float4::point(std::cos(t) * 300, 120, std::sin(t) * 300), float4::point(0, 0, 0));
-        const CullView vB = makeLookAtView(
+        const Camera vB = makeLookAtCamera(
             float4::point(-std::sin(t) * 90, 25, std::cos(t) * 90), float4::point(30, 0, -20));
 
         std::vector<CutEntry> cutA, cutB, cutAlone, cutBlone;
-        both.w.selectCut(dA.damp(vA), p, cutA);
-        both.w.selectCut(dB.damp(vB), p, cutB);   // interleaved with A every frame
-        onlyA.w.selectCut(dAlone.damp(vA), p, cutAlone);
-        onlyB.w.selectCut(dBlone.damp(vB), p, cutBlone);
+        selectCutUncached(both.w, dA.damp(vA), p, cutA);
+        selectCutUncached(both.w, dB.damp(vB), p, cutB);   // interleaved with A every frame
+        selectCutUncached(onlyA.w, dAlone.damp(vA), p, cutAlone);
+        selectCutUncached(onlyB.w, dBlone.damp(vB), p, cutBlone);
 
         ASSERT_EQ(cutA.size(), cutAlone.size()) << "frame " << frame;
         for (size_t i = 0; i < cutA.size(); ++i)
@@ -324,27 +360,27 @@ TEST(Contracts, StaleInstanceRefIsIgnored)
     ASSERT_NE(refA.generation, refB.generation);
 
     w.applyUpdates();
-    const CullView v = makeLookAtView(float4::point(0, 0, -30), float4::point(0, 0, 0));
+    const Camera v = makeLookAtCamera(float4::point(0, 0, -30), float4::point(0, 0, 0));
     std::vector<CutEntry> cut;
-    w.selectCut(v, {4, 0}, cut);
+    selectCutUncached(w, v, {4, 0}, cut);
     ASSERT_FALSE(cut.empty());
 
     // Stale move: B must not teleport.
     w.moveInstance(refA, float4::point(50000, 0, 0));
     cut.clear();
-    w.selectCut(v, {4, 0}, cut);
+    selectCutUncached(w, v, {4, 0}, cut);
     EXPECT_FALSE(cut.empty()) << "stale moveInstance displaced the new instance";
 
     // Stale remove: B must survive.
     w.removeInstance(refA);
     cut.clear();
-    w.selectCut(v, {4, 0}, cut);
+    selectCutUncached(w, v, {4, 0}, cut);
     EXPECT_FALSE(cut.empty()) << "stale removeInstance killed the new instance";
 
     // The live ref still works.
     w.removeInstance(refB);
     cut.clear();
-    w.selectCut(v, {4, 0}, cut);
+    selectCutUncached(w, v, {4, 0}, cut);
     EXPECT_TRUE(cut.empty());
 }
 
@@ -371,7 +407,7 @@ TEST(Contracts, PointLeavesMatchReference)
     markAllResident(w, ids);
     w.applyUpdates();
 
-    const CullView v = makeLookAtView(float4::point(0, 20, -60), float4::point(0, 0, 0));
+    const Camera v = makeLookAtCamera(float4::point(0, 20, -60), float4::point(0, 0, 0));
     const CutParams p{4.0f, 0.0f};
     const Outputs o = run(w, v, p);
     const RefResult want = TA::referenceCut(w, v, p);
@@ -398,7 +434,7 @@ TEST(Contracts, CameraInsideTreeMatchesReference)
     markAllResident(w, ids);
     w.applyUpdates();
 
-    const CullView v = makeLookAtView(float4::point(1, 2, 3), float4::point(40, 0, 40));
+    const Camera v = makeLookAtCamera(float4::point(1, 2, 3), float4::point(40, 0, 40));
     const CutParams p{4.0f, 0.0f};
     const Outputs o = run(w, v, p);
     const RefResult want = TA::referenceCut(w, v, p);
@@ -426,7 +462,7 @@ TEST(Contracts, FarFromOriginMatchesReference)
     markAllResident(w, ids);
     w.applyUpdates();
 
-    const CullView v = makeLookAtView(farPos + float4::vec(0, 30, -80), farPos);
+    const Camera v = makeLookAtCamera(farPos + float4::vec(0, 30, -80), farPos);
     const CutParams p{4.0f, 0.0f};
     const Outputs o = run(w, v, p);
     const RefResult want = TA::referenceCut(w, v, p);
@@ -453,7 +489,7 @@ TEST(Contracts, ScaledInstanceMatchesReference)
         markAllResident(w, ids);
         w.applyUpdates();
 
-        const CullView v = makeLookAtView(float4::point(0, 10 * scale, -40 * scale),
+        const Camera v = makeLookAtCamera(float4::point(0, 10 * scale, -40 * scale),
                                           float4::point(0, 0, 0));
         const CutParams p{4.0f, 0.0f};
         const Outputs o = run(w, v, p);

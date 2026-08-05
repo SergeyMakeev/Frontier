@@ -39,10 +39,9 @@
 // report them absent — the normal race between streaming completion and GC.
 //
 // World updates are single-writer. applyUpdates() publishes a stable snapshot;
-// contextual selectCut overloads then read only that snapshot and may run
-// concurrently when each call has its own contexts and outputs. LOD damping
-// lives in the CullView (ViewDamper) or in an optional per-view
-// SelectionContext, never as per-node World state.
+// View::selectCut then reads only that snapshot and may run concurrently when
+// each call has its own View and outputs. LOD damping, cut reuse, query scratch,
+// and selection statistics all live in the View, never as mutable World state.
 
 #include <cstdint>
 #include <cstring>
@@ -57,7 +56,7 @@
 namespace hlod {
 
 class World;
-struct SelectionScratch;
+struct ViewScratch;
 
 // Registered page asset: the unit of sharing. Returned by registerAsset().
 struct AssetHandle
@@ -151,7 +150,7 @@ struct InstanceDesc
     // slot. kAutoTag echoes the InstanceId instead.
     uint32_t tag = kAutoTag;
 
-    // ANDed against CullView::viewMask; a zero result culls the instance at
+    // ANDed against Camera::viewMask; a zero result culls the instance at
     // the top level. Cheap layer visibility: shadow-only props, editor-only
     // gizmos, per-view opt-outs.
     uint32_t mask = ~0u;
@@ -192,7 +191,7 @@ public:
     }
 
     // Append n contiguous values. Same result as n pushes, one bulk copy: this
-    // is how a SelectionContext hands back an instance's recorded cut.
+    // is how a View hands back an instance's recorded cut.
     void pushRange(const T* p, uint32_t n)
     {
         if (n == 0) return;
@@ -247,7 +246,7 @@ struct CutStats
 // primary camera but not shadow cascades).
 //
 // A context may accumulate observations across many update epochs. Like
-// SelectionContext, it belongs to one view and must not be used concurrently
+// View, it belongs to one view and must not be used concurrently
 // by two calls; distinct contexts are independent.
 class PageUsageContext
 {
@@ -277,7 +276,7 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// SelectionContext — everything selection remembers about one view
+// View — everything selection remembers about one view
 //
 // A world that is mostly static, seen by a camera that moves continuously,
 // produces a cut that is nearly identical frame to frame. This exploits that:
@@ -285,40 +284,38 @@ private:
 // its entries are handed back where they already lie.
 //
 // THE STATE IS ALL HERE, NOT IN THE WORLD. Querying several cameras per frame
-// (main view, shadow cascades, a reflection probe) means several contexts, and
-// they cannot interfere: the World stays a pure read during selection, exactly
-// as it is without one.
+// (main view, shadow cascades, a reflection probe) means several Views, and
+// they cannot interfere: the World stays a pure read during selection.
 //
-// It also OWNS THE VIEW DAMPER for its view, and that is not merely tidy. The
+// It also owns the camera damper, and that is not merely tidy. The
 // two are one mechanism read two ways: the damper turns a camera position into
 // a query envelope, and the reuse test below is driven by how far that same
 // envelope has travelled, not by the camera. Held separately, the caller has to
-// pair the right damper with the right context by hand every frame, and pairing
+// pair the right damper with the right View by hand every frame, and pairing
 // the main view's damper with a shadow cascade's cache compiles perfectly well.
-// So selectCut takes the RAW view and damps it internally, one reset() covers
+// So selectCut takes the raw Camera and damps it internally, one reset() covers
 // the discontinuity for both halves, and the pairing cannot be got wrong.
 //
 // It also makes one coupling visible instead of hidden, which is the other
 // reason to keep them together. The damper relaxes projection scale k as well
 // as position. A flip point lies at `geometricError * k / threshold`, so the
 // maximum error observed while recording a cut gives a conservative slope for
-// how far any of its decisions can move per unit k. The context accumulates
+// how far any of its decisions can move per unit k. The View accumulates
 // absolute k travel and charges that per-record slope against the same validity
 // margin used for camera travel.
 //
 // This matters most for damped zoom-out: k changes a little for roughly 24
 // half-lives. The old all-or-nothing epoch invalidated the whole cache on each
 // of those frames. The slope budget keeps unaffected records reusable while
-// preserving the exact node set. Measured by BM_SelectionContext_Zoom at 20k
+// preserving the exact node set. Measured by BM_View_Zoom at 20k
 // instances, halfLife 8 and a zoom step every 120 frames, it removes 39% of the
 // cut time without growing the 48-byte record. Threshold changes still bump an
 // epoch because they change every stored slope at once.
 //
-// Damping and reuse each stay optional and free when unused: halfLife 0 makes
-// the arithmetic bit-identical to an undamped query, and the storage below is
-// empty until the first call. A fully dynamic world wants the damper and not
-// the reuse, and pays ~8% for the reuse it cannot use; a shadow cascade often
-// wants the reverse.
+// Damping and reuse are independent. A half-life of 0 makes the arithmetic
+// bit-identical to an undamped query; setReuseEnabled(false) selects the
+// uncached traversal and avoids allocating records. A fully dynamic world may
+// want damping without reuse, while a shadow cascade often wants the reverse.
 //
 // WHY IT IS SOUND, AND WHY IT WINS
 // --------------------------------
@@ -347,18 +344,17 @@ private:
 //
 // FLAT OUTPUT
 // -----------
-// This overload writes the same contiguous CutEntry sequence as every other
-// one, so the only difference at the call site is the context argument.
-// Reused entries are copied from context-owned storage into the caller's flat
+// Cached and uncached modes write the same contiguous CutEntry sequence.
+// Reused entries are copied from View-owned storage into the caller's flat
 // output; no World-owned mutable query state is involved.
 //
 // WHAT IS EXACT AND WHAT IS NOT
 // -----------------------------
-// The set of emitted nodes is exactly what a stateless selectCut would emit.
+// The set of emitted nodes is exactly what an uncached selectCut would emit.
 // CutEntry::err is not: it is the value from the recorded camera position, so
 // it is stale by at most the margin expressed in error units. Use it for
 // prioritisation and dithering, which is what it is for; do not expect it to
-// be bit-identical to the stateless path.
+// be bit-identical to the uncached path.
 //
 // Streaming and residency are part of the recorded unified cut. Page content
 // versions invalidate a record when any page it depended on changes. Instances
@@ -366,20 +362,20 @@ private:
 // simply re-walked.
 // ---------------------------------------------------------------------------
 
-class SelectionContext
+class View
 {
 public:
-    SelectionContext();
-    explicit SelectionContext(float halfLifeFrames);
-    ~SelectionContext();
+    View();
+    explicit View(float halfLifeFrames);
+    ~View();
 
-    SelectionContext(SelectionContext&&) noexcept;
-    SelectionContext& operator=(SelectionContext&&) noexcept;
-    SelectionContext(const SelectionContext&) = delete;
-    SelectionContext& operator=(const SelectionContext&) = delete;
+    View(View&&) noexcept;
+    View& operator=(View&&) noexcept;
+    View(const View&) = delete;
+    View& operator=(const View&) = delete;
 
     // LOD hysteresis for this view, in frames; 0 disables it exactly. See
-    // ViewDamper in math.h for what the envelope does.
+    // CameraDamper in math.h for what the envelope does.
     float halfLife() const { return damper_.halfLife(); }
     void  setHalfLife(float frames) { damper_.setHalfLife(frames); }
 
@@ -387,9 +383,30 @@ public:
     uint32_t reused() const { return reused_; }
     uint32_t walked() const { return walked_; }
 
-    // Counters from this context's last call. Per-context ownership keeps
+    // Counters from this View's last call. Per-view ownership keeps
     // concurrent views from racing over a global "last selection" value.
     const CutStats& lastCutStats() const { return stats_; }
+
+    // Cached selection is the default. Disable it for highly dynamic views
+    // that prefer the internally parallel uncached traversal. Changing modes
+    // resets accumulated damping and reuse state but retains allocations.
+    bool reuseEnabled() const { return reuseEnabled_; }
+    void setReuseEnabled(bool enabled);
+
+    // Query a World snapshot published by applyUpdates(). The View is mutable
+    // and must not be used concurrently; any number of distinct Views may read
+    // the same const World concurrently. A View binds to the first World it
+    // queries and reset() releases that binding.
+    void selectCut(const World& world, const Camera& camera,
+                   const CutParams& params, CutSink& outCut);
+    void selectCut(const World& world, const Camera& camera,
+                   const CutParams& params, PageUsageContext& usage,
+                   CutSink& outCut);
+    void selectCut(const World& world, const Camera& camera,
+                   const CutParams& params, std::vector<CutEntry>& outCut);
+    void selectCut(const World& world, const Camera& camera,
+                   const CutParams& params, PageUsageContext& usage,
+                   std::vector<CutEntry>& outCut);
 
     // Forget everything: the damping window and every record. Call it on a
     // teleport or camera cut. Reuse never *requires* this -- every record
@@ -441,20 +458,20 @@ private:
         uint32_t depVersion[kMaxDeps]{};
         uint32_t depCount = 0;
     };
-    static_assert(sizeof(Rec) == 48, "SelectionContext::Rec must stay 48 bytes");
+    static_assert(sizeof(Rec) == 48, "View::Rec must stay 48 bytes");
 
     void compact();
 
     // This view's hysteresis. selectCut damps through it, so the odometer
     // below measures the envelope it produces.
-    ViewDamper damper_;
+    CameraDamper damper_;
 
     std::vector<Rec>      rec_;      // by InstanceId
     std::vector<CutEntry> store_;    // slab of recorded runs
     uint32_t              used_ = 0;
     uint32_t              garbage_ = 0;
 
-    // Distance the damped query envelope has travelled since this context was
+    // Distance the damped query envelope has travelled since this View was
     // created, accumulated per call. kTravel_ similarly accumulates absolute
     // projection-scale motion. A record taken with margin m remains valid
     // while positionTravel + kSlope * kTravel stays below its saved budget:
@@ -473,10 +490,12 @@ private:
     uint32_t reused_ = 0;
     uint32_t walked_ = 0;
     CutStats stats_{};
+    const World* world_ = nullptr;
+    bool reuseEnabled_ = true;
 
     // Mutable query scratch. Opaque so traversal
     // implementation details do not become part of the public API.
-    std::unique_ptr<SelectionScratch> scratch_;
+    std::unique_ptr<ViewScratch> scratch_;
 };
 
 // ---------------------------------------------------------------------------
@@ -532,9 +551,9 @@ struct WorldConfig
     // hundred spawns. See ARCHITECTURE.md, experiment L.
     float tlasEditFraction = 0.05f;
 
-    // Minimum number of visible instances before selectCut fans out across
-    // context.parallelFor. 0 disables parallel cut selection entirely.
-    // Also requires context.workerCount > 1.
+    // Minimum number of visible instances before an uncached View fans
+    // selection out across context.parallelFor. 0 disables parallel cut
+    // selection entirely. Also requires context.workerCount > 1.
     //
     // There is no correctness caveat attached to this: selection reads the
     // World and writes only per-worker buffers, which are concatenated in
@@ -674,60 +693,8 @@ public:
     // snapshot. Call once before a group of selections, even when no world
     // objects changed; it also advances the epoch used by collection aging.
     // No World mutation (including collect) may overlap or occur before every
-    // contextual selection using this snapshot has completed.
+    // View selection using this snapshot has completed.
     void applyUpdates();
-
-    // The single output is the union of the current and ideal cuts. Shared
-    // entries appear once; CutMembership identifies the two additive deltas.
-    // NeedsExpansion entries expose topology that is not attached yet. The
-    // caller owns residency policy: inspect ideal-side entries, query
-    // isResident(), deduplicate shared node ids as desired, and schedule IO.
-    //
-    // For LOD damping, run the view through a ViewDamper (math.h) first.
-    // Stateless overloads retain World-owned scratch and aggregate stats; do
-    // not call them concurrently. Use SelectionContext overloads for
-    // concurrent views.
-    void selectCut(const CullView& view, const CutParams& params,
-                   std::vector<CutEntry>& outCut);
-
-    void selectCut(const CullView& view, const CutParams& params,
-                   PageUsageContext& usage, std::vector<CutEntry>& outCut);
-
-    // Sink form: write straight into caller memory. Check Sink::dropped() to
-    // find out whether the buffers were big enough.
-    void selectCut(const CullView& view, const CutParams& params, CutSink& outCut);
-
-    void selectCut(const CullView& view, const CutParams& params,
-                   PageUsageContext& usage, CutSink& outCut);
-
-    // Contextual form: same output as the overloads above, but an instance whose
-    // cut provably cannot have changed is not walked -- its recorded entries are
-    // copied out instead. One context per view.
-    //
-    // Two things differ from the stateless overloads, both deliberate:
-    //  - pass the RAW view. This is the only overload that damps internally,
-    //    through the context's own ViewDamper.
-    //  - CutEntry::err on a reused entry is stale within the proven margin. The
-    //    node set is exact; see the notes on SelectionContext.
-    //
-    // These overloads are const and may run concurrently after applyUpdates().
-    // Each in-flight call must use distinct SelectionContext, optional
-    // PageUsageContext, and output objects. The same context is not internally
-    // synchronized.
-    void selectCut(const CullView& view, const CutParams& params,
-                   SelectionContext& ctx, CutSink& outCut) const;
-
-    void selectCut(const CullView& view, const CutParams& params,
-                   SelectionContext& ctx, PageUsageContext& usage,
-                   CutSink& outCut) const;
-
-    void selectCut(const CullView& view, const CutParams& params,
-                   SelectionContext& ctx,
-                   std::vector<CutEntry>& outCut) const;
-
-    void selectCut(const CullView& view, const CutParams& params,
-                   SelectionContext& ctx, PageUsageContext& usage,
-                   std::vector<CutEntry>& outCut) const;
 
     // ---- garbage collection ----------------------------------------------------
     // Detaches cold pages from the LRU tail until streamedPageCount() <=
@@ -757,15 +724,12 @@ public:
     size_t overlayCount() const { return liveOverlays_; }
     size_t overlayBytes() const;
 
-    // Filled by the last stateless selectCut. Contextual calls report through
-    // SelectionContext::lastCutStats(). All zero unless built with HLOD_STATS.
-    const CutStats& lastCutStats() const { return stats_; }
-
     struct TestAccess;   // defined by tests; full access to internals
 
 private:
     friend struct TestAccess;
-    friend struct SelectionScratch;
+    friend struct ViewScratch;
+    friend class View;
 
     struct NodeRef
     {
@@ -809,7 +773,7 @@ private:
         std::vector<uint32_t> coveredChildren; // covered immediate children
         // Bumped by anything that can change what a walk of this page emits:
         // a child attaching or detaching, a payload becoming resident or
-        // ceasing to be, a new error clamp. A SelectionContext records this per
+        // ceasing to be, a new error clamp. A View records this per
         // page it walked, which is what lets one shared asset streaming in
         // invalidate every instance of it without any per-instance work.
         uint32_t   contentVersion = 0;
@@ -859,7 +823,7 @@ private:
     };
 
     // Exactly one cache line containing everything the cut walk and
-    // SelectionContext read per visible instance. TLAS-only state lives in the
+    // View read per visible instance. TLAS-only state lives in the
     // parallel InstanceTlas array below, so the instance prefetch no longer
     // drags a second line into the latency-bound walk.
     struct Instance
@@ -956,10 +920,10 @@ private:
 
         std::vector<uint32_t> touched;      // page dependencies / optional usage
         bool trackTouches = false;
-        bool uniqueTouches = false;         // SelectionContext dependency list
+        bool uniqueTouches = false;         // View dependency list
         CutStats stats;
 
-        // Validity-margin tracking for SelectionContext. Off for every ordinary
+        // Validity-margin tracking for View. Off for every ordinary
         // selection, and the branch is invariant for a whole call.
         bool  trackMargin = false;
         float margin = FLT_MAX;   // min distance to a decision flip so far
@@ -1023,7 +987,7 @@ private:
     void tlasRebuild();
     int32_t tlasBuildRange(std::vector<uint32_t>& items, int lo, int hi, int32_t parent);
     int  tlasSplit(std::vector<uint32_t>& items, int lo, int hi);
-    void tlasQuery(const CullView& view, float minPix,
+    void tlasQuery(const Camera& view, float minPix,
                    std::vector<std::pair<uint32_t, uint8_t>>& outVisible,
                    std::vector<TlasItem>& stack) const;
     void recomputeInstanceBounds(InstanceId id);
@@ -1045,22 +1009,23 @@ private:
 
     bool visibleDescendantsCovered(uint32_t slot, uint32_t node, uint8_t mask,
                                    const Instance& inst,
-                                   const CullView& local,
+                                   const Camera& local,
                                    std::vector<uint32_t>* touched = nullptr,
                                    bool uniqueTouches = true) const;
-    void runInstance(uint32_t instIdx, const CullView& view, const CutParams& params,
+    void runInstance(uint32_t instIdx, const Camera& view, const CutParams& params,
                      uint8_t mask, Worker& w) const;
-    void runPage(const WorkItem& item, const Instance& inst, const CullView& local,
+    void runPage(const WorkItem& item, const Instance& inst, const Camera& local,
                  const CutParams& params, Worker& w) const;
     void wideVisit(const WorkItem& item, const PageView& pg, float errClamp,
                    uint32_t gen, uint32_t tag, uint32_t node, uint8_t mask,
                    uint8_t currentKids, uint8_t idealKids,
-                   const CullView& local, Worker& w) const;
-    void selectCutContext(const CullView& view, const CutParams& params,
-                          SelectionContext& ctx, PageUsageContext* usage,
-                          CutSink& outCut) const;
-    void selectCutStateless(const CullView& view, const CutParams& params,
-                            PageUsageContext* usage, CutSink& outCut);
+                   const Camera& local, Worker& w) const;
+    void selectCutCached(const Camera& camera, const CutParams& params,
+                         View& view, PageUsageContext* usage,
+                         CutSink& outCut) const;
+    void selectCutUncached(const Camera& camera, const CutParams& params,
+                           View& view, PageUsageContext* usage,
+                           CutSink& outCut) const;
     void recordPageUsage(PageUsageContext& usage, uint32_t slot) const;
 
     // ---- state ----
@@ -1099,8 +1064,6 @@ private:
 
     uint32_t lruHead_ = kInvalidIndex, lruTail_ = kInvalidIndex;
     uint32_t frame_ = 0;
-    CutStats stats_;
-
     // Submitted bounds in submission order. The generation stamps make
     // entries self-invalidating: if the page detached (or either slot was
     // reused) before the flush, the entry is skipped instead of applying to
@@ -1113,11 +1076,8 @@ private:
     };
     std::vector<PendingMove> pendingMoves_;
 
-    // per-call scratch (kept to avoid reallocation)
+    // Shared TLAS build scratch. Per-selection scratch lives in View.
     struct TlasItem { int32_t node; uint8_t mask; };
-    std::vector<Worker>                        workers_;
-    std::vector<std::pair<uint32_t, uint8_t>>  visibleTmp_;
-    std::vector<TlasItem>                      tlasStack_;
     std::vector<std::pair<uint64_t, uint32_t>> tlasKeys_;
     std::vector<std::pair<uint64_t, uint32_t>> tlasKeysTmp_;
     std::vector<int32_t>                       tlasLevelTmp_;

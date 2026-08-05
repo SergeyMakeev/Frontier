@@ -251,7 +251,7 @@ struct AABB
 
 // Box-to-box separation: distance from [qmn, qmx] to b, 0 when they touch or
 // overlap. The LOD path queries with the camera *envelope* (where the camera
-// has been recently) rather than a bare position; see ViewDamper below.
+// has been recently) rather than a bare position; see CameraDamper below.
 //
 // Collapsing the query box to a point (qmn == qmx == p) reduces this to the
 // textbook point-to-box distance term for term, so the damped and undamped
@@ -753,11 +753,11 @@ inline float8 distanceToBoxes(const WideBounds& b, float4 p)
 }
 
 // ---------------------------------------------------------------------------
-// Cull view: camera position, frustum, and the error scale k so that
+// Camera: position, frustum, and the error scale k so that
 // screenErrorPx = geometricError * k / distance.
 // ---------------------------------------------------------------------------
 
-struct CullView
+struct Camera
 {
     float4  pos;
     Frustum frustum;
@@ -779,8 +779,9 @@ struct CullView
     //
     // Both components are non-negative and default to zero, which collapses
     // the envelope onto pos and makes the arithmetic bit-identical to an
-    // undamped point query. Any hand-built CullView is therefore correct
-    // without knowing this field exists. ViewDamper maintains it for you.
+    // undamped point query. Any hand-built Camera is therefore correct
+    // without knowing this field exists. View's internal CameraDamper
+    // maintains it during selection.
     float4 envLo{}, envHi{};
 
     float4 queryMin() const { return pos - envLo; }
@@ -791,17 +792,17 @@ struct CullView
 
 // Widen v's envelope to also cover otherPos -- the literal two-camera form of
 // damping, for callers who keep last frame's view around and do not want the
-// longer window ViewDamper provides.
-inline CullView withEnvelope(const CullView& v, float4 otherPos)
+// longer window CameraDamper provides.
+inline Camera withEnvelope(const Camera& v, float4 otherPos)
 {
-    CullView r = v;
+    Camera r = v;
     const float4 zero{};
     r.envLo = max4(r.envLo, max4(v.pos - otherPos, zero));
     r.envHi = max4(r.envHi, max4(otherPos - v.pos, zero));
     return r;
 }
 
-inline CullView makePerspectiveView(float4 pos, float4 forward, float4 up,
+inline Camera makePerspectiveCamera(float4 pos, float4 forward, float4 up,
                                     float fovY, float aspect,
                                     float viewportHeightPx,
                                     float nearD, float farD)
@@ -812,7 +813,7 @@ inline CullView makePerspectiveView(float4 pos, float4 forward, float4 up,
     const float tanY = std::tan(fovY * 0.5f);
     const float tanX = tanY * aspect;
 
-    CullView v;
+    Camera v;
     v.pos = pos;
     v.k   = viewportHeightPx / (2.0f * tanY);
 
@@ -839,7 +840,7 @@ enum class ClipRange : uint8_t
     MinusOneToOne, // OpenGL
 };
 
-// Build a CullView straight from a combined view-projection matrix
+// Build a Camera straight from a combined view-projection matrix
 // (Gribb-Hartmann plane extraction) — the form engines already have on hand.
 //
 // m16 is the 16 floats as DirectXMath (row-vector, row-major) or glm/GL
@@ -848,16 +849,16 @@ enum class ClipRange : uint8_t
 // projYScale is the projection matrix's [1][1] element, i.e. 1/tan(fovY/2).
 // It cannot be recovered from the combined matrix (the view rotation is
 // entangled with it), and it is what turns a geometric error into pixels.
-inline CullView fromViewProj(const float* m16, float4 cameraPos,
-                             float viewportHeightPx, float projYScale,
-                             ClipRange range = ClipRange::ZeroToOne)
+inline Camera cameraFromViewProjection(const float* m16, float4 cameraPos,
+                                       float viewportHeightPx, float projYScale,
+                                       ClipRange range = ClipRange::ZeroToOne)
 {
     auto coeffs = [&](int c) -> float4
     { return {m16[c], m16[c + 4], m16[c + 8], m16[c + 12]}; };
 
     const float4 cx = coeffs(0), cy = coeffs(1), cz = coeffs(2), cw = coeffs(3);
 
-    CullView v;
+    Camera v;
     v.pos = cameraPos;
     v.k   = viewportHeightPx * 0.5f * projYScale;
 
@@ -881,26 +882,27 @@ inline CullView fromViewProj(const float* m16, float4 cameraPos,
     return v;
 }
 
-inline CullView fromViewProj(const float4x4& viewProj, float4 cameraPos,
-                             float viewportHeightPx, float projYScale,
-                             ClipRange range = ClipRange::ZeroToOne)
+inline Camera cameraFromViewProjection(const float4x4& viewProj, float4 cameraPos,
+                                       float viewportHeightPx, float projYScale,
+                                       ClipRange range = ClipRange::ZeroToOne)
 {
-    return fromViewProj(viewProj.m, cameraPos, viewportHeightPx, projYScale, range);
+    return cameraFromViewProjection(viewProj.m, cameraPos, viewportHeightPx,
+                                    projYScale, range);
 }
 
 // Escape hatch for callers that already have the six planes (a cascaded
 // shadow split, a portal-clipped volume, a hand-built culling volume).
 // Planes are inward: a point p is inside plane i when dot3(n, p) + w >= 0.
-inline CullView fromPlanes(const float4 planes[6], float4 cameraPos, float errorScaleK)
+inline Camera cameraFromPlanes(const float4 planes[6], float4 cameraPos, float errorScaleK)
 {
-    CullView v;
+    Camera v;
     v.pos = cameraPos;
     v.k   = errorScaleK;
     for (uint32_t p = 0; p < 6; ++p) v.frustum.plane[p] = planes[p];
     return v;
 }
 
-inline CullView makeLookAtView(float4 pos, float4 target,
+inline Camera makeLookAtCamera(float4 pos, float4 target,
                                float fovY = 1.0f, float aspect = 16.0f / 9.0f,
                                float viewportHeightPx = 1080.0f,
                                float nearD = 0.1f, float farD = 1.0e9f)
@@ -908,16 +910,16 @@ inline CullView makeLookAtView(float4 pos, float4 target,
     float4 fwd = target - pos;
     float4 up  = std::fabs(fwd.y) > 0.99f * length3(fwd) ? float4::vec(1, 0, 0)
                                                          : float4::vec(0, 1, 0);
-    return makePerspectiveView(pos, fwd, up, fovY, aspect, viewportHeightPx, nearD, farD);
+    return makePerspectiveCamera(pos, fwd, up, fovY, aspect, viewportHeightPx, nearD, farD);
 }
 
 // Transform a world-space view into an instance's local space.
 // Instances are positioned by translation + uniform scale (no rotation).
 // The error ratio geomError / distance is scale-invariant, so k is unchanged.
-inline CullView toLocal(const CullView& v, float4 instPos, float instScale)
+inline Camera toLocal(const Camera& v, float4 instPos, float instScale)
 {
     assert(instScale > 0.0f);
-    CullView local;
+    Camera local;
     local.pos = (v.pos - instPos) / instScale;
     local.k   = v.k;
     local.viewMask = v.viewMask;
@@ -1064,7 +1066,7 @@ inline float8 screenErrorFromSq8(const float8& geomError, float k, const float8&
 
 
 // ---------------------------------------------------------------------------
-// ViewDamper — LOD hysteresis, held per view instead of per node.
+// CameraDamper — LOD hysteresis, held per view instead of per node.
 //
 // Hysteresis is inherently stateful: a Schmitt trigger has to remember which
 // way it last flipped, and reconstructing that from just the previous frame is
@@ -1083,15 +1085,17 @@ inline float8 screenErrorFromSq8(const float8& geomError, float k, const float8&
 // after the camera pulls back past the threshold. 0 disables damping, and then
 // selection is bit-identical to an undamped run.
 //
-// Hold one of these per view (main camera, each shadow cascade, ...) and call
-// damp() once per frame; feed the result to World::selectCut.
+// View owns one of these and calls damp() from View::selectCut. The class is
+// also public for code that needs a damped Camera outside selection. Do not
+// pre-damp a Camera and also enable damping on its View, or damping is applied
+// twice.
 // ---------------------------------------------------------------------------
 
-class ViewDamper
+class CameraDamper
 {
 public:
-    ViewDamper() = default;
-    explicit ViewDamper(float halfLifeFrames) : halfLife_(halfLifeFrames) {}
+    CameraDamper() = default;
+    explicit CameraDamper(float halfLifeFrames) : halfLife_(halfLifeFrames) {}
 
     float halfLife() const { return halfLife_; }
     void  setHalfLife(float frames) { halfLife_ = frames > 0.0f ? frames : 0.0f; }
@@ -1101,9 +1105,9 @@ public:
     // everything between the two positions.
     void reset() { primed_ = false; }
 
-    CullView damp(const CullView& v)
+    Camera damp(const Camera& v)
     {
-        CullView out = v;
+        Camera out = v;
         if (halfLife_ <= 0.0f) { primed_ = false; return out; }
 
         if (!primed_)

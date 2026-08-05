@@ -74,9 +74,9 @@ struct Field
 // both directions around (x, z). Getting this wrong is the easy way to write a
 // test that passes because the instance it is asserting about was never in the
 // frustum: fovY 1.4 gives tan(fovY/2) ~ 0.84, so 1.4x the half-extent clears it.
-CullView viewFrom(float x, float z, float halfExtent, uint32_t mask = ~0u)
+Camera viewFrom(float x, float z, float halfExtent, uint32_t mask = ~0u)
 {
-    CullView v = makePerspectiveView(float4::point(x, halfExtent * 1.4f, z),
+    Camera v = makePerspectiveCamera(float4::point(x, halfExtent * 1.4f, z),
                                      float4::vec(0, -1, 0.001f), float4::vec(0, 1, 0),
                                      1.4f, 1.0f, 1080.0f, 0.1f, 1.0e9f);
     v.viewMask = mask;
@@ -120,9 +120,9 @@ TEST(Tlas, SpawnIsVisibleWithoutRebuilding)
     for (int i = 0; i < 200; ++i)
         f.add(float(i % 20) * 4.0f - 40.0f, float(i / 20) * 4.0f - 20.0f);
 
-    const CullView v = viewFrom(0, 0, 60.0f);
+    const Camera v = viewFrom(0, 0, 60.0f);
     std::vector<CutEntry> before;
-    f.w.selectCut(v, kParams, before);
+    selectCutUncached(f.w, v, kParams, before);
     ASSERT_FALSE(TAX::tlasDirty(f.w));
 
     const Placed fresh = f.add(2.0f, 2.0f);
@@ -130,7 +130,7 @@ TEST(Tlas, SpawnIsVisibleWithoutRebuilding)
     EXPECT_EQ(TAX::tlasValidate(f.w), "");
 
     std::vector<CutEntry> after;
-    f.w.selectCut(v, kParams, after);
+    selectCutUncached(f.w, v, kParams, after);
     EXPECT_GT(after.size(), before.size());
     EXPECT_TRUE(tagsOf(after).count(fresh.tag)) << "the spawned instance is missing";
 }
@@ -142,9 +142,9 @@ TEST(Tlas, RemoveVanishesWithoutRebuilding)
     for (int i = 0; i < 200; ++i)
         refs.push_back(f.add(float(i % 20) * 4.0f - 40.0f, float(i / 20) * 4.0f - 20.0f));
 
-    const CullView v = viewFrom(0, 0, 60.0f);
+    const Camera v = viewFrom(0, 0, 60.0f);
     std::vector<CutEntry> cut;
-    f.w.selectCut(v, kParams, cut);
+    selectCutUncached(f.w, v, kParams, cut);
     const uint32_t victim = refs[97].tag;
     ASSERT_TRUE(tagsOf(cut).count(victim));
 
@@ -152,7 +152,7 @@ TEST(Tlas, RemoveVanishesWithoutRebuilding)
     EXPECT_FALSE(TAX::tlasDirty(f.w)) << "a single removal must not dirty the tree";
     EXPECT_EQ(TAX::tlasValidate(f.w), "");
 
-    f.w.selectCut(v, kParams, cut);
+    selectCutUncached(f.w, v, kParams, cut);
     EXPECT_EQ(tagsOf(cut).count(victim), 0u) << "a removed instance is still emitted";
 }
 
@@ -187,13 +187,13 @@ TEST(Tlas, IncrementalEditsMatchARebuiltTree)
 
         ASSERT_EQ(TAX::tlasValidate(f.w), "") << "round " << round;
 
-        const CullView v = viewFrom(uni(rng) * 0.3f, uni(rng) * 0.3f, 90.0f);
+        const Camera v = viewFrom(uni(rng) * 0.3f, uni(rng) * 0.3f, 90.0f);
         std::vector<CutEntry> incremental;
-        f.w.selectCut(v, kParams, incremental);
+        selectCutUncached(f.w, v, kParams, incremental);
 
         TAX::forceTlasRebuild(f.w);
         std::vector<CutEntry> rebuilt;
-        f.w.selectCut(v, kParams, rebuilt);
+        selectCutUncached(f.w, v, kParams, rebuilt);
 
         EXPECT_EQ(tagsOf(incremental), tagsOf(rebuilt)) << "round " << round;
     }
@@ -213,8 +213,8 @@ TEST(Tlas, SplittingFullLeavesKeepsEveryInstanceReachable)
     for (int i = 0; i < 64; ++i) f.add(float(i % 8) * 8.0f, float(i / 8) * 8.0f);
 
     std::vector<CutEntry> cut;
-    const CullView v = viewFrom(28.0f, 28.0f, 40.0f);
-    f.w.selectCut(v, kParams, cut);
+    const Camera v = viewFrom(28.0f, 28.0f, 40.0f);
+    selectCutUncached(f.w, v, kParams, cut);
     ASSERT_FALSE(TAX::tlasDirty(f.w));
     const size_t nodesBefore = TAX::tlasNodeCount(f.w);
 
@@ -229,7 +229,7 @@ TEST(Tlas, SplittingFullLeavesKeepsEveryInstanceReachable)
     }
     EXPECT_GT(TAX::tlasNodeCount(f.w), nodesBefore) << "no split ever happened";
 
-    f.w.selectCut(v, kParams, cut);
+    selectCutUncached(f.w, v, kParams, cut);
     const std::multiset<uint32_t> tags = tagsOf(cut);
     for (const Placed& r : added)
         EXPECT_TRUE(tags.count(r.tag)) << "instance " << r.tag << " lost by a split";
@@ -246,7 +246,7 @@ TEST(Tlas, InsertionPropagatesLayerMasksUpTheTree)
         f.add(float(i % 20) * 4.0f - 40.0f, float(i / 20) * 4.0f - 20.0f, 0x1u);
 
     std::vector<CutEntry> cut;
-    f.w.selectCut(viewFrom(0, 0, 60.0f), kParams, cut);
+    selectCutUncached(f.w, viewFrom(0, 0, 60.0f), kParams, cut);
     ASSERT_FALSE(TAX::tlasDirty(f.w));
 
     // A spawn on a layer no existing instance uses: every ancestor lane mask on
@@ -255,12 +255,12 @@ TEST(Tlas, InsertionPropagatesLayerMasksUpTheTree)
     ASSERT_FALSE(TAX::tlasDirty(f.w));
     EXPECT_EQ(TAX::tlasValidate(f.w), "");
 
-    f.w.selectCut(viewFrom(0, 0, 60.0f, 0x4u), kParams, cut);
+    selectCutUncached(f.w, viewFrom(0, 0, 60.0f, 0x4u), kParams, cut);
     EXPECT_TRUE(tagsOf(cut).count(odd.tag))
         << "the layer filter culled a freshly inserted instance";
 
     // And a view on the layer it is not on must not pick it up.
-    f.w.selectCut(viewFrom(0, 0, 60.0f, 0x1u), kParams, cut);
+    selectCutUncached(f.w, viewFrom(0, 0, 60.0f, 0x1u), kParams, cut);
     EXPECT_EQ(tagsOf(cut).count(odd.tag), 0u);
 }
 
@@ -274,14 +274,14 @@ TEST(Tlas, InsertionOutsideTheRootExtentGrowsThePath)
     for (int i = 0; i < 200; ++i)
         f.add(float(i % 20) * 2.0f - 20.0f, float(i / 20) * 2.0f - 10.0f);
     std::vector<CutEntry> cut;
-    f.w.selectCut(viewFrom(0, 0, 40.0f), kParams, cut);
+    selectCutUncached(f.w, viewFrom(0, 0, 40.0f), kParams, cut);
     ASSERT_FALSE(TAX::tlasDirty(f.w));
 
     const Placed out = f.add(900.0f, 900.0f);
     ASSERT_FALSE(TAX::tlasDirty(f.w));
     EXPECT_EQ(TAX::tlasValidate(f.w), "");
 
-    f.w.selectCut(viewFrom(900.0f, 900.0f, 20.0f), kParams, cut);
+    selectCutUncached(f.w, viewFrom(900.0f, 900.0f, 20.0f), kParams, cut);
     EXPECT_TRUE(tagsOf(cut).count(out.tag)) << "an out-of-extent spawn is unreachable";
 }
 
@@ -296,14 +296,14 @@ TEST(Tlas, ADistantSpawnTripsTheAreaBudget)
     for (int i = 0; i < 200; ++i)
         f.add(float(i % 20) * 2.0f - 20.0f, float(i / 20) * 2.0f - 10.0f);
     std::vector<CutEntry> cut;
-    f.w.selectCut(viewFrom(0, 0, 40.0f), kParams, cut);
+    selectCutUncached(f.w, viewFrom(0, 0, 40.0f), kParams, cut);
     ASSERT_FALSE(TAX::tlasDirty(f.w));
 
     const Placed out = f.add(9000.0f, 9000.0f);
     EXPECT_TRUE(TAX::tlasDirty(f.w));
 
     // Still correct, just by the slower route.
-    f.w.selectCut(viewFrom(9000.0f, 9000.0f, 20.0f), kParams, cut);
+    selectCutUncached(f.w, viewFrom(9000.0f, 9000.0f, 20.0f), kParams, cut);
     EXPECT_EQ(TAX::tlasValidate(f.w), "");
     EXPECT_TRUE(tagsOf(cut).count(out.tag));
 }
@@ -321,8 +321,8 @@ TEST(Tlas, EmptyingAndRefillingReusesNodesSafely)
         refs.push_back(f.add(float(i % 16) * 4.0f + 1.0f, float(i / 16) * 4.0f + 1.0f));
 
     std::vector<CutEntry> cut;
-    const CullView v = viewFrom(30.0f, 14.0f, 50.0f);
-    f.w.selectCut(v, kParams, cut);
+    const Camera v = viewFrom(30.0f, 14.0f, 50.0f);
+    selectCutUncached(f.w, v, kParams, cut);
     ASSERT_FALSE(TAX::tlasDirty(f.w));
     ASSERT_EQ(TAX::tlasValidate(f.w), "");
 
@@ -345,7 +345,7 @@ TEST(Tlas, EmptyingAndRefillingReusesNodesSafely)
     EXPECT_EQ(TAX::tlasNodeCount(f.w), nodesAfterRemoval)
         << "respawning grew the node array instead of reusing emptied nodes";
 
-    f.w.selectCut(v, kParams, cut);
+    selectCutUncached(f.w, v, kParams, cut);
     const std::multiset<uint32_t> tags = tagsOf(cut);
     for (const Placed& r : again)
         EXPECT_TRUE(tags.count(r.tag)) << "respawned instance " << r.tag << " is missing";
@@ -362,13 +362,13 @@ TEST(Tlas, RemovingEveryInstanceLeavesAQueryableEmptyWorld)
     EXPECT_EQ(TAX::tlasValidate(f.w), "");
 
     std::vector<CutEntry> cut;
-    const CullView v = viewFrom(70.0f, 0, 120.0f);
-    f.w.selectCut(v, kParams, cut);
+    const Camera v = viewFrom(70.0f, 0, 120.0f);
+    selectCutUncached(f.w, v, kParams, cut);
     EXPECT_TRUE(cut.empty());
 
     // And the world still works afterwards.
     const Placed fresh = f.add(70.0f, 0.0f);
-    f.w.selectCut(v, kParams, cut);
+    selectCutUncached(f.w, v, kParams, cut);
     EXPECT_TRUE(tagsOf(cut).count(fresh.tag));
 }
 
@@ -383,8 +383,8 @@ TEST(Tlas, SustainedChurnEventuallyForcesARebuild)
     for (int i = 0; i < 200; ++i) refs.push_back(f.add(uni(rng), uni(rng)));
 
     std::vector<CutEntry> cut;
-    const CullView v = viewFrom(0, 0, 90.0f);
-    f.w.selectCut(v, kParams, cut);
+    const Camera v = viewFrom(0, 0, 90.0f);
+    selectCutUncached(f.w, v, kParams, cut);
     ASSERT_FALSE(TAX::tlasDirty(f.w));
 
     // tlasEditFraction defaults to 0.05, so ~10 edits against 200 instances.
@@ -400,7 +400,7 @@ TEST(Tlas, SustainedChurnEventuallyForcesARebuild)
     }
     EXPECT_TRUE(rebuilt) << "the edit budget never triggered a rebuild";
 
-    f.w.selectCut(v, kParams, cut);
+    selectCutUncached(f.w, v, kParams, cut);
     EXPECT_FALSE(TAX::tlasDirty(f.w));
     EXPECT_EQ(TAX::tlasValidate(f.w), "");
 }
@@ -419,7 +419,7 @@ TEST(Tlas, EscapeBudgetCountsDistinctInstances)
         refs.push_back(f.add(float(i % 20) * 4.0f, float(i / 20) * 4.0f));
 
     std::vector<CutEntry> cut;
-    f.w.selectCut(viewFrom(40.0f, 20.0f, 80.0f), kParams, cut);
+    selectCutUncached(f.w, viewFrom(40.0f, 20.0f, 80.0f), kParams, cut);
     ASSERT_FALSE(TAX::tlasDirty(f.w));
 
     for (int frame = 0; frame < 100; ++frame)
@@ -443,15 +443,15 @@ TEST(Tlas, MassDespawnStillForcesAQualityRebuild)
     for (int i = 0; i < 200; ++i)
         refs.push_back(f.add(float(i % 20) * 4.0f, float(i / 20) * 4.0f));
     std::vector<CutEntry> cut;
-    const CullView v = viewFrom(40.0f, 20.0f, 60.0f);
-    f.w.selectCut(v, kParams, cut);
+    const Camera v = viewFrom(40.0f, 20.0f, 60.0f);
+    selectCutUncached(f.w, v, kParams, cut);
     ASSERT_FALSE(TAX::tlasDirty(f.w));
 
     // tlasCountDrift defaults to 0.2: half the population is well past it.
     for (int i = 0; i < 100; ++i) f.w.removeInstance(refs[size_t(i)].ref);
     EXPECT_TRUE(TAX::tlasDirty(f.w));
 
-    f.w.selectCut(v, kParams, cut);
+    selectCutUncached(f.w, v, kParams, cut);
     EXPECT_EQ(TAX::tlasValidate(f.w), "");
     const std::multiset<uint32_t> tags = tagsOf(cut);
     for (int i = 0; i < 100; ++i) EXPECT_EQ(tags.count(refs[size_t(i)].tag), 0u);
@@ -465,7 +465,7 @@ TEST(Tlas, MovingAnIncrementallyInsertedInstanceRefitsCorrectly)
     Field f(neverRebuild());
     for (int i = 0; i < 64; ++i) f.add(float(i % 8) * 8.0f, float(i / 8) * 8.0f);
     std::vector<CutEntry> cut;
-    f.w.selectCut(viewFrom(28.0f, 28.0f, 40.0f), kParams, cut);
+    selectCutUncached(f.w, viewFrom(28.0f, 28.0f, 40.0f), kParams, cut);
     ASSERT_FALSE(TAX::tlasDirty(f.w));
 
     const Placed r = f.add(9.0f, 9.0f);
@@ -473,7 +473,7 @@ TEST(Tlas, MovingAnIncrementallyInsertedInstanceRefitsCorrectly)
     f.w.moveInstance(r.ref, float4::point(300.0f, 0, 300.0f));
     EXPECT_EQ(TAX::tlasValidate(f.w), "");
 
-    f.w.selectCut(viewFrom(300.0f, 300.0f, 20.0f), kParams, cut);
+    selectCutUncached(f.w, viewFrom(300.0f, 300.0f, 20.0f), kParams, cut);
     EXPECT_TRUE(tagsOf(cut).count(r.tag)) << "moved after insertion and lost";
 }
 
@@ -490,12 +490,12 @@ TEST(Tlas, MortonRebuildHandlesCoincidentCentroids)
     refs.reserve(1100);
     for (int i = 0; i < 1100; ++i) refs.push_back(f.add(0.0f, 0.0f));
 
-    const CullView view = viewFrom(0.0f, 0.0f, 400.0f);
+    const Camera view = viewFrom(0.0f, 0.0f, 400.0f);
     std::vector<CutEntry> cut;
-    f.w.selectCut(view, kParams, cut);   // initial quality build
+    selectCutUncached(f.w, view, kParams, cut);   // initial quality build
 
     f.w.moveInstance(refs[0].ref, float4::point(300.0f, 0.0f, 300.0f));
-    f.w.selectCut(view, kParams, cut);   // forced Morton rebuild
+    selectCutUncached(f.w, view, kParams, cut);   // forced Morton rebuild
 
     EXPECT_EQ(TAX::tlasValidate(f.w), "");
     EXPECT_EQ(tagsOf(cut), tagsOf(TAX::referenceCut(f.w, view, kParams).cut));

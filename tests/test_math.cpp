@@ -50,7 +50,7 @@ TEST(Aabb, DistanceToBox)
 
 TEST(Frustum, TriStateScalar)
 {
-    const CullView v = makeLookAtView(float4::point(0, 0, -10), float4::point(0, 0, 0));
+    const Camera v = makeLookAtCamera(float4::point(0, 0, -10), float4::point(0, 0, 0));
 
     uint8_t mask = kAllPlanes;
     EXPECT_EQ(testAabb(AABB::fromMinMax(float4::vec(-1, -1, -1), float4::vec(1, 1, 1)),
@@ -73,7 +73,7 @@ TEST(Frustum, TriStateScalar)
 
 TEST(Frustum, MaskedTestSkipsClearedPlanes)
 {
-    const CullView v = makeLookAtView(float4::point(0, 0, -10), float4::point(0, 0, 0));
+    const Camera v = makeLookAtCamera(float4::point(0, 0, -10), float4::point(0, 0, 0));
     // With an empty mask, even a far-away box "passes" — the caller
     // guarantees an ancestor was fully inside.
     uint8_t mask = 0;
@@ -89,7 +89,7 @@ TEST(Frustum, WideMatchesScalarOnRandomBoxes)
     std::uniform_real_distribution<float> ext(0.1f, 20.0f);
     std::uniform_int_distribution<int> maskDist(0, kAllPlanes);
 
-    const CullView v = makeLookAtView(float4::point(5, -3, -40), float4::point(0, 0, 0));
+    const Camera v = makeLookAtCamera(float4::point(5, -3, -40), float4::point(0, 0, 0));
 
     for (int iter = 0; iter < 500; ++iter)
     {
@@ -126,7 +126,7 @@ TEST(Frustum, WideMatchesScalarOnDegenerateBoxes)
 {
     // Zero-extent (point) boxes, camera-enclosing boxes, and huge boxes must
     // agree between the scalar and wide paths, with exact tri-state masks.
-    const CullView v = makeLookAtView(float4::point(0, 0, -10), float4::point(0, 0, 0));
+    const Camera v = makeLookAtCamera(float4::point(0, 0, -10), float4::point(0, 0, 0));
 
     WideBounds wb = WideBounds::allEmpty();
     AABB boxes[kWide] = {
@@ -188,12 +188,12 @@ TEST(ScreenError, ZeroDistanceSaturatesFinitePositive)
     EXPECT_FALSE(std::isnan(e));
 }
 
-TEST(View, LocalTransformIsScaleInvariant)
+TEST(Camera, LocalTransformIsScaleInvariant)
 {
-    const CullView v = makeLookAtView(float4::point(0, 10, -40), float4::point(0, 0, 0));
+    const Camera v = makeLookAtCamera(float4::point(0, 10, -40), float4::point(0, 0, 0));
     const float4 instPos = float4::point(3, -2, 7);
     const float scale = 2.5f;
-    const CullView local = toLocal(v, instPos, scale);
+    const Camera local = toLocal(v, instPos, scale);
 
     // A local box and its world image must agree on culling and screen error.
     const AABB localBox = AABB::fromCenterExtent(float4::vec(1, 2, 3), float4::vec(1, 1, 1));

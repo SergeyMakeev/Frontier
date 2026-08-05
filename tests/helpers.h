@@ -19,6 +19,29 @@ struct RefResult
     std::vector<CutEntry> cut;
 };
 
+// Exercise the uncached public path without carrying a View between calls.
+// Most correctness tests want a fresh reference query; tests for reuse own a
+// persistent View explicitly.
+inline void selectCutUncached(World& world, const Camera& camera,
+                              const CutParams& params,
+                              std::vector<CutEntry>& outCut)
+{
+    world.applyUpdates();
+    View view;
+    view.setReuseEnabled(false);
+    view.selectCut(world, camera, params, outCut);
+}
+
+inline void selectCutUncached(World& world, const Camera& camera,
+                              const CutParams& params, PageUsageContext& usage,
+                              std::vector<CutEntry>& outCut)
+{
+    world.applyUpdates();
+    View view;
+    view.setReuseEnabled(false);
+    view.selectCut(world, camera, params, usage, outCut);
+}
+
 // Full access to World internals plus a straightforward recursive scalar
 // reference for selectCut (no wide tests, no masks, no epoch stamps, no
 // pruning shortcuts beyond the algorithm's own semantics). It reads the
@@ -107,7 +130,7 @@ struct World::TestAccess
     }
 
     static std::vector<std::pair<uint32_t, uint8_t>> tlasQuery(World& w,
-                                                               const CullView& v,
+                                                               const Camera& v,
                                                                float minPix)
     {
         std::vector<std::pair<uint32_t, uint8_t>> out;
@@ -222,7 +245,7 @@ struct World::TestAccess
         }
     }
 
-    static RefResult referenceCut(World& w, const CullView& view, const CutParams& p)
+    static RefResult referenceCut(World& w, const Camera& view, const CutParams& p)
     {
         w.flushBounds();
         RefResult out;
@@ -241,7 +264,7 @@ struct World::TestAccess
                     distanceToBox(spatial.worldBox, view.queryMin(), view.queryMax()));
                 if (e < p.minPix) continue;
             }
-            const CullView local = toLocal(view, inst.pos, inst.scale);
+            const Camera local = toLocal(view, inst.pos, inst.scale);
             refChildren(w, inst, inst.rootSlot, 0, true, true, local, p, out);
         }
         return out;
@@ -250,7 +273,7 @@ struct World::TestAccess
 private:
     static void refChildren(World& w, const Instance& inst, uint32_t slot,
                             uint32_t node, bool current, bool ideal,
-                            const CullView& local,
+                            const Camera& local,
                             const CutParams& p, RefResult& out)
     {
         const PageView& pg = w.slots_[slot].page;
@@ -263,7 +286,7 @@ private:
     }
 
     static void refNode(World& w, const Instance& inst, uint32_t slot, uint32_t i,
-                        bool current, bool ideal, const CullView& local,
+                        bool current, bool ideal, const Camera& local,
                         const CutParams& p,
                         RefResult& out)
     {

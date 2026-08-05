@@ -54,14 +54,14 @@ int main()
     World world;
     world.addInstance(builder.build(), float4::point(0, 0, 0));
 
-    const CullView view = makeLookAtView(
+    const Camera camera = makeLookAtCamera(
         float4::point(0, 2, -8), float4::point(0, 0, 0));
 
-    SelectionContext selection;          // one per view
+    View view;                            // persistent state for this camera
     std::vector<CutEntry> cut;
     world.applyUpdates();                 // publish a stable read-only snapshot
     const World& published = world;
-    published.selectCut(view, CutParams{4.0f, 0.0f}, selection, cut);
+    view.selectCut(published, camera, CutParams{4.0f, 0.0f}, cut);
 
     for (const CutEntry& entry : cut)
     {
@@ -83,7 +83,7 @@ The representative workload resembles a forest, city, or prop field:
 
 - 80,000 instances share one fully resident 85-node asset and are spread over
   a roughly 6.8 km square.
-- A per-view `SelectionContext` is always used. Selection returns the unified
+- A per-view `View` is always used. Selection returns the unified
   current/ideal cut with a 4-pixel error threshold and `minPix=0`; because this
   workload is fully resident, every entry is `Shared`.
 - Moving-camera cases use the same continuous 600-frame fly-through at 1080p
@@ -103,8 +103,8 @@ algorithm's uncontended cost; real frame time can be higher under host load.
 
 | Operation | Time | Included work |
 |---|---:|---|
-| Create the world | 10.5-10.9 ms | Build and register the shared asset, add 80,000 instances, and mark its payloads resident |
-| First published selection cycle | 50.1-55.9 ms | `applyUpdates` builds the initial quality TLAS; `selectCut` queries it, produces the first unified cut, and populates the `SelectionContext` |
+| Create the world | 10.3-10.5 ms | Build and register the shared asset, add 80,000 instances, and mark its payloads resident |
+| First published selection cycle | 53.8-58.1 ms | `applyUpdates` builds the initial quality TLAS; `selectCut` queries it, produces the first unified cut, and populates the `View` |
 
 World creation does not force the initial quality TLAS build; the first
 `applyUpdates` performs it before publishing the read-only snapshot. Treat the
@@ -116,14 +116,14 @@ first published selection cycle as level warm-up rather than steady latency.
 |---|---:|---:|---:|
 | Apply transform updates and maintain the TLAS | 0.15 ms | 0.14 ms | n/a |
 | Publish queued node-bound changes with `applyUpdates` | <0.001 ms | <0.001 ms | <0.001 ms |
-| `selectCut` | 0.55 ms | 0.41 ms | 0.48 ms |
-| **Total HLodTree frame work** | **0.70 ms** | **0.56 ms** | **0.48 ms** |
+| `selectCut` | 0.52 ms | 0.41 ms | 0.42 ms |
+| **Total HLodTree frame work** | **0.67 ms** | **0.55 ms** | **0.42 ms** |
 
 The moving-camera cases average about 21,919 visible instances and a
-24,986-entry render cut. With objects moving, the context reuses 92.6% of
+24,986-entry render cut. With objects moving, the `View` reuses 92.6% of
 visible instance cuts; with static objects it reuses 97.6%. The fixed-camera
 case averages 19,602 visible instances, a 22,872-entry cut, and 94.1% reuse.
-The context occupies 12.13 MiB after the fly-through and 4.87 MiB for the fixed
+The `View` occupies 12.13 MiB after the fly-through and 4.87 MiB for the fixed
 view.
 
 Bounded motion of the same 5% cohort stays on the grow-only refit path in this
@@ -139,7 +139,7 @@ They draw from 700 separately registered, fully resident 85-node assets with
 maximum depth 3, instead of sharing one asset across the entire world. The
 moving-object cases update exactly 1,000 instances per frame. Creating and
 populating this world takes 12.9-13.0 ms; its first published selection cycle,
-including the initial quality TLAS build and context population, takes
+including the initial quality TLAS build and `View` population, takes
 5.3-6.2 ms.
 
 | HLodTree work per frame | Camera and 1,000 objects moving | Static camera, 1,000 objects moving | Moving camera, static objects |
@@ -151,25 +151,25 @@ including the initial quality TLAS build and context population, takes
 
 The moving-camera cases average about 2,782 visible instances (27.8% of the
 world) and a 5,920-entry cut. Reuse is 82.4% with 1,000 movers and 93.3% with
-static objects; the context occupies 4.52 MiB. The fixed-camera case averages
+static objects; the `View` occupies 4.52 MiB. The fixed-camera case averages
 2,501 visible instances (25.0%), a 5,792-entry cut, 85.8% reuse, and a 0.73 MiB
-context.
+of view state.
 
 ### Multiple views
 
-Each view needs its own `SelectionContext` and output. With the same
+Each view needs its own `View` and output. With the same
 moving-camera route and nearby view origins 24 metres apart, wall time for all
 six selections is:
 
 | Execution | Static objects | 4,000 moving objects |
 |---|---:|---:|
-| Six views, serial | 3.77 ms | 4.26 ms |
-| Six views, concurrent | 0.97 ms | 1.15 ms |
-| **Speedup** | **3.9×** | **3.7×** |
+| Six views, serial | 3.82 ms | 4.44 ms |
+| Six views, concurrent | 0.97 ms | 1.05 ms |
+| **Speedup** | **3.9×** | **4.2×** |
 
 Object transforms are applied once before these selections and are not included
 in the table. The concurrent arms use six persistent worker threads; thread
-creation is excluded. Six contexts occupy about 73 MiB. Scaling is below 6×
+creation is excluded. Six `View` objects occupy about 73 MiB. Scaling is below 6×
 because the views share memory bandwidth and cache capacity, but the read-only
 selection phase removes serialization between them.
 
@@ -221,19 +221,21 @@ mutations using it become safe no-ops.
 - `setNodeBounds(instance, node, bounds)` creates bounds-only copy-on-write
   overlays for the affected instance. Refits are queued and published by
   `applyUpdates`.
-- `SelectionContext` is optional, one per view. It owns that view's damping
-  envelope and reuses instance cuts only while a conservative camera/projection
-  margin proves their node set unchanged.
-- Contextual `selectCut` is a read-only `World` operation. Calls may run
-  concurrently when every call has a distinct `SelectionContext`, optional
+- Every camera or shadow cascade owns a `View`. It contains damping, reusable
+  cut records, traversal scratch, and selection statistics. Reuse is enabled
+  by default and can be disabled with `setReuseEnabled(false)` for highly
+  dynamic workloads.
+- `View::selectCut` reads a published `const World`. Calls may run concurrently
+  when every call has a distinct `View`, optional
   `PageUsageContext`, and output objects. Mutations and `collect` remain serial
   and must happen outside that selection phase.
 - `PageUsageContext` is optional per view. It records page-use feedback without
   touching the World; `collect` later consumes only the contexts the caller
   chooses, so a primary camera can influence page retention while shadow
   cameras do not.
-- Stateless selection can fan out over visible instances through a host
-  `parallelFor`; it remains an externally serial compatibility path.
+- An uncached `View` can fan out over visible instances through the host
+  `parallelFor`; its scratch and statistics still remain view-owned, so it has
+  the same threading contract as cached selection.
 
 The current contracts, algorithms, lifecycle rules, and complexity bounds are
 in [hlod_design.md](hlod_design.md).
@@ -280,7 +282,7 @@ Normal configuration options:
 
 | Option | Default | Meaning |
 |---|---:|---|
-| `HLOD_BUILD_TESTS` | `ON` | Build the 93-test correctness suite |
+| `HLOD_BUILD_TESTS` | `ON` | Build the 95-test correctness suite |
 | `HLOD_BUILD_BENCH` | `ON` | Build the Google Benchmark suite |
 | `HLOD_AVX2` | `ON` | Use AVX2/FMA on x86-64 when available |
 | `HLOD_FORCE_SCALAR` | `OFF` | Disable intrinsic implementations |

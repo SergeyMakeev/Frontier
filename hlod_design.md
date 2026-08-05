@@ -39,11 +39,10 @@ screenErrorPx = geometricError * projectionScale / distance(camera, bounds)
 refine when screenErrorPx > CutParams::threshold
 ```
 
-Distance is measured to the node box, not its center. The view constructors
-compute `projectionScale` from vertical FOV and viewport height. A
-`ViewDamper` or `SelectionContext` replaces the camera point with a decaying
-camera envelope to provide LOD hysteresis without storing sticky state on every
-node.
+Distance is measured to the node box, not its center. The camera constructors
+compute `projectionScale` from vertical FOV and viewport height. A `View` uses
+its internal `CameraDamper` to replace the camera point with a decaying camera
+envelope, providing LOD hysteresis without sticky state on every node.
 
 ## 2. Public objects and handles
 
@@ -72,7 +71,7 @@ owns that table outside the library.
 
 - `pos` and positive uniform `scale`;
 - `tag`, echoed as `CutEntry::instance`; and
-- `mask`, ANDed with `CullView::viewMask` for cheap layer filtering.
+- `mask`, ANDed with `Camera::viewMask` for cheap layer filtering.
 
 Rotation and non-uniform scale are not represented by `InstanceDesc`. Bake
 them into authored bounds/proxies or place such objects in an integration layer
@@ -94,13 +93,13 @@ desc.tag = entityIndex;
 World::InstanceRef instance = world.addInstance(tree, desc);
 
 std::vector<CutEntry> cut;
-SelectionContext selection;       // one per view
+Camera camera = makeLookAtCamera(eye, target);
+View view;                      // persistent state for this camera
 PageUsageContext primaryUsage;    // only retention-relevant views need one
 
 world.applyUpdates();              // apply changes and publish the read-only world
 const World& published = world;
-published.selectCut(view, CutParams{4.0f, 0.0f}, selection, primaryUsage,
-                    cut);
+view.selectCut(published, camera, CutParams{4.0f, 0.0f}, primaryUsage, cut);
 
 for (const CutEntry& entry : cut)
 {
@@ -229,7 +228,7 @@ frustum needs full structural coverage; a node crossing a frustum plane may
 ignore missing branches that are outside the view, so selection recursively
 checks only surviving uncovered branches. Those pages count as used for
 optional `PageUsageContext` feedback. Instances touching a frustum plane are
-re-walked rather than cached by `SelectionContext`.
+re-walked rather than cached by `View`.
 
 An expansion point is a renderable collapsed proxy whose children live in a
 different page. If its error is acceptable it remains a normal ideal-cut entry.
@@ -245,7 +244,7 @@ runtime invariant:
 
 Payload residency, page attachment, instance updates, and collection are
 single-writer operations. Finish them before `applyUpdates`, then treat the
-published World as read-only until every contextual selection has joined.
+published World as read-only until every view selection has joined.
 
 ### Streamer policy
 
@@ -320,18 +319,16 @@ reasonably separating TLAS. In the adversarial case where all R instances
 overlap, the TLAS must report all R and the query is necessarily O(R). No
 algorithm can cost less than the output it must emit.
 
-## 7. Stateful selection and damping
+## 7. View state and damping
 
-Stateless selection accepts an already prepared `CullView`. Callers that want
-only damping can keep one `ViewDamper` per view and pass `damper.damp(rawView)`.
-
-`SelectionContext` combines damping with conservative cut reuse. It is also
-one object per view. Pass the raw view to its overload; the context damps it
-internally so its validity odometers and the query envelope cannot be paired
-with different cameras by mistake.
+Every logical camera, shadow cascade, or reflection probe owns a `View`.
+`View::selectCut` accepts the frame's raw `Camera`, damps it internally, and
+queries a published `const World`. Keeping the damper, reuse records, traversal
+scratch, and statistics together prevents state from one camera being paired
+with another by mistake.
 
 For a fully-frustum-inside instance, every LOD decision changes only when the
-camera envelope or projection scale crosses a recorded flip point. The context
+camera envelope or projection scale crosses a recorded flip point. The view
 records a conservative margin, transform/content versions, up to two page
 dependencies, and the emitted cut. A later call copies that cut without walking
 the instance only while every proof condition still holds.
@@ -343,34 +340,36 @@ Important limits are explicit:
 - An instance with more than two distinct page dependencies is not cached.
   Streaming does not otherwise disable reuse: residency and topology versions
   invalidate records that depend on changed pages.
-- The emitted node set matches stateless selection exactly. `CutEntry::err` on
+- The emitted node set matches uncached selection exactly. `CutEntry::err` on
   a reused entry is the recorded value and can be stale within the proven
   margin; use it for prioritization or dithering, not bit-exact comparison.
-- A single contextual call walks its view serially, but different views can run
-  concurrently because all mutable query state is owned by their contexts.
+- A cached call walks its camera serially, but different views can run
+  concurrently because all mutable query state is view-owned.
 
 Each per-instance record is 48 bytes plus storage for recorded cut entries.
 `reset()` clears logical state and its damping window but retains capacity,
 which is appropriate for camera cuts and teleports. `setHalfLife(0)` disables
-damping exactly.
+damping exactly. `setReuseEnabled(false)` disables temporal cut reuse while
+retaining the same API and ownership model.
 
 ## 8. Parallel selection and threading
 
 There are two independent forms of parallelism.
 
-For multiple views, call `applyUpdates()` once, then invoke contextual
-`selectCut` concurrently on the published `const World`. Every in-flight call
-must own a distinct `SelectionContext`, optional `PageUsageContext`, and output
+For multiple views, call `applyUpdates()` once, then invoke `View::selectCut`
+concurrently on the published `const World`. Every in-flight call
+must own a distinct `View`, optional `PageUsageContext`, and output
 buffers. Those objects are deliberately unsynchronized; sharing one between
-threads is a caller error. `selectCut` mutates only those caller-owned objects.
+threads is a caller error. Selection mutates only those caller-owned objects.
 
 After all view tasks join, the caller may resume World mutation and call
 `collect`. Passing only important cameras' `PageUsageContext` objects lets a
 primary view influence page retention without giving the same weight to shadow
 or probe views.
 
-For one stateless view, `HlodContext` supplies aligned allocation and an
-optional blocking `parallelFor`. Set `workerCount > 1` and
+For one uncached view, `HlodContext` supplies aligned allocation and an
+optional blocking `parallelFor`. Call `view.setReuseEnabled(false)`, set
+`workerCount > 1`, and set
 `WorldConfig::parallelInstanceThreshold > 0` to fan that call out once the
 visible instance count reaches the threshold.
 
@@ -380,9 +379,10 @@ unified cuts are intended to match entry-for-entry for the same backend and
 input.
 
 `parallelFor` may run task indices in any order but must return only after all
-tasks finish. Stateless selection remains externally serial because its
-per-call scratch and aggregate statistics live in the World. No selection may
-overlap a World mutation, another `applyUpdates`, or `collect`.
+tasks finish. Its scratch and aggregate statistics live in the `View`, so
+distinct uncached views have the same external concurrency contract as cached
+ones. No selection may overlap a World mutation, another `applyUpdates`, or
+`collect`.
 
 ## 9. TLAS lifecycle
 
@@ -459,7 +459,7 @@ and accumulates that feedback until collection.
 `collect(usageContexts, maxAttachedPages, minAge, freedPayloads)` first consumes
 only the supplied views' accumulated feedback, then detaches cold leaf mounts
 until `streamedPageCount()` is no larger than the requested budget. The
-single-context and no-feedback overloads are conveniences. Pinned root mounts
+single-`PageUsageContext` and no-feedback overloads are conveniences. Pinned root mounts
 do not count because they cannot be collected. A candidate must:
 
 - be non-pinned;
@@ -474,8 +474,8 @@ candidates examined, and pages detached; it does not scan the entire world.
 
 | Operation | Expected cost |
 |---|---|
-| Stateless `selectCut` | TLAS query + visible unified-cut region + outputs |
-| Context hit | TLAS query + record validation + copied cut entries |
+| Uncached `View::selectCut` | TLAS query + visible unified-cut region + outputs |
+| View reuse hit | TLAS query + record validation + copied cut entries |
 | `markResident` / `markNonResident` | O(changed coverage path to the mount root), with early-out |
 | `attachPage` | O(page nodes) runtime-state initialization |
 | `detachPage` | O(detached mount state); child mounts must be detached first |
@@ -489,8 +489,8 @@ Current integration limits and tuning decisions are:
 - page size is content-dependent; hundreds to low thousands of nodes is the
   intended starting range, but boundary frequency and streaming granularity
   should be profiled;
-- contextual views parallelize across calls; parallelizing within one
-  contextual call remains unnecessary for the measured multi-view workload;
+- cached views parallelize across calls; parallelizing within one cached call
+  remains unnecessary for the measured multi-view workload;
 - translation plus uniform scale is the built-in instance transform;
 - internal deformation needs caller-maintained proxy fidelity and has no
   page-level shrink pass; and

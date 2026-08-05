@@ -35,10 +35,9 @@ inline CutMembership membership(bool current, bool ideal)
 
 } // namespace
 
-// Opaque per-view query state. Its contents deliberately mirror the World's
-// legacy stateless scratch, but ownership by SelectionContext is what makes
-// contextual selection safe to run concurrently.
-struct SelectionScratch
+// Opaque per-view query state. Cached and uncached selection both use it;
+// ownership by View is what makes every query a read-only World operation.
+struct ViewScratch
 {
     std::vector<World::Worker>                       workers{1};
     std::vector<std::pair<uint32_t, uint8_t>>        visible;
@@ -60,17 +59,17 @@ struct SelectionScratch
     }
 };
 
-SelectionContext::SelectionContext()
-    : scratch_(std::make_unique<SelectionScratch>())
+View::View()
+    : scratch_(std::make_unique<ViewScratch>())
 {}
 
-SelectionContext::SelectionContext(float halfLifeFrames)
-    : damper_(halfLifeFrames), scratch_(std::make_unique<SelectionScratch>())
+View::View(float halfLifeFrames)
+    : damper_(halfLifeFrames), scratch_(std::make_unique<ViewScratch>())
 {}
 
-SelectionContext::~SelectionContext() = default;
-SelectionContext::SelectionContext(SelectionContext&&) noexcept = default;
-SelectionContext& SelectionContext::operator=(SelectionContext&&) noexcept = default;
+View::~View() = default;
+View::View(View&&) noexcept = default;
+View& View::operator=(View&&) noexcept = default;
 
 void PageUsageContext::reset()
 {
@@ -87,7 +86,6 @@ size_t PageUsageContext::bytes() const
 World::World(const WorldConfig& config) : config_(config)
 {
     if (config_.context.workerCount == 0) config_.context.workerCount = 1;
-    workers_.resize(1);
 }
 
 World::~World() = default;
@@ -227,7 +225,7 @@ uint32_t World::registerPage(uint32_t asset, NodeRef owner, bool pinned)
     rt.generation = ++generationCounter_;
     // Bumped here as well as on every content change, so that a slot which was
     // detached and reused can never present the same contentVersion as before.
-    // That is what lets a SelectionContext record identify a page's state with a
+    // That is what lets a View record identify a page's state with a
     // single word instead of a (generation, version) pair.
     ++rt.contentVersion;
     rt.lastTouched = frame_;
@@ -643,7 +641,7 @@ void World::recomputeInstanceBounds(InstanceId id)
     Instance& inst = instances_[id];
     InstanceTlas& spatial = instanceTlas_[id];
     // Globally unique rather than per-instance so a recycled slot can never
-    // match the previous occupant's SelectionContext record.
+    // match the previous occupant's View record.
     inst.cutVersion = ++generationCounter_;
     const PageRt& rt = slots_[inst.rootSlot];
     const AABB* bbox = boundsFor(inst, inst.rootSlot, rt);
@@ -1625,13 +1623,13 @@ void World::tlasRebuild()
             if (n.validMask & (1u << l)) tlasBaseArea_ += surfaceArea(n.bounds.lane(l));
 }
 
-void World::tlasQuery(const CullView& view, float minPix,
+void World::tlasQuery(const Camera& view, float minPix,
                       std::vector<std::pair<uint32_t, uint8_t>>& outVisible,
                       std::vector<TlasItem>& stack) const
 {
     outVisible.clear();
     HLOD_CHECK(!tlasDirty_ && pendingMoves_.empty(),
-               "World::selectCut: call applyUpdates() after world changes");
+               "View::selectCut: call applyUpdates() after world changes");
     if (tlasRoot_ < 0) return;
 
     const bool useMask = view.viewMask != ~0u;
@@ -1765,7 +1763,7 @@ void World::consumePageUsage(std::initializer_list<PageUsageContext*> usages)
 void World::recordPageUsage(PageUsageContext& usage, uint32_t slot) const
 {
     HLOD_CHECK(usage.world_ == nullptr || usage.world_ == this,
-               "World::selectCut: PageUsageContext belongs to another World");
+               "View::selectCut: PageUsageContext belongs to another World");
     usage.world_ = this;
     const PageRt& rt = slots_[slot];
     if (rt.pinned) return;
@@ -1837,7 +1835,7 @@ size_t World::collect(std::initializer_list<PageUsageContext*> usage,
 void World::wideVisit(const WorkItem& item, const PageView& pg, float errClamp,
                       uint32_t gen, uint32_t tag, uint32_t node, uint8_t mask,
                       uint8_t currentKids, uint8_t idealKids,
-                      const CullView& local, Worker& w) const
+                      const Camera& local, Worker& w) const
 {
     const uint32_t cc = pg.childCount(node);
     uint32_t b = pg.wideOffset(node);
@@ -1909,7 +1907,7 @@ void World::wideVisit(const WorkItem& item, const PageView& pg, float errClamp,
             // above) are emitted without asking. The answer flips when the
             // distance reaches eff * k / bar, so the gap between where this
             // node is and where that happens is how far the camera may travel
-            // before this instance's cut could differ. See SelectionContext.
+            // before this instance's cut could differ. See View.
             if (w.trackMargin && idealKids)
             {
                 w.maxError = std::max(w.maxError, eff.v[l]);
@@ -1924,7 +1922,7 @@ void World::wideVisit(const WorkItem& item, const PageView& pg, float errClamp,
 
 bool World::visibleDescendantsCovered(uint32_t slot, uint32_t node, uint8_t mask,
                                       const Instance& inst,
-                                      const CullView& local,
+                                      const Camera& local,
                                       std::vector<uint32_t>* touched,
                                       bool uniqueTouches) const
 {
@@ -1973,7 +1971,7 @@ bool World::visibleDescendantsCovered(uint32_t slot, uint32_t node, uint8_t mask
     return true;
 }
 
-void World::runPage(const WorkItem& item, const Instance& inst, const CullView& local,
+void World::runPage(const WorkItem& item, const Instance& inst, const Camera& local,
                     const CutParams& params, Worker& w) const
 {
     const PageRt& rt = slots_[item.slot];
@@ -2058,7 +2056,7 @@ void World::runPage(const WorkItem& item, const Instance& inst, const CullView& 
             if (current && !canDescend)
             {
                 HLOD_CHECK(rt.resident[i],
-                           "World::selectCut: uncovered current subtree");
+                           "View::selectCut: uncovered current subtree");
                 w.cut.push({pg.payload[i], here, e.err, tag,
                             CutMembership::CurrentOnly, CutTag::Direct});
             }
@@ -2067,11 +2065,11 @@ void World::runPage(const WorkItem& item, const Instance& inst, const CullView& 
         }
 
         HLOD_CHECK(nextCurrent || nextIdeal,
-                   "World::selectCut: node has no current or ideal continuation");
+                   "View::selectCut: node has no current or ideal continuation");
         if (exp)
         {
             HLOD_CHECK(childSlot != kInvalidIndex,
-                       "World::selectCut: uncovered expansion subtree");
+                       "View::selectCut: uncovered expansion subtree");
             w.work.push_back({childSlot,
                               wideBoundsFor(inst, childSlot, slots_[childSlot]),
                               nextCurrent, nextIdeal, e.planes});
@@ -2082,11 +2080,11 @@ void World::runPage(const WorkItem& item, const Instance& inst, const CullView& 
     }
 }
 
-void World::runInstance(uint32_t instIdx, const CullView& view, const CutParams& params,
+void World::runInstance(uint32_t instIdx, const Camera& view, const CutParams& params,
                         uint8_t mask, Worker& w) const
 {
     const Instance& inst = instances_[instIdx];
-    const CullView local = toLocal(view, inst.pos, inst.scale);
+    const Camera local = toLocal(view, inst.pos, inst.scale);
     HLOD_STAT(w, instancesVisited, 1);
     w.work.push_back({inst.rootSlot,
                       wideBoundsFor(inst, inst.rootSlot, slots_[inst.rootSlot]),
@@ -2099,27 +2097,32 @@ void World::runInstance(uint32_t instIdx, const CullView& view, const CutParams&
     }
 }
 
-void World::selectCutStateless(const CullView& view, const CutParams& params,
-                               PageUsageContext* usage, CutSink& outCut)
+void World::selectCutUncached(const Camera& camera, const CutParams& params,
+                              View& view, PageUsageContext* usage,
+                              CutSink& outCut) const
 {
-    // The stateless overload is the externally-serial compatibility path. It
-    // may prepare pending work itself; the contextual overload never does.
-    if (!pendingMoves_.empty() || tlasDirty_)
+    ViewScratch& scratch = *view.scratch_;
+    view.stats_ = CutStats{};
+    view.reused_ = 0;
+
+    if (usage)
     {
-        flushBounds();
-        if (tlasDirty_) tlasRebuild();
+        HLOD_CHECK(usage->world_ == nullptr || usage->world_ == this,
+                   "View::selectCut: PageUsageContext belongs to another World");
+        usage->world_ = this;
     }
-    stats_ = CutStats{};
 
-    tlasQuery(view, params.minPix, visibleTmp_, tlasStack_);
+    const Camera damped = view.damper_.damp(camera);
+    tlasQuery(damped, params.minPix, scratch.visible, scratch.tlasStack);
 
-    const uint32_t nVis = uint32_t(visibleTmp_.size());
+    const uint32_t nVis = uint32_t(scratch.visible.size());
+    view.walked_ = nVis;
     const uint32_t workerCount = config_.context.workerCount;
     const bool parallel = config_.parallelInstanceThreshold > 0 && workerCount > 1 &&
                           nVis >= config_.parallelInstanceThreshold;
     if (!parallel)
     {
-        Worker& w = workers_[0];
+        Worker& w = scratch.workers[0];
         w.work.clear();
         w.nodeStack.clear();
         w.touched.clear();
@@ -2135,22 +2138,24 @@ void World::selectCutStateless(const CullView& view, const CutParams& params,
         // instance i.
         for (uint32_t i = 0; i < nVis; ++i)
         {
-            if (i + 2 < nVis) HLOD_PREFETCH(&instances_[visibleTmp_[i + 2].first]);
+            if (i + 2 < nVis) HLOD_PREFETCH(&instances_[scratch.visible[i + 2].first]);
             if (i + 1 < nVis)
             {
-                const Instance& next = instances_[visibleTmp_[i + 1].first];
+                const Instance& next = instances_[scratch.visible[i + 1].first];
                 const PageRt& nrt = slots_[next.rootSlot];
                 HLOD_PREFETCH(nrt.page.wide);
                 HLOD_PREFETCH(nrt.page.meta);
                 HLOD_PREFETCH(nrt.page.payload);
             }
-            runInstance(visibleTmp_[i].first, view, params, visibleTmp_[i].second, w);
+            runInstance(scratch.visible[i].first, damped, params,
+                        scratch.visible[i].second, w);
         }
 
         outCut = w.cut;
+        w.cut = CutSink{};
         if (usage)
             for (const uint32_t slot : w.touched) recordPageUsage(*usage, slot);
-        stats_ = w.stats;
+        view.stats_ = w.stats;
         return;
     }
 
@@ -2158,20 +2163,21 @@ void World::selectCutStateless(const CullView& view, const CutParams& params,
     // Each worker takes a contiguous run of visible instances and fills its
     // own buffers, so concatenating in worker order reproduces the serial
     // order exactly — the cut is bit-identical whether or not this path runs.
-    if (workers_.size() < workerCount) workers_.resize(workerCount);
+    if (scratch.workers.size() < workerCount) scratch.workers.resize(workerCount);
 
     struct Chunk
     {
-        World*           world;
-        const CullView*  view;
+        const World*     world;
+        ViewScratch*     scratch;
+        const Camera*    camera;
         const CutParams* params;
         uint32_t         nVis;
         uint32_t         workerCount;
-    } chunk{this, &view, &params, nVis, workerCount};
+    } chunk{this, &scratch, &damped, &params, nVis, workerCount};
 
     for (uint32_t k = 0; k < workerCount; ++k)
     {
-        Worker& w = workers_[k];
+        Worker& w = scratch.workers[k];
         w.work.clear();
         w.nodeStack.clear();
         w.touched.clear();
@@ -2187,50 +2193,39 @@ void World::selectCutStateless(const CullView& view, const CutParams& params,
         [](uint32_t k, void* payload)
         {
             auto* c = static_cast<Chunk*>(payload);
-            World& world = *c->world;
+            const World& world = *c->world;
             const uint32_t per = (c->nVis + c->workerCount - 1) / c->workerCount;
             const uint32_t lo = std::min(k * per, c->nVis);
             const uint32_t hi = std::min(lo + per, c->nVis);
-            Worker& w = world.workers_[k];
+            Worker& w = c->scratch->workers[k];
             for (uint32_t i = lo; i < hi; ++i)
-                world.runInstance(world.visibleTmp_[i].first, *c->view, *c->params,
-                                  world.visibleTmp_[i].second, w);
+                world.runInstance(c->scratch->visible[i].first, *c->camera, *c->params,
+                                  c->scratch->visible[i].second, w);
         },
         &chunk, config_.context.user);
 
     for (uint32_t k = 0; k < workerCount; ++k)
     {
-        Worker& w = workers_[k];
+        Worker& w = scratch.workers[k];
         for (const CutEntry& e : w.cutBuf) outCut.push(e);
         if (usage)
             for (const uint32_t slot : w.touched) recordPageUsage(*usage, slot);
 #ifdef HLOD_STATS
-        stats_.instancesVisited += w.stats.instancesVisited;
-        stats_.pagesVisited += w.stats.pagesVisited;
-        stats_.nodesVisited += w.stats.nodesVisited;
-        stats_.wideBlocksTested += w.stats.wideBlocksTested;
-        stats_.lanesSurvived += w.stats.lanesSurvived;
+        view.stats_.instancesVisited += w.stats.instancesVisited;
+        view.stats_.pagesVisited += w.stats.pagesVisited;
+        view.stats_.nodesVisited += w.stats.nodesVisited;
+        view.stats_.wideBlocksTested += w.stats.wideBlocksTested;
+        view.stats_.lanesSurvived += w.stats.lanesSurvived;
 #endif
+        w.cut = CutSink{};
     }
-}
-
-void World::selectCut(const CullView& view, const CutParams& params,
-                      CutSink& outCut)
-{
-    selectCutStateless(view, params, nullptr, outCut);
-}
-
-void World::selectCut(const CullView& view, const CutParams& params,
-                      PageUsageContext& usage, CutSink& outCut)
-{
-    selectCutStateless(view, params, &usage, outCut);
 }
 
 // ---------------------------------------------------------------------------
 // Cached selection
 // ---------------------------------------------------------------------------
 
-void SelectionContext::reset()
+void View::reset()
 {
     rec_.clear();
     store_.clear();
@@ -2238,6 +2233,8 @@ void SelectionContext::reset()
     travel_ = kTravel_ = 0.0f;
     primed_ = false;
     k_ = bar_ = 0.0f;
+    stats_ = CutStats{};
+    world_ = nullptr;
     ++epoch_;
     // The half-life is configuration and survives; the accumulated window is
     // state and does not. This is the half that reset() exists for: records
@@ -2246,7 +2243,14 @@ void SelectionContext::reset()
     damper_.reset();
 }
 
-size_t SelectionContext::bytes() const
+void View::setReuseEnabled(bool enabled)
+{
+    if (reuseEnabled_ == enabled) return;
+    reset();
+    reuseEnabled_ = enabled;
+}
+
+size_t View::bytes() const
 {
     return rec_.capacity() * sizeof(Rec) + store_.capacity() * sizeof(CutEntry) +
            (scratch_ ? scratch_->bytes() : 0);
@@ -2255,7 +2259,7 @@ size_t SelectionContext::bytes() const
 // Runs are allocated by bumping and abandoned when an instance's cut outgrows
 // its block, so the slab accumulates holes. Squeeze them out once the holes
 // outweigh the live data. Records keep their contents; only `begin` moves.
-void SelectionContext::compact()
+void View::compact()
 {
     // Record ids and slab-allocation order are unrelated (the latter follows
     // TLAS traversal order).  Compacting in-place while iterating rec_ could
@@ -2285,25 +2289,25 @@ void SelectionContext::compact()
     garbage_ = 0;
 }
 
-void World::selectCutContext(const CullView& view, const CutParams& params,
-                             SelectionContext& ctx, PageUsageContext* usage,
-                             CutSink& outCut) const
+void World::selectCutCached(const Camera& camera, const CutParams& params,
+                            View& ctx, PageUsageContext* usage,
+                            CutSink& outCut) const
 {
-    SelectionScratch& scratch = *ctx.scratch_;
+    ViewScratch& scratch = *ctx.scratch_;
     ctx.stats_ = CutStats{};
 
     if (usage)
     {
         HLOD_CHECK(usage->world_ == nullptr || usage->world_ == this,
-                   "World::selectCut: PageUsageContext belongs to another World");
+                   "View::selectCut: PageUsageContext belongs to another World");
         usage->world_ = this;
     }
 
-    // This overload owns the hysteresis, so it takes the raw view and damps it
+    // The View owns hysteresis, so it takes the raw Camera and damps it
     // here. Everything below -- the cull, the walk, the odometer -- sees `dv`
     // and only `dv`, which is what makes the reuse argument about the envelope
     // rather than about the camera.
-    const CullView dv = ctx.damper_.damp(view);
+    const Camera dv = ctx.damper_.damp(camera);
 
     tlasQuery(dv, params.minPix, scratch.visible, scratch.tlasStack);
 
@@ -2373,7 +2377,7 @@ void World::selectCutContext(const CullView& view, const CutParams& params,
         const uint32_t instIdx = scratch.visible[i].first;
         const uint8_t  mask = scratch.visible[i].second;
         const Instance& inst = instances_[instIdx];
-        SelectionContext::Rec& r = ctx.rec_[instIdx];
+        View::Rec& r = ctx.rec_[instIdx];
 
         // Everything the record was taken under, re-checked, in one cache
         // line. `mask == 0` is the frustum condition: this instance is wholly
@@ -2399,7 +2403,7 @@ void World::selectCutContext(const CullView& view, const CutParams& params,
             // The whole saving is the walk that did not happen. Copying the
             // recorded entries out is ~1.5% of the call at 80k instances, and
             // handing back a descriptor instead measured no better while
-            // costing the caller an indirection: see SelectionContext.
+            // costing the caller an indirection: see View.
             outCut.pushRange(ctx.store_.data() + r.begin, r.count);
             ++ctx.reused_;
             continue;
@@ -2417,7 +2421,7 @@ void World::selectCutContext(const CullView& view, const CutParams& params,
         for (const uint32_t slot : w.touched) recordUsage(slot);
 
         const bool eligible = mask == 0 &&
-                              w.touched.size() <= SelectionContext::kMaxDeps;
+                              w.touched.size() <= View::kMaxDeps;
 
         const uint32_t n = uint32_t(w.cutBuf.size());
         if (r.capacity < n)
@@ -2467,48 +2471,45 @@ void World::selectCutContext(const CullView& view, const CutParams& params,
     ctx.stats_ = w.stats;
 }
 
-void World::selectCut(const CullView& view, const CutParams& params,
-                      SelectionContext& ctx, CutSink& outCut) const
+void View::selectCut(const World& world, const Camera& camera,
+                     const CutParams& params, CutSink& outCut)
 {
-    selectCutContext(view, params, ctx, nullptr, outCut);
+    HLOD_CHECK(world_ == nullptr || world_ == &world,
+               "View::selectCut: View belongs to another World; call reset()");
+    world_ = &world;
+    if (reuseEnabled_)
+        world.selectCutCached(camera, params, *this, nullptr, outCut);
+    else
+        world.selectCutUncached(camera, params, *this, nullptr, outCut);
 }
 
-void World::selectCut(const CullView& view, const CutParams& params,
-                      SelectionContext& ctx, PageUsageContext& usage,
-                      CutSink& outCut) const
+void View::selectCut(const World& world, const Camera& camera,
+                     const CutParams& params, PageUsageContext& usage,
+                     CutSink& outCut)
 {
-    selectCutContext(view, params, ctx, &usage, outCut);
+    HLOD_CHECK(world_ == nullptr || world_ == &world,
+               "View::selectCut: View belongs to another World; call reset()");
+    world_ = &world;
+    if (reuseEnabled_)
+        world.selectCutCached(camera, params, *this, &usage, outCut);
+    else
+        world.selectCutUncached(camera, params, *this, &usage, outCut);
 }
 
-void World::selectCut(const CullView& view, const CutParams& params,
-                      SelectionContext& ctx,
-                      std::vector<CutEntry>& outCut) const
+void View::selectCut(const World& world, const Camera& camera,
+                     const CutParams& params,
+                     std::vector<CutEntry>& outCut)
 {
     CutSink cut(outCut);
-    selectCutContext(view, params, ctx, nullptr, cut);
+    selectCut(world, camera, params, cut);
 }
 
-void World::selectCut(const CullView& view, const CutParams& params,
-                      SelectionContext& ctx, PageUsageContext& usage,
-                      std::vector<CutEntry>& outCut) const
+void View::selectCut(const World& world, const Camera& camera,
+                     const CutParams& params, PageUsageContext& usage,
+                     std::vector<CutEntry>& outCut)
 {
     CutSink cut(outCut);
-    selectCutContext(view, params, ctx, &usage, cut);
-}
-
-void World::selectCut(const CullView& view, const CutParams& params,
-                      std::vector<CutEntry>& outCut)
-{
-    CutSink cut(outCut);
-    selectCut(view, params, cut);
-}
-
-void World::selectCut(const CullView& view, const CutParams& params,
-                      PageUsageContext& usage,
-                      std::vector<CutEntry>& outCut)
-{
-    CutSink cut(outCut);
-    selectCut(view, params, usage, cut);
+    selectCut(world, camera, params, usage, cut);
 }
 
 } // namespace hlod

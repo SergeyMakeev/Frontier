@@ -16,11 +16,11 @@ struct Outputs
     std::vector<CutEntry> cut;
 };
 
-Outputs frame(World& w, const CullView& v, const CutParams& p)
+Outputs frame(World& w, const Camera& v, const CutParams& p)
 {
     w.applyUpdates();
     Outputs o;
-    w.selectCut(v, p, o.cut);
+    selectCutUncached(w, v, p, o.cut);
     return o;
 }
 
@@ -51,7 +51,7 @@ TEST(Streaming, AllOrNothingRefinement)
     w.addInstance(std::move(pg), float4::point(0, 0, 0));
     // Root is pinned-resident automatically. Children start non-resident.
 
-    const CullView v = makeLookAtView(float4::point(0, 0, -20), float4::point(0, 0, 0));
+    const Camera v = makeLookAtCamera(float4::point(0, 0, -20), float4::point(0, 0, 0));
     const CutParams p{4.0f, 0.0f};
 
     auto o = frame(w, v, p);
@@ -108,8 +108,8 @@ TEST(Streaming, ResidentDescendantsBypassMissingIntermediateProxies)
     world.addInstance(builder.build(), float4::point(0, 0, 0));
     markResident(world, 3);   // payload 2 deliberately remains non-resident
 
-    const CullView view =
-        makeLookAtView(float4::point(0, 0, -12), float4::point(0, 0, 0));
+    const Camera view =
+        makeLookAtCamera(float4::point(0, 0, -12), float4::point(0, 0, 0));
     const Outputs output = frame(world, view, {4.0f, 0.0f});
 
     EXPECT_FALSE(isResident(world, 2));
@@ -139,8 +139,8 @@ TEST(Streaming, InvisibleMissingBranchDoesNotBlockResidentCover)
     world.addInstance(builder.build(), float4::point(0, 0, 0));
     markResident(world, 3);   // the off-screen branch remains entirely missing
 
-    const CullView view =
-        makeLookAtView(float4::point(0, 0, -20), float4::point(0, 0, 0));
+    const Camera view =
+        makeLookAtCamera(float4::point(0, 0, -20), float4::point(0, 0, 0));
     const Outputs output = frame(world, view, {4.0f, 0.0f});
 
     EXPECT_EQ(cutIds(output), std::set<UserId>{3});
@@ -164,7 +164,7 @@ TEST(Streaming, IdealCutLeadsCurrentCut)
     w.addInstance(std::move(pg), float4::point(0, 0, 0));
     // Nothing resident except the pinned root.
 
-    const CullView v = makeLookAtView(float4::point(0, 0, -50), float4::point(0, 0, 0));
+    const Camera v = makeLookAtCamera(float4::point(0, 0, -50), float4::point(0, 0, 0));
     const auto o = frame(w, v, {4.0f, 0.0f});
 
     // Current cut: the root proxy only. Ideal cut: deeper, all DIRECT.
@@ -200,7 +200,7 @@ TEST(Streaming, ExpansionLifeCycle)
 
     // Far away: collapsed expansion points draw their proxies; steady state.
     {
-        const CullView far = makeLookAtView(float4::point(0, 0, -100000), float4::point(0, 0, 0));
+        const Camera far = makeLookAtCamera(float4::point(0, 0, -100000), float4::point(0, 0, 0));
         const auto o = frame(w, far, p);
         for (const auto& e : o.cut)
             if (inIdealCut(e)) EXPECT_EQ(int(e.tag), int(CutTag::Direct));
@@ -208,7 +208,7 @@ TEST(Streaming, ExpansionLifeCycle)
 
     // Close: the expansion points are too coarse -> NEEDS_EXPANSION, no
     // separate request entries for expansions.
-    const CullView near = makeLookAtView(float4::point(0, 0, -45), float4::point(0, 0, 0));
+    const Camera near = makeLookAtCamera(float4::point(0, 0, -45), float4::point(0, 0, 0));
     std::vector<UserId> needed;
     {
         const auto o = frame(w, near, p);
@@ -284,7 +284,7 @@ TEST(Streaming, AttachClampsChildErrors)
         markResident(w, 10);
         // Close enough that the expansion node (err 0.5, box within 2 units)
         // always wants to refine into the attached page.
-        const CullView v = makeLookAtView(float4::point(0, 0, -6), float4::point(0, 0, 0));
+        const Camera v = makeLookAtCamera(float4::point(0, 0, -6), float4::point(0, 0, 0));
         return frame(w, v, {4.0f, 0.0f});
     };
 
@@ -363,21 +363,23 @@ TEST(Streaming, GarbageCollection)
     // level1[0]'s page (plus the root page) is touched by the walk.
     const AABB region0 = gen.recipes.at(level1[0]).region;
     const float4 c0 = region0.center();
-    const CullView v = makeLookAtView(c0 + float4::vec(60, 0, 0),
+    const Camera v = makeLookAtCamera(c0 + float4::vec(60, 0, 0),
                                       c0 - float4::vec(150, 0, 0));
     const AABB region1 = gen.recipes.at(level1[1]).region;
     const float4 c1 = region1.center();
-    const CullView shadow = makeLookAtView(c1 + float4::vec(60, 0, 0),
+    const Camera shadow = makeLookAtCamera(c1 + float4::vec(60, 0, 0),
                                            c1 - float4::vec(150, 0, 0));
     std::vector<CutEntry> cut;
     std::vector<CutEntry> shadowCut;
-    SelectionContext selection;
+    View selection;
+    View shadowView;
+    shadowView.setReuseEnabled(false);
     PageUsageContext usage;
     for (int f = 0; f < 10; ++f)
     {
         w.applyUpdates();
-        w.selectCut(v, {0.5f, 0.0f}, selection, usage, cut);
-        w.selectCut(shadow, {0.5f, 0.0f}, shadowCut);
+        selection.selectCut(w, v, {0.5f, 0.0f}, usage, cut);
+        shadowView.selectCut(w, shadow, {0.5f, 0.0f}, shadowCut);
     }
     // Selection only accumulates feedback. The World LRU is updated when the
     // caller explicitly chooses this camera at collect time.
@@ -405,7 +407,7 @@ TEST(Streaming, GarbageCollection)
     for (int f = 0; f < 10; ++f)
     {
         w.applyUpdates();
-        w.selectCut(v, {0.5f, 0.0f}, selection, usage, cut);
+        selection.selectCut(w, v, {0.5f, 0.0f}, usage, cut);
         w.collect(usage, 0, 3);
     }
     EXPECT_TRUE(isAttached(w, level1[0]));
@@ -502,12 +504,12 @@ TEST(Streaming, GcChurnStress)
     {
         // Two full passes over the world at high speed, low altitude.
         const float x = -500.0f + 1000.0f * float(f % 60) / 60.0f;
-        const CullView v = makePerspectiveView(
+        const Camera v = makePerspectiveCamera(
             float4::point(x, 40.0f, 0), float4::vec(1.0f, -0.3f, 0.0f),
             float4::vec(0, 1, 0), 1.0f, 16.0f / 9.0f, 1080.0f, 0.1f, 1.0e9f);
 
         w.applyUpdates();
-        w.selectCut(v, p, usage, cut);
+        selectCutUncached(w, v, p, usage, cut);
 
         if (f % 7 == 0)   // spot-check equivalence on the exact same state
         {
@@ -561,7 +563,7 @@ TEST(Streaming, ConvergesToIdealCut)
     World w;
     w.addInstance(std::move(root), float4::point(0, 0, 0));
 
-    const CullView v = makeLookAtView(float4::point(0, 10, -80), float4::point(0, 0, 0));
+    const Camera v = makeLookAtCamera(float4::point(0, 10, -80), float4::point(0, 0, 0));
     const CutParams p{4.0f, 0.0f};
 
     Outputs o;

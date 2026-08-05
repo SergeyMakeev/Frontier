@@ -39,16 +39,22 @@ using namespace hlodtest;
 
 namespace {
 
+struct UncachedView : View
+{
+    UncachedView() { setReuseEnabled(false); }
+};
+
 struct Outputs
 {
+    UncachedView view;
     std::vector<CutEntry> cut;
 };
 
-CullView orbitView(float t, float dist, float4 center = float4::point(0, 0, 0))
+Camera orbitView(float t, float dist, float4 center = float4::point(0, 0, 0))
 {
     const float4 pos = center + float4::vec(std::cos(t) * dist, dist * 0.35f,
                                             std::sin(t) * dist);
-    return makeLookAtView(pos, center);
+    return makeLookAtCamera(pos, center);
 }
 
 // Cheap deterministic RNG so the timed loops don't measure std::mt19937.
@@ -149,13 +155,13 @@ static void BM_DeepTree_StaticCamera(benchmark::State& state)
     const auto wp = makeDeepWorld(8, uint32_t(state.range(0)));
     World& w = *wp;
     Outputs o;
-    const CullView v = orbitView(0.7f, 2500.0f);
+    const Camera v = orbitView(0.7f, 2500.0f);
     const CutParams p{4.0f, 0.0f};
 
     for (auto _ : state)
     {
         w.applyUpdates();
-        w.selectCut(v, p, o.cut);
+        o.view.selectCut(w, v, p, o.cut);
         benchmark::DoNotOptimize(o.cut.data());
     }
     state.counters["cut"] = double(o.cut.size());
@@ -166,16 +172,17 @@ BENCHMARK(BM_DeepTree_StaticCamera)->Arg(4)->Arg(5)->Arg(6)->Unit(benchmark::kMi
 // entirely Shared.
 static void BM_DeepTree_CutOnly(benchmark::State& state)
 {
+    UncachedView selection;
     const auto wp = makeDeepWorld(8, uint32_t(state.range(0)));
     World& w = *wp;
     std::vector<CutEntry> cut;
-    const CullView v = orbitView(0.7f, 2500.0f);
+    const Camera v = orbitView(0.7f, 2500.0f);
     const CutParams p{4.0f, 0.0f};
 
     for (auto _ : state)
     {
         w.applyUpdates();
-        w.selectCut(v, p, cut);
+        selection.selectCut(w, v, p, cut);
         benchmark::DoNotOptimize(cut.data());
     }
     state.counters["cut"] = double(cut.size());
@@ -199,9 +206,9 @@ static void BM_DeepTree_FlyThrough(benchmark::State& state)
         t += 0.02f;
         // Swoop in and out while orbiting.
         const float dist = 1800.0f + 1500.0f * std::sin(t * 3.1f);
-        const CullView v = orbitView(t, dist);
+        const Camera v = orbitView(t, dist);
         w.applyUpdates();
-        w.selectCut(v, p, o.cut);
+        o.view.selectCut(w, v, p, o.cut);
         benchmark::DoNotOptimize(o.cut.data());
         cutTotal += o.cut.size();
         ++frames;
@@ -230,7 +237,7 @@ static void BM_DeepTree_FlyThroughDamped(benchmark::State& state)
     World& w = *wp;
     Outputs o;
     const CutParams p{4.0f, 0.0f};
-    ViewDamper damper(float(state.range(1)));
+    CameraDamper damper(float(state.range(1)));
 
     float t = 0.0f;
     size_t cutTotal = 0, frames = 0;
@@ -238,9 +245,9 @@ static void BM_DeepTree_FlyThroughDamped(benchmark::State& state)
     {
         t += 0.02f;
         const float dist = 60000.0f + 30000.0f * std::sin(t * 3.1f);
-        const CullView v = damper.damp(orbitView(t, dist));
+        const Camera v = damper.damp(orbitView(t, dist));
         w.applyUpdates();
-        w.selectCut(v, p, o.cut);
+        o.view.selectCut(w, v, p, o.cut);
         benchmark::DoNotOptimize(o.cut.data());
         cutTotal += o.cut.size();
         ++frames;
@@ -276,10 +283,10 @@ static void BM_PagedPlanet_StreamingFly(benchmark::State& state)
     {
         t += 0.03f;
         const float dist = 250000.0f * std::exp(-2.5f * (0.5f + 0.5f * std::sin(t)));
-        const CullView v = orbitView(t * 0.2f, 20000.0f + dist);
+        const Camera v = orbitView(t * 0.2f, 20000.0f + dist);
 
         w.applyUpdates();
-        w.selectCut(v, p, usage, o.cut);
+        o.view.selectCut(w, v, p, usage, o.cut);
 
         attaches += attachTopByPriority(w, gen, o.cut, 8);
         makeIdealResident(w, o.cut);
@@ -321,12 +328,12 @@ static void BM_GcStress_FastFlythrough(benchmark::State& state)
     {
         x += speed;
         if (x > half) x = -half;   // wrap: revisit collapsed regions
-        const CullView v = makePerspectiveView(
+        const Camera v = makePerspectiveCamera(
             float4::point(x, half * 0.02f, 0), float4::vec(1.0f, -0.15f, 0.0f),
             float4::vec(0, 1, 0), 1.0f, 16.0f / 9.0f, 1080.0f, 0.1f, 1.0e9f);
 
         w.applyUpdates();
-        w.selectCut(v, p, usage, o.cut);
+        o.view.selectCut(w, v, p, usage, o.cut);
 
         attaches += attachTopByPriority(w, gen, o.cut, 16);
         const size_t currentCount = makeIdealResident(w, o.cut);
@@ -368,9 +375,9 @@ static void BM_ManyShallowTrees(benchmark::State& state)
     for (auto _ : state)
     {
         t += 0.01f;
-        const CullView v = orbitView(t, area * 0.4f);
+        const Camera v = orbitView(t, area * 0.4f);
         w.applyUpdates();
-        w.selectCut(v, p, o.cut);
+        o.view.selectCut(w, v, p, o.cut);
         benchmark::DoNotOptimize(o.cut.data());
     }
     state.counters["cut"] = double(o.cut.size());
@@ -416,9 +423,9 @@ static void BM_MovingInstances(benchmark::State& state)
                            float4::point(fast.uniform(-area, area), 0,
                                          fast.uniform(-area, area)));
         }
-        const CullView v = orbitView(t, area * 0.4f);
+        const Camera v = orbitView(t, area * 0.4f);
         w.applyUpdates();
-        w.selectCut(v, p, o.cut);
+        o.view.selectCut(w, v, p, o.cut);
         benchmark::DoNotOptimize(o.cut.data());
     }
 }
@@ -578,9 +585,9 @@ static void BM_LeafMotion_TeleportWithCut(benchmark::State& state)
             mw.world.setNodeBounds(mw.inst, mw.leaves[i],
                                    AABB::fromCenterExtent(c, float4::vec(1, 1, 1)));
         }
-        const CullView v = orbitView(t, mw.half * 2.0f);
+        const Camera v = orbitView(t, mw.half * 2.0f);
         mw.world.applyUpdates();
-        mw.world.selectCut(v, p, o.cut);
+        o.view.selectCut(mw.world, v, p, o.cut);
         benchmark::DoNotOptimize(o.cut.data());
         cutTotal += o.cut.size();
         ++frames;
@@ -632,9 +639,9 @@ static void BM_MovingLeafNodes(benchmark::State& state)
                                                      rng.uniform(-900, 900)),
                                          float4::vec(2, 2, 2)));
         }
-        const CullView v = orbitView(t, 2500.0f);
+        const Camera v = orbitView(t, 2500.0f);
         w.applyUpdates();
-        w.selectCut(v, p, o.cut);
+        o.view.selectCut(w, v, p, o.cut);
         benchmark::DoNotOptimize(o.cut.data());
     }
 }
@@ -676,9 +683,9 @@ static void BM_ResidencyChurn(benchmark::State& state)
             if (w.isResident(h)) w.markNonResident(h);
             else w.markResident(h);
         }
-        const CullView v = orbitView(t, 2500.0f);
+        const Camera v = orbitView(t, 2500.0f);
         w.applyUpdates();
-        w.selectCut(v, p, o.cut);
+        o.view.selectCut(w, v, p, o.cut);
         benchmark::DoNotOptimize(o.cut.data());
     }
 }
@@ -776,12 +783,12 @@ static void BM_Combined_KitchenSink(benchmark::State& state)
                             AABB::fromCenterExtent(c, float4::vec(1, 1, 1)));
         }
 
-        const CullView v = makePerspectiveView(
+        const Camera v = makePerspectiveCamera(
             float4::point(x, half * 0.03f, 0), float4::vec(1.0f, -0.2f, 0.1f),
             float4::vec(0, 1, 0), 1.0f, 16.0f / 9.0f, 1080.0f, 0.1f, 1.0e9f);
 
         w.applyUpdates();
-        w.selectCut(v, p, usage, o.cut);
+        o.view.selectCut(w, v, p, usage, o.cut);
 
         attaches += attachTopByPriority(w, planetGen, o.cut, 12);
         const size_t currentCount = makeIdealResident(w, o.cut);
@@ -814,6 +821,7 @@ BENCHMARK(BM_Combined_KitchenSink)->Unit(benchmark::kMicrosecond);
 // ---------------------------------------------------------------------------
 static void BM_TypicalForest_Breakdown(benchmark::State& state)
 {
+    UncachedView selection;
     using clock = std::chrono::steady_clock;
     const int count = int(state.range(0));
     // ~20 m spacing: 10k trees live on a ~2x2 km map.
@@ -878,10 +886,10 @@ static void BM_TypicalForest_Breakdown(benchmark::State& state)
         const auto t1 = clock::now();
         w.applyUpdates();   // refit and TLAS work are measured in this phase
         const auto t2 = clock::now();
-        const CullView v = makePerspectiveView(
+        const Camera v = makePerspectiveCamera(
             float4::point(x, 1.7f, 0), float4::vec(1.0f, 0.0f, 0.05f),
             float4::vec(0, 1, 0), 1.0f, 16.0f / 9.0f, 1080.0f, 0.1f, 1.0e9f);
-        w.selectCut(v, p, cut);
+        selection.selectCut(w, v, p, cut);
         const auto t3 = clock::now();
 
         moveNs += std::chrono::duration<double, std::nano>(t1 - t0).count();
@@ -917,6 +925,7 @@ BENCHMARK(BM_TypicalForest_Breakdown)->Arg(10000)->Arg(50000)
 // ---------------------------------------------------------------------------
 static void BM_TypicalForest_Churn(benchmark::State& state)
 {
+    UncachedView selection;
     using clock = std::chrono::steady_clock;
     const int count = int(state.range(0));
     const int churnPct = int(state.range(1));
@@ -1011,10 +1020,10 @@ static void BM_TypicalForest_Churn(benchmark::State& state)
         const auto t2 = clock::now();
         w.applyUpdates();
         const auto t3 = clock::now();
-        const CullView v = makePerspectiveView(
+        const Camera v = makePerspectiveCamera(
             float4::point(x, 1.7f, 0), float4::vec(1.0f, 0.0f, 0.05f),
             float4::vec(0, 1, 0), 1.0f, 16.0f / 9.0f, 1080.0f, 0.1f, 1.0e9f);
-        w.selectCut(v, p, cut);
+        selection.selectCut(w, v, p, cut);
         const auto t4 = clock::now();
 
         churnNs += std::chrono::duration<double, std::nano>(t1 - t0).count();
@@ -1100,16 +1109,17 @@ BENCHMARK(BM_Builder_BuildPage)
 // ---------------------------------------------------------------------------
 static void BM_CutScaling_OutputSensitivity(benchmark::State& state)
 {
+    UncachedView selection;
     const auto wp = makeDeepWorld(8, 6);
     World& w = *wp;
     std::vector<CutEntry> cut;
-    const CullView v = orbitView(0.7f, 2500.0f);
+    const Camera v = orbitView(0.7f, 2500.0f);
     const CutParams p{float(state.range(0)), 0.0f};
 
     for (auto _ : state)
     {
         w.applyUpdates();
-        w.selectCut(v, p, cut);
+        selection.selectCut(w, v, p, cut);
         benchmark::DoNotOptimize(cut.data());
     }
     state.counters["cut"] = double(cut.size());
@@ -1130,6 +1140,7 @@ BENCHMARK(BM_CutScaling_OutputSensitivity)
 // ---------------------------------------------------------------------------
 static void BM_CameraTeleport_ColdFrame(benchmark::State& state)
 {
+    UncachedView selection;
     using clock = std::chrono::steady_clock;
     std::mt19937 rng(777);
     const float half = 6000.0f;
@@ -1163,11 +1174,11 @@ static void BM_CameraTeleport_ColdFrame(benchmark::State& state)
         const bool jump = ((steadyFrames + teleportFrames) % 16) == 15;
         if (jump) center = float4::point(fast.uniform(-half, half), 0,
                                          fast.uniform(-half, half));
-        const CullView v = orbitView(t, 400.0f, center);
+        const Camera v = orbitView(t, 400.0f, center);
 
         const auto t0 = clock::now();
         w.applyUpdates();
-        w.selectCut(v, p, cut);
+        selection.selectCut(w, v, p, cut);
         const auto t1 = clock::now();
         benchmark::DoNotOptimize(cut.data());
 
@@ -1188,6 +1199,7 @@ BENCHMARK(BM_CameraTeleport_ColdFrame)->Unit(benchmark::kMicrosecond);
 // ---------------------------------------------------------------------------
 static void BM_MultiView(benchmark::State& state)
 {
+    UncachedView selection;
     using clock = std::chrono::steady_clock;
     std::mt19937 rng(4321);
     const float half = 4000.0f;
@@ -1220,12 +1232,12 @@ static void BM_MultiView(benchmark::State& state)
         const float4 eye = float4::vec(std::cos(t) * 900.0f, 300.0f, std::sin(t) * 900.0f);
 
         const auto t0 = clock::now();
-        w.selectCut(makeLookAtView(eye, float4::point(0, 0, 0)), p, cut[0]);
+        selection.selectCut(w, makeLookAtCamera(eye, float4::point(0, 0, 0)), p, cut[0]);
         const auto t1 = clock::now();
         // Extra views: same eye, different directions (cascade-style).
-        w.selectCut(makeLookAtView(eye, float4::point(2000, 0, 0)), p, cut[1]);
-        w.selectCut(makeLookAtView(eye, float4::point(-1000, 0, 1500)), p, cut[2]);
-        w.selectCut(makeLookAtView(eye + float4::vec(0, 1200, 0), eye), p, cut[3]);
+        selection.selectCut(w, makeLookAtCamera(eye, float4::point(2000, 0, 0)), p, cut[1]);
+        selection.selectCut(w, makeLookAtCamera(eye, float4::point(-1000, 0, 1500)), p, cut[2]);
+        selection.selectCut(w, makeLookAtCamera(eye + float4::vec(0, 1200, 0), eye), p, cut[3]);
         const auto t2 = clock::now();
 
         for (auto& c : cut) benchmark::DoNotOptimize(c.data());
@@ -1276,7 +1288,7 @@ namespace {
 // One frame of the predictive policy, entirely content-side (the streamer
 // owns the page data and the recipes; the World only sees attachPage).
 void predictiveAttachFrame(World& w, TreeGen& gen, const std::vector<CutEntry>& cut,
-                           const CullView& view, float threshold, size_t budget)
+                           const Camera& view, float threshold, size_t budget)
 {
     struct Cand
     {
@@ -1364,9 +1376,9 @@ static void BM_StreamingConvergence(benchmark::State& state)
         }
         ++frameInCycle;
 
-        const CullView v = makeLookAtView(eye, eye + float4::vec(1, -0.15f, 0.3f));
+        const Camera v = makeLookAtCamera(eye, eye + float4::vec(1, -0.15f, 0.3f));
         w.applyUpdates();
-        w.selectCut(v, p, usage, o.cut);
+        o.view.selectCut(w, v, p, usage, o.cut);
 
         // Residual: worst screen error still waiting on an expansion.
         // Clamped: the camera inside a collapsed box saturates err toward
@@ -1412,6 +1424,7 @@ BENCHMARK(BM_StreamingConvergence)
 // ---------------------------------------------------------------------------
 static void BM_TlasScale(benchmark::State& state)
 {
+    UncachedView selection;
     using clock = std::chrono::steady_clock;
     const int count = int(state.range(0));
     const float half = 40.0f * std::sqrt(float(count));
@@ -1433,7 +1446,7 @@ static void BM_TlasScale(benchmark::State& state)
     // Level-load burst: the first cut pays the quality TLAS build.
     const auto b0 = clock::now();
     w.applyUpdates();
-    w.selectCut(orbitView(0.0f, half * 0.25f), p, cut);
+    selection.selectCut(w, orbitView(0.0f, half * 0.25f), p, cut);
     const auto b1 = clock::now();
     const double firstMs = std::chrono::duration<double, std::milli>(b1 - b0).count();
 
@@ -1442,7 +1455,7 @@ static void BM_TlasScale(benchmark::State& state)
     {
         t += 0.01f;
         w.applyUpdates();
-        w.selectCut(orbitView(t, half * 0.25f), p, cut);
+        selection.selectCut(w, orbitView(t, half * 0.25f), p, cut);
         benchmark::DoNotOptimize(cut.data());
     }
     state.counters["cut"] = double(cut.size());
@@ -1458,6 +1471,7 @@ BENCHMARK(BM_TlasScale)
 // so it cannot promote that rebuild back to the quality tier.
 static void BM_TlasMortonRebuild(benchmark::State& state)
 {
+    UncachedView selection;
     const int count = int(state.range(0));
     const bool stacked = state.range(1) != 0;
     const float half = 40.0f * std::sqrt(float(count));
@@ -1488,8 +1502,9 @@ static void BM_TlasMortonRebuild(benchmark::State& state)
 
     std::vector<CutEntry> cut;
     const CutParams params{4.0f, 1.0f};
-    const CullView view = orbitView(0.0f, half * 0.25f);
-    w.selectCut(view, params, cut);   // establish the quality tree
+    const Camera view = orbitView(0.0f, half * 0.25f);
+    w.applyUpdates();
+    selection.selectCut(w, view, params, cut);   // establish the quality tree
 
     bool high = false;
     for (auto _ : state)
@@ -1498,7 +1513,7 @@ static void BM_TlasMortonRebuild(benchmark::State& state)
         const float corner = high ? half * 0.95f : -half * 0.95f;
         w.moveInstance(refs[0], float4::point(corner, 0, corner));
         w.applyUpdates();
-        w.selectCut(view, params, cut);
+        selection.selectCut(w, view, params, cut);
         benchmark::DoNotOptimize(cut.data());
     }
     state.counters["cut"] = double(cut.size());
@@ -1515,6 +1530,7 @@ BENCHMARK(BM_TlasMortonRebuild)
 // scale with the 10% that remain.
 static void BM_TlasSparseRebuild(benchmark::State& state)
 {
+    UncachedView selection;
     using clock = std::chrono::steady_clock;
     const int peak = int(state.range(0));
     const int live = peak / 10;
@@ -1541,12 +1557,14 @@ static void BM_TlasSparseRebuild(benchmark::State& state)
 
     std::vector<CutEntry> cut;
     const CutParams params{4.0f, 1.0f};
-    const CullView view = orbitView(0.0f, half * 0.25f);
-    w.selectCut(view, params, cut);   // establish the peak-quality tree
+    const Camera view = orbitView(0.0f, half * 0.25f);
+    w.applyUpdates();
+    selection.selectCut(w, view, params, cut);   // establish the peak-quality tree
     for (int i = live; i < peak; ++i) w.removeInstance(refs[i]);
 
     const auto t0 = clock::now();
-    w.selectCut(view, params, cut);   // sparse Morton rebuild
+    w.applyUpdates();
+    selection.selectCut(w, view, params, cut);   // sparse Morton rebuild
     const auto t1 = clock::now();
     const double rebuildMs =
         std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -1554,7 +1572,7 @@ static void BM_TlasSparseRebuild(benchmark::State& state)
     for (auto _ : state)
     {
         w.applyUpdates();
-        w.selectCut(view, params, cut);
+        selection.selectCut(w, view, params, cut);
         benchmark::DoNotOptimize(cut.data());
     }
     state.counters["cut"] = double(cut.size());
@@ -1578,6 +1596,7 @@ BENCHMARK(BM_TlasSparseRebuild)->Arg(100000)->Unit(benchmark::kMicrosecond);
 // ---------------------------------------------------------------------------
 static void BM_AssetSharing_CutCost(benchmark::State& state)
 {
+    UncachedView selection;
     const bool shared = state.range(0) != 0;
     const int  count  = int(state.range(1));
 
@@ -1611,13 +1630,13 @@ static void BM_AssetSharing_CutCost(benchmark::State& state)
     std::vector<CutEntry> cut;
     const CutParams p{4.0f, 0.0f};
     const float span = float(side) * pitch;
-    const CullView v = makeLookAtView(float4::point(0, span * 0.8f, -span * 0.8f),
+    const Camera v = makeLookAtCamera(float4::point(0, span * 0.8f, -span * 0.8f),
                                       float4::point(0, 0, 0));
 
     for (auto _ : state)
     {
         w.applyUpdates();
-        w.selectCut(v, p, cut);
+        selection.selectCut(w, v, p, cut);
         benchmark::DoNotOptimize(cut.data());
     }
     state.counters["cut"] = double(cut.size());
@@ -1651,6 +1670,7 @@ BENCHMARK(BM_AssetSharing_CutCost)
 // ---------------------------------------------------------------------------
 static void BM_DeformedCutCost(benchmark::State& state)
 {
+    UncachedView selection;
     const int count = int(state.range(0));
     const int pct   = int(state.range(1));
 
@@ -1689,13 +1709,13 @@ static void BM_DeformedCutCost(benchmark::State& state)
     std::vector<CutEntry> cut;
     const CutParams p{4.0f, 0.0f};
     const float span = float(side) * pitch;
-    const CullView v = makeLookAtView(float4::point(0, span * 0.8f, -span * 0.8f),
+    const Camera v = makeLookAtCamera(float4::point(0, span * 0.8f, -span * 0.8f),
                                       float4::point(0, 0, 0));
 
     for (auto _ : state)
     {
         w.applyUpdates();
-        w.selectCut(v, p, cut);
+        selection.selectCut(w, v, p, cut);
         benchmark::DoNotOptimize(cut.data());
     }
     state.counters["cut"] = double(cut.size());
@@ -1709,14 +1729,14 @@ BENCHMARK(BM_DeformedCutCost)
     ->Unit(benchmark::kMicrosecond);
 
 // ---------------------------------------------------------------------------
-// SelectionContext: what temporal reuse is worth on the workload it targets.
+// View: what temporal reuse is worth on the workload it targets.
 //
 // A large instanced world seen by a camera that moves continuously and never
 // teleports, with a configurable slice of the instances moving every frame.
-// arg0 = instances, arg1 = 0 stateless / 1 cached, arg2 = percent of instances
+// arg0 = instances, arg1 = 0 uncached / 1 cached, arg2 = percent of instances
 // that move each frame.
 //
-// The stateless and cached arms do the same work per frame from the caller's
+// The uncached and cached arms do the same work per frame from the caller's
 // point of view: same TLAS query, same view, same cut. The difference is that
 // the cached arm skips the per-instance walk wherever it can prove the answer
 // has not moved, and hands back the entries where they already sit instead of
@@ -1726,7 +1746,7 @@ BENCHMARK(BM_DeformedCutCost)
 // population the margin actually covered, and it is the mechanism's own
 // report on whether this world suits it.
 // ---------------------------------------------------------------------------
-static void BM_SelectionContext_FlyThrough(benchmark::State& state)
+static void BM_View_FlyThrough(benchmark::State& state)
 {
     const int count = int(state.range(0));
     const bool cached = state.range(1) != 0;
@@ -1759,7 +1779,8 @@ static void BM_SelectionContext_FlyThrough(benchmark::State& state)
     const int movers = count * movePct / 100;
 
     std::vector<CutEntry> cut;
-    SelectionContext cache;
+    View cache;
+    cache.setReuseEnabled(cached);
     const CutParams p{4.0f, 0.0f};
     XorShift32 fast;
 
@@ -1780,16 +1801,13 @@ static void BM_SelectionContext_FlyThrough(benchmark::State& state)
         for (int i = 0; i < movers; ++i)
             w.moveInstance(insts[i], home[i] + float4::vec(fast.uniform(-0.4f, 0.4f), 0,
                                                            fast.uniform(-0.4f, 0.4f)));
-        const CullView v = makePerspectiveView(
+        const Camera v = makePerspectiveCamera(
             float4::point(0, 2.0f, z), float4::vec(0.0f, 0.0f, 1.0f),
             float4::vec(0, 1, 0), 1.0f, 16.0f / 9.0f, 1080.0f, 0.1f, 1.0e9f);
         w.applyUpdates();
 
         const auto t0 = clock::now();
-        if (cached)
-            w.selectCut(v, p, cache, cut);
-        else
-            w.selectCut(v, p, cut);
+        cache.selectCut(w, v, p, cut);
         const auto t1 = clock::now();
         cutNs += std::chrono::duration<double, std::nano>(t1 - t0).count();
 
@@ -1818,7 +1836,7 @@ static void BM_SelectionContext_FlyThrough(benchmark::State& state)
     // array came out the same size as the data it described.
     state.counters["ent_inst"] = visible > 0 ? entries / visible : 0.0;
 }
-BENCHMARK(BM_SelectionContext_FlyThrough)
+BENCHMARK(BM_View_FlyThrough)
     ->Args({20000, 0, 0})->Args({20000, 1, 0})
     ->Args({20000, 0, 5})->Args({20000, 1, 5})
     ->Args({20000, 0, 100})->Args({20000, 1, 100})
@@ -1827,14 +1845,14 @@ BENCHMARK(BM_SelectionContext_FlyThrough)
     ->Unit(benchmark::kMicrosecond);
 
 // Operation-level breakdown for the representative README workloads. This is
-// deliberately SelectionContext-only: three arms at each scale separate object
+// deliberately View-only: three arms at each scale separate object
 // motion from camera motion while keeping the view and 600-frame route fixed.
 //
 // arg0 = instance count
 // arg1 = separately registered assets shared by those instances
 // arg2 = instances moved per frame
 // arg3 = 0 fixed camera / 1 continuous fly-through
-static void BM_SelectionContext_Breakdown(benchmark::State& state)
+static void BM_View_Breakdown(benchmark::State& state)
 {
     using clock = std::chrono::steady_clock;
 
@@ -1878,21 +1896,21 @@ static void BM_SelectionContext_Breakdown(benchmark::State& state)
     {
         const float t = float(frame % 600) / 600.0f;
         const float z = cameraMoves ? (t * 2.0f - 1.0f) * half * 0.8f : 0.0f;
-        return makePerspectiveView(
+        return makePerspectiveCamera(
             float4::point(0, 2.0f, z), float4::vec(0.0f, 0.0f, 1.0f),
             float4::vec(0, 1, 0), 1.0f, 16.0f / 9.0f, 1080.0f, 0.1f, 1.0e9f);
     };
 
-    SelectionContext context;
+    View viewState;
     std::vector<CutEntry> cut;
     const CutParams params{4.0f, 0.0f};
 
     // The first published selection cycle builds the initial TLAS and
-    // populates the context. Steady-frame counters start from a warm state.
+    // populates the View. Steady-frame counters start from a warm state.
     const auto cold0 = clock::now();
     w.applyUpdates();
-    const CullView coldView = viewAt(0);
-    w.selectCut(coldView, params, context, cut);
+    const Camera coldView = viewAt(0);
+    viewState.selectCut(w, coldView, params, cut);
     const auto cold1 = clock::now();
 
     XorShift32 fast;
@@ -1907,7 +1925,7 @@ static void BM_SelectionContext_Breakdown(benchmark::State& state)
 
     for (auto _ : state)
     {
-        const CullView view = viewAt(frames);
+        const Camera view = viewAt(frames);
         const auto frame0 = clock::now();
 
         const auto move0 = frame0;
@@ -1919,7 +1937,7 @@ static void BM_SelectionContext_Breakdown(benchmark::State& state)
         w.applyUpdates();
         const auto maintenance1 = clock::now();
 
-        w.selectCut(view, params, context, cut);
+        viewState.selectCut(w, view, params, cut);
         const auto cut1 = clock::now();
 
         moveNs += std::chrono::duration<double, std::nano>(move1 - move0).count();
@@ -1928,8 +1946,8 @@ static void BM_SelectionContext_Breakdown(benchmark::State& state)
         cutNs += std::chrono::duration<double, std::nano>(cut1 - maintenance1).count();
         totalNs += std::chrono::duration<double, std::nano>(cut1 - frame0).count();
 
-        const double n = double(context.reused() + context.walked());
-        reuse += n > 0.0 ? 100.0 * double(context.reused()) / n : 0.0;
+        const double n = double(viewState.reused() + viewState.walked());
+        reuse += n > 0.0 ? 100.0 * double(viewState.reused()) / n : 0.0;
         entries += double(cut.size());
         visible += n;
         benchmark::DoNotOptimize(cut.data());
@@ -1948,9 +1966,9 @@ static void BM_SelectionContext_Breakdown(benchmark::State& state)
     state.counters["reuse%"] = reuse / f;
     state.counters["visible"] = visible / f;
     state.counters["avg_cut"] = entries / f;
-    state.counters["cache_MB"] = double(context.bytes()) / (1024.0 * 1024.0);
+    state.counters["cache_MB"] = double(viewState.bytes()) / (1024.0 * 1024.0);
 }
-BENCHMARK(BM_SelectionContext_Breakdown)
+BENCHMARK(BM_View_Breakdown)
     ->Args({80000, 1, 4000, 1})    // large: moving camera and objects
     ->Args({80000, 1, 4000, 0})    // large: static camera, moving objects
     ->Args({80000, 1, 0, 1})       // large: moving camera, static objects
@@ -1962,7 +1980,7 @@ BENCHMARK(BM_SelectionContext_Breakdown)
     ->Unit(benchmark::kMicrosecond);
 
 // Multi-view scaling for the same representative world. Object updates happen
-// once per frame; each nearby view owns its own SelectionContext and output.
+// once per frame; each nearby view owns its own View and output.
 // `select_us` is wall time for all six views. The MT arms use six persistent
 // worker threads, so the measurement excludes thread creation and directly
 // compares serial and concurrent selection of the same published snapshot.
@@ -1970,7 +1988,7 @@ BENCHMARK(BM_SelectionContext_Breakdown)
 // arg0 = percent of instances moved per frame
 // arg1 = number of views
 // arg2 = 0 serial views / 1 concurrent views on persistent worker threads
-static void BM_SelectionContext_MultiView(benchmark::State& state)
+static void BM_View_MultiView(benchmark::State& state)
 {
     using clock = std::chrono::steady_clock;
 
@@ -2006,20 +2024,20 @@ static void BM_SelectionContext_MultiView(benchmark::State& state)
         const float t = float(frame % 600) / 600.0f;
         const float z = (t * 2.0f - 1.0f) * half * 0.8f;
         const float x = (float(viewIndex) - float(viewCount - 1) * 0.5f) * 24.0f;
-        return makePerspectiveView(
+        return makePerspectiveCamera(
             float4::point(x, 2.0f, z), float4::vec(0.0f, 0.0f, 1.0f),
             float4::vec(0, 1, 0), 1.0f, 16.0f / 9.0f, 1080.0f, 0.1f, 1.0e9f);
     };
 
-    std::vector<SelectionContext> contexts(static_cast<size_t>(viewCount));
+    std::vector<View> contexts(static_cast<size_t>(viewCount));
     std::vector<std::vector<CutEntry>> cuts(static_cast<size_t>(viewCount));
     const CutParams params{4.0f, 0.0f};
 
     w.applyUpdates();
     for (int v = 0; v < viewCount; ++v)
-        w.selectCut(viewAt(0, v), params, contexts[size_t(v)], cuts[size_t(v)]);
+        contexts[size_t(v)].selectCut(w, viewAt(0, v), params, cuts[size_t(v)]);
 
-    std::vector<CullView> currentViews(static_cast<size_t>(viewCount));
+    std::vector<Camera> currentViews(static_cast<size_t>(viewCount));
     std::atomic<bool> stop{false};
     std::barrier<> start(viewCount + 1);
     std::barrier<> done(viewCount + 1);
@@ -2034,8 +2052,8 @@ static void BM_SelectionContext_MultiView(benchmark::State& state)
                 {
                     start.arrive_and_wait();
                     if (stop.load(std::memory_order_relaxed)) return;
-                    static_cast<const World&>(w).selectCut(
-                        currentViews[size_t(v)], params, contexts[size_t(v)],
+                    contexts[size_t(v)].selectCut(
+                        static_cast<const World&>(w), currentViews[size_t(v)], params,
                         cuts[size_t(v)]);
                     done.arrive_and_wait();
                 }
@@ -2071,8 +2089,8 @@ static void BM_SelectionContext_MultiView(benchmark::State& state)
         {
             const auto select0 = clock::now();
             for (int v = 0; v < viewCount; ++v)
-                w.selectCut(viewAt(frames, v), params, contexts[size_t(v)],
-                            cuts[size_t(v)]);
+                contexts[size_t(v)].selectCut(w, viewAt(frames, v), params,
+                                              cuts[size_t(v)]);
             const auto select1 = clock::now();
             selectNs +=
                 std::chrono::duration<double, std::nano>(select1 - select0).count();
@@ -2105,7 +2123,7 @@ static void BM_SelectionContext_MultiView(benchmark::State& state)
     state.counters["reuse%"] = reuse / calls;
     state.counters["avg_cut"] = entries / calls;
 }
-BENCHMARK(BM_SelectionContext_MultiView)
+BENCHMARK(BM_View_MultiView)
     ->Args({0, 6, 0})
     ->Args({0, 6, 1})
     ->Args({5, 6, 0})
@@ -2133,7 +2151,7 @@ BENCHMARK(BM_SelectionContext_MultiView)
 // that has nothing to do with the cache. Compare within a period, across
 // half-lives: /0/120 against /8/120.
 // ---------------------------------------------------------------------------
-static void BM_SelectionContext_Zoom(benchmark::State& state)
+static void BM_View_Zoom(benchmark::State& state)
 {
     const float halfLife = float(state.range(0));
     const int   zoomEvery = int(state.range(1));
@@ -2154,7 +2172,7 @@ static void BM_SelectionContext_Zoom(benchmark::State& state)
         w.addInstance(asset, float4::point(uni(rng), 0, uni(rng)));
     markAllResident(w, w.assetRootPage(asset), nodes);
 
-    SelectionContext ctx(halfLife);
+    View ctx(halfLife);
     std::vector<CutEntry> cut;
     const CutParams p{4.0f, 0.0f};
 
@@ -2170,13 +2188,13 @@ static void BM_SelectionContext_Zoom(benchmark::State& state)
         // continuous sweep. Undamped, k is then constant between steps.
         const bool zoomedIn = zoomEvery > 0 && ((fi / size_t(zoomEvery)) & 1u) != 0;
         const float fovY = zoomedIn ? 0.5f : 1.0f;
-        const CullView v = makePerspectiveView(
+        const Camera v = makePerspectiveCamera(
             float4::point(0, 2.0f, z), float4::vec(0.0f, 0.0f, 1.0f),
             float4::vec(0, 1, 0), fovY, 16.0f / 9.0f, 1080.0f, 0.1f, 1.0e9f);
         w.applyUpdates();
 
         const auto t0 = clock::now();
-        w.selectCut(v, p, ctx, cut);
+        ctx.selectCut(w, v, p, cut);
         const auto t1 = clock::now();
         cutNs += std::chrono::duration<double, std::nano>(t1 - t0).count();
 
@@ -2191,7 +2209,7 @@ static void BM_SelectionContext_Zoom(benchmark::State& state)
     state.counters["reuse%"] = reuse / f;
     state.counters["stall_f"] = double(stalls);
 }
-BENCHMARK(BM_SelectionContext_Zoom)
+BENCHMARK(BM_View_Zoom)
     ->Args({0, 0})->Args({0, 120})
     ->Args({8, 0})->Args({8, 120})
     // 300 isolates the direction: with this period the run contains exactly one
@@ -2202,9 +2220,9 @@ BENCHMARK(BM_SelectionContext_Zoom)
     ->Unit(benchmark::kMicrosecond);
 
 // Camera-cut/reset latency. A reset forgets reuse and damping state, but the
-// same view immediately starts filling the context again; retaining its
+// the same View immediately starts filling its records again; retaining its
 // buffers avoids turning that normal cycle into allocator traffic.
-static void BM_SelectionContext_Reset(benchmark::State& state)
+static void BM_View_Reset(benchmark::State& state)
 {
     const int count = int(state.range(0));
     TreeGen gen;
@@ -2222,27 +2240,28 @@ static void BM_SelectionContext_Reset(benchmark::State& state)
         w.addInstance(asset, float4::point(uni(rng), 0, uni(rng)));
     markAllResident(w, w.assetRootPage(asset), nodes);
 
-    SelectionContext ctx(6.0f);
+    View ctx(6.0f);
     std::vector<CutEntry> cut;
     const CutParams params{4.0f, 0.0f};
-    const CullView view = makePerspectiveView(
+    const Camera view = makePerspectiveCamera(
         float4::point(0, 2.0f, 0), float4::vec(0, 0, 1), float4::vec(0, 1, 0),
         1.0f, 16.0f / 9.0f, 1080.0f, 0.1f, 1.0e9f);
 
     // Allocate once before timing. The benchmark measures whether reset keeps
     // or discards that reusable storage.
-    w.selectCut(view, params, ctx, cut);
+    w.applyUpdates();
+    ctx.selectCut(w, view, params, cut);
     for (auto _ : state)
     {
         ctx.reset();
         w.applyUpdates();
-        w.selectCut(view, params, ctx, cut);
+        ctx.selectCut(w, view, params, cut);
         benchmark::DoNotOptimize(cut.data());
     }
     state.counters["cut"] = double(cut.size());
     state.counters["ctx_MB"] = double(ctx.bytes()) / (1024.0 * 1024.0);
 }
-BENCHMARK(BM_SelectionContext_Reset)->Arg(20000)->Unit(benchmark::kMicrosecond);
+BENCHMARK(BM_View_Reset)->Arg(20000)->Unit(benchmark::kMicrosecond);
 
 // ---------------------------------------------------------------------------
 // What does ONE spawn cost?
@@ -2267,6 +2286,7 @@ BENCHMARK(BM_SelectionContext_Reset)->Arg(20000)->Unit(benchmark::kMicrosecond);
 // ---------------------------------------------------------------------------
 static void BM_Spawn_MarginalCost(benchmark::State& state)
 {
+    UncachedView selection;
     using clock = std::chrono::steady_clock;
     const int count = int(state.range(0));
     const int churn = int(state.range(1));
@@ -2300,7 +2320,7 @@ static void BM_Spawn_MarginalCost(benchmark::State& state)
     for (auto _ : state)
     {
         const float t = float(frames);
-        const CullView v = makePerspectiveView(
+        const Camera v = makePerspectiveCamera(
             float4::point(std::sin(t * 0.01f) * half * 0.5f, 40.0f,
                           std::cos(t * 0.01f) * half * 0.5f),
             float4::vec(0, -0.3f, 1), float4::vec(0, 1, 0), 1.1f, 16.0f / 9.0f,
@@ -2319,7 +2339,7 @@ static void BM_Spawn_MarginalCost(benchmark::State& state)
         }
         const auto t1 = clock::now();
         w.applyUpdates();
-        w.selectCut(v, p, cut);
+        selection.selectCut(w, v, p, cut);
         const auto t2 = clock::now();
 
         churnNs += std::chrono::duration<double, std::nano>(t1 - t0).count();
@@ -2350,6 +2370,7 @@ BENCHMARK(BM_Spawn_MarginalCost)
 // ---------------------------------------------------------------------------
 static void BM_Adversarial_StackedInstances(benchmark::State& state)
 {
+    UncachedView selection;
     TreeGen gen;
     gen.fanout = 4;
     gen.depth = 1;
@@ -2364,12 +2385,12 @@ static void BM_Adversarial_StackedInstances(benchmark::State& state)
 
     std::vector<CutEntry> cut;
     const CutParams p{4.0f, 0.0f};
-    const CullView v = makeLookAtView(float4::point(0, 20, -60), float4::point(0, 0, 0));
+    const Camera v = makeLookAtCamera(float4::point(0, 20, -60), float4::point(0, 0, 0));
 
     for (auto _ : state)
     {
         w.applyUpdates();
-        w.selectCut(v, p, cut);
+        selection.selectCut(w, v, p, cut);
         benchmark::DoNotOptimize(cut.data());
     }
     state.counters["cut"] = double(cut.size());
@@ -2383,6 +2404,7 @@ BENCHMARK(BM_Adversarial_StackedInstances)->Unit(benchmark::kMicrosecond);
 // ---------------------------------------------------------------------------
 static void BM_Adversarial_WideNode(benchmark::State& state)
 {
+    UncachedView selection;
     HLodBuilder b;
     const auto root = b.createRoot(1, 512.0f, AABB::empty());
     XorShift32 fast;
@@ -2403,7 +2425,7 @@ static void BM_Adversarial_WideNode(benchmark::State& state)
     {
         t += 0.02f;
         w.applyUpdates();
-        w.selectCut(orbitView(t, 300.0f), p, cut);
+        selection.selectCut(w, orbitView(t, 300.0f), p, cut);
         benchmark::DoNotOptimize(cut.data());
     }
     state.counters["cut"] = double(cut.size());
@@ -2417,6 +2439,7 @@ BENCHMARK(BM_Adversarial_WideNode)->Unit(benchmark::kMicrosecond);
 // ---------------------------------------------------------------------------
 static void BM_Adversarial_DeepPageChain(benchmark::State& state)
 {
+    UncachedView selection;
     TreeGen gen;
     gen.fanout = 1;
     gen.depth = 1;
@@ -2444,12 +2467,12 @@ static void BM_Adversarial_DeepPageChain(benchmark::State& state)
 
     std::vector<CutEntry> cut;
     const CutParams p{4.0f, 0.0f};
-    const CullView v = makeLookAtView(float4::point(0, 3, -8), float4::point(0, 0, 0));
+    const Camera v = makeLookAtCamera(float4::point(0, 3, -8), float4::point(0, 0, 0));
 
     for (auto _ : state)
     {
         w.applyUpdates();
-        w.selectCut(v, p, cut);
+        selection.selectCut(w, v, p, cut);
         benchmark::DoNotOptimize(cut.data());
     }
     state.counters["pages"] = double(depth + 1);

@@ -20,15 +20,14 @@ split:
   incremental insert/remove. Initial and repair builds can use a quality
   splitter; frequent motion/edit rebuilds use a cheaper Morton hierarchy.
 
-`selectCut` queries the TLAS, walks only surviving page regions, and emits one
+`View::selectCut` queries the TLAS, walks only surviving page regions, and emits one
 unified current/ideal cut. Membership marks entries shared by both cuts and the
 two additive deltas; `NeedsExpansion` marks unknown topology. The caller derives
-IO work from ideal-side entries. `SelectionContext` adds per-view damping and
-conservative cut reuse. After `applyUpdates` publishes a stable snapshot,
-different contextual calls
-read only the World and can run concurrently. Stateless selection can instead
-fan one call out over visible instances through the host's blocking
-`parallelFor`.
+IO work from ideal-side entries. `View` owns per-camera damping, conservative
+cut reuse, traversal scratch, and statistics. After `applyUpdates` publishes a
+stable snapshot, distinct views read only the World and can run concurrently.
+Disabling reuse on a `View` enables the internally parallel uncached path
+through the host's blocking `parallelFor` without changing that contract.
 
 ### Why it is fast
 
@@ -45,9 +44,9 @@ fan one call out over visible instances through the host's blocking
    stack round trip. At fanout eight, most authored nodes are leaves.
 4. **Shared immutable working sets.** Thousands of identical instances can walk
    one hot page. The cut-path `Instance` record is one cache line, while TLAS
-   maintenance state occupies a separate cache line. Stateless selection
-   prefetches the next instance and root page; contextual selection pipelines
-   its spatially ordered random instance/context reads eight entries ahead.
+   maintenance state occupies a separate cache line. Uncached selection
+   prefetches the next instance and root page; cached selection pipelines
+   its spatially ordered random instance/view-record reads eight entries ahead.
 5. **Handle-only mutation.** The world has no payload index or node hash table.
    Cut entries carry generation-stamped handles; stale asynchronous
    completions fail one generation check and are ignored.
@@ -65,7 +64,7 @@ fan one call out over visible instances through the host's blocking
    populations of at least 1,024, with retained scratch and only the 11-bit
    passes required by key variation. A dense live-id list avoids scanning dead
    historical slots.
-9. **Frame-coherent reuse.** A 48-byte `SelectionContext` record proves when a
+9. **Frame-coherent reuse.** A 48-byte `View` record proves when a
    fully-inside instance's unified cut cannot change under camera-envelope or
    projection-scale travel. Page versions cover topology and residency changes;
    reused entries are copied without rewalking pages.
@@ -88,11 +87,11 @@ least ten repetitions.
 | 10k instances, 700 assets, moving camera / 1k moving | 0.126 ms selection | 82.4% reused; 27.8% visible; 5,920-entry unified cut |
 | Same 10k world, static camera / 1k moving | 0.108 ms selection | 85.8% reused; 25.0% visible; 5,792 entries |
 | Same 10k world, moving camera / static objects | 0.082 ms selection | 93.3% reused; 5,920 entries |
-| 80k instances, moving camera / 5% moving | 0.55 ms selection | 92.6% reused; 24,986 entries |
+| 80k instances, moving camera / 5% moving | 0.52 ms selection | 92.6% reused; 24,986 entries |
 | Same 80k world, static camera / 5% moving | 0.41 ms selection | 94.1% reused; 22,872 entries |
-| Same 80k world, moving camera / static objects | 0.48 ms selection | 97.6% reused; 24,986 entries |
-| Six 80k views, static objects, serial / concurrent | 3.77 / 0.97 ms wall time | 3.9× on six persistent workers |
-| Six 80k views, 5% moving, serial / concurrent | 4.26 / 1.15 ms wall time | 3.7× on six persistent workers |
+| Same 80k world, moving camera / static objects | 0.42 ms selection | 97.6% reused; 24,986 entries |
+| Six 80k views, static objects, serial / concurrent | 3.82 / 0.97 ms wall time | 3.9× on six persistent workers |
+| Six 80k views, 5% moving, serial / concurrent | 4.44 / 1.05 ms wall time | 4.2× on six persistent workers |
 
 These are scale indicators, not guarantees. Output size and cache locality can
 dominate population size, and contended runs on this host can be much slower.
@@ -360,8 +359,8 @@ the history, however, the boundary was `selectCut`:
   queue.
 
 The current API moves that same work to explicit `applyUpdates`, before any
-view selection. This is what makes contextual selection a const, concurrently
-callable read of the published World.
+view selection. This is what lets `View::selectCut` accept a const World and
+run concurrently across distinct views.
 
 The second half — replacing the per-mover ancestor walk with an explicitly
 deduplicated bottom-up sweep — was implemented three different ways, all
@@ -478,7 +477,7 @@ submissions/s).
 cut/ideal antichain + residency invariants fuzzed over random paged worlds;
 byte-identical determinism across identically built worlds (the then-current
 hysteresis path); multi-view state isolation (originally scratch, now covered
-by independent dampers and `SelectionContext` objects);
+by independent dampers and `View` objects);
 `collect()` minAge boundary and exact `freedPayloads` accounting;
 `screenError8` and degenerate-box (zero-extent, camera-inside, far-off-axis)
 wide-vs-scalar equivalence; camera-inside-tree, point leaves, 1e6-offset
@@ -607,10 +606,10 @@ by the unified cut; the other listed mechanisms remain:
   `screenErrorFromSq8`, matching the page walk's reciprocal-square-root path and
   improving the focused 50k-200k cases by 3.0-3.5%.
 - Request deduplication at that revision lived in per-selection scratch rather
-  than mutable page state. Parallel stateless workers merge their private
-  request sets; concurrent contextual views cannot overwrite one another's
+  than mutable page state. Parallel uncached workers merge their private
+  request sets; concurrent cached views cannot overwrite one another's
   epochs.
-- `SelectionContext` budgets both camera-envelope travel and projection-scale
+- `View` budgets both camera-envelope travel and projection-scale
   travel. Each 48-byte record stores a conservative flip-point slope, avoiding
   the old all-cache invalidation throughout damped zoom-out. The affected 20k
   benchmark improved 38.9%. Reset retains warm storage, improving reset+cold
@@ -618,10 +617,10 @@ by the unified cut; the other listed mechanisms remain:
 - Contextual selection prefetches its spatially ordered random instance and
   record reads eight entries ahead, and the output sink directly pushes its
   dominant one-entry runs. The then-current 20k fly-through reached 0.121 ms.
-- Contextual TLAS stacks, visible lists, traversal workers, request stamps, and
-  statistics are owned by each `SelectionContext`. `applyUpdates` performs the
-  serial refit/rebuild work first; the contextual overload is then const and
-  independent views may select concurrently.
+- TLAS stacks, visible lists, traversal workers, request stamps, and
+  statistics are owned by each `View`. `applyUpdates` performs the
+  serial refit/rebuild work first; `View::selectCut` then accepts a const World
+  and independent views may select concurrently.
 - Page touches accumulate in an optional `PageUsageContext`. Selection does
   not mutate the intrusive World LRU; `collect` consumes only the important
   cameras supplied by the caller.
@@ -646,11 +645,11 @@ replace an unavailable intermediate proxy. The propagated bit is the common
 O(1) decision. At a frustum boundary, an uncovered branch outside the view need
 not block refinement, so selection recursively validates only visible branches
 and records every inspected page for optional page-use feedback. Frustum-edge
-instances are deliberately not retained by `SelectionContext`.
+instances are deliberately not retained by `View`.
 
 The resulting traversal carries current and ideal liveness together, preserves
-the replace-only antichain for both cuts, and lets contextual calls keep their
-read-only multi-view behavior. Current representative measurements are in
+the replace-only antichain for both cuts, and keeps selection read-only with
+respect to the World. Current representative measurements are in
 section 1 and the README; older output-path timings above are historical.
 
 The archived [2026-08-05 handoff](docs/archive/HANDOFF-2026-08-05.md), section
@@ -662,10 +661,10 @@ guidance.
 
 ## 3. Current constraints and possible follow-up
 
-- **Parallelism is across contextual views, not within one contextual walk.**
-  Six representative 80k views fall from 3.77-4.26 ms serial to 0.97-1.15 ms
-  on six persistent workers and occupy about 73 MiB of context state. Stateless
-  selection can still parallelize one call across visible instances. Combining
+- **Cached parallelism is across views, not within one cached walk.**
+  Six representative 80k views fall from 3.82-4.44 ms serial to 0.97-1.05 ms
+  on six persistent workers and occupy about 73 MiB of view state. An uncached
+  View can still parallelize one call across visible instances. Combining
   both forms would add nested scheduling and merge costs; profile a production
   need before doing so.
 - **Internal overlay bounds do not shrink.** Grow-only refit means long-running
@@ -681,6 +680,6 @@ guidance.
   representation; adding them directly would change bound transforms and hot
   instance state.
 - **Host policy remains host policy.** Page size, GC watermarks/dwell, attach
-  budget, predictive lookahead, and whether to retain a `SelectionContext` are
+  budget, predictive lookahead, and whether a `View` enables reuse are
   content- and IO-dependent decisions. The benchmark suite supplies the
   mechanisms' scale but cannot choose production values.

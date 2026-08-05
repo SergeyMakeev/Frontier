@@ -17,11 +17,11 @@ struct Outputs
     std::vector<CutEntry> cut;
 };
 
-Outputs frame(World& w, const CullView& v, const CutParams& p)
+Outputs frame(World& w, const Camera& v, const CutParams& p)
 {
     w.applyUpdates();
     Outputs o;
-    w.selectCut(v, p, o.cut);
+    selectCutUncached(w, v, p, o.cut);
     return o;
 }
 
@@ -117,12 +117,12 @@ TEST(Motion, LeafMoveRefitsAncestors)
     EXPECT_TRUE(rootBoundsOf(w, inst, 11).contains(newBox));   // grew to the sentinel
 
     // A camera looking only at the new position sees exactly that wall.
-    const CullView vNew = makeLookAtView(float4::point(200, 50, -30), float4::point(200, 50, 0));
+    const Camera vNew = makeLookAtCamera(float4::point(200, 50, -30), float4::point(200, 50, 0));
     auto o = frame(w, vNew, {4.0f, 0.0f});
     EXPECT_TRUE(cutIds(o).count(11));
 
     // A camera at the old position no longer draws it.
-    const CullView vOld = makeLookAtView(float4::point(4, 0, -10), float4::point(4, 0, 0));
+    const Camera vOld = makeLookAtCamera(float4::point(4, 0, -10), float4::point(4, 0, 0));
     o = frame(w, vOld, {4.0f, 0.0f});
     EXPECT_FALSE(cutIds(o).count(11));
 }
@@ -167,7 +167,7 @@ TEST(Motion, CrossPagePropagation)
     EXPECT_TRUE(boundsOf(w, inst, expId).contains(newBox));
 
     // And the cut can actually find the moved leaf out there.
-    const CullView v = makeLookAtView(float4::point(500, 0, -20), float4::point(500, 0, 0));
+    const Camera v = makeLookAtCamera(float4::point(500, 0, -20), float4::point(500, 0, 0));
     const auto o = frame(w, v, {1.0f, 0.0f});
     EXPECT_TRUE(cutIds(o).count(movedId));
 }
@@ -249,13 +249,13 @@ TEST(Motion, InstanceMove)
     markAllResident(w, ids);
     w.applyUpdates();
 
-    const CullView vOrigin = makeLookAtView(float4::point(0, 0, -30), float4::point(0, 0, 0));
+    const Camera vOrigin = makeLookAtCamera(float4::point(0, 0, -30), float4::point(0, 0, 0));
     EXPECT_FALSE(cutIds(frame(w, vOrigin, {4, 0})).empty());
 
     w.moveInstance(inst, float4::point(10000, 0, 0), 2.0f);
     EXPECT_TRUE(cutIds(frame(w, vOrigin, {4, 0})).empty());
 
-    const CullView vThere = makeLookAtView(float4::point(10000, 0, -60), float4::point(10000, 0, 0));
+    const Camera vThere = makeLookAtCamera(float4::point(10000, 0, -60), float4::point(10000, 0, 0));
     EXPECT_FALSE(cutIds(frame(w, vThere, {4, 0})).empty());
 }
 
@@ -283,7 +283,7 @@ TEST(Motion, TlasMatchesBruteForce)
     TA::forceTlasRebuild(w);
     w.applyUpdates();
 
-    const CullView v = makeLookAtView(float4::point(0, 100, -2500), float4::point(0, 0, 0));
+    const Camera v = makeLookAtCamera(float4::point(0, 100, -2500), float4::point(0, 0, 0));
     const auto visible = TA::tlasQuery(w, v, 0.0f);
 
     std::set<uint32_t> got;
@@ -325,9 +325,9 @@ TEST(Motion, ManyMovesStayCorrect)
             w.moveInstance(insts[i], float4::point(uni(rng), uni(rng) * 0.05f, uni(rng)));
         w.applyUpdates();
 
-        const CullView v = makeLookAtView(float4::point(uni(rng), 200, -800), float4::point(0, 0, 0));
+        const Camera v = makeLookAtCamera(float4::point(uni(rng), 200, -800), float4::point(0, 0, 0));
         Outputs o;
-        w.selectCut(v, p, o.cut);
+        selectCutUncached(w, v, p, o.cut);
         const RefResult want = TA::referenceCut(w, v, p);
 
         std::set<UserId> gotIds, wantIds;
@@ -395,10 +395,10 @@ TEST(Motion, InstanceChurnStaysCorrect)
         for (int k = 0; k < 8; ++k) addTree(float4::point(uni(rng), 0, uni(rng)));
 
         w.applyUpdates();
-        const CullView v = makeLookAtView(float4::point(uni(rng), 300, -900),
+        const Camera v = makeLookAtCamera(float4::point(uni(rng), 300, -900),
                                           float4::point(0, 0, 0));
         std::vector<CutEntry> cut;
-        w.selectCut(v, p, cut);
+        selectCutUncached(w, v, p, cut);
         const RefResult want = TA::referenceCut(w, v, p);
 
         std::multiset<UserId> gotIds, wantIds;
@@ -496,7 +496,7 @@ TEST(Motion, HandleMovesMatchIdMoves)
         EXPECT_EQ(a[i].mx.x, b[i].mx.x) << "node " << i;
     }
 
-    const CullView v = makeLookAtView(float4::point(200, 50, -30), float4::point(200, 50, 0));
+    const Camera v = makeLookAtCamera(float4::point(200, 50, -30), float4::point(200, 50, 0));
     auto o = frame(*byHandle, v, {4.0f, 0.0f});
     EXPECT_TRUE(cutIds(o).count(11));
 }
@@ -615,9 +615,9 @@ TEST(Motion, ApplyUpdatesFlushesPendingBounds)
     setNodeBounds(w, inst, 11,
                   AABB::fromCenterExtent(float4::vec(300, 0, 0), float4::vec(1, 1, 1)));
     w.applyUpdates();
-    const CullView v = makeLookAtView(float4::point(300, 0, -20), float4::point(300, 0, 0));
+    const Camera v = makeLookAtCamera(float4::point(300, 0, -20), float4::point(300, 0, 0));
     Outputs o;
-    w.selectCut(v, {2.0f, 0.0f}, o.cut);
+    selectCutUncached(w, v, {2.0f, 0.0f}, o.cut);
     std::set<UserId> got;
     for (const auto& e : o.cut)
         if (inCurrentCut(e)) got.insert(e.payload);
