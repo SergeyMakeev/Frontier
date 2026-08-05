@@ -14,6 +14,15 @@ buildings, and stream deeper topology only where the camera needs it. The
 library owns no meshes, materials, jobs, or renderer state, so it can sit in
 front of an existing asset and rendering system.
 
+Streaming has two independent dimensions. **Residency** says whether a known
+node's render payload is loaded. A parent remains in the actual cut until every
+child needed to replace it is resident, so partial loads never create holes or
+parent/child overlap. **Expansion and collapse** control whether deeper topology
+is known at all: a collapsed expansion point is a renderable coarse proxy;
+attaching a child page expands that branch, while explicit detach or cold-page
+garbage collection collapses it again. The ideal cut and load requests tell the
+host what to expand and load next without forcing HLodTree to own an IO system.
+
 ## Minimal example
 
 This one-node asset is intentionally small so the complete build, instance,
@@ -65,25 +74,32 @@ contribution is smaller than that value; zero disables contribution culling.
 Representative current measurements on a 64-hardware-thread, 2.4 GHz EPYC,
 using one thread, MSVC 19.51, Release `/O2 /arch:AVX2`, on 2026-08-05:
 
-| Scenario | Current result |
-|---|---:|
-| 2.4M-node deep hierarchy, 259,933-entry cut | 1.72 ms |
-| 20k static shared instances, stateless selection | 0.538 ms |
-| Same 20k scene with `SelectionContext` (94.8% reused) | 0.152 ms |
-| 80k shared instances, 5% moving, stateless / cached | 2.62 / 2.03 ms |
-| TLAS steady selection, 200k / 500k instances | 5.48 / 6.14 ms |
-| First quality TLAS build plus selection, 200k / 500k | 134 / 417 ms |
-| Forced Morton rebuild plus cut, 100k / 500k instances | 7.88 / 44.5 ms |
-| 4k instances of a 51 KiB asset, cloned / shared | 35.4 / 12.9 ms |
-| Immutable page bytes in that cloned / shared case | 199 MiB / 51 KiB |
+Here, **stateless** means calling `selectCut` without a `SelectionContext`: every
+visible instance is traversed on every call. **Contextual** selection proves
+that eligible instance cuts cannot have changed and copies their recorded
+entries instead. **Cut-only** means the optional ideal-cut and request outputs
+are disabled. Rebuild rows include both rebuilding the TLAS and selecting the
+following cut; they are not sort-only microbenchmarks.
+
+| Scenario | What the workload measures | Current result |
+|---|---|---:|
+| Deep hierarchy, stateless and cut-only | 2.4M authored nodes; traversal stops at and emits a 259,933-entry actual cut | 1.72 ms |
+| 20k static instances of one shared asset, stateless | Camera flies continuously; every visible instance is walked, producing 8,587 entries on average | 0.538 ms selection |
+| Same 20k workload, contextual | `SelectionContext` reuses 94.8% of visible instance cuts and occupies 2.91 MiB | 0.152 ms selection |
+| 80k shared instances with 5% moving, stateless / contextual | Selection portion only; contextual arm still reuses 92.4% and emits the same 24,986-entry average cut | 2.62 / 2.03 ms selection |
+| Steady stateless TLAS selection, 200k / 500k instances | `minPix=1` contribution culling leaves 34,573 / 30,975 actual-cut entries; no rebuild in the timed steady iterations | 5.48 / 6.14 ms |
+| First quality TLAS build plus stateless selection, 200k / 500k | One-time level-load path: default binned-SAH build followed by its first cut | 134 / 417 ms |
+| Forced Morton repair rebuild plus stateless cut, 100k / 500k | One instance crosses the world each iteration and a zero escape budget forces a full Morton rebuild before selection | 7.88 / 44.5 ms |
+| 4k fully resident instances of a 51 KiB asset, cloned / shared | Stateless cut-only comparison with identical placement and identical 2.048M-entry output; only page/runtime-state sharing differs | 35.4 / 12.9 ms |
+| Immutable page bytes in that cloned / shared workload | 4,000 private page copies versus one registered shared page | 199 MiB / 51 KiB |
 
 These are point estimates for scale, not platform promises. Selection is
 output-sensitive, so cut size, visibility, residency, page layout, and memory
-locality matter more than total authored node count. The latest controlled A/B
-runs found that the retained Morton radix sort reduced forced rebuild-plus-cut
-time by 36.2% at 100k instances and 42.0% at 500k. See
-[ARCHITECTURE.md](ARCHITECTURE.md) for methodology, historical baselines, and
-reverted experiments.
+locality matter more than total authored node count. Morton repair builds
+quantize centroids to 63-bit keys and use a stable LSD radix sort for
+populations of at least 1,024; smaller populations use `std::stable_sort`.
+See [ARCHITECTURE.md](ARCHITECTURE.md) for benchmark methodology and detailed
+implementation notes.
 
 ## What selection returns
 
@@ -173,8 +189,8 @@ Normal configuration options:
 | `HLOD_AVX2` | `ON` | Use AVX2/FMA on x86-64 when available |
 | `HLOD_FORCE_SCALAR` | `OFF` | Disable intrinsic implementations |
 
-The remaining CMake options are A/B measurement scaffolds documented where
-they are declared; they are not normal integration settings.
+Additional internal benchmark toggles are documented where they are declared;
+they are not supported integration settings.
 
 ## SIMD and CI
 
