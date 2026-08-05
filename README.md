@@ -71,35 +71,54 @@ contribution is smaller than that value; zero disables contribution culling.
 
 ## Performance at a glance
 
-Representative current measurements on a 64-hardware-thread, 2.4 GHz EPYC,
-using one thread, MSVC 19.51, Release `/O2 /arch:AVX2`, on 2026-08-05:
+The representative workload is a moving camera in a large, partly dynamic
+world. It is intended to resemble a forest, city, or prop field rather than an
+isolated algorithm microbenchmark:
 
-Here, **stateless** means calling `selectCut` without a `SelectionContext`: every
-visible instance is traversed on every call. **Contextual** selection proves
-that eligible instance cuts cannot have changed and copies their recorded
-entries instead. **Cut-only** means the optional ideal-cut and request outputs
-are disabled. Rebuild rows include both rebuilding the TLAS and selecting the
-following cut; they are not sort-only microbenchmarks.
+- 80,000 instances share one fully resident 85-node asset (four children per
+  node, three edges from root to leaf). Instance origins are spread over a
+  roughly 6.8 km square.
+- The camera flies continuously through the world for 600 frames with no cuts
+  or teleports. It uses a 1080p, 16:9 perspective view.
+- Every frame, 5% of the population (4,000 instances) receives an updated
+  transform around its home position. After those updates and the associated
+  TLAS maintenance, the benchmark begins the frame, flushes pending bounds
+  work, and selects the cut.
+- Selection uses a 4-pixel error threshold and `minPix=0`, so the TLAS still
+  performs frustum culling but does not discard small visible instances. Only
+  the actual render cut is requested; ideal-cut and streaming-request outputs
+  are disabled.
+- The test is single-threaded. It does not include rendering, asset IO,
+  payload-residency changes, or instance spawning and removal.
 
-| Scenario | What the workload measures | Current result |
-|---|---|---:|
-| Deep hierarchy, stateless and cut-only | 2.4M authored nodes; traversal stops at and emits a 259,933-entry actual cut | 1.72 ms |
-| 20k static instances of one shared asset, stateless | Camera flies continuously; every visible instance is walked, producing 8,587 entries on average | 0.538 ms selection |
-| Same 20k workload, contextual | `SelectionContext` reuses 94.8% of visible instance cuts and occupies 2.91 MiB | 0.152 ms selection |
-| 80k shared instances with 5% moving, stateless / contextual | Selection portion only; contextual arm still reuses 92.4% and emits the same 24,986-entry average cut | 2.62 / 2.03 ms selection |
-| Steady stateless TLAS selection, 200k / 500k instances | `minPix=1` contribution culling leaves 34,573 / 30,975 actual-cut entries; no rebuild in the timed steady iterations | 5.48 / 6.14 ms |
-| First quality TLAS build plus stateless selection, 200k / 500k | One-time level-load path: default binned-SAH build followed by its first cut | 134 / 417 ms |
-| Forced Morton repair rebuild plus stateless cut, 100k / 500k | One instance crosses the world each iteration and a zero escape budget forces a full Morton rebuild before selection | 7.88 / 44.5 ms |
-| 4k fully resident instances of a 51 KiB asset, cloned / shared | Stateless cut-only comparison with identical placement and identical 2.048M-entry output; only page/runtime-state sharing differs | 35.4 / 12.9 ms |
-| Immutable page bytes in that cloned / shared workload | 4,000 private page copies versus one registered shared page | 199 MiB / 51 KiB |
+Two supported selection modes run the same deterministic camera path and
+instance motion. **Stateless** selection walks the hierarchy of every visible
+instance each frame. A per-view **`SelectionContext`** instead reuses a recorded
+instance cut only while conservative camera, projection, asset, residency, and
+motion checks prove that the result cannot have changed. Moving instances are
+therefore re-walked; unchanged instances can still be reused while the camera
+moves.
 
-These are point estimates for scale, not platform promises. Selection is
-output-sensitive, so cut size, visibility, residency, page layout, and memory
-locality matter more than total authored node count. Morton repair builds
-quantize centroids to 63-bit keys and use a stable LSD radix sort for
-populations of at least 1,024; smaller populations use `std::stable_sort`.
-See [ARCHITECTURE.md](ARCHITECTURE.md) for benchmark methodology and detailed
-implementation notes.
+The numbers below are means of five 600-frame runs on a 64-hardware-thread,
+2.4 GHz EPYC, using one thread, MSVC 19.51, Release `/O2 /arch:AVX2`, measured
+on 2026-08-05:
+
+| Per-frame result | Stateless | `SelectionContext` |
+|---|---:|---:|
+| Complete benchmark loop (4,000 moves, frame/bounds maintenance, selection, and result consumption) | 3.27 ms | 2.61 ms |
+| `selectCut` portion after bounds are flushed | 2.87 ms | 2.16 ms |
+| Visible instance cuts reused | 0% | 92.4% |
+| Context memory for this view | 0 | 7.66 MiB |
+| Average visible instances | about 21,919 | about 21,919 |
+| Average actual-cut entries | 24,986 | 24,986 |
+| Entries per visible instance | 1.14 | 1.14 |
+
+Both modes return the same render cut; the context changes how much traversal
+is repeated, not the answer. These are point estimates for scale, not platform
+promises. Selection remains output-sensitive, so visibility, cut size,
+residency, page layout, and memory locality can matter more than the total
+authored node count. See [ARCHITECTURE.md](ARCHITECTURE.md) for benchmark
+methodology and specialized measurements.
 
 ## What selection returns
 
