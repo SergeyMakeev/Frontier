@@ -20,12 +20,16 @@
 #include <benchmark/benchmark.h>
 
 #include <algorithm>
+#include <array>
+#include <atomic>
+#include <barrier>
 #include <chrono>
 #include <cmath>
 #include <limits>
 #include <memory>
 #include <queue>
 #include <random>
+#include <thread>
 #include <vector>
 
 #include "helpers.h"   // TreeGen etc. (shared with the unit tests)
@@ -136,7 +140,7 @@ static void BM_DeepTree_StaticCamera(benchmark::State& state)
 
     for (auto _ : state)
     {
-        w.beginFrame();
+        w.applyUpdates();
         w.selectCut(v, p, o.cut, o.ideal, o.reqs);
         benchmark::DoNotOptimize(o.cut.data());
     }
@@ -157,7 +161,7 @@ static void BM_DeepTree_CutOnly(benchmark::State& state)
 
     for (auto _ : state)
     {
-        w.beginFrame();
+        w.applyUpdates();
         w.selectCut(v, p, cut);
         benchmark::DoNotOptimize(cut.data());
     }
@@ -183,7 +187,7 @@ static void BM_DeepTree_FlyThrough(benchmark::State& state)
         // Swoop in and out while orbiting.
         const float dist = 1800.0f + 1500.0f * std::sin(t * 3.1f);
         const CullView v = orbitView(t, dist);
-        w.beginFrame();
+        w.applyUpdates();
         w.selectCut(v, p, o.cut, o.ideal, o.reqs);
         benchmark::DoNotOptimize(o.cut.data());
         cutTotal += o.cut.size();
@@ -222,7 +226,7 @@ static void BM_DeepTree_FlyThroughDamped(benchmark::State& state)
         t += 0.02f;
         const float dist = 60000.0f + 30000.0f * std::sin(t * 3.1f);
         const CullView v = damper.damp(orbitView(t, dist));
-        w.beginFrame();
+        w.applyUpdates();
         w.selectCut(v, p, o.cut, o.ideal, o.reqs);
         benchmark::DoNotOptimize(o.cut.data());
         cutTotal += o.cut.size();
@@ -249,6 +253,7 @@ static void BM_PagedPlanet_StreamingFly(benchmark::State& state)
                         float4::point(0, 0, 0));
 
     Outputs o;
+    PageUsageContext usage;
     const CutParams p{8.0f, 0.0f};
     const size_t pageBudget = size_t(state.range(0));
 
@@ -260,12 +265,12 @@ static void BM_PagedPlanet_StreamingFly(benchmark::State& state)
         const float dist = 250000.0f * std::exp(-2.5f * (0.5f + 0.5f * std::sin(t)));
         const CullView v = orbitView(t * 0.2f, 20000.0f + dist);
 
-        w.beginFrame();
-        w.selectCut(v, p, o.cut, o.ideal, o.reqs);
+        w.applyUpdates();
+        w.selectCut(v, p, usage, o.cut, &o.ideal, &o.reqs);
 
         attaches += attachTopByPriority(w, gen, o.ideal, 8);
         for (const auto& r : o.reqs) w.markResident(r.node);
-        w.collect(pageBudget, 16);
+        w.collect(usage, pageBudget, 16);
         benchmark::DoNotOptimize(o.cut.data());
     }
     state.counters["attached"] = double(w.attachedPageCount());
@@ -291,6 +296,7 @@ static void BM_GcStress_FastFlythrough(benchmark::State& state)
                         float4::point(0, 0, 0));
 
     Outputs o;
+    PageUsageContext usage;
     const CutParams p{8.0f, 1.0f};
     const size_t pageBudget = size_t(state.range(0));
     const uint32_t minAge = 8;
@@ -306,12 +312,12 @@ static void BM_GcStress_FastFlythrough(benchmark::State& state)
             float4::point(x, half * 0.02f, 0), float4::vec(1.0f, -0.15f, 0.0f),
             float4::vec(0, 1, 0), 1.0f, 16.0f / 9.0f, 1080.0f, 0.1f, 1.0e9f);
 
-        w.beginFrame();
-        w.selectCut(v, p, o.cut, o.ideal, o.reqs);
+        w.applyUpdates();
+        w.selectCut(v, p, usage, o.cut, &o.ideal, &o.reqs);
 
         attaches += attachTopByPriority(w, gen, o.ideal, 16);
         for (const auto& r : o.reqs) w.markResident(r.node);
-        collected += w.collect(pageBudget, minAge);
+        collected += w.collect(usage, pageBudget, minAge);
 
         cutTotal += o.cut.size();
         ++frames;
@@ -350,7 +356,7 @@ static void BM_ManyShallowTrees(benchmark::State& state)
     {
         t += 0.01f;
         const CullView v = orbitView(t, area * 0.4f);
-        w.beginFrame();
+        w.applyUpdates();
         w.selectCut(v, p, o.cut, o.ideal, o.reqs);
         benchmark::DoNotOptimize(o.cut.data());
     }
@@ -398,7 +404,7 @@ static void BM_MovingInstances(benchmark::State& state)
                                          fast.uniform(-area, area)));
         }
         const CullView v = orbitView(t, area * 0.4f);
-        w.beginFrame();
+        w.applyUpdates();
         w.selectCut(v, p, o.cut, o.ideal, o.reqs);
         benchmark::DoNotOptimize(o.cut.data());
     }
@@ -560,7 +566,7 @@ static void BM_LeafMotion_TeleportWithCut(benchmark::State& state)
                                    AABB::fromCenterExtent(c, float4::vec(1, 1, 1)));
         }
         const CullView v = orbitView(t, mw.half * 2.0f);
-        mw.world.beginFrame();
+        mw.world.applyUpdates();
         mw.world.selectCut(v, p, o.cut, o.ideal, o.reqs);
         benchmark::DoNotOptimize(o.cut.data());
         cutTotal += o.cut.size();
@@ -614,7 +620,7 @@ static void BM_MovingLeafNodes(benchmark::State& state)
                                          float4::vec(2, 2, 2)));
         }
         const CullView v = orbitView(t, 2500.0f);
-        w.beginFrame();
+        w.applyUpdates();
         w.selectCut(v, p, o.cut, o.ideal, o.reqs);
         benchmark::DoNotOptimize(o.cut.data());
     }
@@ -658,7 +664,7 @@ static void BM_ResidencyChurn(benchmark::State& state)
             else w.markResident(h);
         }
         const CullView v = orbitView(t, 2500.0f);
-        w.beginFrame();
+        w.applyUpdates();
         w.selectCut(v, p, o.cut, o.ideal, o.reqs);
         benchmark::DoNotOptimize(o.cut.data());
     }
@@ -723,6 +729,7 @@ static void BM_Combined_KitchenSink(benchmark::State& state)
     }
 
     Outputs o;
+    PageUsageContext usage;
     const CutParams p{8.0f, 0.5f};
     XorShift32 fast;
 
@@ -760,12 +767,12 @@ static void BM_Combined_KitchenSink(benchmark::State& state)
             float4::point(x, half * 0.03f, 0), float4::vec(1.0f, -0.2f, 0.1f),
             float4::vec(0, 1, 0), 1.0f, 16.0f / 9.0f, 1080.0f, 0.1f, 1.0e9f);
 
-        w.beginFrame();
-        w.selectCut(v, p, o.cut, o.ideal, o.reqs);
+        w.applyUpdates();
+        w.selectCut(v, p, usage, o.cut, &o.ideal, &o.reqs);
 
         attaches += attachTopByPriority(w, planetGen, o.ideal, 12);
         for (const auto& r : o.reqs) w.markResident(r.node);
-        collected += w.collect(300, 8);
+        collected += w.collect(usage, 300, 8);
 
         cutTotal += o.cut.size();
         ++frames;
@@ -856,8 +863,7 @@ static void BM_TypicalForest_Breakdown(benchmark::State& state)
                             AABB::fromCenterExtent(c, float4::vec(0.5f, 0.5f, 0.5f)));
         }
         const auto t1 = clock::now();
-        w.beginFrame();
-        w.flushBounds();   // explicit here so refit shows up as its own phase
+        w.applyUpdates();   // refit and TLAS work are measured in this phase
         const auto t2 = clock::now();
         const CullView v = makePerspectiveView(
             float4::point(x, 1.7f, 0), float4::vec(1.0f, 0.0f, 0.05f),
@@ -990,8 +996,7 @@ static void BM_TypicalForest_Churn(benchmark::State& state)
             }
         }
         const auto t2 = clock::now();
-        w.beginFrame();
-        w.flushBounds();
+        w.applyUpdates();
         const auto t3 = clock::now();
         const CullView v = makePerspectiveView(
             float4::point(x, 1.7f, 0), float4::vec(1.0f, 0.0f, 0.05f),
@@ -1090,7 +1095,7 @@ static void BM_CutScaling_OutputSensitivity(benchmark::State& state)
 
     for (auto _ : state)
     {
-        w.beginFrame();
+        w.applyUpdates();
         w.selectCut(v, p, cut);
         benchmark::DoNotOptimize(cut.data());
     }
@@ -1148,7 +1153,7 @@ static void BM_CameraTeleport_ColdFrame(benchmark::State& state)
         const CullView v = orbitView(t, 400.0f, center);
 
         const auto t0 = clock::now();
-        w.beginFrame();
+        w.applyUpdates();
         w.selectCut(v, p, cut);
         const auto t1 = clock::now();
         benchmark::DoNotOptimize(cut.data());
@@ -1198,7 +1203,7 @@ static void BM_MultiView(benchmark::State& state)
     for (auto _ : state)
     {
         t += 0.01f;
-        w.beginFrame();
+        w.applyUpdates();
         const float4 eye = float4::vec(std::cos(t) * 900.0f, 300.0f, std::sin(t) * 900.0f);
 
         const auto t0 = clock::now();
@@ -1324,6 +1329,7 @@ static void BM_StreamingConvergence(benchmark::State& state)
                         float4::point(0, 0, 0));
 
     Outputs o;
+    PageUsageContext usage;
     const CutParams p{4.0f, 0.0f};
     XorShift32 fast;
 
@@ -1345,8 +1351,8 @@ static void BM_StreamingConvergence(benchmark::State& state)
         ++frameInCycle;
 
         const CullView v = makeLookAtView(eye, eye + float4::vec(1, -0.15f, 0.3f));
-        w.beginFrame();
-        w.selectCut(v, p, o.cut, o.ideal, o.reqs);
+        w.applyUpdates();
+        w.selectCut(v, p, usage, o.cut, &o.ideal, &o.reqs);
 
         // Residual: worst screen error still waiting on an expansion.
         // Clamped: the camera inside a collapsed box saturates err toward
@@ -1370,7 +1376,7 @@ static void BM_StreamingConvergence(benchmark::State& state)
         else
             attachTopByPriority(w, gen, o.ideal, attachBudget);
         for (const auto& r : o.reqs) w.markResident(r.node);
-        w.collect(20000, 30);
+        w.collect(usage, 20000, 30);
         benchmark::DoNotOptimize(o.cut.data());
     }
     state.counters["px_f1"] = resSum[0] / double(resCnt[0] ? resCnt[0] : 1);
@@ -1412,7 +1418,7 @@ static void BM_TlasScale(benchmark::State& state)
 
     // Level-load burst: the first cut pays the quality TLAS build.
     const auto b0 = clock::now();
-    w.beginFrame();
+    w.applyUpdates();
     w.selectCut(orbitView(0.0f, half * 0.25f), p, cut);
     const auto b1 = clock::now();
     const double firstMs = std::chrono::duration<double, std::milli>(b1 - b0).count();
@@ -1421,7 +1427,7 @@ static void BM_TlasScale(benchmark::State& state)
     for (auto _ : state)
     {
         t += 0.01f;
-        w.beginFrame();
+        w.applyUpdates();
         w.selectCut(orbitView(t, half * 0.25f), p, cut);
         benchmark::DoNotOptimize(cut.data());
     }
@@ -1477,7 +1483,7 @@ static void BM_TlasMortonRebuild(benchmark::State& state)
         high = !high;
         const float corner = high ? half * 0.95f : -half * 0.95f;
         w.moveInstance(refs[0], float4::point(corner, 0, corner));
-        w.beginFrame();
+        w.applyUpdates();
         w.selectCut(view, params, cut);
         benchmark::DoNotOptimize(cut.data());
     }
@@ -1533,7 +1539,7 @@ static void BM_TlasSparseRebuild(benchmark::State& state)
 
     for (auto _ : state)
     {
-        w.beginFrame();
+        w.applyUpdates();
         w.selectCut(view, params, cut);
         benchmark::DoNotOptimize(cut.data());
     }
@@ -1596,7 +1602,7 @@ static void BM_AssetSharing_CutCost(benchmark::State& state)
 
     for (auto _ : state)
     {
-        w.beginFrame();
+        w.applyUpdates();
         w.selectCut(v, p, cut);
         benchmark::DoNotOptimize(cut.data());
     }
@@ -1674,7 +1680,7 @@ static void BM_DeformedCutCost(benchmark::State& state)
 
     for (auto _ : state)
     {
-        w.beginFrame();
+        w.applyUpdates();
         w.selectCut(v, p, cut);
         benchmark::DoNotOptimize(cut.data());
     }
@@ -1763,8 +1769,7 @@ static void BM_SelectionContext_FlyThrough(benchmark::State& state)
         const CullView v = makePerspectiveView(
             float4::point(0, 2.0f, z), float4::vec(0.0f, 0.0f, 1.0f),
             float4::vec(0, 1, 0), 1.0f, 16.0f / 9.0f, 1080.0f, 0.1f, 1.0e9f);
-        w.beginFrame();
-        w.flushBounds();
+        w.applyUpdates();
 
         const auto t0 = clock::now();
         if (cached)
@@ -1868,12 +1873,11 @@ static void BM_SelectionContext_Breakdown(benchmark::State& state)
     std::vector<CutEntry> cut;
     const CutParams params{4.0f, 0.0f};
 
-    // The cold cut performs any deferred initial TLAS build and populates the
-    // context. Steady-frame counters below start from a realistic warm state.
-    w.beginFrame();
-    w.flushBounds();
-    const CullView coldView = viewAt(0);
+    // The first published selection cycle builds the initial TLAS and
+    // populates the context. Steady-frame counters start from a warm state.
     const auto cold0 = clock::now();
+    w.applyUpdates();
+    const CullView coldView = viewAt(0);
     w.selectCut(coldView, params, context, cut);
     const auto cold1 = clock::now();
 
@@ -1898,8 +1902,7 @@ static void BM_SelectionContext_Breakdown(benchmark::State& state)
                                                            fast.uniform(-0.4f, 0.4f)));
         const auto move1 = clock::now();
 
-        w.beginFrame();
-        w.flushBounds();
+        w.applyUpdates();
         const auto maintenance1 = clock::now();
 
         w.selectCut(view, params, context, cut);
@@ -1946,11 +1949,13 @@ BENCHMARK(BM_SelectionContext_Breakdown)
 
 // Multi-view scaling for the same representative world. Object updates happen
 // once per frame; each nearby view owns its own SelectionContext and output.
-// `select_us` is the aggregate selection cost, while `first_us` and `extra_us`
-// show the marginal cost after the first view has consumed world maintenance.
+// `select_us` is wall time for all six views. The MT arms use six persistent
+// worker threads, so the measurement excludes thread creation and directly
+// compares serial and concurrent selection of the same published snapshot.
 //
 // arg0 = percent of instances moved per frame
 // arg1 = number of views
+// arg2 = 0 serial views / 1 concurrent views on persistent worker threads
 static void BM_SelectionContext_MultiView(benchmark::State& state)
 {
     using clock = std::chrono::steady_clock;
@@ -1958,6 +1963,7 @@ static void BM_SelectionContext_MultiView(benchmark::State& state)
     constexpr int count = 80000;
     const int movePct = int(state.range(0));
     const int viewCount = int(state.range(1));
+    const bool concurrent = state.range(2) != 0;
 
     TreeGen gen;
     gen.fanout = 4;
@@ -1995,14 +2001,36 @@ static void BM_SelectionContext_MultiView(benchmark::State& state)
     std::vector<std::vector<CutEntry>> cuts(static_cast<size_t>(viewCount));
     const CutParams params{4.0f, 0.0f};
 
-    w.beginFrame();
+    w.applyUpdates();
     for (int v = 0; v < viewCount; ++v)
         w.selectCut(viewAt(0, v), params, contexts[size_t(v)], cuts[size_t(v)]);
+
+    std::vector<CullView> currentViews(static_cast<size_t>(viewCount));
+    std::atomic<bool> stop{false};
+    std::barrier<> start(viewCount + 1);
+    std::barrier<> done(viewCount + 1);
+    std::vector<std::thread> viewThreads;
+    if (concurrent)
+    {
+        viewThreads.reserve(static_cast<size_t>(viewCount));
+        for (int v = 0; v < viewCount; ++v)
+            viewThreads.emplace_back([&, v]
+            {
+                for (;;)
+                {
+                    start.arrive_and_wait();
+                    if (stop.load(std::memory_order_relaxed)) return;
+                    static_cast<const World&>(w).selectCut(
+                        currentViews[size_t(v)], params, contexts[size_t(v)],
+                        cuts[size_t(v)]);
+                    done.arrive_and_wait();
+                }
+            });
+    }
 
     const int movers = count * movePct / 100;
     XorShift32 fast;
     double selectNs = 0.0;
-    double firstNs = 0.0;
     double entries = 0.0;
     double reuse = 0.0;
     size_t frames = 0;
@@ -2012,19 +2040,32 @@ static void BM_SelectionContext_MultiView(benchmark::State& state)
         for (int i = 0; i < movers; ++i)
             w.moveInstance(insts[i], home[i] + float4::vec(fast.uniform(-0.4f, 0.4f), 0,
                                                            fast.uniform(-0.4f, 0.4f)));
-        w.beginFrame();
-        w.flushBounds();
+        w.applyUpdates();
+
+        if (concurrent)
+        {
+            for (int v = 0; v < viewCount; ++v)
+                currentViews[size_t(v)] = viewAt(frames, v);
+            const auto select0 = clock::now();
+            start.arrive_and_wait();
+            done.arrive_and_wait();
+            const auto select1 = clock::now();
+            selectNs +=
+                std::chrono::duration<double, std::nano>(select1 - select0).count();
+        }
+        else
+        {
+            const auto select0 = clock::now();
+            for (int v = 0; v < viewCount; ++v)
+                w.selectCut(viewAt(frames, v), params, contexts[size_t(v)],
+                            cuts[size_t(v)]);
+            const auto select1 = clock::now();
+            selectNs +=
+                std::chrono::duration<double, std::nano>(select1 - select0).count();
+        }
 
         for (int v = 0; v < viewCount; ++v)
         {
-            const auto one0 = clock::now();
-            w.selectCut(viewAt(frames, v), params, contexts[size_t(v)], cuts[size_t(v)]);
-            const auto one1 = clock::now();
-            const double oneNs =
-                std::chrono::duration<double, std::nano>(one1 - one0).count();
-            selectNs += oneNs;
-            if (v == 0)
-                firstNs += oneNs;
             const double n = double(contexts[size_t(v)].reused() +
                                     contexts[size_t(v)].walked());
             reuse += n > 0.0 ? 100.0 * double(contexts[size_t(v)].reused()) / n : 0.0;
@@ -2034,24 +2075,28 @@ static void BM_SelectionContext_MultiView(benchmark::State& state)
         ++frames;
     }
 
+    if (concurrent)
+    {
+        stop.store(true, std::memory_order_relaxed);
+        start.arrive_and_wait();
+        for (std::thread& thread : viewThreads) thread.join();
+    }
+
     const double f = double(frames ? frames : 1);
     const double calls = f * double(viewCount);
     const double selectUs = selectNs / f / 1000.0;
-    const double firstUs = firstNs / f / 1000.0;
     state.counters["select_us"] = selectUs;
-    state.counters["first_us"] = firstUs;
-    state.counters["extra_us"] =
-        viewCount > 1 ? (selectUs - firstUs) / double(viewCount - 1) : 0.0;
     state.counters["per_view"] = selectUs / double(viewCount);
+    state.counters["view_mt"] = concurrent ? 1.0 : 0.0;
     state.counters["reuse%"] = reuse / calls;
     state.counters["avg_cut"] = entries / calls;
 }
 BENCHMARK(BM_SelectionContext_MultiView)
-    ->Args({0, 1})
-    ->Args({0, 6})
-    ->Args({5, 1})
-    ->Args({5, 6})
-    ->ArgNames({"move_pct", "views"})
+    ->Args({0, 6, 0})
+    ->Args({0, 6, 1})
+    ->Args({5, 6, 0})
+    ->Args({5, 6, 1})
+    ->ArgNames({"move_pct", "views", "view_mt"})
     ->Iterations(600)
     ->Unit(benchmark::kMicrosecond);
 
@@ -2114,7 +2159,7 @@ static void BM_SelectionContext_Zoom(benchmark::State& state)
         const CullView v = makePerspectiveView(
             float4::point(0, 2.0f, z), float4::vec(0.0f, 0.0f, 1.0f),
             float4::vec(0, 1, 0), fovY, 16.0f / 9.0f, 1080.0f, 0.1f, 1.0e9f);
-        w.beginFrame();
+        w.applyUpdates();
 
         const auto t0 = clock::now();
         w.selectCut(v, p, ctx, cut);
@@ -2176,7 +2221,7 @@ static void BM_SelectionContext_Reset(benchmark::State& state)
     for (auto _ : state)
     {
         ctx.reset();
-        w.beginFrame();
+        w.applyUpdates();
         w.selectCut(view, params, ctx, cut);
         benchmark::DoNotOptimize(cut.data());
     }
@@ -2259,7 +2304,7 @@ static void BM_Spawn_MarginalCost(benchmark::State& state)
                                                    fast.uniform(-half, half))));
         }
         const auto t1 = clock::now();
-        w.beginFrame();
+        w.applyUpdates();
         w.selectCut(v, p, cut);
         const auto t2 = clock::now();
 
@@ -2309,7 +2354,7 @@ static void BM_Adversarial_StackedInstances(benchmark::State& state)
 
     for (auto _ : state)
     {
-        w.beginFrame();
+        w.applyUpdates();
         w.selectCut(v, p, cut);
         benchmark::DoNotOptimize(cut.data());
     }
@@ -2343,7 +2388,7 @@ static void BM_Adversarial_WideNode(benchmark::State& state)
     for (auto _ : state)
     {
         t += 0.02f;
-        w.beginFrame();
+        w.applyUpdates();
         w.selectCut(orbitView(t, 300.0f), p, cut);
         benchmark::DoNotOptimize(cut.data());
     }
@@ -2389,7 +2434,7 @@ static void BM_Adversarial_DeepPageChain(benchmark::State& state)
 
     for (auto _ : state)
     {
-        w.beginFrame();
+        w.applyUpdates();
         w.selectCut(v, p, cut);
         benchmark::DoNotOptimize(cut.data());
     }

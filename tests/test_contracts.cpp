@@ -87,7 +87,7 @@ struct RandomWorld
 
         for (UserId id : allIds)
             if (contains(w, id) && uni(rng) < 0.6f) markResident(w, id);
-        w.beginFrame();
+        w.applyUpdates();
     }
 };
 
@@ -189,8 +189,8 @@ TEST(Contracts, DeterministicAcrossIdenticalWorlds)
 
         for (int frame = 0; frame < 6; ++frame)
         {
-            a.w.beginFrame();
-            b.w.beginFrame();
+            a.w.applyUpdates();
+            b.w.applyUpdates();
             const CullView va = da.damp(randomView(rngA));
             const CullView vb = db.damp(randomView(rngB));
             const Outputs oa = run(a.w, va, p);
@@ -243,8 +243,8 @@ TEST(Contracts, ParallelSelectionMatchesSerialRequests)
         parallel.addInstance(parallelAsset, pos);
     }
 
-    serial.beginFrame();
-    parallel.beginFrame();
+    serial.applyUpdates();
+    parallel.applyUpdates();
     const CullView view = makeLookAtView(float4::point(3, 8, -40),
                                          float4::point(3, 0, 3));
     const CutParams params{0.25f, 0.0f};
@@ -286,9 +286,9 @@ TEST(Contracts, MultiViewDamperIsolation)
 
     for (int frame = 0; frame < 8; ++frame)
     {
-        both.w.beginFrame();
-        onlyA.w.beginFrame();
-        onlyB.w.beginFrame();
+        both.w.applyUpdates();
+        onlyA.w.applyUpdates();
+        onlyB.w.applyUpdates();
 
         const float t = float(frame) * 0.35f;
         const CullView vA = makeLookAtView(
@@ -336,7 +336,7 @@ TEST(Contracts, StaleInstanceRefIsIgnored)
     ASSERT_EQ(refA.id, refB.id);   // the slot was recycled (LIFO free list)
     ASSERT_NE(refA.generation, refB.generation);
 
-    w.beginFrame();
+    w.applyUpdates();
     const CullView v = makeLookAtView(float4::point(0, 0, -30), float4::point(0, 0, 0));
     std::vector<CutEntry> cut;
     w.selectCut(v, {4, 0}, cut);
@@ -382,7 +382,7 @@ TEST(Contracts, PointLeavesMatchReference)
     World w;
     w.addInstance(std::move(pg), float4::point(0, 0, 0));
     markAllResident(w, ids);
-    w.beginFrame();
+    w.applyUpdates();
 
     const CullView v = makeLookAtView(float4::point(0, 20, -60), float4::point(0, 0, 0));
     const CutParams p{4.0f, 0.0f};
@@ -408,7 +408,7 @@ TEST(Contracts, CameraInsideTreeMatchesReference)
     World w;
     w.addInstance(std::move(pg), float4::point(0, 0, 0));
     markAllResident(w, ids);
-    w.beginFrame();
+    w.applyUpdates();
 
     const CullView v = makeLookAtView(float4::point(1, 2, 3), float4::point(40, 0, 40));
     const CutParams p{4.0f, 0.0f};
@@ -435,7 +435,7 @@ TEST(Contracts, FarFromOriginMatchesReference)
     World w;
     w.addInstance(std::move(pg), farPos);
     markAllResident(w, ids);
-    w.beginFrame();
+    w.applyUpdates();
 
     const CullView v = makeLookAtView(farPos + float4::vec(0, 30, -80), farPos);
     const CutParams p{4.0f, 0.0f};
@@ -461,7 +461,7 @@ TEST(Contracts, ScaledInstanceMatchesReference)
         World w;
         w.addInstance(std::move(pg), float4::point(0, 0, 0), scale);
         markAllResident(w, ids);
-        w.beginFrame();
+        w.applyUpdates();
 
         const CullView v = makeLookAtView(float4::point(0, 10 * scale, -40 * scale),
                                           float4::point(0, 0, 0));

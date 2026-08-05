@@ -96,9 +96,13 @@ World::InstanceRef instance = world.addInstance(tree, desc);
 std::vector<CutEntry> cut;
 std::vector<IdealEntry> ideal;
 std::vector<LoadRequest> requests;
+SelectionContext selection;       // one per view
+PageUsageContext primaryUsage;    // only views that influence residency need one
 
-world.beginFrame();
-world.selectCut(view, CutParams{4.0f, 0.0f}, cut, &ideal, &requests);
+world.applyUpdates();              // apply changes and publish the read-only world
+const World& published = world;
+published.selectCut(view, CutParams{4.0f, 0.0f}, selection, primaryUsage,
+                    cut, &ideal, &requests);
 
 for (const LoadRequest& request : requests)
     if (payloadFinishedLoading(request.payload))
@@ -107,6 +111,8 @@ for (const LoadRequest& request : requests)
 for (const IdealEntry& entry : ideal)
     if (entry.tag == IdealTag::NeedsExpansion)
         world.attachPage(entry.node, loadChildPage(entry.payload));
+
+world.collect(primaryUsage, pageBudget, minPageAge);
 ```
 
 In a real asynchronous streamer, completions normally arrive in later frames.
@@ -218,9 +224,9 @@ runtime invariant:
 
 > A node that is drawn, or refined through, is resident and materialized.
 
-Payload residency and page attachment should be mutated between external
-selection calls. The `World` is a single-writer object; it does not make
-concurrent public mutations safe.
+Payload residency, page attachment, instance updates, and collection are
+single-writer operations. Finish them before `applyUpdates`, then treat the
+published World as read-only until every contextual selection has joined.
 
 ### Streamer policy
 
@@ -240,7 +246,7 @@ inspect the new page, estimate the next expansion errors, and continue until
 the page budget is exhausted. A depth-first lookahead can starve other regions
 under fanout. The measured global-heap policy reduced worst residual error two
 frames after a teleport by about 120x at the same page budget; see experiment N
-in experiment N of [ARCHITECTURE.md](ARCHITECTURE.md).
+in [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## 6. Selection outputs and traversal
 
@@ -260,19 +266,18 @@ memory; a fixed sink reports dropped entries, so the caller can grow its
 capacity without an allocation inside the traversal. Vector-backed sinks may
 grow like any vector.
 
-Selection proceeds as follows:
+`applyUpdates` first flushes queued bounds and performs any requested TLAS
+build or repair. Selection then proceeds against that stable snapshot:
 
-1. Flush pending bounds changes.
-2. Rebuild the TLAS if a configured quality/escape/edit budget requested it.
-3. Walk the wide TLAS with tri-state frustum and optional `minPix` contribution
+1. Walk the wide TLAS with tri-state frustum and optional `minPix` contribution
    culling.
-4. Transform the view into each surviving instance's local space.
-5. Walk attached pages with an explicit DFS stack, descending only while the
+2. Transform the view into each surviving instance's local space.
+3. Walk attached pages with an explicit DFS stack, descending only while the
    ideal decision wants refinement.
-6. Test up to eight children together. Fully outside lanes disappear; fully
+4. Test up to eight children together. Fully outside lanes disappear; fully
    inside lanes clear their remaining plane masks; partial lanes carry only
    undecided planes.
-7. Emit plain leaves directly from their parent's wide test. Interior and
+5. Emit plain leaves directly from their parent's wide test. Interior and
    expansion nodes carry error, plane mask, and actual-cut liveness on the DFS
    stack.
 
@@ -315,7 +320,8 @@ Important limits are explicit:
 - The emitted node set matches stateless selection exactly. `CutEntry::err` on
   a reused entry is the recorded value and can be stale within the proven
   margin; use it for prioritization or dithering, not bit-exact comparison.
-- Contextual selection is serial in the current implementation.
+- A single contextual call walks its view serially, but different views can run
+  concurrently because all mutable query state is owned by their contexts.
 
 Each per-instance record is 48 bytes plus storage for recorded cut entries.
 `reset()` clears logical state and its damping window but retains capacity,
@@ -324,10 +330,23 @@ damping exactly.
 
 ## 8. Parallel selection and threading
 
-`HlodContext` supplies aligned allocation and an optional blocking
-`parallelFor`. Set `workerCount > 1` and
-`WorldConfig::parallelInstanceThreshold > 0` to enable stateless parallel
-selection once the visible instance count reaches that threshold.
+There are two independent forms of parallelism.
+
+For multiple views, call `applyUpdates()` once, then invoke contextual
+`selectCut` concurrently on the published `const World`. Every in-flight call
+must own a distinct `SelectionContext`, optional `PageUsageContext`, and output
+buffers. Those objects are deliberately unsynchronized; sharing one between
+threads is a caller error. `selectCut` mutates only those caller-owned objects.
+
+After all view tasks join, the caller may resume World mutation and call
+`collect`. Passing only important cameras' `PageUsageContext` objects lets a
+primary view influence residency without giving the same weight to shadow or
+probe views.
+
+For one stateless view, `HlodContext` supplies aligned allocation and an
+optional blocking `parallelFor`. Set `workerCount > 1` and
+`WorldConfig::parallelInstanceThreshold > 0` to fan that call out once the
+visible instance count reaches the threshold.
 
 The runtime gives each worker a contiguous visible-instance range and private
 output buffers. It concatenates ranges in serial order, then deduplicates load
@@ -336,9 +355,9 @@ and parallel cuts, ideal cuts, and request ordering are intended to match for
 the same backend and input.
 
 `parallelFor` may run task indices in any order but must return only after all
-tasks finish. The `World` itself remains single-writer: do not invoke public
-operations or multiple selections concurrently on the same world. Internal
-parallelism is owned and joined by one calling thread.
+tasks finish. Stateless selection remains externally serial because its
+per-call scratch and aggregate statistics live in the World. No selection may
+overlap a World mutation, another `applyUpdates`, or `collect`.
 
 ## 9. TLAS lifecycle
 
@@ -346,7 +365,8 @@ The top level is an 8-wide dynamic BVH over live instances. It stores world
 bounds, maximum effective error, layer masks, and parent/lane back-pointers in
 maintenance arrays separate from the cut-path instance record.
 
-The first query builds the configured quality tier:
+The first `applyUpdates` builds the configured quality tier before publishing
+the selection snapshot:
 
 - `TlasQuality::BinnedSAH` (default) favors traversal quality;
 - `TlasQuality::Median` uses recursive longest-axis median splits; and
@@ -388,8 +408,8 @@ and wide bounds into an overlay. Further edits reuse it. Propagation across a
 page boundary creates overlays only along the path to that instance root;
 siblings that use the same asset keep seeing the original bounds.
 
-Submissions are appended to a flat queue. The next `selectCut`, `nodeBounds`,
-or explicit `flushBounds()` applies them in order. A node's own box ends at the
+Submissions are appended to a flat queue. `applyUpdates`, `nodeBounds`, or an
+explicit `flushBounds()` applies them in order. A node's own box ends at the
 last submitted value. Ancestors grow conservatively and stop at the first box
 that already contains the change; that early-out cheaply coalesces shared
 ancestors and repeated moves without a dirty-node table.
@@ -406,22 +426,24 @@ caller-generated dynamic proxies.
 
 ## 11. Garbage collection
 
-Non-pinned attached pages participate in one intrusive world LRU. `beginFrame`
-advances the age clock. A page touched repeatedly in one frame is linked only
-once; all views contribute to the same recency because any view needing the
-page should keep it alive.
+Non-pinned attached pages participate in an intrusive world LRU, but selection
+never mutates it. `applyUpdates` advances the age epoch. A
+`PageUsageContext` records the latest epoch in which its view needed each page
+and accumulates that feedback until collection.
 
-`collect(maxAttachedPages, minAge, freedPayloads)` detaches cold leaf mounts
-until `streamedPageCount()` is no larger than the requested budget. Pinned root
-mounts do not count because they cannot be collected. A candidate must:
+`collect(usageContexts, maxAttachedPages, minAge, freedPayloads)` first consumes
+only the supplied views' accumulated feedback, then detaches cold leaf mounts
+until `streamedPageCount()` is no larger than the requested budget. The
+single-context and no-feedback overloads are conveniences. Pinned root mounts
+do not count because they cannot be collected. A candidate must:
 
 - be non-pinned;
 - have no attached child pages; and
 - have been untouched for at least `minAge` frames.
 
 The optional output receives resident payload values that became unreachable.
-Collection works from the cold tail and is proportional to candidates examined
-and pages detached; it does not scan the entire world.
+Collection works from the cold tail and is proportional to feedback consumed,
+candidates examined, and pages detached; it does not scan the entire world.
 
 ## 12. Complexity and current limits
 
@@ -434,15 +456,16 @@ and pages detached; it does not scan the entire world.
 | `detachPage` | O(detached mount state); child mounts must be detached first |
 | Incremental add / move / remove instance | O(TLAS depth), excluding asset teardown |
 | Bounds submission | O(1) queue append |
-| Bounds flush | O(changed ancestor paths), with containment early-outs |
-| `collect` | O(cold candidates examined + mounts detached) |
+| `applyUpdates` | O(changed ancestor paths + any scheduled TLAS repair) |
+| `collect` | O(feedback consumed + cold candidates examined + mounts detached) |
 
 Current integration limits and tuning decisions are:
 
 - page size is content-dependent; hundreds to low thousands of nodes is the
   intended starting range, but boundary frequency and streaming granularity
   should be profiled;
-- `SelectionContext` reuse and parallel instance selection are separate paths;
+- contextual views parallelize across calls; parallelizing within one
+  contextual call remains unnecessary for the measured multi-view workload;
 - translation plus uniform scale is the built-in instance transform;
 - internal deformation needs caller-maintained proxy fidelity and has no
   page-level shrink pass; and

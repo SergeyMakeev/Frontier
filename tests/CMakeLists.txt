@@ -8,7 +8,7 @@ add_executable(hlod_tests
     test_cache.cpp
     test_contracts.cpp
 )
-target_link_libraries(hlod_tests PRIVATE hlod GTest::gtest_main)
+target_link_libraries(hlod_tests PRIVATE hlod GTest::gtest_main Threads::Threads)
 
 include(GoogleTest)
 gtest_discover_tests(hlod_tests DISCOVERY_TIMEOUT 60)

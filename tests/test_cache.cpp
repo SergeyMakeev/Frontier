@@ -8,7 +8,11 @@
 // that is the one documented approximation.
 
 #include <algorithm>
+#include <array>
+#include <barrier>
+#include <exception>
 #include <random>
+#include <thread>
 
 #include <gtest/gtest.h>
 
@@ -64,6 +68,7 @@ struct Scene
         // After the instances: the asset's root mount, which is where residency
         // lives, is created by the first addInstance.
         markAllResident(*world, world->assetRootPage(asset), nodes);
+        world->applyUpdates();
     }
 };
 
@@ -157,6 +162,7 @@ TEST(Cache, DeformInvalidatesOnlyThatInstance)
     AABB b = sc.world->nodeBounds(sc.inst[5], h);
     b.expand(b.mx + float4::vec(3, 3, 3));
     sc.world->setNodeBounds(sc.inst[5], h, b);
+    sc.world->applyUpdates();
 
     sc.world->selectCut(v, p, cache, cut);
     EXPECT_EQ(cache.walked(), 1u);
@@ -412,15 +418,15 @@ TEST(Cache, SurvivesStreamingAndInstanceChurn)
         }
         if (f % 11 == 5) markNonResident(world, rootIds.back());
         if (f % 11 == 6) markResident(world, rootIds.back());
-        world.beginFrame();
+        world.applyUpdates();
     }
     EXPECT_GT(reused, 0u);
     EXPECT_GT(attached, 0u) << "no pages attached; churn was not exercised";
 }
 
-// Reuse must not let a page look cold to the collector: skipping the walk
-// still has to keep the LRU honest.
-TEST(Cache, ReuseStillTouchesPagesForTheCollector)
+// Residency feedback is optional: a view that does not influence collection
+// pays no PageUsageContext storage and still gets normal cut reuse.
+TEST(Cache, ReuseDoesNotRequirePageUsage)
 {
     Scene sc;
     SelectionContext cache;
@@ -429,10 +435,121 @@ TEST(Cache, ReuseStillTouchesPagesForTheCollector)
     const CullView v = viewAt(float4::vec(0, 0, 0));
 
     sc.world->selectCut(v, p, cache, cut);
-    sc.world->beginFrame();
+    sc.world->applyUpdates();
     sc.world->selectCut(v, p, cache, cut);
     ASSERT_EQ(cache.walked(), 0u);
-    EXPECT_EQ(TAX::lastTouched(*sc.world, sc.gen.lastIds.front()), sc.world->frame());
+}
+
+TEST(Cache, SixViewsSelectConcurrentlyFromOnePublishedWorld)
+{
+    constexpr size_t kViews = 6;
+    Scene sc(20);
+    const World& published = *sc.world;
+    const CutParams params{6.0f, 0.0f};
+
+    std::array<SelectionContext, kViews> serialCtx;
+    std::array<SelectionContext, kViews> parallelCtx;
+    std::array<std::vector<CutEntry>, kViews> serialCut;
+    std::array<std::vector<CutEntry>, kViews> parallelCut;
+
+    for (int frame = 0; frame < 12; ++frame)
+    {
+        for (size_t i = 0; i < 20; ++i)
+            sc.world->moveInstance(
+                sc.inst[i],
+                float4::vec(float(i % 5) * 300.0f - 3000.0f + float(frame),
+                            float(i / 5) * 300.0f - 3000.0f, 2500.0f));
+        sc.world->applyUpdates();
+
+        std::array<CullView, kViews> views;
+        for (size_t v = 0; v < kViews; ++v)
+            views[v] = viewAt(float4::vec((float(v) - 2.5f) * 35.0f,
+                                          float(v) * 8.0f, float(frame) * 4.0f));
+
+        for (size_t v = 0; v < kViews; ++v)
+            published.selectCut(views[v], params, serialCtx[v], serialCut[v]);
+
+        std::barrier<> start(static_cast<std::ptrdiff_t>(kViews + 1));
+        std::array<std::exception_ptr, kViews> errors{};
+        std::array<std::thread, kViews> threads;
+        for (size_t v = 0; v < kViews; ++v)
+            threads[v] = std::thread([&, v]
+            {
+                start.arrive_and_wait();
+                try
+                {
+                    published.selectCut(views[v], params, parallelCtx[v],
+                                        parallelCut[v]);
+                }
+                catch (...)
+                {
+                    errors[v] = std::current_exception();
+                }
+            });
+        start.arrive_and_wait();
+        for (std::thread& thread : threads) thread.join();
+
+        for (size_t v = 0; v < kViews; ++v)
+        {
+            if (errors[v]) std::rethrow_exception(errors[v]);
+            EXPECT_EQ(keysOf(parallelCut[v]), keysOf(serialCut[v]))
+                << "frame " << frame << ", view " << v;
+            EXPECT_EQ(parallelCtx[v].reused(), serialCtx[v].reused());
+            EXPECT_EQ(parallelCtx[v].walked(), serialCtx[v].walked());
+        }
+    }
+}
+
+TEST(Cache, ConcurrentViewsDeduplicateRequestsIndependently)
+{
+    constexpr size_t kViews = 6;
+    TreeGen gen;
+    gen.fanout = 4;
+    gen.depth = 3;
+    Page page = gen.makeRootPage(unitRegion(40.0f), 128.0f, 0);
+
+    World world;
+    const AssetHandle asset = world.registerAsset(std::move(page));
+    for (uint32_t i = 0; i < 256; ++i)
+        world.addInstance(asset,
+                          float4::point(float(i % 16) * 20.0f - 150.0f, 0.0f,
+                                        float(i / 16) * 20.0f + 1000.0f));
+    world.applyUpdates();
+    const World& published = world;
+
+    const CutParams params{0.25f, 0.0f};
+    std::array<CullView, kViews> views;
+    std::array<std::vector<LoadRequest>, kViews> serialRequests, parallelRequests;
+    std::array<std::vector<CutEntry>, kViews> serialCut, parallelCut;
+    std::array<SelectionContext, kViews> contexts;
+    for (size_t v = 0; v < kViews; ++v)
+    {
+        views[v] = viewAt(float4::vec((float(v) - 2.5f) * 10.0f, 0.0f, 0.0f));
+        world.selectCut(views[v], params, serialCut[v], nullptr, &serialRequests[v]);
+    }
+
+    std::array<std::thread, kViews> threads;
+    for (size_t v = 0; v < kViews; ++v)
+        threads[v] = std::thread([&, v]
+        {
+            published.selectCut(views[v], params, contexts[v], parallelCut[v],
+                                nullptr, &parallelRequests[v]);
+        });
+    for (std::thread& thread : threads) thread.join();
+
+    for (size_t v = 0; v < kViews; ++v)
+    {
+        ASSERT_EQ(parallelRequests[v].size(), serialRequests[v].size());
+        for (size_t i = 0; i < serialRequests[v].size(); ++i)
+        {
+            EXPECT_EQ(parallelRequests[v][i].node.slot,
+                      serialRequests[v][i].node.slot);
+            EXPECT_EQ(parallelRequests[v][i].node.index,
+                      serialRequests[v][i].node.index);
+            EXPECT_FLOAT_EQ(parallelRequests[v][i].priority,
+                            serialRequests[v][i].priority);
+        }
+    }
 }
 
 TEST(Cache, ResetForgetsEverythingAndStaysCorrect)

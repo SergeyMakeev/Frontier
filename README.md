@@ -53,9 +53,11 @@ int main()
     const CullView view = makeLookAtView(
         float4::point(0, 2, -8), float4::point(0, 0, 0));
 
+    SelectionContext selection;          // one per view
     std::vector<CutEntry> cut;
-    world.beginFrame();
-    world.selectCut(view, CutParams{4.0f, 0.0f}, cut);
+    world.applyUpdates();                 // publish a stable read-only snapshot
+    const World& published = world;
+    published.selectCut(view, CutParams{4.0f, 0.0f}, selection, cut);
 
     for (const CutEntry& entry : cut)
     {
@@ -81,8 +83,9 @@ The representative workload resembles a forest, city, or prop field:
   and 16:9, with no camera cuts or teleports.
 - Moving-object cases update 5% of the population (4,000 transforms) every
   frame.
-- The benchmark is single-threaded. It excludes rendering, asset IO,
-  residency changes, and instance spawning or removal.
+- Single-view cases use one thread. The multiple-view section compares serial
+  calls with six persistent worker threads. Measurements exclude rendering,
+  asset IO, residency changes, and instance spawning or removal.
 
 Measurements are the best repeat from at least ten 600-frame runs on a noisy
 shared 64-hardware-thread, 2.4 GHz EPYC, using one thread, MSVC 19.51, Release
@@ -93,19 +96,19 @@ algorithm's uncontended cost; real frame time can be higher under host load.
 
 | Operation | Time | Included work |
 |---|---:|---|
-| Create the world | 10.1 ms | Build and register the shared asset, add 80,000 instances, and mark its payloads resident |
-| First `selectCut` | 49.3-52.8 ms | Build the initial quality TLAS, query it, walk visible hierarchies, produce the first cut, and populate the `SelectionContext` |
+| Create the world | 10.4-11.4 ms | Build and register the shared asset, add 80,000 instances, and mark its payloads resident |
+| First published selection cycle | 50-55 ms | `applyUpdates` builds the initial quality TLAS; `selectCut` queries it, produces the first cut, and populates the `SelectionContext` |
 
-World creation does not force the initial quality TLAS build; that work is
-deferred until the first query. Applications can therefore treat the first cut
-as part of level warm-up rather than expecting steady-frame latency from it.
+World creation does not force the initial quality TLAS build; the first
+`applyUpdates` performs it before publishing the read-only snapshot. Treat the
+first published selection cycle as level warm-up rather than steady latency.
 
 ### Steady-frame breakdown
 
 | HLodTree work per frame | Camera and 4,000 objects moving | Static camera, 4,000 objects moving | Moving camera, static objects |
 |---|---:|---:|---:|
 | Apply transform updates and maintain the TLAS | 0.15 ms | 0.14 ms | n/a |
-| `beginFrame` and flush pending node-bound changes | <0.001 ms | <0.001 ms | <0.001 ms |
+| Publish queued node-bound changes with `applyUpdates` | <0.001 ms | <0.001 ms | <0.001 ms |
 | `selectCut` | 0.50 ms | 0.40 ms | 0.40 ms |
 | **Total HLodTree frame work** | **0.65 ms** | **0.54 ms** | **0.40 ms** |
 
@@ -113,14 +116,14 @@ The moving-camera cases average about 21,919 visible instances and a
 24,986-entry render cut. With objects moving, the context reuses 92.6% of
 visible instance cuts; with static objects it reuses 97.6%. The fixed-camera
 case averages 19,602 visible instances, a 22,872-entry cut, and 94.1% reuse.
-The context occupies 7.66 MiB after the fly-through and 4.16 MiB for the fixed
+The context occupies 8.13 MiB after the fly-through and 4.37 MiB for the fixed
 view.
 
 Bounded motion of the same 5% cohort stays on the grow-only refit path in this
 run. The escape budget counts distinct leaves since the last TLAS build, so the
 same movers do not periodically force a rebuild merely by moving every frame.
 If enough different instances escape, or accumulated lane area grows too far,
-the next query repairs the TLAS and that call is intentionally more expensive.
+the next `applyUpdates` repairs the TLAS before selection begins.
 
 ### Smaller 10,000-instance world
 
@@ -128,36 +131,40 @@ The smaller test uses 10,000 instances spread over a roughly 2.4 km square.
 They draw from 700 separately registered, fully resident 85-node assets with
 maximum depth 3, instead of sharing one asset across the entire world. The
 moving-object cases update exactly 1,000 instances per frame. Creating and
-populating this world takes 12.4 ms; its first `selectCut`, including the
-initial quality TLAS build and context population, takes 5.08-5.82 ms.
+populating this world takes 12.5-13.8 ms; its first published selection cycle,
+including the initial quality TLAS build and context population, takes
+5.3-6.4 ms.
 
 | HLodTree work per frame | Camera and 1,000 objects moving | Static camera, 1,000 objects moving | Moving camera, static objects |
 |---|---:|---:|---:|
 | Apply transform updates and maintain the TLAS | 34 µs | 33 µs | n/a |
-| `beginFrame` and flush pending node-bound changes | <0.1 µs | <0.1 µs | <0.1 µs |
-| `selectCut` | 118 µs | 102 µs | 78 µs |
-| **Total HLodTree frame work** | **152 µs** | **135 µs** | **78 µs** |
+| Publish queued node-bound changes with `applyUpdates` | <0.1 µs | <0.1 µs | <0.1 µs |
+| `selectCut` | 121 µs | 105 µs | 80 µs |
+| **Total HLodTree frame work** | **155 µs** | **139 µs** | **80 µs** |
 
 The moving-camera cases average about 2,782 visible instances (27.8% of the
 world) and a 5,920-entry cut. Reuse is 82.4% with 1,000 movers and 93.3% with
-static objects; the context occupies 2.45 MiB. The fixed-camera case averages
-2,501 visible instances (25.0%), a 5,792-entry cut, 85.8% reuse, and a 0.58 MiB
+static objects; the context occupies 2.52 MiB. The fixed-camera case averages
+2,501 visible instances (25.0%), a 5,792-entry cut, 85.8% reuse, and a 0.61 MiB
 context.
 
 ### Multiple views
 
-Each view needs its own `SelectionContext`. With the same moving-camera route
-and nearby view origins 24 metres apart, aggregate `selectCut` time is:
+Each view needs its own `SelectionContext` and output. With the same
+moving-camera route and nearby view origins 24 metres apart, wall time for all
+six selections is:
 
-| Views per frame | Static objects | 4,000 moving objects |
-|---:|---:|---:|
-| 1 | 0.40 ms | 0.50 ms |
-| 6 | 3.32 ms | 3.84 ms |
+| Execution | Static objects | 4,000 moving objects |
+|---|---:|---:|
+| Six views, serial | 3.75 ms | 4.23 ms |
+| Six views, concurrent | 0.94 ms | 1.08 ms |
+| **Speedup** | **4.0×** | **3.9×** |
 
 Object transforms are applied once before these selections and are not included
-in the table. Contextual selections are currently serial; six contexts also
-occupy about 46 MiB and put more pressure on caches, so the cost is slightly
-more than six times the one-view best case.
+in the table. The concurrent arms use six persistent worker threads; thread
+creation is excluded. Six contexts occupy about 49 MiB. Scaling is below 6×
+because the views share memory bandwidth and cache capacity, but the read-only
+selection phase removes serialization between them.
 
 The main distinction is visible immediately: creating the quality TLAS is a
 one-time cost, transform updates are relatively small, and object motion makes
@@ -194,14 +201,21 @@ mutations using it become safe no-ops.
 - Expansion points connect independently streamed pages. All-or-nothing child
   readiness keeps the actual cut free of holes and parent/child overlap.
 - `setNodeBounds(instance, node, bounds)` creates bounds-only copy-on-write
-  overlays for the affected instance. Refits are queued and flushed lazily by
-  the next selection.
+  overlays for the affected instance. Refits are queued and published by
+  `applyUpdates`.
 - `SelectionContext` is optional, one per view. It owns that view's damping
   envelope and reuses instance cuts only while a conservative camera/projection
   margin proves their node set unchanged.
+- Contextual `selectCut` is a read-only `World` operation. Calls may run
+  concurrently when every call has a distinct `SelectionContext`, optional
+  `PageUsageContext`, and output objects. Mutations and `collect` remain serial
+  and must happen outside that selection phase.
+- `PageUsageContext` is optional per view. It records page-use feedback without
+  touching the World; `collect` later consumes only the contexts the caller
+  chooses, so a primary camera can influence residency while shadow cameras do
+  not.
 - Stateless selection can fan out over visible instances through a host
-  `parallelFor`. Contextual selection is currently serial. All other world
-  mutation is single-writer.
+  `parallelFor`; it remains an externally serial compatibility path.
 
 The current contracts, algorithms, lifecycle rules, and complexity bounds are
 in [hlod_design.md](hlod_design.md).
@@ -248,7 +262,7 @@ Normal configuration options:
 
 | Option | Default | Meaning |
 |---|---:|---|
-| `HLOD_BUILD_TESTS` | `ON` | Build the 88-test correctness suite |
+| `HLOD_BUILD_TESTS` | `ON` | Build the 91-test correctness suite |
 | `HLOD_BUILD_BENCH` | `ON` | Build the Google Benchmark suite |
 | `HLOD_AVX2` | `ON` | Use AVX2/FMA on x86-64 when available |
 | `HLOD_FORCE_SCALAR` | `OFF` | Disable intrinsic implementations |

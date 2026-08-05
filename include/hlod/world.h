@@ -38,15 +38,16 @@
 // detected by the generation stamp: mutating calls ignore them, queries
 // report them absent — the normal race between streaming completion and GC.
 //
-// Single-writer by construction. Stateless selectCut can fan out across
-// instances through the context's parallelFor (see
-// WorldConfig::parallelInstanceThreshold), but one calling thread owns and
-// joins that work; public operations and selections must not run concurrently
-// on the same World. LOD damping lives in the CullView (ViewDamper) or in an
-// optional per-view SelectionContext, never as per-node World state.
+// World updates are single-writer. applyUpdates() publishes a stable snapshot;
+// contextual selectCut overloads then read only that snapshot and may run
+// concurrently when each call has its own contexts and outputs. LOD damping
+// lives in the CullView (ViewDamper) or in an optional per-view
+// SelectionContext, never as per-node World state.
 
 #include <cstdint>
 #include <cstring>
+#include <initializer_list>
+#include <memory>
 #include <vector>
 
 #include "config.h"
@@ -54,6 +55,10 @@
 #include "page.h"
 
 namespace hlod {
+
+class World;
+struct SelectionWorker;
+struct SelectionScratch;
 
 // Registered page asset: the unit of sharing. Returned by registerAsset().
 struct AssetHandle
@@ -234,6 +239,52 @@ using CutSink     = Sink<CutEntry>;
 using IdealSink   = Sink<IdealEntry>;
 using RequestSink = Sink<LoadRequest>;
 
+// Traversal counters, filled only when the library is built with HLOD_STATS.
+struct CutStats
+{
+    uint64_t instancesVisited = 0;
+    uint64_t pagesVisited = 0;
+    uint64_t nodesVisited = 0;
+    uint64_t wideBlocksTested = 0;
+    uint64_t lanesSurvived = 0;
+};
+
+// Optional per-camera page-use feedback. Passing one to selectCut records the
+// pages that camera needed; omitting it makes selection pay no residency-touch
+// cost. The World consumes feedback only when collect() is called, so callers
+// choose which cameras influence residency (for example, the primary camera
+// but not shadow cascades).
+//
+// A context may accumulate observations across many update epochs. Like
+// SelectionContext, it belongs to one view and must not be used concurrently
+// by two calls; distinct contexts are independent.
+class PageUsageContext
+{
+public:
+    PageUsageContext() = default;
+    PageUsageContext(PageUsageContext&&) noexcept = default;
+    PageUsageContext& operator=(PageUsageContext&&) noexcept = default;
+    PageUsageContext(const PageUsageContext&) = delete;
+    PageUsageContext& operator=(const PageUsageContext&) = delete;
+
+    void   reset();
+    size_t bytes() const;
+
+private:
+    friend class World;
+
+    struct Rec
+    {
+        uint32_t generation = 0;
+        uint32_t lastUsed = 0;
+        bool     pending = false;
+    };
+
+    const World*     world_ = nullptr;
+    std::vector<Rec> rec_;
+    std::vector<uint32_t> dirty_;
+};
+
 // ---------------------------------------------------------------------------
 // SelectionContext — everything selection remembers about one view
 //
@@ -345,8 +396,14 @@ using RequestSink = Sink<LoadRequest>;
 class SelectionContext
 {
 public:
-    SelectionContext() = default;
-    explicit SelectionContext(float halfLifeFrames) : damper_(halfLifeFrames) {}
+    SelectionContext();
+    explicit SelectionContext(float halfLifeFrames);
+    ~SelectionContext();
+
+    SelectionContext(SelectionContext&&) noexcept;
+    SelectionContext& operator=(SelectionContext&&) noexcept;
+    SelectionContext(const SelectionContext&) = delete;
+    SelectionContext& operator=(const SelectionContext&) = delete;
 
     // LOD hysteresis for this view, in frames; 0 disables it exactly. See
     // ViewDamper in math.h for what the envelope does.
@@ -356,6 +413,10 @@ public:
     // Instances served from the cache, and re-walked, in the last call.
     uint32_t reused() const { return reused_; }
     uint32_t walked() const { return walked_; }
+
+    // Counters from this context's last call. Per-context ownership keeps
+    // concurrent views from racing over a global "last selection" value.
+    const CutStats& lastCutStats() const { return stats_; }
 
     // Forget everything: the damping window and every record. Call it on a
     // teleport or camera cut. Reuse never *requires* this -- every record
@@ -438,6 +499,11 @@ private:
     float    k_ = 0.0f, bar_ = 0.0f;
     uint32_t reused_ = 0;
     uint32_t walked_ = 0;
+    CutStats stats_{};
+
+    // Mutable query scratch and request-dedup state. Opaque so traversal
+    // implementation details do not become part of the public API.
+    std::unique_ptr<SelectionScratch> scratch_;
 };
 
 // ---------------------------------------------------------------------------
@@ -501,16 +567,6 @@ struct WorldConfig
     // World and writes only per-worker buffers, which are concatenated in
     // instance order, so a parallel cut is bit-identical to a serial one.
     uint32_t parallelInstanceThreshold = 0;
-};
-
-// Traversal counters, filled only when the library is built with HLOD_STATS.
-struct CutStats
-{
-    uint64_t instancesVisited = 0;
-    uint64_t pagesVisited = 0;
-    uint64_t nodesVisited = 0;
-    uint64_t wideBlocksTested = 0;
-    uint64_t lanesSurvived = 0;
 };
 
 class World
@@ -615,9 +671,9 @@ public:
     // ---- motion --------------------------------------------------------------
     // Record new local-space bounds for one node OF ONE INSTANCE: a bounds
     // check and a queue push. Call it as often as needed; the refit runs
-    // LAZILY, so the tree is guaranteed up to date only
-    // where that matters — at the next selectCut (which flushes internally) or
-    // an explicit flushBounds(). A node moved many times between cuts ends at
+    // LAZILY, so the tree is guaranteed up to date after applyUpdates() (or an
+    // explicit flushBounds() for tools and tests). A node moved many times
+    // between update barriers ends at
     // exactly the last submitted box; the repeat applications hit hot cache
     // lines and early-out at the already-grown parent, so they cost a fraction
     // of a first move. Stale handles are dropped at flush time via the
@@ -640,15 +696,28 @@ public:
     // one, the shared page otherwise. Flushes pending moves first.
     AABB nodeBounds(InstanceRef inst, NodeHandle h);
 
-    // ---- per frame ------------------------------------------------------------
-    void beginFrame();   // advances the world clock (GC aging, LRU touch)
+    // Publish queued changes and prepare a stable read-only selection
+    // snapshot. Call once before a group of selections, even when no world
+    // objects changed; it also advances the epoch used by collection aging.
+    // No World mutation (including collect) may overlap or occur before every
+    // contextual selection using this snapshot has completed.
+    void applyUpdates();
 
     // outIdealCut / outRequests are optional: pass nullptr to skip them and
     // their emission cost entirely. A static fully-resident scene (no
     // streaming) then pays for exactly one output: the actual cut.
     //
     // For LOD damping, run the view through a ViewDamper (math.h) first.
+    // Stateless overloads retain World-owned scratch and aggregate stats; do
+    // not call them concurrently. Use SelectionContext overloads for
+    // concurrent views.
     void selectCut(const CullView& view, const CutParams& params,
+                   std::vector<CutEntry>&    outCut,
+                   std::vector<IdealEntry>*  outIdealCut = nullptr,
+                   std::vector<LoadRequest>* outRequests = nullptr);
+
+    void selectCut(const CullView& view, const CutParams& params,
+                   PageUsageContext& usage,
                    std::vector<CutEntry>&    outCut,
                    std::vector<IdealEntry>*  outIdealCut = nullptr,
                    std::vector<LoadRequest>* outRequests = nullptr);
@@ -666,6 +735,10 @@ public:
     void selectCut(const CullView& view, const CutParams& params,
                    CutSink& outCut, IdealSink* outIdealCut, RequestSink* outRequests);
 
+    void selectCut(const CullView& view, const CutParams& params,
+                   PageUsageContext& usage, CutSink& outCut,
+                   IdealSink* outIdealCut, RequestSink* outRequests);
+
     // Contextual form: same output as the overloads above, but an instance whose
     // cut provably cannot have changed is not walked -- its recorded entries are
     // copied out instead. One context per view.
@@ -677,14 +750,30 @@ public:
     //    node set is exact; see the notes on SelectionContext.
     //
     // Passing outIdealCut bypasses reuse for that call.
+    //
+    // These overloads are const and may run concurrently after applyUpdates().
+    // Each in-flight call must use distinct SelectionContext, optional
+    // PageUsageContext, and output objects. The same context is not internally
+    // synchronized.
     void selectCut(const CullView& view, const CutParams& params,
                    SelectionContext& ctx, CutSink& outCut,
-                   IdealSink* outIdealCut, RequestSink* outRequests);
+                   IdealSink* outIdealCut, RequestSink* outRequests) const;
+
+    void selectCut(const CullView& view, const CutParams& params,
+                   SelectionContext& ctx, PageUsageContext& usage,
+                   CutSink& outCut, IdealSink* outIdealCut,
+                   RequestSink* outRequests) const;
 
     void selectCut(const CullView& view, const CutParams& params,
                    SelectionContext& ctx, std::vector<CutEntry>& outCut,
                    std::vector<IdealEntry>*  outIdealCut = nullptr,
-                   std::vector<LoadRequest>* outRequests = nullptr);
+                   std::vector<LoadRequest>* outRequests = nullptr) const;
+
+    void selectCut(const CullView& view, const CutParams& params,
+                   SelectionContext& ctx, PageUsageContext& usage,
+                   std::vector<CutEntry>& outCut,
+                   std::vector<IdealEntry>*  outIdealCut = nullptr,
+                   std::vector<LoadRequest>* outRequests = nullptr) const;
 
     // ---- garbage collection ----------------------------------------------------
     // Detaches cold pages from the LRU tail until streamedPageCount() <=
@@ -692,27 +781,37 @@ public:
     // collected). Only pages untouched for >= minAge frames, with no attached
     // child pages, and not pinned are eligible. Returns the number of pages
     // detached; freedPayloads (if given) receives the payloads whose content
-    // became unreachable (they were resident).
+    // became unreachable (they were resident). Overloads taking page-usage
+    // contexts consume their accumulated feedback before examining the tail;
+    // omitted views do not influence residency.
     size_t collect(size_t maxAttachedPages, uint32_t minAge,
+                   std::vector<UserPayload>* freedPayloads = nullptr);
+    size_t collect(PageUsageContext& usage, size_t maxAttachedPages,
+                   uint32_t minAge,
+                   std::vector<UserPayload>* freedPayloads = nullptr);
+    size_t collect(std::initializer_list<PageUsageContext*> usage,
+                   size_t maxAttachedPages, uint32_t minAge,
                    std::vector<UserPayload>* freedPayloads = nullptr);
 
     // ---- introspection -----------------------------------------------------------
     size_t   attachedPageCount() const { return attachedPages_; }
     size_t   streamedPageCount() const { return attachedPages_ - pinnedPages_; }
-    uint32_t frame() const { return frame_; }
+    uint32_t frame() const { return frame_; }   // published update epoch
 
     // Number of live copy-on-write bounds overlays, and the bytes they hold.
     // Both stay zero for a scene that never calls setNodeBounds.
     size_t overlayCount() const { return liveOverlays_; }
     size_t overlayBytes() const;
 
-    // Filled by the last selectCut. All zero unless built with HLOD_STATS.
+    // Filled by the last stateless selectCut. Contextual calls report through
+    // SelectionContext::lastCutStats(). All zero unless built with HLOD_STATS.
     const CutStats& lastCutStats() const { return stats_; }
 
     struct TestAccess;   // defined by tests; full access to internals
 
 private:
     friend struct TestAccess;
+    friend struct SelectionScratch;
 
     struct NodeRef
     {
@@ -753,9 +852,6 @@ private:
         float                 errClamp = FLT_MAX;
         std::vector<uint8_t>  resident;       // payload loaded
         std::vector<uint32_t> readyChildren;  // resident children per node
-        // Per-node (selectCut epoch << 32 | output index) for LoadRequest
-        // dedup. Allocated on the page's first emitted request.
-        std::vector<uint64_t> reqStamp;
         // Bumped by anything that can change what a walk of this page emits:
         // a child attaching or detaching, a payload becoming resident or
         // ceasing to be, a new error clamp. A SelectionContext records this per
@@ -862,6 +958,8 @@ private:
         int32_t    parent = -1;
     };
 
+    struct TlasItem;
+
     // One page queued on an instance walk. Which bounds this instance sees is
     // resolved once, when the page is pushed, so the inner loop never asks
     // whether there is an overlay — it just reads through a stride.
@@ -902,9 +1000,15 @@ private:
         IdealSink   ideal;
         RequestSink requests;
 
-        std::vector<uint32_t> touched;      // slots to LRU-touch afterwards
-        bool     deferTouch = false;        // parallel: touch after the join
-        uint32_t epoch = 0;                 // request-dedup stamp for this pass
+        std::vector<uint32_t> touched;      // page dependencies / optional usage
+        bool trackTouches = false;
+        uint32_t epoch = 0;                 // local request-dedup epoch
+        struct RequestPage
+        {
+            uint32_t generation = 0;
+            std::vector<uint64_t> stamp;
+        };
+        std::vector<RequestPage> requestPages;
         CutStats stats;
 
         // Validity-margin tracking for SelectionContext. Off for every ordinary
@@ -936,7 +1040,9 @@ private:
 
     void lruUnlink(uint32_t slot);
     void lruPushFront(uint32_t slot);
-    void lruTouch(uint32_t slot);
+    void lruTouch(uint32_t slot, uint32_t epoch);
+    void consumePageUsage(PageUsageContext& usage);
+    void consumePageUsage(std::initializer_list<PageUsageContext*> usage);
 
     // ---- copy-on-write bounds ----
     // Live overlay for (instance, slot), or nullptr. Stale overlays (the
@@ -967,7 +1073,8 @@ private:
     int32_t tlasBuildRange(std::vector<uint32_t>& items, int lo, int hi, int32_t parent);
     int  tlasSplit(std::vector<uint32_t>& items, int lo, int hi);
     void tlasQuery(const CullView& view, float minPix,
-                   std::vector<std::pair<uint32_t, uint8_t>>& outVisible);
+                   std::vector<std::pair<uint32_t, uint8_t>>& outVisible,
+                   std::vector<TlasItem>& stack) const;
     void recomputeInstanceBounds(InstanceId id);
     void tlasOnInstanceMoved(InstanceId id);
     void tlasNoteGrowth(float addedArea);
@@ -986,14 +1093,25 @@ private:
     void tlasNoteEdit();
 
     void runInstance(uint32_t instIdx, const CullView& view, const CutParams& params,
-                     uint8_t mask, Worker& w, bool wantIdeal, bool wantRequests);
+                     uint8_t mask, Worker& w, bool wantIdeal,
+                     bool wantRequests) const;
     void runPage(const WorkItem& item, const Instance& inst, const CullView& local,
-                 const CutParams& params, Worker& w, bool wantIdeal, bool wantRequests);
+                 const CutParams& params, Worker& w, bool wantIdeal,
+                 bool wantRequests) const;
     void wideVisit(const WorkItem& item, const PageView& pg, float errClamp,
                    uint32_t gen, uint32_t tag, uint32_t node, uint8_t mask,
-                   uint8_t aliveKids, const CullView& local, Worker& w, bool wantIdeal);
-    void pushLoadRequests(PageRt& rt, uint32_t slot, uint32_t node, float priority,
-                          Worker& w);
+                   uint8_t aliveKids, const CullView& local, Worker& w,
+                   bool wantIdeal) const;
+    void pushLoadRequests(const PageRt& rt, uint32_t slot, uint32_t node,
+                          float priority, Worker& w) const;
+    void selectCutContext(const CullView& view, const CutParams& params,
+                          SelectionContext& ctx, PageUsageContext* usage,
+                          CutSink& outCut, IdealSink* outIdealCut,
+                          RequestSink* outRequests) const;
+    void selectCutStateless(const CullView& view, const CutParams& params,
+                            PageUsageContext* usage, CutSink& outCut,
+                            IdealSink* outIdealCut, RequestSink* outRequests);
+    void recordPageUsage(PageUsageContext& usage, uint32_t slot) const;
 
     // ---- state ----
     WorldConfig config_;
@@ -1031,7 +1149,7 @@ private:
 
     uint32_t lruHead_ = kInvalidIndex, lruTail_ = kInvalidIndex;
     uint32_t frame_ = 0;
-    uint32_t selectEpoch_ = 0;   // bumped per selectCut; stamps request dedup
+    uint32_t selectEpoch_ = 0;   // stateless worker request-dedup epochs
 
     CutStats stats_;
 

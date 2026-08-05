@@ -113,7 +113,8 @@ struct World::TestAccess
                                                                float minPix)
     {
         std::vector<std::pair<uint32_t, uint8_t>> out;
-        w.tlasQuery(v, minPix, out);
+        std::vector<World::TlasItem> stack;
+        w.tlasQuery(v, minPix, out, stack);
         return out;
     }
 

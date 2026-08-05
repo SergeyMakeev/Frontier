@@ -92,7 +92,7 @@ TEST(Cut, TownExample)
     World w;
     w.addInstance(std::move(pg), float4::point(0, 0, 0));
     markAllResident(w, ids);
-    w.beginFrame();
+    w.applyUpdates();
 
     // Both buildings on screen; A close enough to refine into walls, the
     // walls themselves fine at this distance, B drawn as one proxy.
@@ -126,7 +126,7 @@ TEST(Cut, CoarsensWithDistance)
     World w;
     w.addInstance(std::move(pg), float4::point(0, 0, 0));
     markAllResident(w, ids);
-    w.beginFrame();
+    w.applyUpdates();
 
     size_t lastSize = SIZE_MAX;
     for (float d : {80.0f, 300.0f, 1500.0f, 30000.0f})
@@ -166,7 +166,7 @@ TEST(Cut, IsAntichain)
         attachPage(w, expId, std::move(child));
         markAllResident(w, childIds);
     }
-    w.beginFrame();
+    w.applyUpdates();
 
     const CullView v = makeLookAtView(float4::point(10, 20, -100), float4::point(0, 0, 0));
     const auto o = run(w, v, {6.0f, 0.0f});
@@ -232,7 +232,7 @@ TEST(Cut, MatchesBruteForceReference)
         for (UserId id : allIds)
             if (contains(w, id) && uni(rng) < 0.6f) markResident(w, id);
 
-        w.beginFrame();
+        w.applyUpdates();
 
         CutParams p;
         p.threshold = 1.0f + uni(rng) * 30.0f;
@@ -268,11 +268,11 @@ TEST(Cut, StableAcrossFrames)
     markAllResident(w, ids);
 
     const CullView v = makeLookAtView(float4::point(20, 10, -90), float4::point(0, 0, 0));
-    w.beginFrame();
+    w.applyUpdates();
     const auto first = run(w, v, {5.0f, 0.0f});
     for (int f = 0; f < 5; ++f)
     {
-        w.beginFrame();
+        w.applyUpdates();
         const auto o = run(w, v, {5.0f, 0.0f});
         expectSameCut(o.cut, first.cut);
     }
@@ -319,7 +319,7 @@ struct DampFixture
 
     bool coarse(const CullView& v, const CutParams& p)
     {
-        w.beginFrame();
+        w.applyUpdates();
         const Outputs o = run(w, v, p);
         return o.cut.size() == 1 && o.cut[0].payload == 1;
     }
@@ -437,7 +437,7 @@ TEST(Cut, ContributionCulling)
     w.addInstance(std::move(far), float4::point(0, 0, 500000.0f), 0.01f);   // tiny & distant
     markAllResident(w, nearIds);
     markAllResident(w, farIds);
-    w.beginFrame();
+    w.applyUpdates();
 
     const CullView v = makeLookAtView(float4::point(0, 5, -60), float4::point(0, 0, 100));
 
@@ -478,7 +478,7 @@ TEST(Cut, MultiViewIndependence)
 
     for (int f = 0; f < 3; ++f)
     {
-        w.beginFrame();
+        w.applyUpdates();
         const auto oNear = run(w, vNear, {4.0f, 0.0f});
         const auto oFar = run(w, vFar, {4.0f, 0.0f});
         EXPECT_GT(oNear.cut.size(), oFar.cut.size());

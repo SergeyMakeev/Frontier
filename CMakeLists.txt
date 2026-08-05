@@ -11,6 +11,10 @@ option(HLOD_FORCE_SCALAR "Disable SIMD intrinsics; use the portable scalar paths
 option(HLOD_OVERLAY_FULL_PAGE
        "Experiment: on deform, privatise the whole page instead of just its bounds" OFF)
 
+if(HLOD_BUILD_TESTS OR HLOD_BUILD_BENCH)
+    find_package(Threads REQUIRED)
+endif()
+
 # Carry the eight per-lane plane masks packed in one register instead of a byte
 # array. A real win on its own (~9% on a memory-bound cut) but it adds nothing
 # on top of the reciprocal-sqrt error path, which is always on and relieves the

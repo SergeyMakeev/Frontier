@@ -20,7 +20,7 @@ struct Outputs
 
 Outputs frame(World& w, const CullView& v, const CutParams& p)
 {
-    w.beginFrame();
+    w.applyUpdates();
     Outputs o;
     w.selectCut(v, p, o.cut, o.ideal, o.reqs);
     return o;
@@ -262,10 +262,12 @@ TEST(Streaming, GarbageCollection)
         if (contains(w, id)) level1.push_back(id);
     std::sort(level1.begin(), level1.end());
     std::vector<UserId> level2;
+    std::vector<UserId> pageProbe;
     for (UserId id : level1)
     {
         Page child = gen.makeChildPage(id);
         const auto ids = pageIds(child);
+        pageProbe.push_back(ids.front());
         attachPage(w, id, std::move(child));
         markAllResident(w, ids);
         std::vector<UserId> exps;
@@ -288,17 +290,25 @@ TEST(Streaming, GarbageCollection)
     const float4 c0 = region0.center();
     const CullView v = makeLookAtView(c0 + float4::vec(60, 0, 0),
                                       c0 - float4::vec(150, 0, 0));
+    const AABB region1 = gen.recipes.at(level1[1]).region;
+    const float4 c1 = region1.center();
+    const CullView shadow = makeLookAtView(c1 + float4::vec(60, 0, 0),
+                                           c1 - float4::vec(150, 0, 0));
     std::vector<CutEntry> cut;
-    std::vector<IdealEntry> ideal;
-    std::vector<LoadRequest> reqs;
+    std::vector<CutEntry> shadowCut;
+    SelectionContext selection;
+    PageUsageContext usage;
     for (int f = 0; f < 10; ++f)
     {
-        w.beginFrame();
-        w.selectCut(v, {0.5f, 0.0f}, cut, ideal, reqs);
+        w.applyUpdates();
+        w.selectCut(v, {0.5f, 0.0f}, selection, usage, cut);
+        w.selectCut(shadow, {0.5f, 0.0f}, shadowCut);
     }
-
-    // Nothing collapses while every page is younger than minAge.
-    EXPECT_EQ(w.collect(1, 100), 0u);
+    // Selection only accumulates feedback. The World LRU is updated when the
+    // caller explicitly chooses this camera at collect time.
+    EXPECT_LT(TA::lastTouched(w, pageProbe[0]), w.frame());
+    EXPECT_EQ(w.collect({&usage}, 1, 100), 0u);
+    EXPECT_EQ(TA::lastTouched(w, pageProbe[0]), w.frame());
     EXPECT_EQ(w.attachedPageCount(), allAttached);
 
     // With a small dwell, unseen pages collapse; the viewed page, its
@@ -308,6 +318,7 @@ TEST(Streaming, GarbageCollection)
     EXPECT_GT(collected, 0u);
     EXPECT_FALSE(freed.empty());
     EXPECT_TRUE(isAttached(w, level1[0]));           // still in view
+    EXPECT_FALSE(isAttached(w, level1[1]));          // shadow view was untracked
     for (UserId id : rootIds) EXPECT_TRUE(contains(w, id));   // pinned root intact
 
     // The unseen level-1 pages are gone, and the level-2 page went first
@@ -318,9 +329,9 @@ TEST(Streaming, GarbageCollection)
     // be collected, no matter how tight the budget.
     for (int f = 0; f < 10; ++f)
     {
-        w.beginFrame();
-        w.selectCut(v, {0.5f, 0.0f}, cut, ideal, reqs);
-        w.collect(0, 3);
+        w.applyUpdates();
+        w.selectCut(v, {0.5f, 0.0f}, selection, usage, cut);
+        w.collect(usage, 0, 3);
     }
     EXPECT_TRUE(isAttached(w, level1[0]));
 }
@@ -367,7 +378,7 @@ TEST(Streaming, CollectMinAgeBoundaryAndExactFreedPayloads)
     }
 
     const uint32_t minAge = 5;
-    for (uint32_t f = 0; f + 1 < minAge; ++f) w.beginFrame();
+    for (uint32_t f = 0; f + 1 < minAge; ++f) w.applyUpdates();
 
     // One frame short of the dwell: nothing may be collected.
     std::vector<UserId> freed;
@@ -377,7 +388,7 @@ TEST(Streaming, CollectMinAgeBoundaryAndExactFreedPayloads)
 
     // At exactly minAge every streamed page is eligible; the freed report is
     // exactly the resident payloads of the collected pages.
-    w.beginFrame();
+    w.applyUpdates();
     EXPECT_EQ(w.collect(0, minAge, &freed), exps.size());
     const std::set<UserId> freedSet(freed.begin(), freed.end());
     EXPECT_EQ(freedSet.size(), freed.size()) << "duplicate payloads in freed report";
@@ -411,6 +422,7 @@ TEST(Streaming, GcChurnStress)
     std::vector<CutEntry> cut;
     std::vector<IdealEntry> ideal;
     std::vector<LoadRequest> reqs;
+    PageUsageContext usage;
 
     size_t attaches = 0, collected = 0;
     for (int f = 0; f < 120; ++f)
@@ -421,8 +433,8 @@ TEST(Streaming, GcChurnStress)
             float4::point(x, 40.0f, 0), float4::vec(1.0f, -0.3f, 0.0f),
             float4::vec(0, 1, 0), 1.0f, 16.0f / 9.0f, 1080.0f, 0.1f, 1.0e9f);
 
-        w.beginFrame();
-        w.selectCut(v, p, cut, ideal, reqs);
+        w.applyUpdates();
+        w.selectCut(v, p, usage, cut, &ideal, &reqs);
 
         if (f % 7 == 0)   // spot-check equivalence on the exact same state
         {
@@ -447,7 +459,7 @@ TEST(Streaming, GcChurnStress)
             ++attaches;
         }
         for (const auto& r : reqs) w.markResident(r.node);
-        collected += w.collect(6, 2);
+        collected += w.collect(usage, 6, 2);
     }
 
     // The stress actually stressed: pages were expanded, collapsed, and

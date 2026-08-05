@@ -21,7 +21,7 @@ struct Outputs
 
 Outputs frame(World& w, const CullView& v, const CutParams& p)
 {
-    w.beginFrame();
+    w.applyUpdates();
     Outputs o;
     w.selectCut(v, p, o.cut, o.ideal, o.reqs);
     return o;
@@ -107,7 +107,7 @@ TEST(Motion, LeafMoveRefitsAncestors)
     World w;
     const auto inst = w.addInstance(std::move(pg), float4::point(0, 0, 0));
     markAllResident(w, ids);
-    w.beginFrame();
+    w.applyUpdates();
 
     // Move wall 11 far outside every ancestor box.
     const AABB newBox = AABB::fromCenterExtent(float4::vec(200, 50, 0), float4::vec(1, 1, 1));
@@ -150,7 +150,7 @@ TEST(Motion, CrossPagePropagation)
     const auto childIds = pageIds(child);
     attachPage(w, expId, std::move(child));
     markAllResident(w, childIds);
-    w.beginFrame();
+    w.applyUpdates();
 
     // Move a leaf of the child page way outside the whole tree.
     const UserId movedId = childIds.back();
@@ -248,7 +248,7 @@ TEST(Motion, InstanceMove)
     World w;
     const auto inst = w.addInstance(std::move(pg), float4::point(0, 0, 0));
     markAllResident(w, ids);
-    w.beginFrame();
+    w.applyUpdates();
 
     const CullView vOrigin = makeLookAtView(float4::point(0, 0, -30), float4::point(0, 0, 0));
     EXPECT_FALSE(cutIds(frame(w, vOrigin, {4, 0})).empty());
@@ -280,8 +280,9 @@ TEST(Motion, TlasMatchesBruteForce)
         w.addInstance(std::move(pg), pos);
         markAllResident(w, ids);
     }
-    w.beginFrame();
+    w.applyUpdates();
     TA::forceTlasRebuild(w);
+    w.applyUpdates();
 
     const CullView v = makeLookAtView(float4::point(0, 100, -2500), float4::point(0, 0, 0));
     const auto visible = TA::tlasQuery(w, v, 0.0f);
@@ -323,7 +324,7 @@ TEST(Motion, ManyMovesStayCorrect)
     {
         for (size_t i = 0; i < insts.size(); i += 3)
             w.moveInstance(insts[i], float4::point(uni(rng), uni(rng) * 0.05f, uni(rng)));
-        w.beginFrame();
+        w.applyUpdates();
 
         const CullView v = makeLookAtView(float4::point(uni(rng), 200, -800), float4::point(0, 0, 0));
         Outputs o;
@@ -392,7 +393,7 @@ TEST(Motion, InstanceChurnStaysCorrect)
         }
         for (int k = 0; k < 8; ++k) addTree(float4::point(uni(rng), 0, uni(rng)));
 
-        w.beginFrame();
+        w.applyUpdates();
         const CullView v = makeLookAtView(float4::point(uni(rng), 300, -900),
                                           float4::point(0, 0, 0));
         std::vector<CutEntry> cut;
@@ -465,7 +466,7 @@ TEST(Motion, HandleMovesMatchIdMoves)
         w = std::make_unique<World>();
         const auto inst = w->addInstance(std::move(pg), float4::point(0, 0, 0));
         markAllResident(*w, ids);
-        w->beginFrame();
+        w->applyUpdates();
         return inst;
     };
 
@@ -559,7 +560,7 @@ TEST(Motion, HandleOfUnknownIdThrows)
 // cuts; its own bbox ends at exactly the LAST submitted box (last write
 // wins), ancestors stay conservative (grow-only, they may also cover
 // intermediate positions), and no flush is needed before selectCut — the
-// cut flushes internally and sees the final state.
+// applyUpdates publishes the final queued state.
 // ---------------------------------------------------------------------------
 TEST(Motion, RepeatedMovesLastWins)
 {
@@ -595,7 +596,7 @@ TEST(Motion, RepeatedMovesLastWins)
     EXPECT_EQ(w.overlayCount(), 1u);
 }
 
-TEST(Motion, NoFlushNeededBeforeSelectCut)
+TEST(Motion, ApplyUpdatesFlushesPendingBounds)
 {
     HLodBuilder b;
     const auto root = b.createRoot(1, 32.0f);
@@ -608,9 +609,10 @@ TEST(Motion, NoFlushNeededBeforeSelectCut)
     const auto inst = w.addInstance(std::move(pg), float4::point(0, 0, 0));
     markAllResident(w, ids);
 
-    // Move and cut with no beginFrame/flushBounds in between.
+    // The explicit update barrier applies pending bounds before selection.
     setNodeBounds(w, inst, 11,
                   AABB::fromCenterExtent(float4::vec(300, 0, 0), float4::vec(1, 1, 1)));
+    w.applyUpdates();
     const CullView v = makeLookAtView(float4::point(300, 0, -20), float4::point(300, 0, 0));
     Outputs o;
     w.selectCut(v, {2.0f, 0.0f}, o.cut, nullptr, nullptr);

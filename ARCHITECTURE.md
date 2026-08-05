@@ -23,8 +23,10 @@ split:
 `selectCut` queries the TLAS, walks only surviving page regions, and can emit
 the actual cut, ideal cut, and load requests in one pass. The latter two are
 optional. `SelectionContext` adds per-view damping and conservative cut reuse;
-stateless selection can instead fan out over visible instances through the
-host's blocking `parallelFor`.
+after `applyUpdates` publishes a stable snapshot, different contextual calls
+read only the World and can run concurrently. Stateless selection can instead
+fan one call out over visible instances through the host's blocking
+`parallelFor`.
 
 ### Why it is fast
 
@@ -50,7 +52,7 @@ host's blocking `parallelFor`.
 6. **O(1) readiness decisions.** Residency changes maintain immediate-child
    counters, so the all-or-nothing refine check is one comparison within and
    across pages.
-7. **Lazy, bounded updates.** Bounds edits queue until a cut needs them and grow
+7. **Lazy, bounded updates.** Bounds edits queue until `applyUpdates` and grow
    ancestors only until containment permits an early-out. Instance adds/removes
    edit the TLAS in O(depth); configured edit/escape/area budgets decide when a
    rebuild earns its cost. Escape pressure counts distinct leaves since the
@@ -62,15 +64,17 @@ host's blocking `parallelFor`.
 9. **Frame-coherent reuse.** A 48-byte `SelectionContext` record proves when a
    fully-inside, converged instance's cut cannot change under camera-envelope or
    projection-scale travel. Reused entries are copied without rewalking pages.
-10. **Cold-tail GC.** Non-pinned mounts touch an intrusive LRU at most once per
-    frame. Collection examines the cold tail and detaches only aged leaf mounts;
-    pinned roots are outside the budget and list.
+10. **Deferred, camera-selective GC feedback.** Optional `PageUsageContext`
+    objects collect page touches without writing the World. `collect` consumes
+    only the important cameras chosen by the caller, updates the intrusive LRU,
+    and detaches aged leaf mounts; pinned roots are outside the budget and list.
 
 ### Current measurements
 
 Point estimates below were rerun on 2026-08-05 with MSVC 19.51, Release
-`/O2 /arch:AVX2`, one benchmark thread, on a noisy shared 64-hardware-thread
-2.4 GHz EPYC. Values are the best recurring repeat, which estimates
+`/O2 /arch:AVX2`, on a noisy shared 64-hardware-thread 2.4 GHz EPYC.
+Single-view cases use one benchmark thread; the concurrent six-view cases use
+six persistent workers. Values are the best recurring repeat, which estimates
 uncontended algorithm cost. Google Benchmark used a 0.2 s minimum for ordinary
 benchmarks; fixed-trajectory `SelectionContext` cases use 600 iterations.
 
@@ -82,7 +86,8 @@ benchmarks; fixed-trajectory `SelectionContext` cases use 600 iterations.
 | 10k instances, 700 assets, moving camera / 1k moving | 0.118 ms selection | 82.4% reused; 27.8% visible; 5,920-entry cut |
 | 80k instances, moving camera / static objects | 0.40 ms selection | 97.6% reused; 24,986-entry cut |
 | 80k instances, moving camera / 5% moving | 0.50 ms selection | 92.6% reused; 24,986-entry cut |
-| Same 80k cases, six nearby views | 3.32 / 3.84 ms total selection | static / 5% moving; one context per view |
+| Same 80k cases, six nearby views, serial | 3.75 / 4.23 ms wall time | static / 5% moving; one context per view |
+| Same six views, concurrent | 0.94 / 1.08 ms wall time | 4.0× / 3.9× speedup on six persistent workers |
 | `TlasScale`, 200k / 500k steady | 5.48 / 6.14 ms | 34,573 / 30,975 cut entries |
 | `TlasScale`, first quality build + cut | 134 / 417 ms | level-load cost, not steady frame cost |
 | Forced Morton rebuild + cut, 100k / 500k | 7.88 / 44.5 ms | random centroids |
@@ -340,20 +345,24 @@ and kitchen-sink wins are mostly the attach/detach map maintenance. The
 API also got *simpler*: one opaque currency flows out of `selectCut` and
 back into every mutating call, and there is no id index to keep coherent.
 
-### K. Lazy motion (flush at selectCut) — KEPT; explicit refit dedup — REJECTED, three ways
+### K. Lazy motion queue — KEPT; select-time flush — SUPERSEDED; explicit refit dedup — REJECTED
 
 Two API asks landed together: a node can move many times per frame, so
-refit-per-move is waste; and the tree only has to be correct at one moment
-— `selectCut`. The first half is an API/semantics change and it stuck:
+refit-per-move is waste; and the tree only has to be correct at a publish
+boundary. The flat queue and refit algorithm remain current. At this point in
+the history, however, the boundary was `selectCut`:
 
-- `setNodeBounds` stays a ~16 ns flat queue push, but nothing is applied by
-  `beginFrame` anymore. The pending queue is flushed inside `selectCut` (the
-  one place that needs current bounds) or by an explicit `flushBounds()` for
-  tools and tests. `beginFrame` is now purely the GC/LRU clock.
+- `setNodeBounds` stays a ~16 ns flat queue push, but nothing was applied by
+  the frame clock. The pending queue was flushed inside `selectCut` or by an
+  explicit `flushBounds()` for tools and tests.
 - Contract: after the flush, a node's own bbox equals exactly the *last*
   submitted box; ancestors are conservative (grow-only) over everything
-  submitted. Multiple views flush once — the second `selectCut` finds an
-  empty queue.
+  submitted. Multiple views flushed once because later calls found an empty
+  queue.
+
+The current API moves that same work to explicit `applyUpdates`, before any
+view selection. This is what makes contextual selection a const, concurrently
+callable read of the published World.
 
 The second half — replacing the per-mover ancestor walk with an explicitly
 deduplicated bottom-up sweep — was implemented three different ways, all
@@ -381,8 +390,8 @@ submissions/frame. The contains() early-out IS the dedup; bookkeeping to
 avoid a nearly-free walk costs more than the walk.
 
 What did stick from the exercise besides the lazy timing: nothing — the
-final flush is the experiment-I loop moved verbatim from `beginFrame` into
-`flushBounds()`. Zero new state on pages, zero new state per node.
+final flush is still the experiment-I loop in `flushBounds()`, now invoked by
+`applyUpdates`. Zero new state on pages, zero new state per node.
 
 ### L. Dynamic instance churn (spawn/despawn) + builder cost — two cliffs FIXED
 
@@ -597,11 +606,9 @@ model:
 - TLAS contribution culling now uses squared box distance and
   `screenErrorFromSq8`, matching the page walk's reciprocal-square-root path and
   improving the focused 50k-200k cases by 3.0-3.5%.
-- A page already LRU-touched this frame is left linked in place, eliminating
-  repeated unlink/relink work when many reused instances share an asset.
-- Parallel workers still use private request epochs while walking, but the join
-  performs a page-stamped deduplication. Request order and priority now match
-  serial selection as well as the cut itself.
+- Request deduplication now lives in per-selection scratch rather than mutable
+  page state. Parallel stateless workers merge their private request sets;
+  concurrent contextual views cannot overwrite one another's epochs.
 - `SelectionContext` budgets both camera-envelope travel and projection-scale
   travel. Each 48-byte record stores a conservative flip-point slope, avoiding
   the old all-cache invalidation throughout damped zoom-out. The affected 20k
@@ -610,11 +617,19 @@ model:
 - Contextual selection prefetches its spatially ordered random instance and
   record reads eight entries ahead, and the output sink directly pushes its
   dominant one-entry runs. The current 20k fly-through reaches 0.121 ms.
+- Contextual TLAS stacks, visible lists, traversal workers, request stamps, and
+  statistics are owned by each `SelectionContext`. `applyUpdates` performs the
+  serial refit/rebuild work first; the contextual overload is then const and
+  independent views may select concurrently.
+- Page touches accumulate in an optional `PageUsageContext`. Selection does
+  not mutate the intrusive World LRU; `collect` consumes only the important
+  cameras supplied by the caller.
 - The TLAS escape budget now counts each escaped instance once per rebuild,
   rather than counting every later growth of the same lane. A bounded 5% moving
   cohort therefore stays on incremental refit instead of periodically charging
-  a repair to `selectCut`; the representative 80k selection is 0.50 ms, and six
-  nearby views total 3.84 ms.
+  a repair to a view; `applyUpdates` owns any repair. The representative 80k
+  selection is 0.50 ms. Six nearby moving-object views measure 4.23 ms serial
+  and 1.08 ms on six persistent workers.
 
 The archived [2026-08-05 handoff](docs/archive/HANDOFF-2026-08-05.md), section
 14, preserves the interleaved A/B tables, rejected margin vectorization,
@@ -625,13 +640,12 @@ guidance.
 
 ## 3. Current constraints and possible follow-up
 
-- **Context reuse and parallel selection are separate paths.** Stateless
-  selection already parallelizes across visible instances and preserves serial
-  output/request order. `SelectionContext` remains serial because reuse records,
-  the cut slab, and dependency validation are optimized as one compact stream.
-  Six representative 80k views currently cost 3.32-3.84 ms in aggregate and
-  occupy about 46 MiB of context state. Combine the paths only if a production
-  profile shows a net win after per-worker merge and record-write costs.
+- **Parallelism is across contextual views, not within one contextual walk.**
+  Six representative 80k views fall from 3.75-4.23 ms serial to 0.94-1.08 ms
+  on six persistent workers and occupy about 49 MiB of context state. Stateless
+  selection can still parallelize one call across visible instances. Combining
+  both forms would add nested scheduling and merge costs; profile a production
+  need before doing so.
 - **Internal overlay bounds do not shrink.** Grow-only refit means long-running
   large teleports can loosen page ancestors. This costs culling efficiency, not
   correctness; TLAS rebuilds retighten only the top level. A budgeted bottom-up
