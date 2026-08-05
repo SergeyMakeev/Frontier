@@ -14,7 +14,7 @@ namespace {
 
 struct Outputs
 {
-    std::vector<CutEntry> cut;
+    CutResults cut;
 };
 
 Outputs frame(World& w, const Camera& v, const CutParams& p)
@@ -25,11 +25,10 @@ Outputs frame(World& w, const Camera& v, const CutParams& p)
     return o;
 }
 
-std::set<UserId> cutIds(const Outputs& o)
+std::set<UserId> cutIds(World& world, const Outputs& o)
 {
     std::set<UserId> ids;
-    for (const auto& e : o.cut)
-        if (inCurrentCut(e)) ids.insert(e.payload);
+    for (const auto& e : currentCut(o.cut)) ids.insert(payloadOf(world, e));
     return ids;
 }
 
@@ -43,8 +42,8 @@ void verifyConservativeBounds(World& w, World::InstanceRef inst, UserId anyId)
 {
     const NodeHandle h = handleOf(w, anyId);
     const PageView& pg = TA::pageOf(w, anyId);
-    const AABB* bbox = TA::bboxOf(w, inst, h.slot);
-    const WideBoundsRef wide = TA::wideOf(w, inst, h.slot);
+    const AABB* bbox = TA::bboxOf(w, inst, h.slot());
+    const WideBoundsRef wide = TA::wideOf(w, inst, h.slot());
     ASSERT_NE(bbox, nullptr);
     ASSERT_TRUE(wide.valid());
 
@@ -83,7 +82,7 @@ AABB boundsOf(World& w, World::InstanceRef inst, UserId id)
 // Bounds of a page's sentinel (node 0) as `inst` sees them.
 AABB rootBoundsOf(World& w, World::InstanceRef inst, UserId anyIdInPage)
 {
-    return TA::bboxOf(w, inst, handleOf(w, anyIdInPage).slot)[0];
+    return TA::bboxOf(w, inst, handleOf(w, anyIdInPage).slot())[0];
 }
 
 } // namespace
@@ -119,12 +118,12 @@ TEST(Motion, LeafMoveRefitsAncestors)
     // A camera looking only at the new position sees exactly that wall.
     const Camera vNew = makeLookAtCamera(float4::point(200, 50, -30), float4::point(200, 50, 0));
     auto o = frame(w, vNew, {4.0f, 0.0f});
-    EXPECT_TRUE(cutIds(o).count(11));
+    EXPECT_TRUE(cutIds(w, o).count(11));
 
     // A camera at the old position no longer draws it.
     const Camera vOld = makeLookAtCamera(float4::point(4, 0, -10), float4::point(4, 0, 0));
     o = frame(w, vOld, {4.0f, 0.0f});
-    EXPECT_FALSE(cutIds(o).count(11));
+    EXPECT_FALSE(cutIds(w, o).count(11));
 }
 
 // ---------------------------------------------------------------------------
@@ -169,7 +168,7 @@ TEST(Motion, CrossPagePropagation)
     // And the cut can actually find the moved leaf out there.
     const Camera v = makeLookAtCamera(float4::point(500, 0, -20), float4::point(500, 0, 0));
     const auto o = frame(w, v, {1.0f, 0.0f});
-    EXPECT_TRUE(cutIds(o).count(movedId));
+    EXPECT_TRUE(cutIds(w, o).count(movedId));
 }
 
 // ---------------------------------------------------------------------------
@@ -250,13 +249,13 @@ TEST(Motion, InstanceMove)
     w.applyUpdates();
 
     const Camera vOrigin = makeLookAtCamera(float4::point(0, 0, -30), float4::point(0, 0, 0));
-    EXPECT_FALSE(cutIds(frame(w, vOrigin, {4, 0})).empty());
+    EXPECT_FALSE(cutIds(w, frame(w, vOrigin, {4, 0})).empty());
 
     w.moveInstance(inst, float4::point(10000, 0, 0), 2.0f);
-    EXPECT_TRUE(cutIds(frame(w, vOrigin, {4, 0})).empty());
+    EXPECT_TRUE(cutIds(w, frame(w, vOrigin, {4, 0})).empty());
 
     const Camera vThere = makeLookAtCamera(float4::point(10000, 0, -60), float4::point(10000, 0, 0));
-    EXPECT_FALSE(cutIds(frame(w, vThere, {4, 0})).empty());
+    EXPECT_FALSE(cutIds(w, frame(w, vThere, {4, 0})).empty());
 }
 
 // ---------------------------------------------------------------------------
@@ -331,10 +330,8 @@ TEST(Motion, ManyMovesStayCorrect)
         const RefResult want = TA::referenceCut(w, v, p);
 
         std::set<UserId> gotIds, wantIds;
-        for (const auto& e : o.cut)
-            if (inCurrentCut(e)) gotIds.insert(e.payload);
-        for (const auto& e : want.cut)
-            if (inCurrentCut(e)) wantIds.insert(e.payload);
+        for (const auto& e : currentCut(o.cut)) gotIds.insert(payloadOf(w, e));
+        for (const auto& e : currentCut(want.cut)) wantIds.insert(payloadOf(w, e));
         EXPECT_EQ(gotIds, wantIds) << "frame " << f;
     }
 }
@@ -397,14 +394,13 @@ TEST(Motion, InstanceChurnStaysCorrect)
         w.applyUpdates();
         const Camera v = makeLookAtCamera(float4::point(uni(rng), 300, -900),
                                           float4::point(0, 0, 0));
-        std::vector<CutEntry> cut;
+        CutResults cut;
         selectCutUncached(w, v, p, cut);
         const RefResult want = TA::referenceCut(w, v, p);
 
         std::multiset<UserId> gotIds, wantIds;
-        for (const auto& e : cut) gotIds.insert(e.payload);
-        for (const auto& e : want.cut)
-            if (inCurrentCut(e)) wantIds.insert(e.payload);
+        for (const auto& e : currentCut(cut)) gotIds.insert(payloadOf(w, e));
+        for (const auto& e : currentCut(want.cut)) wantIds.insert(payloadOf(w, e));
         EXPECT_EQ(gotIds, wantIds) << "frame " << f;
     }
     EXPECT_EQ(trees.size(), 40u);
@@ -485,8 +481,8 @@ TEST(Motion, HandleMovesMatchIdMoves)
     byHandle->flushBounds();
 
     verifyConservativeBounds(*byHandle, instH, 11);
-    const uint32_t slotA = handleOf(*byId, 11).slot;
-    const uint32_t slotB = h.slot;
+    const uint32_t slotA = handleOf(*byId, 11).slot();
+    const uint32_t slotB = h.slot();
     const AABB* a = TA::bboxOf(*byId, instId, slotA);
     const AABB* b = TA::bboxOf(*byHandle, instH, slotB);
     const uint32_t n = TA::pageOf(*byId, 11).nodeCount();
@@ -498,7 +494,7 @@ TEST(Motion, HandleMovesMatchIdMoves)
 
     const Camera v = makeLookAtCamera(float4::point(200, 50, -30), float4::point(200, 50, 0));
     auto o = frame(*byHandle, v, {4.0f, 0.0f});
-    EXPECT_TRUE(cutIds(o).count(11));
+    EXPECT_TRUE(cutIds(*byHandle, o).count(11));
 }
 
 // ---------------------------------------------------------------------------
@@ -619,8 +615,7 @@ TEST(Motion, ApplyUpdatesFlushesPendingBounds)
     Outputs o;
     selectCutUncached(w, v, {2.0f, 0.0f}, o.cut);
     std::set<UserId> got;
-    for (const auto& e : o.cut)
-        if (inCurrentCut(e)) got.insert(e.payload);
+    for (const auto& e : currentCut(o.cut)) got.insert(payloadOf(w, e));
     EXPECT_TRUE(got.count(11));
     verifyConservativeBounds(w, inst, 11);
 }

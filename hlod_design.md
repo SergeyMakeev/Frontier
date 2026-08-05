@@ -27,8 +27,9 @@ replace-only: either a node draws, or its children replace it. This makes a cut
 hole-free without parent/child overdraw.
 
 The library is deliberately external to rendering. A node stores an opaque
-`uint64_t UserPayload`; selection echoes it without interpreting or indexing
-it. It can be a mesh-table index, an entity key, a pointer-sized token, or any
+`uint64_t UserPayload`; selection carries a compact node handle and the caller
+may resolve that payload with `World::tryGetPayload` only when needed. A
+payload can be a mesh-table index, entity key, pointer-sized token, or any
 other value. Duplicate payloads are legal. Every node must nevertheless have a
 renderable representation because any node can become part of the current cut.
 
@@ -56,7 +57,9 @@ The runtime has four distinct concepts:
   asset. `World::InstanceRef` also contains a generation and its root page
   handle.
 
-`NodeHandle{slot, index, generation}` names a node in a mounted page.
+`NodeHandle{slot, index, generation}` names a node in a mounted page and packs
+those fields into 64 bits: 20 bits each for mount slot and page-local index,
+plus a 24-bit per-slot generation.
 `nodeAt(page, index)` composes one from a `PageHandle` and a packed page-local
 index. Generations prevent ABA bugs when page or instance slots are recycled.
 An asynchronous completion using a handle whose page was collected is an
@@ -70,8 +73,12 @@ owns that table outside the library.
 `InstanceDesc` contains:
 
 - `pos` and positive uniform `scale`;
-- `tag`, echoed as `CutEntry::instance`; and
 - `mask`, ANDed with `Camera::viewMask` for cheap layer filtering.
+
+`World::addInstance` returns the generation-stamped owner reference. Selection
+packs its dense 24-bit `InstanceId` into each `CutEntry`; callers normally use
+that id to index the same placement/transform table that stores the returned
+`InstanceRef`.
 
 Rotation and non-uniform scale are not represented by `InstanceDesc`. Bake
 them into authored bounds/proxies or place such objects in an integration layer
@@ -89,36 +96,50 @@ AssetHandle tree = world.registerAsset(loadRootPage());
 InstanceDesc desc;
 desc.pos = float4::point(100, 0, 20);
 desc.scale = 1.0f;
-desc.tag = entityIndex;
 World::InstanceRef instance = world.addInstance(tree, desc);
 
-std::vector<CutEntry> cut;
+CutResults cut;
 Camera camera = makeLookAtCamera(eye, target);
-View view;                      // persistent state for this camera
+View view;                         // persistent state for this camera
 PageUsageContext primaryUsage;    // only retention-relevant views need one
 
 world.applyUpdates();              // apply changes and publish the read-only world
 const World& published = world;
 view.selectCut(published, camera, CutParams{4.0f, 0.0f}, primaryUsage, cut);
 
-for (const CutEntry& entry : cut)
+const auto render = [&](const CutEntry& entry)
 {
-    if (!inIdealCut(entry))
-        continue;
-    if (entry.tag == CutTag::NeedsExpansion && !world.isAttached(entry.node))
-        world.attachPage(entry.node, loadChildPage(entry.payload));
-    else if (!world.isResident(entry.node) &&
-             payloadFinishedLoading(entry.payload))
-        world.markResident(entry.node);
-}
+    UserPayload payload;
+    if (published.tryGetPayload(entry.nodeHandle, payload))
+        submit(payload, transforms[entry.instance()]);
+};
+for (const CutEntry& entry : cut.shared) render(entry);
+for (const CutEntry& entry : cut.currentOnly) render(entry);
+
+// After all view queries join, streaming and World mutation are serial again.
+const auto streamIdeal = [&](const CutEntry& entry)
+{
+    UserPayload payload;
+    if (!world.tryGetPayload(entry.nodeHandle, payload)) return;
+
+    if (entry.overThreshold() && contentGraph.hasChildren(payload) &&
+        !world.isAttached(entry.nodeHandle))
+        world.attachPage(entry.nodeHandle, loadChildPage(payload));
+    else if (!world.isResident(entry.nodeHandle) &&
+             payloadFinishedLoading(payload))
+        world.markResident(entry.nodeHandle);
+};
+for (const CutEntry& entry : cut.shared) streamIdeal(entry);
+for (const CutEntry& entry : cut.idealOnly) streamIdeal(entry);
 
 world.collect(primaryUsage, pageBudget, minPageAge);
 ```
 
 In a real asynchronous streamer, completions normally arrive in later frames.
-It normally deduplicates payload ids and applies IO/page budgets before
+It normally deduplicates content identities and applies IO/page budgets before
 scheduling work; `World` deliberately does neither. The loop above shows the
-state transitions, not a production scheduler.
+state transitions, not a production scheduler. The caller's content graph is
+also what distinguishes a high-error terminal leaf from an expandable leaf.
 
 The generation check is why no extra page-lifetime lock is needed at completion
 time. A stale `attachPage` returns an invalid `PageHandle` and leaves the caller
@@ -232,9 +253,11 @@ re-walked rather than cached by `View`.
 
 An expansion point is a renderable collapsed proxy whose children live in a
 different page. If its error is acceptable it remains a normal ideal-cut entry.
-If it is too coarse and no child page is attached, it is emitted as
-`CutTag::NeedsExpansion`. Attaching a child page makes traversal able to cross
-the boundary on the next cut.
+If it is too coarse and no child page is attached, it appears as a high-error
+ideal-side leaf. Attaching a child page makes traversal able to cross the
+boundary on the next cut. No per-entry expansion tag is needed: the caller's
+external content graph says whether that node has another page, while the
+quantized error says whether expansion is currently useful.
 
 Instance-root payloads are pinned resident. This is the base case for the
 runtime invariant:
@@ -249,8 +272,9 @@ published World as read-only until every view selection has joined.
 ### Streamer policy
 
 Output order is traversal-defined. It is stable for a given state but is not a
-priority order. An attach budget must choose `NeedsExpansion` entries by
-descending ideal-side `CutEntry::err`, not by vector position.
+priority order. An attach budget should choose expandable ideal-side entries
+(`shared` and `idealOnly`) by descending `errorCode()`, not by vector position.
+Call `approximateError(threshold)` when a pixel-scale value is more convenient.
 
 Pure discovery can add one frame of latency per missing page level. A streamer
 that owns page metadata can use the observed error to look ahead:
@@ -268,26 +292,34 @@ in [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## 6. Selection outputs and traversal
 
-`selectCut` fills one unified sequence of
-`CutEntry{payload, node, err, instance, membership, tag}`. Membership makes the
-two cuts additive:
+`selectCut` fills a `CutResults` with three vectors:
 
-- `Shared` belongs to both the current and ideal cuts;
-- `CurrentOnly` is a resident fallback needed only by the current cut; and
-- `IdealOnly` belongs only to the fully-resident ideal cut.
+- `shared` belongs to both the current and ideal cuts;
+- `currentOnly` is a resident fallback needed only by the current cut; and
+- `idealOnly` belongs only to the fully-resident ideal cut.
 
-Thus `CurrentOnly + Shared` is the hole-free render cut, while
-`IdealOnly + Shared` is the cut known topology would choose if every payload
-were resident. `inCurrentCut` and `inIdealCut` are convenience filters. A
-`Direct` ideal-side entry names a known payload; `NeedsExpansion` represents
-unknown descendants below a collapsed page boundary.
+Thus `shared + currentOnly` is the hole-free render cut, while
+`shared + idealOnly` is the frontier known topology would choose if every
+payload were resident. Keeping membership in the container rather than every
+entry avoids two per-entry tags and makes each `CutEntry` exactly 12 bytes:
+
+- an 8-byte `NodeHandle`;
+- a dense 24-bit `InstanceId`; and
+- an 8-bit threshold-relative screen-error code.
+
+Error codes 0 through 127 mean at or below the query threshold; 128 through
+255 mean above it. `overThreshold()` preserves the exact comparison result.
+Magnitude is logarithmically quantized at roughly eight steps per octave and
+`approximateError(threshold)` decodes an estimate for prioritization. Payloads
+are not repeated in the output; use `tryGetPayload(nodeHandle, payload)` or the
+caller's external graph when needed.
 
 There is no request output. The caller inspects ideal-side entries, tests
 residency, deduplicates whatever it considers the same content, and applies its
-own IO priorities and budgets. `Sink<CutEntry>` can target a growable
-`std::vector` or fixed caller memory; a fixed sink reports dropped entries, so
-the caller can grow its capacity without an allocation inside the traversal.
-Vector-backed sinks may grow like any vector.
+own IO priorities and budgets. Each member of `CutResultSink` can target a
+growable `std::vector` or fixed caller memory; a fixed sink reports dropped
+entries, so the caller can grow its capacity without an allocation inside the
+traversal. Vector-backed sinks may grow like any vector.
 
 `applyUpdates` first flushes queued bounds and performs any requested TLAS
 build or repair. Selection then proceeds against that stable snapshot:
@@ -307,14 +339,14 @@ build or repair. Selection then proceeds against that stable snapshot:
    DFS stack. Shared nodes are emitted once.
 
 There is no required per-node per-view scratch and no per-frame clear over all
-materialized nodes. Work is bounded by the visible unified-cut region rather
-than the full authored hierarchy:
+materialized nodes. Work is bounded by the visible current/ideal cut region
+rather than the full authored hierarchy:
 
 ```text
-O(TLAS query + visible instances + visible unified-cut region + output size)
+O(TLAS query + visible instances + visible cut region + output size)
 ```
 
-The more compact shorthand `O(log R + hits + unified-cut region)` assumes a
+The more compact shorthand `O(log R + hits + cut region)` assumes a
 reasonably separating TLAS. In the adversarial case where all R instances
 overlap, the TLAS must report all R and the query is necessarily O(R). No
 algorithm can cost less than the output it must emit.
@@ -340,9 +372,10 @@ Important limits are explicit:
 - An instance with more than two distinct page dependencies is not cached.
   Streaming does not otherwise disable reuse: residency and topology versions
   invalidate records that depend on changed pages.
-- The emitted node set matches uncached selection exactly. `CutEntry::err` on
-  a reused entry is the recorded value and can be stale within the proven
-  margin; use it for prioritization or dithering, not bit-exact comparison.
+- The emitted node set matches uncached selection exactly. `errorCode()` on a
+  reused entry is the recorded quantized value and can be stale within the
+  proven margin; use its magnitude for prioritization or dithering, not
+  bit-exact comparison with a freshly walked view.
 - A cached call walks its camera serially, but different views can run
   concurrently because all mutable query state is view-owned.
 
@@ -374,9 +407,8 @@ optional blocking `parallelFor`. Call `view.setReuseEnabled(false)`, set
 visible instance count reaches the threshold.
 
 The runtime gives each worker a contiguous visible-instance range and private
-output buffers, then concatenates ranges in serial order. Serial and parallel
-unified cuts are intended to match entry-for-entry for the same backend and
-input.
+output buffers, then concatenates each bucket in serial order. Serial and
+parallel results match entry-for-entry for the same backend and input.
 
 `parallelFor` may run task indices in any order but must return only after all
 tasks finish. Its scratch and aggregate statistics live in the `View`, so
@@ -474,7 +506,7 @@ candidates examined, and pages detached; it does not scan the entire world.
 
 | Operation | Expected cost |
 |---|---|
-| Uncached `View::selectCut` | TLAS query + visible unified-cut region + outputs |
+| Uncached `View::selectCut` | TLAS query + visible current/ideal cut region + outputs |
 | View reuse hit | TLAS query + record validation + copied cut entries |
 | `markResident` / `markNonResident` | O(changed coverage path to the mount root), with early-out |
 | `attachPage` | O(page nodes) runtime-state initialization |
@@ -489,6 +521,10 @@ Current integration limits and tuning decisions are:
 - page size is content-dependent; hundreds to low thousands of nodes is the
   intended starting range, but boundary frequency and streaming granularity
   should be profiled;
+- compact identifiers cap a world at 1,048,575 simultaneously mounted page
+  slots, a page at 1,048,576 entries including its sentinel, and the dense
+  instance table at 16,777,215 live slots; a mount generation wraps only after
+  that same slot has been recycled more than 16 million times;
 - cached views parallelize across calls; parallelizing within one cached call
   remains unnecessary for the measured multi-view workload;
 - translation plus uniform scale is the built-in instance transform;

@@ -16,7 +16,7 @@ namespace hlod {
 
 struct RefResult
 {
-    std::vector<CutEntry> cut;
+    CutResults cut;
 };
 
 // Exercise the uncached public path without carrying a View between calls.
@@ -24,7 +24,7 @@ struct RefResult
 // persistent View explicitly.
 inline void selectCutUncached(World& world, const Camera& camera,
                               const CutParams& params,
-                              std::vector<CutEntry>& outCut)
+                              CutResults& outCut)
 {
     world.applyUpdates();
     View view;
@@ -34,7 +34,7 @@ inline void selectCutUncached(World& world, const Camera& camera,
 
 inline void selectCutUncached(World& world, const Camera& camera,
                               const CutParams& params, PageUsageContext& usage,
-                              std::vector<CutEntry>& outCut)
+                              CutResults& outCut)
 {
     world.applyUpdates();
     View view;
@@ -73,11 +73,11 @@ struct World::TestAccess
     }
     static const PageView& pageOf(World& w, UserPayload anyNodeInPage)
     {
-        return w.slots_[requireByScan(w, anyNodeInPage).slot].page;
+        return w.slots_[requireByScan(w, anyNodeInPage).slot()].page;
     }
     static uint32_t lastTouched(World& w, UserPayload anyNodeInPage)
     {
-        return w.slots_[requireByScan(w, anyNodeInPage).slot].lastTouched;
+        return w.slots_[requireByScan(w, anyNodeInPage).slot()].lastTouched;
     }
     static void forceTlasRebuild(World& w) { w.tlasDirty_ = true; }
     // False means the next query will use the tree as it stands. This is how a
@@ -92,7 +92,7 @@ struct World::TestAccess
     // rewrite of the child page's error array (page bytes are immutable).
     static float errClampOf(World& w, UserPayload anyNodeInPage)
     {
-        return w.slots_[requireByScan(w, anyNodeInPage).slot].errClamp;
+        return w.slots_[requireByScan(w, anyNodeInPage).slot()].errClamp;
     }
 
     // How many mounts this instance has taken a private copy of the bounds
@@ -126,7 +126,7 @@ struct World::TestAccess
     // shares: used to assert that deforming one instance does not fork it.
     static const void* mountStateOf(World& w, UserPayload anyNodeInPage)
     {
-        return &w.slots_[requireByScan(w, anyNodeInPage).slot];
+        return &w.slots_[requireByScan(w, anyNodeInPage).slot()];
     }
 
     static std::vector<std::pair<uint32_t, uint8_t>> tlasQuery(World& w,
@@ -229,7 +229,7 @@ struct World::TestAccess
     {
         std::vector<UserPayload> out;
         const NodeHandle h = requireByScan(w, payload);
-        NodeRef r{h.slot, h.index};
+        NodeRef r{h.slot(), h.index()};
         while (true)
         {
             const PageRt& rt = w.slots_[r.slot];
@@ -265,13 +265,14 @@ struct World::TestAccess
                 if (e < p.minPix) continue;
             }
             const Camera local = toLocal(view, inst.pos, inst.scale);
-            refChildren(w, inst, inst.rootSlot, 0, true, true, local, p, out);
+            refChildren(w, inst, id, inst.rootSlot, 0, true, true, local, p, out);
         }
         return out;
     }
 
 private:
-    static void refChildren(World& w, const Instance& inst, uint32_t slot,
+    static void refChildren(World& w, const Instance& inst, InstanceId instance,
+                            uint32_t slot,
                             uint32_t node, bool current, bool ideal,
                             const Camera& local,
                             const CutParams& p, RefResult& out)
@@ -280,12 +281,13 @@ private:
         uint32_t c = node + 1;
         for (uint32_t k = 0; k < pg.childCount(node); ++k)
         {
-            refNode(w, inst, slot, c, current, ideal, local, p, out);
+            refNode(w, inst, instance, slot, c, current, ideal, local, p, out);
             c += pg.subtreeSize[c];
         }
     }
 
-    static void refNode(World& w, const Instance& inst, uint32_t slot, uint32_t i,
+    static void refNode(World& w, const Instance& inst, InstanceId instance,
+                        uint32_t slot, uint32_t i,
                         bool current, bool ideal, const Camera& local,
                         const CutParams& p,
                         RefResult& out)
@@ -307,29 +309,19 @@ private:
         const bool wants = ideal && (cc > 0 || exp) && err > p.threshold;
 
         const NodeHandle here{slot, i, rt.generation};
-        const auto member = [](bool inCurrent, bool inIdeal)
-        {
-            return inCurrent
-                       ? (inIdeal ? CutMembership::Shared : CutMembership::CurrentOnly)
-                       : CutMembership::IdealOnly;
-        };
-
         if (!ideal)
         {
             if (rt.resident[i])
             {
-                out.cut.push_back({pg.payload[i], here, err, inst.tag,
-                                   CutMembership::CurrentOnly, CutTag::Direct});
+                out.cut.currentOnly.emplace_back(here, err, p.threshold, instance);
                 return;
             }
         }
         else if (!wants)
         {
             const bool shared = current && rt.resident[i];
-            out.cut.push_back({pg.payload[i], here, err, inst.tag,
-                               shared ? CutMembership::Shared
-                                      : CutMembership::IdealOnly,
-                               CutTag::Direct});
+            (shared ? out.cut.shared : out.cut.idealOnly)
+                .emplace_back(here, err, p.threshold, instance);
             if (!current || shared) return;
         }
 
@@ -337,8 +329,8 @@ private:
             (exp && !rt.expSlot.empty()) ? rt.expSlot[i] : kInvalidIndex;
         if (ideal && wants && exp && childSlot == kInvalidIndex)
         {
-            out.cut.push_back({pg.payload[i], here, err, inst.tag,
-                               member(current, true), CutTag::NeedsExpansion});
+            const CutEntry entry{here, err, p.threshold, instance};
+            (current ? out.cut.shared : out.cut.idealOnly).push_back(entry);
             return;
         }
 
@@ -350,18 +342,18 @@ private:
                 !current || w.visibleDescendantsCovered(slot, i, mask, inst, local);
             if (current && !canDescend)
             {
-                out.cut.push_back({pg.payload[i], here, err, inst.tag,
-                                   CutMembership::CurrentOnly, CutTag::Direct});
+                out.cut.currentOnly.emplace_back(here, err, p.threshold, instance);
             }
             nextCurrent = current && canDescend;
             nextIdeal = true;
         }
 
         if (exp)
-            refChildren(w, inst, childSlot, 0, nextCurrent, nextIdeal, local, p,
-                        out);
+            refChildren(w, inst, instance, childSlot, 0, nextCurrent, nextIdeal,
+                        local, p, out);
         else
-            refChildren(w, inst, slot, i, nextCurrent, nextIdeal, local, p, out);
+            refChildren(w, inst, instance, slot, i, nextCurrent, nextIdeal,
+                        local, p, out);
     }
 };
 
@@ -376,30 +368,36 @@ using TAX = World::TestAccess;
 // payload. The alias keeps test code reading naturally.
 using UserId = UserPayload;
 
-inline std::vector<CutEntry> currentCut(const std::vector<CutEntry>& unified)
+inline std::vector<CutEntry> currentCut(const CutResults& cut)
 {
-    std::vector<CutEntry> out;
-    for (const CutEntry& entry : unified)
-        if (inCurrentCut(entry)) out.push_back(entry);
+    std::vector<CutEntry> out = cut.shared;
+    out.insert(out.end(), cut.currentOnly.begin(), cut.currentOnly.end());
     return out;
 }
 
-inline std::vector<CutEntry> idealCut(const std::vector<CutEntry>& unified)
+inline std::vector<CutEntry> idealCut(const CutResults& cut)
 {
-    std::vector<CutEntry> out;
-    for (const CutEntry& entry : unified)
-        if (inIdealCut(entry)) out.push_back(entry);
+    std::vector<CutEntry> out = cut.shared;
+    out.insert(out.end(), cut.idealOnly.begin(), cut.idealOnly.end());
     return out;
 }
 
-inline size_t currentCutSize(const std::vector<CutEntry>& unified)
+inline size_t currentCutSize(const CutResults& cut)
 {
-    return size_t(std::count_if(unified.begin(), unified.end(), inCurrentCut));
+    return cut.currentSize();
 }
 
-inline size_t idealCutSize(const std::vector<CutEntry>& unified)
+inline size_t idealCutSize(const CutResults& cut)
 {
-    return size_t(std::count_if(unified.begin(), unified.end(), inIdealCut));
+    return cut.idealSize();
+}
+
+inline UserPayload payloadOf(const World& w, const CutEntry& entry)
+{
+    UserPayload payload = 0;
+    if (!w.tryGetPayload(entry.nodeHandle, payload))
+        throw std::logic_error("payloadOf: stale cut handle");
+    return payload;
 }
 
 inline std::vector<UserPayload> pageIds(const PageView& pg)

@@ -13,9 +13,9 @@
 #include <cstdlib>
 
 #define HLOD_VERSION_MAJOR 0
-#define HLOD_VERSION_MINOR 3
+#define HLOD_VERSION_MINOR 4
 #define HLOD_VERSION_PATCH 0
-#define HLOD_VERSION_STRING "0.3.0"
+#define HLOD_VERSION_STRING "0.4.0"
 
 // ---------------------------------------------------------------------------
 // Diagnostics

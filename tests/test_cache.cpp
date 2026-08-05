@@ -3,9 +3,9 @@
 // The whole value of the cache rests on one claim -- that the set of nodes it
 // hands back is exactly the set an uncached selectCut would have produced --
 // so that claim is what these tests attack, frame after frame, while the
-// camera moves and the world churns underneath. CutEntry::err is deliberately
-// not compared: it is the recorded value, stale within the proven margin, and
-// that is the one documented approximation.
+// camera moves and the world churns underneath. The quantized error code is
+// deliberately not compared: it is the recorded value, stale within the
+// proven margin, and that is the one documented approximation.
 
 #include <algorithm>
 #include <array>
@@ -23,18 +23,22 @@ using namespace hlodtest;
 
 namespace {
 
-// Unified entry identities, sorted as a multiset; only the intentionally stale
+// Bucketed entry identities, sorted as a multiset; only the intentionally stale
 // cached error and emission order are dropped.
-using Keys = std::vector<
-    std::tuple<UserPayload, uint32_t, uint32_t, uint32_t, CutMembership, CutTag>>;
+using Keys = std::vector<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t>>;
 
-Keys keysOf(const std::vector<CutEntry>& cut)
+Keys keysOf(const CutResults& cut)
 {
     Keys k;
     k.reserve(cut.size());
-    for (const CutEntry& e : cut)
-        k.push_back({e.payload, e.instance, e.node.slot, e.node.index,
-                     e.membership, e.tag});
+    const auto append = [&](const std::vector<CutEntry>& entries, uint32_t bucket)
+    {
+        for (const CutEntry& e : entries)
+            k.push_back({bucket, e.instance(), e.nodeHandle.lo, e.nodeHandle.hi});
+    };
+    append(cut.shared, 0);
+    append(cut.currentOnly, 1);
+    append(cut.idealOnly, 2);
     std::sort(k.begin(), k.end());
     return k;
 }
@@ -85,7 +89,7 @@ TEST(Cache, MatchesUncachedOnMovingCamera)
 {
     Scene sc;
     View cache;
-    std::vector<CutEntry> cut;
+    CutResults cut;
     CutParams p{6.0f, 0.0f};
     uint32_t totalReused = 0;
 
@@ -94,7 +98,7 @@ TEST(Cache, MatchesUncachedOnMovingCamera)
         // Continuous motion, no teleports: a few units of drift per frame.
         const Camera v = viewAt(float4::vec(float(f) * 1.5f, float(f) * 0.4f,
                                              float(f) * 6.0f));
-        std::vector<CutEntry> ref;
+        CutResults ref;
         selectCutUncached(*sc.world, v, p, ref);
         cache.selectCut(*sc.world, v, p, cut);
         ASSERT_EQ(keysOf(cut), keysOf(ref)) << "frame " << f;
@@ -110,7 +114,7 @@ TEST(Cache, StationaryCameraReusesAlmostEverything)
 {
     Scene sc;
     View cache;
-    std::vector<CutEntry> cut;
+    CutResults cut;
     CutParams p{6.0f, 0.0f};
     const Camera v = viewAt(float4::vec(0, 0, 0));
 
@@ -128,7 +132,7 @@ TEST(Cache, InstanceMotionInvalidatesOnlyThatInstance)
 {
     Scene sc;
     View cache;
-    std::vector<CutEntry> cut;
+    CutResults cut;
     CutParams p{6.0f, 0.0f};
     const Camera v = viewAt(float4::vec(0, 0, 0));
 
@@ -141,7 +145,7 @@ TEST(Cache, InstanceMotionInvalidatesOnlyThatInstance)
     cache.selectCut(*sc.world, v, p, cut);
     EXPECT_EQ(cache.walked(), 1u);
 
-    std::vector<CutEntry> ref;
+    CutResults ref;
     selectCutUncached(*sc.world, v, p, ref);
     cache.selectCut(*sc.world, v, p, cut);
     EXPECT_EQ(keysOf(cut), keysOf(ref));
@@ -153,7 +157,7 @@ TEST(Cache, DeformInvalidatesOnlyThatInstance)
 {
     Scene sc;
     View cache;
-    std::vector<CutEntry> cut;
+    CutResults cut;
     CutParams p{6.0f, 0.0f};
     const Camera v = viewAt(float4::vec(0, 0, 0));
 
@@ -171,7 +175,7 @@ TEST(Cache, DeformInvalidatesOnlyThatInstance)
     cache.selectCut(*sc.world, v, p, cut);
     EXPECT_EQ(cache.walked(), 1u);
 
-    std::vector<CutEntry> ref;
+    CutResults ref;
     selectCutUncached(*sc.world, v, p, ref);
     cache.selectCut(*sc.world, v, p, cut);
     EXPECT_EQ(keysOf(cut), keysOf(ref));
@@ -183,7 +187,7 @@ TEST(Cache, SharedPageChangeInvalidatesEveryInstanceOfIt)
 {
     Scene sc;
     View cache;
-    std::vector<CutEntry> cut;
+    CutResults cut;
     CutParams p{6.0f, 0.0f};
     const Camera v = viewAt(float4::vec(0, 0, 0));
 
@@ -196,7 +200,7 @@ TEST(Cache, SharedPageChangeInvalidatesEveryInstanceOfIt)
     cache.selectCut(*sc.world, v, p, cut);
     EXPECT_EQ(cache.walked(), visible) << "one shared page changed; all of them stale";
 
-    std::vector<CutEntry> ref;
+    CutResults ref;
     selectCutUncached(*sc.world, v, p, ref);
     cache.selectCut(*sc.world, v, p, cut);
     EXPECT_EQ(keysOf(cut), keysOf(ref));
@@ -214,7 +218,7 @@ TEST(Cache, MatchesUncachedUnderDamping)
 {
     Scene sc;
     View cache(6.0f);
-    std::vector<CutEntry> cut;
+    CutResults cut;
     CameraDamper refDamper(6.0f);
     CutParams p{6.0f, 0.0f};
     std::mt19937 rng(99);
@@ -231,7 +235,7 @@ TEST(Cache, MatchesUncachedUnderDamping)
         // time as camera and damping-envelope travel.
         raw.k *= 0.75f + 0.2f * std::sin(float(f) * 0.13f);
 
-        std::vector<CutEntry> ref;
+        CutResults ref;
         selectCutUncached(*sc.world, refDamper.damp(raw), p, ref);
         cache.selectCut(*sc.world, raw, p, cut);
         ASSERT_EQ(keysOf(cut), keysOf(ref)) << "frame " << f;
@@ -245,14 +249,14 @@ TEST(Cache, UndampedByDefault)
 {
     Scene sc;
     View cache;
-    std::vector<CutEntry> cut;
+    CutResults cut;
     CutParams p{6.0f, 0.0f};
     EXPECT_EQ(cache.halfLife(), 0.0f);
 
     for (int f = 0; f < 8; ++f)
     {
         const Camera raw = viewAt(float4::vec(float(f) * 40.0f, 0.0f, float(f) * 90.0f));
-        std::vector<CutEntry> ref;
+        CutResults ref;
         selectCutUncached(*sc.world, raw, p, ref);
         cache.selectCut(*sc.world, raw, p, cut);
         ASSERT_EQ(keysOf(cut), keysOf(ref)) << "frame " << f;
@@ -267,7 +271,7 @@ TEST(Cache, ResetClearsTheDampingWindow)
 {
     Scene sc;
     View damped(8.0f), fresh;
-    std::vector<CutEntry> dampedCut, freshCut;
+    CutResults dampedCut, freshCut;
     CutParams p{6.0f, 0.0f};
 
     for (int f = 0; f < 12; ++f)
@@ -293,7 +297,7 @@ TEST(Cache, TeleportRewalksAndStaysCorrect)
 {
     Scene sc;
     View cache;
-    std::vector<CutEntry> cut;
+    CutResults cut;
     CutParams p{6.0f, 0.0f};
 
     cache.selectCut(*sc.world, viewAt(float4::vec(0, 0, 0)), p, cut);
@@ -301,7 +305,7 @@ TEST(Cache, TeleportRewalksAndStaysCorrect)
     ASSERT_EQ(cache.walked(), 0u);
 
     const Camera jumped = viewAt(float4::vec(0, 0, 2400.0f));
-    std::vector<CutEntry> ref;
+    CutResults ref;
     selectCutUncached(*sc.world, jumped, p, ref);
     cache.selectCut(*sc.world, jumped, p, cut);
     EXPECT_GT(cache.walked(), cache.reused());
@@ -315,7 +319,7 @@ TEST(Cache, MultipleViewsDoNotInterfere)
 {
     Scene sc;
     View main, shadow;
-    std::vector<CutEntry> mainCut, shadowCut;
+    CutResults mainCut, shadowCut;
     CutParams pm{6.0f, 0.0f}, ps{24.0f, 0.0f};
 
     for (int f = 0; f < 40; ++f)
@@ -323,7 +327,7 @@ TEST(Cache, MultipleViewsDoNotInterfere)
         const Camera vm = viewAt(float4::vec(float(f) * 2.0f, 0, float(f) * 5.0f));
         const Camera vs = viewAt(float4::vec(-float(f) * 3.0f, 120.0f, float(f) * 2.0f));
 
-        std::vector<CutEntry> rm, rs;
+        CutResults rm, rs;
         selectCutUncached(*sc.world, vm, pm, rm);
         selectCutUncached(*sc.world, vs, ps, rs);
         main.selectCut(*sc.world, vm, pm, mainCut);
@@ -340,7 +344,7 @@ TEST(Cache, ThresholdChangesInvalidate)
 {
     Scene sc;
     View cache;
-    std::vector<CutEntry> cut;
+    CutResults cut;
     const Camera v = viewAt(float4::vec(0, 0, 0));
 
     cache.selectCut(*sc.world, v, CutParams{6.0f, 0.0f}, cut);
@@ -350,7 +354,7 @@ TEST(Cache, ThresholdChangesInvalidate)
     cache.selectCut(*sc.world, v, CutParams{3.0f, 0.0f}, cut);
     EXPECT_EQ(cache.reused(), 0u);
 
-    std::vector<CutEntry> ref;
+    CutResults ref;
     selectCutUncached(*sc.world, v, CutParams{3.0f, 0.0f}, ref);
     cache.selectCut(*sc.world, v, CutParams{3.0f, 0.0f}, cut);
     EXPECT_EQ(keysOf(cut), keysOf(ref));
@@ -377,7 +381,7 @@ TEST(Cache, SurvivesStreamingAndInstanceChurn)
     markAllResident(world, rootIds);
 
     View cache;
-    std::vector<CutEntry> cut;
+    CutResults cut;
     CutParams p{5.0f, 0.0f};
     uint32_t reused = 0, attached = 0;
 
@@ -385,7 +389,7 @@ TEST(Cache, SurvivesStreamingAndInstanceChurn)
     {
         const Camera v = viewAt(float4::vec(float(f) * 2.0f, float(f), float(f) * 8.0f));
 
-        std::vector<CutEntry> ref;
+        CutResults ref;
         selectCutUncached(world, v, p, ref);
 
         cache.selectCut(world, v, p, cut);
@@ -393,20 +397,26 @@ TEST(Cache, SurvivesStreamingAndInstanceChurn)
         reused += cache.reused();
 
         // Act on streaming the way a real frame would.
-        for (const CutEntry& entry : cut)
-            if (inIdealCut(entry) && entry.tag == CutTag::Direct &&
-                !world.isResident(entry.node))
-                world.markResident(entry.node);
+        for (const CutEntry& entry : idealCut(cut))
+        {
+            const UserId id = payloadOf(world, entry);
+            const bool expandable = entry.overThreshold() &&
+                                    gen.recipes.count(id) &&
+                                    !world.isAttached(entry.nodeHandle);
+            if (!expandable && !world.isResident(entry.nodeHandle))
+                world.markResident(entry.nodeHandle);
+        }
         if (f % 4 == 0)
-            for (const CutEntry& e : cut)
-                if (inIdealCut(e) && e.tag == CutTag::NeedsExpansion && attached < 8)
+            for (const CutEntry& e : idealCut(cut))
+                if (e.overThreshold() && attached < 8)
                 {
-                    const UserId id = e.payload;
-                    if (gen.recipes.count(id))
+                    const UserId id = payloadOf(world, e);
+                    if (gen.recipes.count(id) && !world.isAttached(e.nodeHandle))
                     {
                         Page child = gen.makeChildPage(id);
                         const uint32_t n = child.nodeCount();
-                        const PageHandle ph = world.attachPage(e.node, std::move(child));
+                        const PageHandle ph = world.attachPage(e.nodeHandle,
+                                                               std::move(child));
                         if (ph.valid())
                         {
                             markAllResident(world, ph, n);
@@ -434,7 +444,7 @@ TEST(Cache, ReuseDoesNotRequirePageUsage)
 {
     Scene sc;
     View cache;
-    std::vector<CutEntry> cut;
+    CutResults cut;
     CutParams p{6.0f, 0.0f};
     const Camera v = viewAt(float4::vec(0, 0, 0));
 
@@ -453,8 +463,8 @@ TEST(Cache, SixViewsSelectConcurrentlyFromOnePublishedWorld)
 
     std::array<View, kViews> serialCtx;
     std::array<View, kViews> parallelCtx;
-    std::array<std::vector<CutEntry>, kViews> serialCut;
-    std::array<std::vector<CutEntry>, kViews> parallelCut;
+    std::array<CutResults, kViews> serialCut;
+    std::array<CutResults, kViews> parallelCut;
 
     for (int frame = 0; frame < 12; ++frame)
     {
@@ -504,7 +514,7 @@ TEST(Cache, SixViewsSelectConcurrentlyFromOnePublishedWorld)
     }
 }
 
-TEST(Cache, ConcurrentViewsClassifyUnifiedCutsIndependently)
+TEST(Cache, ConcurrentViewsClassifyBucketedCutsIndependently)
 {
     constexpr size_t kViews = 6;
     TreeGen gen;
@@ -523,7 +533,7 @@ TEST(Cache, ConcurrentViewsClassifyUnifiedCutsIndependently)
 
     const CutParams params{0.25f, 0.0f};
     std::array<Camera, kViews> views;
-    std::array<std::vector<CutEntry>, kViews> serialCut, parallelCut;
+    std::array<CutResults, kViews> serialCut, parallelCut;
     std::array<View, kViews> contexts;
     for (size_t v = 0; v < kViews; ++v)
     {
@@ -549,7 +559,7 @@ TEST(Cache, ResetForgetsEverythingAndStaysCorrect)
 {
     Scene sc;
     View cache;
-    std::vector<CutEntry> cut;
+    CutResults cut;
     CutParams p{6.0f, 0.0f};
     const Camera v = viewAt(float4::vec(0, 0, 0));
 
@@ -565,7 +575,7 @@ TEST(Cache, ResetForgetsEverythingAndStaysCorrect)
     EXPECT_EQ(cache.walked(), 0u);
     EXPECT_EQ(cache.lastCutStats().instancesVisited, 0u);
 
-    std::vector<CutEntry> ref;
+    CutResults ref;
     selectCutUncached(*sc.world, v, p, ref);
     cache.selectCut(*sc.world, v, p, cut);
     EXPECT_EQ(cache.reused(), 0u);

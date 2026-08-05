@@ -4,6 +4,7 @@
 #include <cmath>
 #include <random>
 #include <set>
+#include <tuple>
 
 #include "helpers.h"
 
@@ -19,7 +20,7 @@ namespace {
 
 struct Outputs
 {
-    std::vector<CutEntry> cut;
+    CutResults cut;
 };
 
 Outputs run(World& w, const Camera& v, const CutParams& p)
@@ -29,12 +30,30 @@ Outputs run(World& w, const Camera& v, const CutParams& p)
     return o;
 }
 
-std::set<UserId> cutIds(const std::vector<CutEntry>& v)
+std::set<UserId> cutIds(World& world, const CutResults& cut)
 {
     std::set<UserId> s;
-    for (const auto& e : v)
-        if (inCurrentCut(e)) s.insert(e.payload);
+    for (const auto& e : currentCut(cut)) s.insert(payloadOf(world, e));
     return s;
+}
+
+using ResultKey = std::tuple<uint32_t, UserPayload, uint8_t, InstanceId,
+                             uint32_t, uint32_t>;
+
+std::vector<ResultKey> resultKeys(World& world, const CutResults& cut)
+{
+    std::vector<ResultKey> keys;
+    keys.reserve(cut.size());
+    const auto append = [&](const std::vector<CutEntry>& entries, uint32_t bucket)
+    {
+        for (const CutEntry& e : entries)
+            keys.emplace_back(bucket, payloadOf(world, e), e.errorCode(),
+                              e.instance(), e.nodeHandle.lo, e.nodeHandle.hi);
+    };
+    append(cut.shared, 0);
+    append(cut.currentOnly, 1);
+    append(cut.idealOnly, 2);
+    return keys;
 }
 
 // Deterministic random world: several instances of a paged tree, a couple of
@@ -105,9 +124,8 @@ Camera randomView(std::mt19937& rng)
 // Structural invariants that must hold for ANY world and ANY camera:
 //   - the current cut is an antichain (no entry is an ancestor of another)
 //     and every entry is resident;
-//   - the ideal cut is an antichain; NeedsExpansion entries are unattached
-//     expansion points and their handles are live;
-//   - every entry carries a live node handle and correct membership.
+//   - the ideal cut is an antichain;
+//   - every entry carries a live compact node handle in the correct bucket.
 // ---------------------------------------------------------------------------
 TEST(Contracts, CutInvariantsHoldOnRandomWorlds)
 {
@@ -127,40 +145,32 @@ TEST(Contracts, CutInvariantsHoldOnRandomWorlds)
             const Camera v = randomView(rng);
             const Outputs o = run(w, v, p);
 
-            const std::set<UserId> cut = cutIds(o.cut);
+            const std::set<UserId> cut = cutIds(w, o.cut);
             ASSERT_EQ(cut.size(), currentCutSize(o.cut))
                 << "duplicate payloads in current cut";
-            for (const auto& e : o.cut)
+            for (const auto& e : currentCut(o.cut))
             {
-                if (!inCurrentCut(e)) continue;
-                EXPECT_TRUE(w.isResident(e.node))
-                    << "current entry " << e.payload << " not resident";
-                EXPECT_FALSE(std::isnan(e.err));
-                for (UserId anc : TA::ancestorIds(w, e.payload))
+                const UserId id = payloadOf(w, e);
+                EXPECT_TRUE(w.isResident(e.nodeHandle))
+                    << "current entry " << id << " not resident";
+                for (UserId anc : TA::ancestorIds(w, id))
                     EXPECT_EQ(cut.count(anc), 0u)
-                        << "cut contains ancestor " << anc << " of " << e.payload;
+                        << "cut contains ancestor " << anc << " of " << id;
             }
 
             std::set<UserId> ideal;
-            for (const auto& e : o.cut)
-                if (inIdealCut(e)) ideal.insert(e.payload);
+            for (const auto& e : idealCut(o.cut)) ideal.insert(payloadOf(w, e));
             ASSERT_EQ(ideal.size(), idealCutSize(o.cut))
                 << "duplicate payloads in ideal";
-            for (const auto& e : o.cut)
+            for (const auto& e : idealCut(o.cut))
             {
-                if (!inIdealCut(e)) continue;
-                for (UserId anc : TA::ancestorIds(w, e.payload))
+                const UserId id = payloadOf(w, e);
+                for (UserId anc : TA::ancestorIds(w, id))
                     EXPECT_EQ(ideal.count(anc), 0u)
-                        << "ideal contains ancestor " << anc << " of " << e.payload;
+                        << "ideal contains ancestor " << anc << " of " << id;
 
-                const NodeHandle found = TA::requireByScan(w, e.payload);
-                EXPECT_EQ(found.slot, e.node.slot);
-                EXPECT_EQ(found.index, e.node.index);
-                if (e.tag == CutTag::NeedsExpansion)
-                {
-                    EXPECT_TRUE(TA::pageOf(w, e.payload).isExpansion(found.index));
-                    EXPECT_FALSE(w.isAttached(e.node));
-                }
+                const NodeHandle found = TA::requireByScan(w, id);
+                EXPECT_EQ(found, e.nodeHandle);
             }
         }
     }
@@ -168,7 +178,7 @@ TEST(Contracts, CutInvariantsHoldOnRandomWorlds)
 
 // ---------------------------------------------------------------------------
 // Identical inputs must give byte-identical outputs: same world construction
-// + same camera path => the same unified sequence, in the same order,
+// + same camera path => the same three bucket sequences, in the same order,
 // with bit-equal errors. (No unordered containers or pointers may leak into
 // the traversal order.)
 // ---------------------------------------------------------------------------
@@ -191,22 +201,14 @@ TEST(Contracts, DeterministicAcrossIdenticalWorlds)
             const Outputs oa = run(a.w, va, p);
             const Outputs ob = run(b.w, vb, p);
 
-            ASSERT_EQ(oa.cut.size(), ob.cut.size()) << "seed " << seed << " frame " << frame;
-            for (size_t i = 0; i < oa.cut.size(); ++i)
-            {
-                EXPECT_EQ(oa.cut[i].payload, ob.cut[i].payload) << "pos " << i;
-                EXPECT_EQ(oa.cut[i].err, ob.cut[i].err) << "pos " << i;   // bit-equal
-                EXPECT_EQ(oa.cut[i].membership, ob.cut[i].membership);
-                EXPECT_EQ(oa.cut[i].tag, ob.cut[i].tag);
-                EXPECT_EQ(oa.cut[i].node.slot, ob.cut[i].node.slot);
-                EXPECT_EQ(oa.cut[i].node.index, ob.cut[i].node.index);
-            }
+            EXPECT_EQ(resultKeys(a.w, oa.cut), resultKeys(b.w, ob.cut))
+                << "seed " << seed << " frame " << frame;
         }
     }
 }
 
-// Parallel workers preserve the exact unified-cut order and classifications.
-TEST(Contracts, ParallelSelectionMatchesSerialUnifiedCut)
+// Parallel workers preserve the exact per-bucket order and classifications.
+TEST(Contracts, ParallelSelectionMatchesSerialBucketedCut)
 {
     TreeGen gen;
     gen.fanout = 4;
@@ -238,14 +240,7 @@ TEST(Contracts, ParallelSelectionMatchesSerialUnifiedCut)
     const Outputs b = run(parallel, view, params);
 
     ASSERT_FALSE(a.cut.empty());
-    ASSERT_EQ(b.cut.size(), a.cut.size());
-    for (size_t i = 0; i < a.cut.size(); ++i)
-    {
-        EXPECT_EQ(b.cut[i].payload, a.cut[i].payload);
-        EXPECT_EQ(b.cut[i].node.index, a.cut[i].node.index);
-        EXPECT_EQ(b.cut[i].membership, a.cut[i].membership);
-        EXPECT_EQ(b.cut[i].tag, a.cut[i].tag);
-    }
+    EXPECT_EQ(resultKeys(parallel, b.cut), resultKeys(serial, a.cut));
 }
 
 TEST(Contracts, ViewBindsToOneWorldUntilReset)
@@ -259,7 +254,7 @@ TEST(Contracts, ViewBindsToOneWorldUntilReset)
     const Camera camera = makeLookAtCamera(float4::point(0, 0, -10),
                                            float4::point(0, 0, 0));
     const CutParams params{4.0f, 0.0f};
-    std::vector<CutEntry> cut;
+    CutResults cut;
     View view;
 
     EXPECT_NO_THROW(view.selectCut(publishedFirst, camera, params, cut));
@@ -277,7 +272,7 @@ TEST(Contracts, ViewRequiresPublishedWorld)
     const Camera camera = makeLookAtCamera(float4::point(0, 0, -10),
                                            float4::point(0, 0, 0));
     const CutParams params{4.0f, 0.0f};
-    std::vector<CutEntry> cut;
+    CutResults cut;
 
     EXPECT_THROW(view.selectCut(world, camera, params, cut), std::logic_error);
     world.applyUpdates();
@@ -319,21 +314,16 @@ TEST(Contracts, MultiCameraDamperIsolation)
         const Camera vB = makeLookAtCamera(
             float4::point(-std::sin(t) * 90, 25, std::cos(t) * 90), float4::point(30, 0, -20));
 
-        std::vector<CutEntry> cutA, cutB, cutAlone, cutBlone;
+        CutResults cutA, cutB, cutAlone, cutBlone;
         selectCutUncached(both.w, dA.damp(vA), p, cutA);
         selectCutUncached(both.w, dB.damp(vB), p, cutB);   // interleaved with A every frame
         selectCutUncached(onlyA.w, dAlone.damp(vA), p, cutAlone);
         selectCutUncached(onlyB.w, dBlone.damp(vB), p, cutBlone);
 
-        ASSERT_EQ(cutA.size(), cutAlone.size()) << "frame " << frame;
-        for (size_t i = 0; i < cutA.size(); ++i)
-        {
-            EXPECT_EQ(cutA[i].payload, cutAlone[i].payload) << "frame " << frame;
-            EXPECT_EQ(cutA[i].err, cutAlone[i].err);
-        }
-        ASSERT_EQ(cutB.size(), cutBlone.size()) << "frame " << frame;
-        for (size_t i = 0; i < cutB.size(); ++i)
-            EXPECT_EQ(cutB[i].payload, cutBlone[i].payload) << "frame " << frame;
+        EXPECT_EQ(resultKeys(both.w, cutA), resultKeys(onlyA.w, cutAlone))
+            << "frame " << frame;
+        EXPECT_EQ(resultKeys(both.w, cutB), resultKeys(onlyB.w, cutBlone))
+            << "frame " << frame;
     }
 }
 
@@ -361,7 +351,7 @@ TEST(Contracts, StaleInstanceRefIsIgnored)
 
     w.applyUpdates();
     const Camera v = makeLookAtCamera(float4::point(0, 0, -30), float4::point(0, 0, 0));
-    std::vector<CutEntry> cut;
+    CutResults cut;
     selectCutUncached(w, v, {4, 0}, cut);
     ASSERT_FALSE(cut.empty());
 
@@ -413,9 +403,8 @@ TEST(Contracts, PointLeavesMatchReference)
     const RefResult want = TA::referenceCut(w, v, p);
 
     std::set<UserId> wantIds;
-    for (const auto& e : want.cut)
-        if (inCurrentCut(e)) wantIds.insert(e.payload);
-    EXPECT_EQ(cutIds(o.cut), wantIds);
+    for (const auto& e : currentCut(want.cut)) wantIds.insert(payloadOf(w, e));
+    EXPECT_EQ(cutIds(w, o.cut), wantIds);
     EXPECT_FALSE(o.cut.empty());
 }
 
@@ -440,12 +429,13 @@ TEST(Contracts, CameraInsideTreeMatchesReference)
     const RefResult want = TA::referenceCut(w, v, p);
 
     ASSERT_FALSE(o.cut.empty());
-    for (const auto& e : o.cut) EXPECT_FALSE(std::isnan(e.err)) << e.payload;
+    for (const auto& e : currentCut(o.cut))
+        EXPECT_TRUE(std::isfinite(e.approximateError(p.threshold)))
+            << payloadOf(w, e);
 
     std::set<UserId> wantIds;
-    for (const auto& e : want.cut)
-        if (inCurrentCut(e)) wantIds.insert(e.payload);
-    EXPECT_EQ(cutIds(o.cut), wantIds);
+    for (const auto& e : currentCut(want.cut)) wantIds.insert(payloadOf(w, e));
+    EXPECT_EQ(cutIds(w, o.cut), wantIds);
 }
 
 // A world far from the origin (1e6 units out): absolute-coordinate math must
@@ -468,9 +458,8 @@ TEST(Contracts, FarFromOriginMatchesReference)
     const RefResult want = TA::referenceCut(w, v, p);
 
     std::set<UserId> wantIds;
-    for (const auto& e : want.cut)
-        if (inCurrentCut(e)) wantIds.insert(e.payload);
-    EXPECT_EQ(cutIds(o.cut), wantIds);
+    for (const auto& e : currentCut(want.cut)) wantIds.insert(payloadOf(w, e));
+    EXPECT_EQ(cutIds(w, o.cut), wantIds);
     EXPECT_FALSE(o.cut.empty());
 }
 
@@ -496,9 +485,8 @@ TEST(Contracts, ScaledInstanceMatchesReference)
         const RefResult want = TA::referenceCut(w, v, p);
 
         std::set<UserId> wantIds;
-        for (const auto& e : want.cut)
-            if (inCurrentCut(e)) wantIds.insert(e.payload);
-        EXPECT_EQ(cutIds(o.cut), wantIds) << "scale " << scale;
+        for (const auto& e : currentCut(want.cut)) wantIds.insert(payloadOf(w, e));
+        EXPECT_EQ(cutIds(w, o.cut), wantIds) << "scale " << scale;
         EXPECT_FALSE(o.cut.empty()) << "scale " << scale;
     }
 }
@@ -535,6 +523,58 @@ TEST(Contracts, NonFiniteBoundsRejected)
 // survive refactors but tight enough to flag a new hot-array or a hash map
 // sneaking back in.
 // ---------------------------------------------------------------------------
+TEST(Contracts, CompactCutRepresentation)
+{
+    EXPECT_EQ(sizeof(NodeHandle), 8u);
+    EXPECT_EQ(sizeof(CutEntry), 12u);
+
+    const NodeHandle handle{NodeHandle::kInvalidSlot - 1,
+                            NodeHandle::kIndexMask,
+                            NodeHandle::kGenerationMask};
+    EXPECT_TRUE(handle.valid());
+    EXPECT_EQ(handle.slot(), NodeHandle::kInvalidSlot - 1);
+    EXPECT_EQ(handle.index(), NodeHandle::kIndexMask);
+    EXPECT_EQ(handle.generation(), NodeHandle::kGenerationMask);
+
+    constexpr float threshold = 4.0f;
+    EXPECT_LT(encodeCutError(threshold, threshold), kCutErrorThreshold);
+    EXPECT_LT(encodeCutError(std::nextafter(threshold, 0.0f), threshold),
+              kCutErrorThreshold);
+    EXPECT_GE(encodeCutError(std::nextafter(
+                  threshold, std::numeric_limits<float>::infinity()), threshold),
+              kCutErrorThreshold);
+
+    uint8_t previous = 0;
+    for (float error : {0.0f, 0.01f, 0.25f, 1.0f, 3.99f, 4.0f,
+                        4.01f, 8.0f, 64.0f, 1.0e20f})
+    {
+        const uint8_t code = encodeCutError(error, threshold);
+        EXPECT_GE(code, previous);
+        previous = code;
+    }
+
+    const CutEntry entry{handle, 8.0f, threshold, kInvalidInstanceId - 1};
+    EXPECT_EQ(entry.nodeHandle, handle);
+    EXPECT_EQ(entry.instance(), kInvalidInstanceId - 1);
+    EXPECT_TRUE(entry.overThreshold());
+    EXPECT_TRUE(std::isfinite(entry.approximateError(threshold)));
+
+    CutEntry sharedStorage[1];
+    CutEntry currentStorage[1];
+    CutEntry idealStorage[1];
+    CutResultSink sink{Sink<CutEntry>{sharedStorage, 1},
+                       Sink<CutEntry>{currentStorage, 1},
+                       Sink<CutEntry>{idealStorage, 1}};
+    sink.shared.push(entry);
+    sink.shared.push(entry);
+    sink.currentOnly.push(entry);
+    sink.idealOnly.push(entry);
+    EXPECT_EQ(sink.shared.count(), 1u);
+    EXPECT_EQ(sink.shared.dropped(), 1u);
+    EXPECT_EQ(sink.currentOnly.count(), 1u);
+    EXPECT_EQ(sink.idealOnly.count(), 1u);
+}
+
 TEST(Contracts, MemoryBudgets)
 {
     TreeGen gen8;

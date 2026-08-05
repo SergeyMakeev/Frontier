@@ -31,9 +31,11 @@
 //    containing its root PageHandle, and attachPage returns a PageHandle.
 //    Node handles are composed from a page handle plus the packed page-local
 //    index, which is immutable after build.
-//  - selectCut outputs carry a NodeHandle wherever the caller might act on
-//    the entry (payload residency or topology expansion).
-//  - the 64-bit UserPayload is opaque: echoed in outputs, never interpreted.
+//  - selectCut outputs carry a compact NodeHandle wherever the caller might
+//    act on the entry (payload residency or topology expansion).
+//  - the 64-bit UserPayload stays in immutable page data and can be resolved
+//    from a live NodeHandle when the caller needs it; it is not copied into
+//    every cut entry.
 // A handle dies with its page (detachPage / collect). Stale handles are
 // detected by the generation stamp: mutating calls ignore them, queries
 // report them absent — the normal race between streaming completion and GC.
@@ -76,58 +78,123 @@ struct PageHandle
     bool valid() const { return slot != kInvalidIndex; }
 };
 
-// Resolved node reference: page slot + node index + generation stamp.
+// Resolved node reference: page slot + node index + generation stamp, packed
+// into 64 bits. A mount slot and a page-local node index each get 20 bits; the
+// remaining 24 bits are a per-slot generation. The invalid slot code is
+// reserved, so a stale handle cannot alias a live mount until that one slot
+// has itself been recycled more than 16 million times.
 struct NodeHandle
 {
-    uint32_t slot = kInvalidIndex;
-    uint32_t index = 0;
-    uint32_t generation = 0;
-    bool valid() const { return slot != kInvalidIndex; }
+    static constexpr uint32_t kSlotBits = 20;
+    static constexpr uint32_t kIndexBits = 20;
+    static constexpr uint32_t kGenerationBits = 24;
+    static constexpr uint32_t kSlotMask = (1u << kSlotBits) - 1u;
+    static constexpr uint32_t kIndexMask = (1u << kIndexBits) - 1u;
+    static constexpr uint32_t kGenerationMask = (1u << kGenerationBits) - 1u;
+    static constexpr uint32_t kInvalidSlot = kSlotMask;
+
+    uint32_t lo = kInvalidSlot;
+    uint32_t hi = 0;
+
+    constexpr NodeHandle() = default;
+    constexpr NodeHandle(uint32_t slot, uint32_t index, uint32_t generation)
+        : lo((slot & kSlotMask) | ((index & 0xfffu) << kSlotBits)),
+          hi(((index >> 12) & 0xffu) |
+             ((generation & kGenerationMask) << 8))
+    {}
+
+    constexpr uint32_t slot() const { return lo & kSlotMask; }
+    constexpr uint32_t index() const
+    {
+        return ((lo >> kSlotBits) & 0xfffu) | ((hi & 0xffu) << 12);
+    }
+    constexpr uint32_t generation() const { return hi >> 8; }
+    constexpr bool valid() const { return slot() != kInvalidSlot; }
+
+    friend constexpr bool operator==(NodeHandle a, NodeHandle b)
+    {
+        return a.lo == b.lo && a.hi == b.hi;
+    }
 };
+static_assert(sizeof(NodeHandle) == 8, "NodeHandle must stay 64 bits");
 
 inline NodeHandle nodeAt(PageHandle page, uint32_t index)
 {
     return NodeHandle{page.slot, index, page.generation};
 }
 
-// Every entry belongs to the current render cut, the fully-resident ideal cut,
-// or both. Shared entries are emitted once, so filtering CurrentOnly|Shared
-// yields the current cut and IdealOnly|Shared yields the ideal cut.
-enum class CutMembership : uint8_t
-{
-    CurrentOnly,
-    IdealOnly,
-    Shared,
-};
+using InstanceId = uint32_t;
+inline constexpr uint32_t kInstanceIdBits = 24;
+inline constexpr InstanceId kInstanceIdMask = (1u << kInstanceIdBits) - 1u;
+inline constexpr InstanceId kInvalidInstanceId = kInstanceIdMask;
+inline constexpr uint8_t kCutErrorThreshold = 128;
 
-enum class CutTag : uint8_t
-{
-    Direct,          // concrete node in known topology
-    NeedsExpansion,  // collapsed and too coarse; this tag IS the expansion request
-};
+// Threshold-relative logarithmic error. Codes [0, 127] are at or below the
+// selection threshold and [128, 255] are above it. The boundary decision is
+// exact even though magnitude is quantized; roughly eight codes cover each
+// power-of-two step away from the threshold.
+uint8_t encodeCutError(float error, float threshold);
+float   decodeCutError(uint8_t code, float threshold);
 
-// `instance` is the caller's tag from InstanceDesc. A result is associated
-// with both its shared node and its instance placement; payloads and caller
-// tags are opaque values and may be duplicated.
+// A cut entry is deliberately 12 bytes: one logical 64-bit node handle plus
+// a packed 24-bit dense InstanceId and 8-bit screen-error code. User payloads
+// and application entity data stay in caller-side tables indexed by the dense
+// instance id, rather than being repeated in every view's cut.
 struct CutEntry
 {
-    UserPayload payload;
-    NodeHandle  node;
-    float       err;
-    uint32_t    instance;
-    CutMembership membership;
-    CutTag        tag;
+    NodeHandle nodeHandle;
+    uint32_t   instanceAndError = kInvalidInstanceId;
+
+    CutEntry() = default;
+    CutEntry(NodeHandle node, float error, float threshold, InstanceId instance)
+        : nodeHandle(node),
+          instanceAndError((instance & kInstanceIdMask) |
+                           (uint32_t(encodeCutError(error, threshold)) <<
+                            kInstanceIdBits))
+    {}
+    CutEntry(NodeHandle node, uint8_t encodedError, InstanceId instance)
+        : nodeHandle(node),
+          instanceAndError((instance & kInstanceIdMask) |
+                           (uint32_t(encodedError) << kInstanceIdBits))
+    {}
+
+    InstanceId instance() const { return instanceAndError & kInstanceIdMask; }
+    uint8_t errorCode() const
+    {
+        return uint8_t(instanceAndError >> kInstanceIdBits);
+    }
+    bool overThreshold() const { return errorCode() >= kCutErrorThreshold; }
+    float approximateError(float threshold) const
+    {
+        return decodeCutError(errorCode(), threshold);
+    }
 };
+static_assert(sizeof(CutEntry) == 12, "CutEntry must stay 12 bytes");
 
-inline bool inCurrentCut(const CutEntry& entry)
+// One traversal produces both realities without per-entry tags. The current
+// render cut is shared + currentOnly. The fully-resident ideal frontier is
+// shared + idealOnly. A high-error leaf on that ideal side is enough for caller-side
+// policy to decide whether its external content graph can expand it.
+struct CutResults
 {
-    return entry.membership != CutMembership::IdealOnly;
-}
+    std::vector<CutEntry> shared;
+    std::vector<CutEntry> currentOnly;
+    std::vector<CutEntry> idealOnly;
 
-inline bool inIdealCut(const CutEntry& entry)
-{
-    return entry.membership != CutMembership::CurrentOnly;
-}
+    void clear()
+    {
+        shared.clear();
+        currentOnly.clear();
+        idealOnly.clear();
+    }
+    size_t currentSize() const { return shared.size() + currentOnly.size(); }
+    size_t idealSize() const { return shared.size() + idealOnly.size(); }
+    size_t size() const
+    {
+        return shared.size() + currentOnly.size() + idealOnly.size();
+    }
+    bool empty() const { return size() == 0; }
+};
 
 struct CutParams
 {
@@ -135,20 +202,10 @@ struct CutParams
     float minPix    = 0.0f;   // contribution culling at the top level; 0 = off
 };
 
-using InstanceId = uint32_t;
-
-// InstanceDesc::tag sentinel: echo the World's own InstanceId in CutEntry.
-inline constexpr uint32_t kAutoTag = kInvalidIndex;
-
 struct InstanceDesc
 {
     float4   pos{};
     float    scale = 1.0f;
-
-    // Echoed in CutEntry::instance. Whatever the
-    // caller wants it to mean: a transform index, an entity id, a draw-list
-    // slot. kAutoTag echoes the InstanceId instead.
-    uint32_t tag = kAutoTag;
 
     // ANDed against Camera::viewMask; a zero result culls the instance at
     // the top level. Cheap layer visibility: shadow-only props, editor-only
@@ -227,7 +284,22 @@ private:
     uint32_t        dropped_ = 0;
 };
 
-using CutSink     = Sink<CutEntry>;
+struct CutResultSink
+{
+    Sink<CutEntry> shared;
+    Sink<CutEntry> currentOnly;
+    Sink<CutEntry> idealOnly;
+
+    CutResultSink() = default;
+    explicit CutResultSink(CutResults& out)
+        : shared(out.shared), currentOnly(out.currentOnly), idealOnly(out.idealOnly)
+    {}
+    CutResultSink(Sink<CutEntry> sharedSink,
+                  Sink<CutEntry> currentOnlySink,
+                  Sink<CutEntry> idealOnlySink)
+        : shared(sharedSink), currentOnly(currentOnlySink), idealOnly(idealOnlySink)
+    {}
+};
 
 // Traversal counters, filled only when the library is built with HLOD_STATS.
 struct CutStats
@@ -342,22 +414,22 @@ private:
 // the per-instance fixed cost (resolve the instance, transform the view, touch
 // the root page) was being paid over and over for an answer that never moved.
 //
-// FLAT OUTPUT
-// -----------
-// Cached and uncached modes write the same contiguous CutEntry sequence.
-// Reused entries are copied from View-owned storage into the caller's flat
-// output; no World-owned mutable query state is involved.
+// BUCKETED OUTPUT
+// ---------------
+// Cached and uncached modes write the same three CutEntry sequences. Reused
+// entries are copied from View-owned storage into the matching caller bucket;
+// no World-owned mutable query state is involved.
 //
 // WHAT IS EXACT AND WHAT IS NOT
 // -----------------------------
 // The set of emitted nodes is exactly what an uncached selectCut would emit.
-// CutEntry::err is not: it is the value from the recorded camera position, so
-// it is stale by at most the margin expressed in error units. Use it for
-// prioritisation and dithering, which is what it is for; do not expect it to
-// be bit-identical to the uncached path.
+// The compact error code is recorded with that cut and may therefore be stale
+// within the proven margin. It remains useful for coarse prioritisation and
+// threshold classification; do not expect a cached result to reproduce a
+// freshly measured pixel error.
 //
-// Streaming and residency are part of the recorded unified cut. Page content
-// versions invalidate a record when any page it depended on changes. Instances
+// Streaming and residency are part of the recorded three-bucket result. Page
+// content versions invalidate a record when any page it depended on changes. Instances
 // that cross more page dependencies than the compact record can hold are
 // simply re-walked.
 // ---------------------------------------------------------------------------
@@ -398,15 +470,15 @@ public:
     // the same const World concurrently. A View binds to the first World it
     // queries and reset() releases that binding.
     void selectCut(const World& world, const Camera& camera,
-                   const CutParams& params, CutSink& outCut);
+                   const CutParams& params, CutResultSink& outCut);
     void selectCut(const World& world, const Camera& camera,
                    const CutParams& params, PageUsageContext& usage,
-                   CutSink& outCut);
+                   CutResultSink& outCut);
     void selectCut(const World& world, const Camera& camera,
-                   const CutParams& params, std::vector<CutEntry>& outCut);
+                   const CutParams& params, CutResults& outCut);
     void selectCut(const World& world, const Camera& camera,
                    const CutParams& params, PageUsageContext& usage,
-                   std::vector<CutEntry>& outCut);
+                   CutResults& outCut);
 
     // Forget everything: the damping window and every record. Call it on a
     // teleport or camera cut. Reuse never *requires* this -- every record
@@ -452,7 +524,9 @@ private:
         uint32_t epoch = 0;          // cache epoch (threshold generation)
         uint32_t cutVersion = 0;     // unique instance transform/deform version
         uint32_t begin = 0;          // block in store_
-        uint32_t count = 0;
+        // Three 10-bit counts for [shared, currentOnly, idealOnly]. A record
+        // with more than 1023 entries in any one bucket is simply not cached.
+        uint32_t counts = 0;
         uint32_t capacity = 0;
         uint32_t depSlot[kMaxDeps]{};
         uint32_t depVersion[kMaxDeps]{};
@@ -609,10 +683,10 @@ public:
     // moveInstance / removeInstance safe no-ops.
     struct InstanceRef
     {
-        InstanceId id = kInvalidIndex;
+        InstanceId id = kInvalidInstanceId;
         uint32_t   generation = 0;
         PageHandle rootPage;
-        bool valid() const { return id != kInvalidIndex; }
+        bool valid() const { return id != kInvalidInstanceId; }
     };
 
     // During initial assembly, additions are accumulated for the first build.
@@ -632,8 +706,9 @@ public:
     void moveInstance(InstanceRef ref, float4 pos, float scale = 1.0f);      // no-op if stale
 
     // ---- topology streaming -------------------------------------------------
-    // The expansion handle comes from a CutEntry{NeedsExpansion} (or is
-    // composed via nodeAt). attachPage returns an invalid PageHandle if the
+    // An expansion handle comes from a high-error ideal-side CutEntry (or is
+    // composed via nodeAt after consulting the caller's content graph).
+    // attachPage returns an invalid PageHandle if the
     // expansion handle went stale while the page was being built (its parent
     // page was detached/collected) — drop the page in that case. It fires
     // HLOD_FATAL only on true contract violations (not an expansion point,
@@ -660,6 +735,10 @@ public:
     void markResident(NodeHandle h);
     void markNonResident(NodeHandle h);
     bool isResident(NodeHandle h) const;
+
+    // Resolve immutable application payload data for a live cut handle. The
+    // false case is the normal async race with page detach/collection.
+    bool tryGetPayload(NodeHandle h, UserPayload& outPayload) const;
 
     // ---- motion --------------------------------------------------------------
     // Record new local-space bounds for one node OF ONE INSTANCE: a bounds
@@ -832,7 +911,6 @@ private:
         std::vector<OverlayRef> overlays;   // sorted by slot; usually empty
         float    scale = 1.0f;
         uint32_t rootSlot = kInvalidIndex;
-        uint32_t tag = 0;
         uint32_t generation = 0;   // stamps InstanceRefs; bumped per reuse
         // Bumped when this instance moves, is rescaled, or is deformed. A
         // deform always privatises bounds into this instance's own overlay, so
@@ -914,9 +992,19 @@ private:
         // Backing storage for the parallel path, where each worker collects
         // into its own vectors; the serial path points the sinks straight at
         // the caller's output instead.
-        std::vector<CutEntry> cutBuf;
+        CutResults cutBuf;
 
-        CutSink cut;
+        CutResultSink cut;
+
+        void emit(const CutEntry& entry, bool current, bool ideal)
+        {
+            if (current && ideal)
+                cut.shared.push(entry);
+            else if (current)
+                cut.currentOnly.push(entry);
+            else
+                cut.idealOnly.push(entry);
+        }
 
         std::vector<uint32_t> touched;      // page dependencies / optional usage
         bool trackTouches = false;
@@ -929,6 +1017,7 @@ private:
         float margin = FLT_MAX;   // min distance to a decision flip so far
         float maxError = 0.0f;    // max effective error among decided nodes
         float bar = 0.0f;         // params.threshold, for the margin arithmetic
+        float barInv = 0.0f;      // reciprocal, so output quantization never divides
     };
 
     // ---- helpers ----
@@ -1017,15 +1106,15 @@ private:
     void runPage(const WorkItem& item, const Instance& inst, const Camera& local,
                  const CutParams& params, Worker& w) const;
     void wideVisit(const WorkItem& item, const PageView& pg, float errClamp,
-                   uint32_t gen, uint32_t tag, uint32_t node, uint8_t mask,
+                   uint32_t gen, InstanceId instance, uint32_t node, uint8_t mask,
                    uint8_t currentKids, uint8_t idealKids,
                    const Camera& local, Worker& w) const;
     void selectCutCached(const Camera& camera, const CutParams& params,
                          View& view, PageUsageContext* usage,
-                         CutSink& outCut) const;
+                         CutResultSink& outCut) const;
     void selectCutUncached(const Camera& camera, const CutParams& params,
                            View& view, PageUsageContext* usage,
-                           CutSink& outCut) const;
+                           CutResultSink& outCut) const;
     void recordPageUsage(PageUsageContext& usage, uint32_t slot) const;
 
     // ---- state ----

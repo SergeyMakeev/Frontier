@@ -47,8 +47,15 @@ struct UncachedView : View
 struct Outputs
 {
     UncachedView view;
-    std::vector<CutEntry> cut;
+    CutResults cut;
 };
+
+void consumeCut(const CutResults& cut)
+{
+    benchmark::DoNotOptimize(cut.shared.data());
+    benchmark::DoNotOptimize(cut.currentOnly.data());
+    benchmark::DoNotOptimize(cut.idealOnly.data());
+}
 
 Camera orbitView(float t, float dist, float4 center = float4::point(0, 0, 0))
 {
@@ -74,48 +81,59 @@ struct XorShift32
     }
 };
 
-// Attach up to `budget` requested expansions, most-visible (largest screen
+// Attach up to `budget` candidate expansions, most-visible (largest screen
 // error) first. The order of ideal-cut entries is traversal-defined, so a
 // streaming policy must prioritize by err — picking "the first N" makes the
 // attach set depend on walk order and over-refines wherever the walk went
 // deep first (measurably worse: the hot set churns instead of converging).
 size_t attachTopByPriority(World& w, TreeGen& gen,
-                           const std::vector<CutEntry>& cut, size_t budget)
+                           const CutResults& cut, size_t budget)
 {
-    static std::vector<uint32_t> idx;
-    idx.clear();
-    for (uint32_t i = 0; i < cut.size(); ++i)
-        if (inIdealCut(cut[i]) && cut[i].tag == CutTag::NeedsExpansion &&
-            gen.recipes.count(cut[i].payload))
-            idx.push_back(i);
-    const size_t take = idx.size() < budget ? idx.size() : budget;
-    std::partial_sort(idx.begin(), idx.begin() + ptrdiff_t(take), idx.end(),
-                      [&](uint32_t a, uint32_t b) { return cut[a].err > cut[b].err; });
+    static std::vector<const CutEntry*> candidates;
+    candidates.clear();
+    const auto gather = [&](const std::vector<CutEntry>& entries)
+    {
+        for (const CutEntry& entry : entries)
+        {
+            const UserId id = payloadOf(w, entry);
+            if (entry.overThreshold() && gen.recipes.count(id) &&
+                !w.isAttached(entry.nodeHandle))
+                candidates.push_back(&entry);
+        }
+    };
+    gather(cut.shared);
+    gather(cut.idealOnly);
+    const size_t take = candidates.size() < budget ? candidates.size() : budget;
+    std::partial_sort(candidates.begin(), candidates.begin() + ptrdiff_t(take),
+                      candidates.end(),
+                      [](const CutEntry* a, const CutEntry* b) {
+                          return a->errorCode() > b->errorCode();
+                      });
     for (size_t j = 0; j < take; ++j)
     {
         // Production flow: content is keyed by payload, attach by handle.
-        const CutEntry& e = cut[idx[j]];
-        Page child = gen.makeChildPage(e.payload);
+        const CutEntry& e = *candidates[j];
+        Page child = gen.makeChildPage(payloadOf(w, e));
         const uint32_t n = child.nodeCount();
-        const PageHandle ph = w.attachPage(e.node, std::move(child));
+        const PageHandle ph = w.attachPage(e.nodeHandle, std::move(child));
         if (ph.valid()) markAllResident(w, ph, n);   // payload streaming is instant
     }
     return take;
 }
 
-// Example streaming policy: make every direct ideal-cut payload resident.
+// Example streaming policy: make every ideal-cut payload resident.
 // A production streamer would normally deduplicate shared payload ids, apply
 // priorities/budgets, and complete these calls asynchronously.
-size_t makeIdealResident(World& w, const std::vector<CutEntry>& cut)
+size_t makeIdealResident(World& w, const CutResults& cut)
 {
-    size_t currentCount = 0;
-    for (const CutEntry& e : cut)
+    const auto mark = [&](const std::vector<CutEntry>& entries)
     {
-        currentCount += size_t(inCurrentCut(e));
-        if (inIdealCut(e) && e.tag == CutTag::Direct && !w.isResident(e.node))
-            w.markResident(e.node);
-    }
-    return currentCount;
+        for (const CutEntry& e : entries)
+            if (!w.isResident(e.nodeHandle)) w.markResident(e.nodeHandle);
+    };
+    mark(cut.shared);
+    mark(cut.idealOnly);
+    return cut.currentSize();
 }
 
 // Add a root page and mark every node resident (handles composed from the
@@ -162,7 +180,7 @@ static void BM_DeepTree_StaticCamera(benchmark::State& state)
     {
         w.applyUpdates();
         o.view.selectCut(w, v, p, o.cut);
-        benchmark::DoNotOptimize(o.cut.data());
+        consumeCut(o.cut);
     }
     state.counters["cut"] = double(o.cut.size());
 }
@@ -175,7 +193,7 @@ static void BM_DeepTree_CutOnly(benchmark::State& state)
     UncachedView selection;
     const auto wp = makeDeepWorld(8, uint32_t(state.range(0)));
     World& w = *wp;
-    std::vector<CutEntry> cut;
+    CutResults cut;
     const Camera v = orbitView(0.7f, 2500.0f);
     const CutParams p{4.0f, 0.0f};
 
@@ -183,7 +201,7 @@ static void BM_DeepTree_CutOnly(benchmark::State& state)
     {
         w.applyUpdates();
         selection.selectCut(w, v, p, cut);
-        benchmark::DoNotOptimize(cut.data());
+        consumeCut(cut);
     }
     state.counters["cut"] = double(cut.size());
 }
@@ -209,7 +227,7 @@ static void BM_DeepTree_FlyThrough(benchmark::State& state)
         const Camera v = orbitView(t, dist);
         w.applyUpdates();
         o.view.selectCut(w, v, p, o.cut);
-        benchmark::DoNotOptimize(o.cut.data());
+        consumeCut(o.cut);
         cutTotal += o.cut.size();
         ++frames;
     }
@@ -248,7 +266,7 @@ static void BM_DeepTree_FlyThroughDamped(benchmark::State& state)
         const Camera v = damper.damp(orbitView(t, dist));
         w.applyUpdates();
         o.view.selectCut(w, v, p, o.cut);
-        benchmark::DoNotOptimize(o.cut.data());
+        consumeCut(o.cut);
         cutTotal += o.cut.size();
         ++frames;
     }
@@ -291,7 +309,7 @@ static void BM_PagedPlanet_StreamingFly(benchmark::State& state)
         attaches += attachTopByPriority(w, gen, o.cut, 8);
         makeIdealResident(w, o.cut);
         w.collect(usage, pageBudget, 16);
-        benchmark::DoNotOptimize(o.cut.data());
+        consumeCut(o.cut);
     }
     state.counters["attached"] = double(w.attachedPageCount());
     state.counters["attaches"] = double(attaches);
@@ -341,7 +359,7 @@ static void BM_GcStress_FastFlythrough(benchmark::State& state)
 
         cutTotal += currentCount;
         ++frames;
-        benchmark::DoNotOptimize(o.cut.data());
+        consumeCut(o.cut);
     }
     state.counters["attached"] = double(w.attachedPageCount());
     state.counters["attach_pf"] = double(attaches) / double(frames ? frames : 1);
@@ -378,7 +396,7 @@ static void BM_ManyShallowTrees(benchmark::State& state)
         const Camera v = orbitView(t, area * 0.4f);
         w.applyUpdates();
         o.view.selectCut(w, v, p, o.cut);
-        benchmark::DoNotOptimize(o.cut.data());
+        consumeCut(o.cut);
     }
     state.counters["cut"] = double(o.cut.size());
 }
@@ -426,7 +444,7 @@ static void BM_MovingInstances(benchmark::State& state)
         const Camera v = orbitView(t, area * 0.4f);
         w.applyUpdates();
         o.view.selectCut(w, v, p, o.cut);
-        benchmark::DoNotOptimize(o.cut.data());
+        consumeCut(o.cut);
     }
 }
 BENCHMARK(BM_MovingInstances)
@@ -588,7 +606,7 @@ static void BM_LeafMotion_TeleportWithCut(benchmark::State& state)
         const Camera v = orbitView(t, mw.half * 2.0f);
         mw.world.applyUpdates();
         o.view.selectCut(mw.world, v, p, o.cut);
-        benchmark::DoNotOptimize(o.cut.data());
+        consumeCut(o.cut);
         cutTotal += o.cut.size();
         ++frames;
     }
@@ -642,7 +660,7 @@ static void BM_MovingLeafNodes(benchmark::State& state)
         const Camera v = orbitView(t, 2500.0f);
         w.applyUpdates();
         o.view.selectCut(w, v, p, o.cut);
-        benchmark::DoNotOptimize(o.cut.data());
+        consumeCut(o.cut);
     }
 }
 BENCHMARK(BM_MovingLeafNodes)->Arg(100)->Arg(1000)->Arg(10000)
@@ -686,7 +704,7 @@ static void BM_ResidencyChurn(benchmark::State& state)
         const Camera v = orbitView(t, 2500.0f);
         w.applyUpdates();
         o.view.selectCut(w, v, p, o.cut);
-        benchmark::DoNotOptimize(o.cut.data());
+        consumeCut(o.cut);
     }
 }
 BENCHMARK(BM_ResidencyChurn)->Arg(100)->Arg(10000)->Unit(benchmark::kMicrosecond);
@@ -796,7 +814,7 @@ static void BM_Combined_KitchenSink(benchmark::State& state)
 
         cutTotal += currentCount;
         ++frames;
-        benchmark::DoNotOptimize(o.cut.data());
+        consumeCut(o.cut);
     }
     state.counters["avg_cut"] = double(cutTotal) / double(frames ? frames : 1);
     state.counters["attach_pf"] = double(attaches) / double(frames ? frames : 1);
@@ -862,7 +880,7 @@ static void BM_TypicalForest_Breakdown(benchmark::State& state)
     std::vector<uint32_t> movers;
     for (uint32_t i = 0; i < leaves.size(); i += 10) movers.push_back(i);
 
-    std::vector<CutEntry> cut;
+    CutResults cut;
     const CutParams p{4.0f, 1.0f};
     XorShift32 fast;
 
@@ -897,7 +915,7 @@ static void BM_TypicalForest_Breakdown(benchmark::State& state)
         cutNs += std::chrono::duration<double, std::nano>(t3 - t2).count();
         cutTotal += cut.size();
         ++frames;
-        benchmark::DoNotOptimize(cut.data());
+        consumeCut(cut);
     }
     const double f = double(frames ? frames : 1);
     state.counters["move_us"] = moveNs / f / 1000.0;
@@ -977,7 +995,7 @@ static void BM_TypicalForest_Churn(benchmark::State& state)
     for (int i = 0; i < count; ++i)
         addTree((i % 5) == 0, float4::point(uni(rng), 0, uni(rng)));
 
-    std::vector<CutEntry> cut;
+    CutResults cut;
     const CutParams p{4.0f, 1.0f};
     XorShift32 fast;
     const size_t churnN = size_t(count) * size_t(churnPct) / 100;
@@ -1032,7 +1050,7 @@ static void BM_TypicalForest_Churn(benchmark::State& state)
         cutNs += std::chrono::duration<double, std::nano>(t4 - t3).count();
         cutTotal += cut.size();
         ++frames;
-        benchmark::DoNotOptimize(cut.data());
+        consumeCut(cut);
     }
     const double f = double(frames ? frames : 1);
     state.counters["churn_us"] = churnNs / f / 1000.0;
@@ -1112,7 +1130,7 @@ static void BM_CutScaling_OutputSensitivity(benchmark::State& state)
     UncachedView selection;
     const auto wp = makeDeepWorld(8, 6);
     World& w = *wp;
-    std::vector<CutEntry> cut;
+    CutResults cut;
     const Camera v = orbitView(0.7f, 2500.0f);
     const CutParams p{float(state.range(0)), 0.0f};
 
@@ -1120,7 +1138,7 @@ static void BM_CutScaling_OutputSensitivity(benchmark::State& state)
     {
         w.applyUpdates();
         selection.selectCut(w, v, p, cut);
-        benchmark::DoNotOptimize(cut.data());
+        consumeCut(cut);
     }
     state.counters["cut"] = double(cut.size());
     // Inverted iteration-invariant rate: seconds per cut entry (SI-suffixed).
@@ -1160,7 +1178,7 @@ static void BM_CameraTeleport_ColdFrame(benchmark::State& state)
     addResidentInstance(w, deepGen.makeRootPage(unitRegion(800.0f), 2048.0f, 0),
                         float4::point(0, 300.0f, 0));
 
-    std::vector<CutEntry> cut;
+    CutResults cut;
     const CutParams p{4.0f, 1.0f};
     XorShift32 fast;
 
@@ -1180,7 +1198,7 @@ static void BM_CameraTeleport_ColdFrame(benchmark::State& state)
         w.applyUpdates();
         selection.selectCut(w, v, p, cut);
         const auto t1 = clock::now();
-        benchmark::DoNotOptimize(cut.data());
+        consumeCut(cut);
 
         const double ns = std::chrono::duration<double, std::nano>(t1 - t0).count();
         if (jump) { teleportNs += ns; ++teleportFrames; }
@@ -1219,7 +1237,7 @@ static void BM_MultiView(benchmark::State& state)
     addResidentInstance(w, deepGen.makeRootPage(unitRegion(600.0f), 2048.0f, 0),
                         float4::point(0, 250.0f, 0));
 
-    std::vector<CutEntry> cut[4];
+    CutResults cut[4];
     const CutParams p{4.0f, 1.0f};
 
     double mainNs = 0, extraNs = 0;
@@ -1240,7 +1258,7 @@ static void BM_MultiView(benchmark::State& state)
         selection.selectCut(w, makeLookAtCamera(eye + float4::vec(0, 1200, 0), eye), p, cut[3]);
         const auto t2 = clock::now();
 
-        for (auto& c : cut) benchmark::DoNotOptimize(c.data());
+        for (auto& c : cut) consumeCut(c);
         mainNs += std::chrono::duration<double, std::nano>(t1 - t0).count();
         extraNs += std::chrono::duration<double, std::nano>(t2 - t1).count();
         ++frames;
@@ -1255,14 +1273,15 @@ BENCHMARK(BM_MultiView)->Unit(benchmark::kMicrosecond);
 // Streaming convergence as ERROR DECAY: the camera teleports into an
 // unexpanded region of an unbounded view (no far-plane trick — a collapsed
 // node is never culled, it renders coarse until its page arrives). The
-// metric is the worst residual screen error among still-expandable
-// NEEDS_EXPANSION entries, sampled 1/2/4/8/16/32 frames after each teleport.
+// metric is the worst residual screen error among high-error ideal-side leaves
+// that the content graph can still expand, sampled 1/2/4/8/16/32 frames after
+// each teleport.
 // Near-field detail must land in a few frames; the far field may take
 // seconds — that distance-proportional tolerance is exactly what the
 // err-priority ordering produces.
 //
 // Two attach policies at the same total page budget:
-//   discovery (arg1 = 0): attach the requested level only, largest error
+//   discovery (arg1 = 0): attach the discovered level only, largest error
 //     first; the next level is discovered by the next walk — a chain D
 //     pages deep costs D frames of latency regardless of budget.
 //   predictive (arg1 = 1): the walk cannot see below a missing page, but
@@ -1287,7 +1306,7 @@ namespace {
 
 // One frame of the predictive policy, entirely content-side (the streamer
 // owns the page data and the recipes; the World only sees attachPage).
-void predictiveAttachFrame(World& w, TreeGen& gen, const std::vector<CutEntry>& cut,
+void predictiveAttachFrame(World& w, TreeGen& gen, const CutResults& cut,
                            const Camera& view, float threshold, size_t budget)
 {
     struct Cand
@@ -1300,10 +1319,18 @@ void predictiveAttachFrame(World& w, TreeGen& gen, const std::vector<CutEntry>& 
     static std::priority_queue<Cand> heap;   // max-heap by (estimated) error
     while (!heap.empty()) heap.pop();
 
-    for (const CutEntry& e : cut)
-        if (inIdealCut(e) && e.tag == CutTag::NeedsExpansion &&
-            gen.recipes.count(e.payload))
-            heap.push({e.err, e.payload, e.node});
+    const auto gather = [&](const std::vector<CutEntry>& entries)
+    {
+        for (const CutEntry& e : entries)
+        {
+            const UserPayload payload = payloadOf(w, e);
+            if (e.overThreshold() && gen.recipes.count(payload) &&
+                !w.isAttached(e.nodeHandle))
+                heap.push({e.approximateError(threshold), payload, e.nodeHandle});
+        }
+    };
+    gather(cut.shared);
+    gather(cut.idealOnly);
 
     while (budget != 0 && !heap.empty())
     {
@@ -1385,10 +1412,17 @@ static void BM_StreamingConvergence(benchmark::State& state)
         // 1e33+ (distance 0), and one such frame would swamp the average —
         // 1e6 px already means "the box you are standing in is unexpanded".
         float worst = 0.0f;
-        for (const auto& e : o.cut)
-            if (inIdealCut(e) && e.tag == CutTag::NeedsExpansion && e.err > worst &&
-                gen.recipes.count(e.payload))
-                worst = e.err;
+        const auto measureResidual = [&](const std::vector<CutEntry>& entries)
+        {
+            for (const CutEntry& e : entries)
+            {
+                const UserPayload payload = payloadOf(w, e);
+                if (e.overThreshold() && gen.recipes.count(payload))
+                    worst = std::max(worst, e.approximateError(p.threshold));
+            }
+        };
+        measureResidual(o.cut.shared);
+        measureResidual(o.cut.idealOnly);
         worst = worst < 1.0e6f ? worst : 1.0e6f;
         for (int b = 0; b < 6; ++b)
             if (frameInCycle == kSampleAt[b])
@@ -1403,7 +1437,7 @@ static void BM_StreamingConvergence(benchmark::State& state)
             attachTopByPriority(w, gen, o.cut, attachBudget);
         makeIdealResident(w, o.cut);
         w.collect(usage, 20000, 30);
-        benchmark::DoNotOptimize(o.cut.data());
+        consumeCut(o.cut);
     }
     state.counters["px_f1"] = resSum[0] / double(resCnt[0] ? resCnt[0] : 1);
     state.counters["px_f2"] = resSum[1] / double(resCnt[1] ? resCnt[1] : 1);
@@ -1440,7 +1474,7 @@ static void BM_TlasScale(benchmark::State& state)
     for (int i = 0; i < count; ++i)
         addResidentInstance(w, proto.clone(), float4::point(uni(rng), 0, uni(rng)));
 
-    std::vector<CutEntry> cut;
+    CutResults cut;
     const CutParams p{4.0f, 1.0f};
 
     // Level-load burst: the first cut pays the quality TLAS build.
@@ -1456,7 +1490,7 @@ static void BM_TlasScale(benchmark::State& state)
         t += 0.01f;
         w.applyUpdates();
         selection.selectCut(w, orbitView(t, half * 0.25f), p, cut);
-        benchmark::DoNotOptimize(cut.data());
+        consumeCut(cut);
     }
     state.counters["cut"] = double(cut.size());
     state.counters["firstcut_ms"] = firstMs;
@@ -1500,7 +1534,7 @@ static void BM_TlasMortonRebuild(benchmark::State& state)
     }
     markAllResident(w, w.assetRootPage(asset), nodes);
 
-    std::vector<CutEntry> cut;
+    CutResults cut;
     const CutParams params{4.0f, 1.0f};
     const Camera view = orbitView(0.0f, half * 0.25f);
     w.applyUpdates();
@@ -1514,7 +1548,7 @@ static void BM_TlasMortonRebuild(benchmark::State& state)
         w.moveInstance(refs[0], float4::point(corner, 0, corner));
         w.applyUpdates();
         selection.selectCut(w, view, params, cut);
-        benchmark::DoNotOptimize(cut.data());
+        consumeCut(cut);
     }
     state.counters["cut"] = double(cut.size());
     state.counters["instances"] = double(count);
@@ -1555,7 +1589,7 @@ static void BM_TlasSparseRebuild(benchmark::State& state)
         refs.push_back(w.addInstance(asset, float4::point(uni(rng), 0, uni(rng))));
     markAllResident(w, w.assetRootPage(asset), nodes);
 
-    std::vector<CutEntry> cut;
+    CutResults cut;
     const CutParams params{4.0f, 1.0f};
     const Camera view = orbitView(0.0f, half * 0.25f);
     w.applyUpdates();
@@ -1573,7 +1607,7 @@ static void BM_TlasSparseRebuild(benchmark::State& state)
     {
         w.applyUpdates();
         selection.selectCut(w, view, params, cut);
-        benchmark::DoNotOptimize(cut.data());
+        consumeCut(cut);
     }
     state.counters["cut"] = double(cut.size());
     state.counters["live"] = double(live);
@@ -1627,7 +1661,7 @@ static void BM_AssetSharing_CutCost(benchmark::State& state)
         for (int i = 0; i < count; ++i) addResidentInstance(w, proto.clone(), at(i));
     }
 
-    std::vector<CutEntry> cut;
+    CutResults cut;
     const CutParams p{4.0f, 0.0f};
     const float span = float(side) * pitch;
     const Camera v = makeLookAtCamera(float4::point(0, span * 0.8f, -span * 0.8f),
@@ -1637,7 +1671,7 @@ static void BM_AssetSharing_CutCost(benchmark::State& state)
     {
         w.applyUpdates();
         selection.selectCut(w, v, p, cut);
-        benchmark::DoNotOptimize(cut.data());
+        consumeCut(cut);
     }
     state.counters["cut"] = double(cut.size());
     state.counters["mounts"] = double(w.attachedPageCount());
@@ -1706,7 +1740,7 @@ static void BM_DeformedCutCost(benchmark::State& state)
     }
     w.flushBounds();
 
-    std::vector<CutEntry> cut;
+    CutResults cut;
     const CutParams p{4.0f, 0.0f};
     const float span = float(side) * pitch;
     const Camera v = makeLookAtCamera(float4::point(0, span * 0.8f, -span * 0.8f),
@@ -1716,7 +1750,7 @@ static void BM_DeformedCutCost(benchmark::State& state)
     {
         w.applyUpdates();
         selection.selectCut(w, v, p, cut);
-        benchmark::DoNotOptimize(cut.data());
+        consumeCut(cut);
     }
     state.counters["cut"] = double(cut.size());
     state.counters["overlays"] = double(w.overlayCount());
@@ -1778,7 +1812,7 @@ static void BM_View_FlyThrough(benchmark::State& state)
 
     const int movers = count * movePct / 100;
 
-    std::vector<CutEntry> cut;
+    CutResults cut;
     View cache;
     cache.setReuseEnabled(cached);
     const CutParams p{4.0f, 0.0f};
@@ -1817,12 +1851,12 @@ static void BM_View_FlyThrough(benchmark::State& state)
             reuse += n > 0 ? 100.0 * double(cache.reused()) / n : 0.0;
             entries += double(cut.size());
             visible += n;
-            benchmark::DoNotOptimize(cut.data());
+        consumeCut(cut);
         }
         else
         {
             entries += double(cut.size());
-            benchmark::DoNotOptimize(cut.data());
+        consumeCut(cut);
         }
         ++frames;
     }
@@ -1902,7 +1936,7 @@ static void BM_View_Breakdown(benchmark::State& state)
     };
 
     View viewState;
-    std::vector<CutEntry> cut;
+    CutResults cut;
     const CutParams params{4.0f, 0.0f};
 
     // The first published selection cycle builds the initial TLAS and
@@ -1950,7 +1984,7 @@ static void BM_View_Breakdown(benchmark::State& state)
         reuse += n > 0.0 ? 100.0 * double(viewState.reused()) / n : 0.0;
         entries += double(cut.size());
         visible += n;
-        benchmark::DoNotOptimize(cut.data());
+        consumeCut(cut);
         ++frames;
     }
 
@@ -2030,7 +2064,7 @@ static void BM_View_MultiView(benchmark::State& state)
     };
 
     std::vector<View> contexts(static_cast<size_t>(viewCount));
-    std::vector<std::vector<CutEntry>> cuts(static_cast<size_t>(viewCount));
+    std::vector<CutResults> cuts(static_cast<size_t>(viewCount));
     const CutParams params{4.0f, 0.0f};
 
     w.applyUpdates();
@@ -2102,7 +2136,7 @@ static void BM_View_MultiView(benchmark::State& state)
                                     contexts[size_t(v)].walked());
             reuse += n > 0.0 ? 100.0 * double(contexts[size_t(v)].reused()) / n : 0.0;
             entries += double(cuts[size_t(v)].size());
-            benchmark::DoNotOptimize(cuts[size_t(v)].data());
+            consumeCut(cuts[size_t(v)]);
         }
         ++frames;
     }
@@ -2173,7 +2207,7 @@ static void BM_View_Zoom(benchmark::State& state)
     markAllResident(w, w.assetRootPage(asset), nodes);
 
     View ctx(halfLife);
-    std::vector<CutEntry> cut;
+    CutResults cut;
     const CutParams p{4.0f, 0.0f};
 
     using clock = std::chrono::steady_clock;
@@ -2201,7 +2235,7 @@ static void BM_View_Zoom(benchmark::State& state)
         const double n = double(ctx.reused() + ctx.walked());
         reuse += n > 0 ? 100.0 * double(ctx.reused()) / n : 0.0;
         if (ctx.reused() == 0 && ctx.walked() > 0) ++stalls;
-        benchmark::DoNotOptimize(cut.data());
+        consumeCut(cut);
         ++frames;
     }
     const double f = double(frames ? frames : 1);
@@ -2241,7 +2275,7 @@ static void BM_View_Reset(benchmark::State& state)
     markAllResident(w, w.assetRootPage(asset), nodes);
 
     View ctx(6.0f);
-    std::vector<CutEntry> cut;
+    CutResults cut;
     const CutParams params{4.0f, 0.0f};
     const Camera view = makePerspectiveCamera(
         float4::point(0, 2.0f, 0), float4::vec(0, 0, 1), float4::vec(0, 1, 0),
@@ -2256,7 +2290,7 @@ static void BM_View_Reset(benchmark::State& state)
         ctx.reset();
         w.applyUpdates();
         ctx.selectCut(w, view, params, cut);
-        benchmark::DoNotOptimize(cut.data());
+        consumeCut(cut);
     }
     state.counters["cut"] = double(cut.size());
     state.counters["ctx_MB"] = double(ctx.bytes()) / (1024.0 * 1024.0);
@@ -2311,7 +2345,7 @@ static void BM_Spawn_MarginalCost(benchmark::State& state)
         insts.push_back(w.addInstance(asset, float4::point(uni(rng), 0, uni(rng))));
     markAllResident(w, w.assetRootPage(asset), nodes);
 
-    std::vector<CutEntry> cut;
+    CutResults cut;
     const CutParams p{6.0f, 0.0f};
     XorShift32 fast;
     double churnNs = 0, cutNs = 0;
@@ -2346,7 +2380,7 @@ static void BM_Spawn_MarginalCost(benchmark::State& state)
         cutNs += std::chrono::duration<double, std::nano>(t2 - t1).count();
         cutTotal += cut.size();
         ++frames;
-        benchmark::DoNotOptimize(cut.data());
+        consumeCut(cut);
     }
     const double f = double(frames ? frames : 1);
     state.counters["churn_us"] = churnNs / f / 1000.0;
@@ -2383,7 +2417,7 @@ static void BM_Adversarial_StackedInstances(benchmark::State& state)
                             float4::point(fast.uniform(-0.01f, 0.01f), 0,
                                           fast.uniform(-0.01f, 0.01f)));
 
-    std::vector<CutEntry> cut;
+    CutResults cut;
     const CutParams p{4.0f, 0.0f};
     const Camera v = makeLookAtCamera(float4::point(0, 20, -60), float4::point(0, 0, 0));
 
@@ -2391,7 +2425,7 @@ static void BM_Adversarial_StackedInstances(benchmark::State& state)
     {
         w.applyUpdates();
         selection.selectCut(w, v, p, cut);
-        benchmark::DoNotOptimize(cut.data());
+        consumeCut(cut);
     }
     state.counters["cut"] = double(cut.size());
 }
@@ -2417,7 +2451,7 @@ static void BM_Adversarial_WideNode(benchmark::State& state)
     World w;
     addResidentInstance(w, b.build(), float4::point(0, 0, 0));
 
-    std::vector<CutEntry> cut;
+    CutResults cut;
     const CutParams p{4.0f, 0.0f};
 
     float t = 0.0f;
@@ -2426,7 +2460,7 @@ static void BM_Adversarial_WideNode(benchmark::State& state)
         t += 0.02f;
         w.applyUpdates();
         selection.selectCut(w, orbitView(t, 300.0f), p, cut);
-        benchmark::DoNotOptimize(cut.data());
+        consumeCut(cut);
     }
     state.counters["cut"] = double(cut.size());
 }
@@ -2465,7 +2499,7 @@ static void BM_Adversarial_DeepPageChain(benchmark::State& state)
         ++depth;
     }
 
-    std::vector<CutEntry> cut;
+    CutResults cut;
     const CutParams p{4.0f, 0.0f};
     const Camera v = makeLookAtCamera(float4::point(0, 3, -8), float4::point(0, 0, 0));
 
@@ -2473,7 +2507,7 @@ static void BM_Adversarial_DeepPageChain(benchmark::State& state)
     {
         w.applyUpdates();
         selection.selectCut(w, v, p, cut);
-        benchmark::DoNotOptimize(cut.data());
+        consumeCut(cut);
     }
     state.counters["pages"] = double(depth + 1);
     state.counters["cut"] = double(cut.size());

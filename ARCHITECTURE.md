@@ -20,12 +20,14 @@ split:
   incremental insert/remove. Initial and repair builds can use a quality
   splitter; frequent motion/edit rebuilds use a cheaper Morton hierarchy.
 
-`View::selectCut` queries the TLAS, walks only surviving page regions, and emits one
-unified current/ideal cut. Membership marks entries shared by both cuts and the
-two additive deltas; `NeedsExpansion` marks unknown topology. The caller derives
-IO work from ideal-side entries. `View` owns per-camera damping, conservative
-cut reuse, traversal scratch, and statistics. After `applyUpdates` publishes a
-stable snapshot, distinct views read only the World and can run concurrently.
+`View::selectCut` queries the TLAS, walks only surviving page regions, and emits
+three compact vectors: entries shared by the current and ideal cuts, plus each
+side's additive difference. A high-error ideal-side leaf exposes a useful
+expansion frontier; the caller's content graph decides whether deeper topology
+exists and derives IO work from those entries. `View` owns per-camera damping,
+conservative cut reuse, traversal scratch, and statistics. After
+`applyUpdates` publishes a stable snapshot, distinct views read only the World
+and can run concurrently.
 Disabling reuse on a `View` enables the internally parallel uncached path
 through the host's blocking `parallelFor` without changing that contract.
 
@@ -47,9 +49,10 @@ through the host's blocking `parallelFor` without changing that contract.
    maintenance state occupies a separate cache line. Uncached selection
    prefetches the next instance and root page; cached selection pipelines
    its spatially ordered random instance/view-record reads eight entries ahead.
-5. **Handle-only mutation.** The world has no payload index or node hash table.
-   Cut entries carry generation-stamped handles; stale asynchronous
-   completions fail one generation check and are ignored.
+5. **Compact handle-only output.** The world has no payload index or node hash
+   table. A cut entry is 12 bytes: an 8-byte generation-stamped handle plus a
+   packed 24-bit instance id and 8-bit error. Stale asynchronous completions
+   fail one generation check and are ignored.
 6. **Propagated resident coverage.** Residency changes maintain a complete
    descendant-cover summary through local and attached-page ancestors. Fully
    covered subtrees pass in O(1); partially visible uncovered subtrees inspect
@@ -65,7 +68,7 @@ through the host's blocking `parallelFor` without changing that contract.
    passes required by key variation. A dense live-id list avoids scanning dead
    historical slots.
 9. **Frame-coherent reuse.** A 48-byte `View` record proves when a
-   fully-inside instance's unified cut cannot change under camera-envelope or
+   fully-inside instance's bucketed cut cannot change under camera-envelope or
    projection-scale travel. Page versions cover topology and residency changes;
    reused entries are copied without rewalking pages.
 10. **Deferred, camera-selective GC feedback.** Optional `PageUsageContext`
@@ -78,20 +81,20 @@ through the host's blocking `parallelFor` without changing that contract.
 Point estimates below were rerun on 2026-08-05 with MSVC 19.51, Release
 `/O2 /arch:AVX2`, on a noisy shared 64-hardware-thread 2.4 GHz EPYC.
 Single-view cases use one benchmark thread; the concurrent six-view cases use
-six persistent workers. Values are the best recurring repeat, which estimates
+six persistent workers. Values are the best observed repeat, which estimates
 uncontended algorithm cost. Every fixed-trajectory case uses 600 frames and at
-least ten repetitions.
+least five repetitions.
 
 | Scenario | Current time | Relevant output/state |
 |---|---:|---|
-| 10k instances, 700 assets, moving camera / 1k moving | 0.126 ms selection | 82.4% reused; 27.8% visible; 5,920-entry unified cut |
+| 10k instances, 700 assets, moving camera / 1k moving | 0.123 ms selection | 82.4% reused; 27.8% visible; 5,920-entry cut; 2.02 MiB `View` |
 | Same 10k world, static camera / 1k moving | 0.108 ms selection | 85.8% reused; 25.0% visible; 5,792 entries |
-| Same 10k world, moving camera / static objects | 0.082 ms selection | 93.3% reused; 5,920 entries |
-| 80k instances, moving camera / 5% moving | 0.52 ms selection | 92.6% reused; 24,986 entries |
-| Same 80k world, static camera / 5% moving | 0.41 ms selection | 94.1% reused; 22,872 entries |
-| Same 80k world, moving camera / static objects | 0.42 ms selection | 97.6% reused; 24,986 entries |
-| Six 80k views, static objects, serial / concurrent | 3.82 / 0.97 ms wall time | 3.9× on six persistent workers |
-| Six 80k views, 5% moving, serial / concurrent | 4.44 / 1.05 ms wall time | 4.2× on six persistent workers |
+| Same 10k world, moving camera / static objects | 0.080 ms selection | 93.3% reused; 5,920 entries |
+| 80k instances, moving camera / 5% moving | 0.586 ms selection | 92.6% reused; 24,986 entries; 7.13 MiB `View` |
+| Same 80k world, static camera / 5% moving | 0.433 ms selection | 94.1% reused; 22,872 entries; 4.24 MiB `View` |
+| Same 80k world, moving camera / static objects | 0.460 ms selection | 97.6% reused; 24,986 entries |
+| Six 80k views, static objects, serial / concurrent | 4.19 / 0.764 ms wall time | 5.5× on six persistent workers |
+| Six 80k views, 5% moving, serial / concurrent | 4.81 / 0.857 ms wall time | 5.6× on six persistent workers |
 
 These are scale indicators, not guarantees. Output size and cache locality can
 dominate population size, and contended runs on this host can be much slower.
@@ -631,13 +634,13 @@ by the unified cut; the other listed mechanisms remain:
   representative 80k selection was 0.50 ms, and six nearby moving-object views
   measured 4.23 ms serial and 1.08 ms on six persistent workers.
 
-### P. Unified cut and recursive resident cover — KEPT
+### P. Unified cut and recursive resident cover — COVER KEPT, OUTPUT LATER SUPERSEDED
 
-Selection now emits one sequence instead of separate current, ideal, and load
-request streams. `Shared` entries occur once; `CurrentOnly` and `IdealOnly` are
-the two additive differences. `Direct` versus `NeedsExpansion` distinguishes a
-known payload from unknown topology. The caller derives IO work from the ideal
-side and owns content deduplication, priority, and budgets.
+At this revision selection emitted one sequence instead of separate current,
+ideal, and load-request streams. `Shared`, `CurrentOnly`, and `IdealOnly`
+encoded the additive differences, while `Direct` and `NeedsExpansion`
+distinguished known payloads from unknown topology. Section Q superseded that
+record layout without changing the traversal or resident-cover algorithm.
 
 Residency is no longer restricted to resident immediate children. Each mount
 propagates complete descendant coverage upward, so a resident detailed node can
@@ -657,13 +660,28 @@ The archived [2026-08-05 handoff](docs/archive/HANDOFF-2026-08-05.md), section
 radix-sort tradeoffs, and full measurements. It is historical evidence, not API
 guidance.
 
+### Q. Compact bucketed cut output — KEPT
+
+Membership moved from every entry into three output vectors: `shared`,
+`currentOnly`, and `idealOnly`. The expansion tag also disappeared. A
+high-error ideal-side leaf is enough for the caller to consult its external
+content graph; terminal and expandable leaves no longer require different hot
+records. Payloads are resolved on demand instead of copied into every view.
+
+`NodeHandle` is now a logical 64-bit value (20-bit mount slot, 20-bit node
+index, 24-bit generation). The dense instance id and threshold-relative error
+share one 32-bit word (24 + 8 bits), making `CutEntry` 12 bytes. The quantized
+error preserves the exact above/below-threshold decision and retains roughly
+eight priority levels per octave. The 80k moving-camera `View` footprint is
+7.13 MiB; the earlier tagged output used 12.13 MiB in the same scenario.
+
 ---
 
 ## 3. Current constraints and possible follow-up
 
 - **Cached parallelism is across views, not within one cached walk.**
-  Six representative 80k views fall from 3.82-4.44 ms serial to 0.97-1.05 ms
-  on six persistent workers and occupy about 73 MiB of view state. An uncached
+  Six representative 80k views fall from 4.19-4.81 ms serial to 0.764-0.857 ms
+  on six persistent workers and occupy about 43 MiB of view state. An uncached
   View can still parallelize one call across visible instances. Combining
   both forms would add nested scheduling and merge costs; profile a production
   need before doing so.
@@ -671,10 +689,11 @@ guidance.
   large teleports can loosen page ancestors. This costs culling efficiency, not
   correctness; TLAS rebuilds retighten only the top level. A budgeted bottom-up
   overlay pass is the remaining mechanism if real content exhibits degradation.
-- **The unified cut carries node handles.** This makes the result self-sufficient
-  for rendering, residency, and topology decisions, at the cost of a larger
-  entry than the former render-only record. Shared entries are emitted once;
-  callers should retain vector capacity and filter in place.
+- **Selection uses compact bucketed output.** `shared`, `currentOnly`, and
+  `idealOnly` avoid per-entry membership and expansion tags. Each 12-byte entry
+  holds a 64-bit node handle, 24-bit dense instance id, and 8-bit
+  threshold-relative error. Payload resolution and external topology lookup
+  are intentionally caller-directed; callers should retain vector capacity.
 - **Transform scope.** Instances support translation and uniform positive scale.
   Rotation and non-uniform scale need authored baking or an integration-layer
   representation; adding them directly would change bound transforms and hot

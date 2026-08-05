@@ -27,10 +27,74 @@ inline float surfaceArea(const AABB& b)
     return 2.0f * (e.x * e.y + e.y * e.z + e.z * e.x);
 }
 
-inline CutMembership membership(bool current, bool ideal)
+inline uint32_t nextPageGeneration(uint32_t generation)
 {
-    return current ? (ideal ? CutMembership::Shared : CutMembership::CurrentOnly)
-                   : CutMembership::IdealOnly;
+    generation = (generation + 1u) & NodeHandle::kGenerationMask;
+    return generation == 0 ? 1u : generation;
+}
+
+inline uint32_t cutCount(uint32_t counts, uint32_t bucket)
+{
+    return (counts >> (bucket * 10)) & 0x3ffu;
+}
+
+inline uint32_t cutTotal(uint32_t counts)
+{
+    return cutCount(counts, 0) + cutCount(counts, 1) + cutCount(counts, 2);
+}
+
+inline uint32_t packCutCounts(uint32_t shared, uint32_t currentOnly,
+                              uint32_t idealOnly)
+{
+    return shared | (currentOnly << 10) | (idealOnly << 20);
+}
+
+inline uint8_t encodeCutErrorRatio(float ratio, bool above)
+{
+    if (!std::isfinite(ratio)) return above ? 255 : 127;
+    if (!(ratio > 0.0f)) return 0;
+
+    const uint32_t bits = std::bit_cast<uint32_t>(ratio);
+    const uint32_t biased = (bits >> 23) & 0xffu;
+    if (biased == 0) return above ? 128 : 0;
+    const int exponent = int(biased) - 127;
+    const int mantissa = int((bits >> 20) & 7u);
+    int code = 128 + exponent * 8 + mantissa;
+    code = std::clamp(code, 0, 255);
+    code = above ? std::max(code, 128) : std::min(code, 127);
+    return uint8_t(code);
+}
+
+} // namespace
+
+uint8_t encodeCutError(float error, float threshold)
+{
+    if (!(error > 0.0f)) return 0;
+    if (!(threshold > 0.0f)) return error > threshold ? 255 : 127;
+
+    const bool above = error > threshold;
+    return encodeCutErrorRatio(error * (1.0f / threshold), above);
+}
+
+float decodeCutError(uint8_t code, float threshold)
+{
+    if (!(threshold > 0.0f)) return threshold;
+    const int q = code < kCutErrorThreshold ? int(code) - 127
+                                             : int(code) - 128;
+    return threshold * std::exp2(float(q) * (1.0f / 8.0f));
+}
+
+namespace {
+
+inline CutEntry makeCutEntry(NodeHandle node, float error, float threshold,
+                             float thresholdInv, InstanceId instance)
+{
+    if (!(error > 0.0f)) return CutEntry{node, uint8_t(0), instance};
+    if (!(threshold > 0.0f))
+        return CutEntry{node, uint8_t(error > threshold ? 255 : 127), instance};
+    return CutEntry{node,
+                    encodeCutErrorRatio(error * thresholdInv, error > threshold),
+                    instance};
 }
 
 } // namespace
@@ -52,7 +116,9 @@ struct ViewScratch
         {
             n += w.work.capacity() * sizeof(World::WorkItem);
             n += w.nodeStack.capacity() * sizeof(World::NodeItem);
-            n += w.cutBuf.capacity() * sizeof(CutEntry);
+            n += w.cutBuf.shared.capacity() * sizeof(CutEntry);
+            n += w.cutBuf.currentOnly.capacity() * sizeof(CutEntry);
+            n += w.cutBuf.idealOnly.capacity() * sizeof(CutEntry);
             n += w.touched.capacity() * sizeof(uint32_t);
         }
         return n;
@@ -96,10 +162,12 @@ World::~World() = default;
 
 const World::PageRt* World::resolve(NodeHandle h) const
 {
-    if (h.slot >= slots_.size()) return nullptr;
-    const PageRt& rt = slots_[h.slot];
-    if (!rt.inUse || rt.generation != h.generation) return nullptr;   // stale
-    if (h.index == 0 || h.index >= rt.page.nodeCount()) return nullptr;
+    const uint32_t slot = h.slot();
+    const uint32_t index = h.index();
+    if (slot >= slots_.size()) return nullptr;
+    const PageRt& rt = slots_[slot];
+    if (!rt.inUse || rt.generation != h.generation()) return nullptr;   // stale
+    if (index == 0 || index >= rt.page.nodeCount()) return nullptr;
     return &rt;
 }
 
@@ -205,6 +273,8 @@ uint32_t World::allocSlot()
         freeSlots_.pop_back();
         return s;
     }
+    HLOD_CHECK(slots_.size() < NodeHandle::kInvalidSlot,
+               "World: exhausted the 20-bit page-mount slot space");
     slots_.emplace_back();
     return uint32_t(slots_.size() - 1);
 }
@@ -215,6 +285,8 @@ uint32_t World::registerPage(uint32_t asset, NodeRef owner, bool pinned)
     AssetRt& as = assets_[asset];
     PageRt& rt = slots_[slot];
 
+    HLOD_CHECK(as.view.nodeCount() <= (1u << NodeHandle::kIndexBits),
+               "World: page exceeds the 20-bit page-local node space");
     rt.page     = as.view;
     rt.asset    = asset;
     rt.errClamp = FLT_MAX;
@@ -222,7 +294,7 @@ uint32_t World::registerPage(uint32_t asset, NodeRef owner, bool pinned)
     rt.covered.assign(rt.page.nodeCount(), 0);
     rt.coveredChildren.assign(rt.page.nodeCount(), 0);
     rt.expSlot.clear();
-    rt.generation = ++generationCounter_;
+    rt.generation = nextPageGeneration(rt.generation);
     // Bumped here as well as on every content change, so that a slot which was
     // detached and reused can never present the same contentVersion as before.
     // That is what lets a View record identify a page's state with a
@@ -267,7 +339,7 @@ PageHandle World::attachPage(NodeHandle expansionNode, AssetHandle assetHandle)
     if (!resolve(expansionNode)) return PageHandle{};
 
     const uint32_t asset = assetHandle.slot;
-    const NodeRef owner{expansionNode.slot, expansionNode.index};
+    const NodeRef owner{expansionNode.slot(), expansionNode.index()};
     {
         const PageRt& ownerRt = slots_[owner.slot];
         HLOD_CHECK(ownerRt.page.isExpansion(owner.index),
@@ -329,7 +401,7 @@ void World::detachPage(NodeHandle expansionNode)
     if (!ownerRt) return;   // parent page already gone; nothing to detach
     const uint32_t child = ownerRt->expSlot.empty()
                                ? kInvalidIndex
-                               : ownerRt->expSlot[expansionNode.index];
+                               : ownerRt->expSlot[expansionNode.index()];
     HLOD_CHECK(child != kInvalidIndex, "World::detachPage: not attached");
     PageRt& rt = slots_[child];
     HLOD_CHECK(rt.attachedChildPages == 0,
@@ -342,7 +414,7 @@ bool World::isAttached(NodeHandle expansionNode) const
 {
     const PageRt* rt = resolve(expansionNode);
     return rt && !rt->expSlot.empty() &&
-           rt->expSlot[expansionNode.index] != kInvalidIndex;
+           rt->expSlot[expansionNode.index()] != kInvalidIndex;
 }
 
 void World::detachSlot(uint32_t slot, std::vector<UserPayload>* freedPayloads)
@@ -362,7 +434,14 @@ void World::detachSlot(uint32_t slot, std::vector<UserPayload>* freedPayloads)
     lruUnlink(slot);
     if (rt.pinned) --pinnedPages_;
     const uint32_t asset = rt.asset;
+    const uint32_t generation = rt.generation;
+    const uint32_t contentVersion = rt.contentVersion;
     rt = PageRt{};
+    // These counters belong to the slot, not to the mounted page. Preserving
+    // them across reset prevents a recycled slot from reviving either a stale
+    // compact handle or a View dependency record.
+    rt.generation = generation;
+    rt.contentVersion = contentVersion;
     freeSlots_.push_back(slot);
     --attachedPages_;
     // Any per-instance bounds overlay on this mount is now describing a page
@@ -448,28 +527,38 @@ void World::markResident(NodeHandle h)
 {
     PageRt* rt = resolve(h);
     if (!rt) return;   // page collected while the payload was loading
-    if (rt->resident[h.index]) return;
-    rt->resident[h.index] = 1;
+    const uint32_t index = h.index();
+    if (rt->resident[index]) return;
+    rt->resident[index] = 1;
     ++rt->contentVersion;
-    propagateCoverage(h.slot, h.index);
+    propagateCoverage(h.slot(), index);
 }
 
 void World::markNonResident(NodeHandle h)
 {
     PageRt* rt = resolve(h);
     if (!rt) return;
-    HLOD_CHECK(!(rt->pinned && rt->page.parent[h.index] == 0),
+    const uint32_t index = h.index();
+    HLOD_CHECK(!(rt->pinned && rt->page.parent[index] == 0),
                "World::markNonResident: pinned root");
-    if (!rt->resident[h.index]) return;
-    rt->resident[h.index] = 0;
+    if (!rt->resident[index]) return;
+    rt->resident[index] = 0;
     ++rt->contentVersion;
-    propagateCoverage(h.slot, h.index);
+    propagateCoverage(h.slot(), index);
 }
 
 bool World::isResident(NodeHandle h) const
 {
     const PageRt* rt = resolve(h);
-    return rt && rt->resident[h.index] != 0;
+    return rt && rt->resident[h.index()] != 0;
+}
+
+bool World::tryGetPayload(NodeHandle h, UserPayload& outPayload) const
+{
+    const PageRt* rt = resolve(h);
+    if (!rt) return false;
+    outPayload = rt->page.payload[h.index()];
+    return true;
 }
 
 // ============================================================================
@@ -488,6 +577,8 @@ World::InstanceRef World::addInstanceInternal(uint32_t asset, const InstanceDesc
     }
     else
     {
+        HLOD_CHECK(instances_.size() < kInvalidInstanceId,
+                   "World: exhausted the 24-bit InstanceId space");
         instances_.emplace_back();
         instanceTlas_.emplace_back();
         id = InstanceId(instances_.size() - 1);
@@ -511,7 +602,6 @@ World::InstanceRef World::addInstanceInternal(uint32_t asset, const InstanceDesc
     inst.pos = desc.pos;
     inst.scale = desc.scale;
     inst.rootSlot = slot;
-    inst.tag = desc.tag == kAutoTag ? id : desc.tag;
     spatial.asset = asset;
     spatial.mask = desc.mask;
     inst.alive = true;
@@ -810,10 +900,10 @@ void World::setNodeBounds(InstanceRef ref, NodeHandle h, const AABB& localBounds
     const Instance* inst = resolveInstance(ref);
     if (!inst) return;         // stale instance ref
     if (!resolve(h)) return;   // stale handle: the page was detached or collected
-    HLOD_ASSERT(mountBelongsTo(*inst, h.slot),
+    HLOD_ASSERT(mountBelongsTo(*inst, h.slot()),
                 "World::setNodeBounds: the node is not in this instance's page tree");
     pendingMoves_.push_back(
-        {ref.id, ref.generation, h.slot, h.generation, h.index, localBounds});
+        {ref.id, ref.generation, h.slot(), h.generation(), h.index(), localBounds});
 }
 
 void World::applyUpdates()
@@ -945,7 +1035,7 @@ AABB World::nodeBounds(InstanceRef ref, NodeHandle h)
     Instance* inst = resolveInstance(ref);
     const PageRt* rt = resolve(h);
     if (!inst || !rt) return AABB::empty();
-    return boundsFor(*inst, h.slot, *rt)[h.index];
+    return boundsFor(*inst, h.slot(), *rt)[h.index()];
 }
 
 // ============================================================================
@@ -1833,7 +1923,7 @@ size_t World::collect(std::initializer_list<PageUsageContext*> usage,
 // shared page. There is no per-block branch for the overlay case: the two
 // layouts differ only in stride.
 void World::wideVisit(const WorkItem& item, const PageView& pg, float errClamp,
-                      uint32_t gen, uint32_t tag, uint32_t node, uint8_t mask,
+                      uint32_t gen, InstanceId instance, uint32_t node, uint8_t mask,
                       uint8_t currentKids, uint8_t idealKids,
                       const Camera& local, Worker& w) const
 {
@@ -1883,9 +1973,9 @@ void World::wideVisit(const WorkItem& item, const PageView& pg, float errClamp,
             const uint32_t l = uint32_t(std::countr_zero(leaves));
             leaves &= leaves - 1;
             const uint32_t c = blk.child[l];
-            w.cut.push({pg.payload[c], NodeHandle{item.slot, c, gen}, errs.v[l],
-                        tag, membership(currentKids != 0, idealKids != 0),
-                        CutTag::Direct});
+            w.emit(makeCutEntry(NodeHandle{item.slot, c, gen}, errs.v[l], w.bar,
+                                w.barInv, instance),
+                   currentKids != 0, idealKids != 0);
         }
 
         uint32_t inner = survivors & ~leafLanes;
@@ -1983,14 +2073,14 @@ void World::runPage(const WorkItem& item, const Instance& inst, const Camera& lo
     HLOD_STAT(w, pagesVisited, 1);
     const PageView& pg = rt.page;
     const uint32_t gen = rt.generation;
-    const uint32_t tag = inst.tag;
+    const InstanceId instance = InstanceId(&inst - instances_.data());
     // One bar, no history: damping is already folded into the view's camera
     // envelope, which widened the measured error rather than moving the
     // threshold. That is what makes selection a pure read of the World.
     const float bar = params.threshold;
 
     w.nodeStack.clear();
-    wideVisit(item, pg, rt.errClamp, gen, tag, 0, item.mask, item.current,
+    wideVisit(item, pg, rt.errClamp, gen, instance, 0, item.mask, item.current,
               item.ideal, local, w);
 
     while (!w.nodeStack.empty())
@@ -2015,8 +2105,8 @@ void World::runPage(const WorkItem& item, const Instance& inst, const Camera& lo
         {
             if (rt.resident[i])
             {
-                w.cut.push({pg.payload[i], here, e.err, tag,
-                            CutMembership::CurrentOnly, CutTag::Direct});
+                w.cut.currentOnly.push(
+                    makeCutEntry(here, e.err, bar, w.barInv, instance));
                 continue;
             }
             nextCurrent = 1;
@@ -2024,9 +2114,9 @@ void World::runPage(const WorkItem& item, const Instance& inst, const Camera& lo
         else if (!(e.err > bar))
         {
             const bool shared = current && rt.resident[i];
-            w.cut.push({pg.payload[i], here, e.err, tag,
-                        shared ? CutMembership::Shared : CutMembership::IdealOnly,
-                        CutTag::Direct});
+            const CutEntry entry =
+                makeCutEntry(here, e.err, bar, w.barInv, instance);
+            w.emit(entry, shared, true);
             if (!current || shared) continue;
             // The ideal proxy is missing, but a recursively complete resident
             // descendant cut exists because the current walk reached it.
@@ -2041,8 +2131,11 @@ void World::runPage(const WorkItem& item, const Instance& inst, const Camera& lo
 
         if (ideal && e.err > bar && exp && childSlot == kInvalidIndex)
         {
-            w.cut.push({pg.payload[i], here, e.err, tag,
-                        membership(current, true), CutTag::NeedsExpansion});
+            HLOD_CHECK(!current || rt.resident[i],
+                       "View::selectCut: non-resident current expansion proxy");
+            const CutEntry entry =
+                makeCutEntry(here, e.err, bar, w.barInv, instance);
+            w.emit(entry, current, true);
             continue;
         }
 
@@ -2057,8 +2150,8 @@ void World::runPage(const WorkItem& item, const Instance& inst, const Camera& lo
             {
                 HLOD_CHECK(rt.resident[i],
                            "View::selectCut: uncovered current subtree");
-                w.cut.push({pg.payload[i], here, e.err, tag,
-                            CutMembership::CurrentOnly, CutTag::Direct});
+                w.cut.currentOnly.push(
+                    makeCutEntry(here, e.err, bar, w.barInv, instance));
             }
             nextCurrent = uint8_t(current && canDescend);
             nextIdeal = 1;
@@ -2075,7 +2168,7 @@ void World::runPage(const WorkItem& item, const Instance& inst, const Camera& lo
                               nextCurrent, nextIdeal, e.planes});
         }
         else
-            wideVisit(item, pg, rt.errClamp, gen, tag, i, e.planes, nextCurrent,
+            wideVisit(item, pg, rt.errClamp, gen, instance, i, e.planes, nextCurrent,
                       nextIdeal, local, w);
     }
 }
@@ -2099,7 +2192,7 @@ void World::runInstance(uint32_t instIdx, const Camera& view, const CutParams& p
 
 void World::selectCutUncached(const Camera& camera, const CutParams& params,
                               View& view, PageUsageContext* usage,
-                              CutSink& outCut) const
+                              CutResultSink& outCut) const
 {
     ViewScratch& scratch = *view.scratch_;
     view.stats_ = CutStats{};
@@ -2130,6 +2223,8 @@ void World::selectCutUncached(const Camera& camera, const CutParams& params,
         w.uniqueTouches = false;
         w.cut = outCut;
         w.stats = CutStats{};
+        w.bar = params.threshold;
+        w.barInv = params.threshold > 0.0f ? 1.0f / params.threshold : 0.0f;
 
         // The per-instance walk is a chain of dependent loads (Instance ->
         // page slot -> wide block); with tens of thousands of visible
@@ -2152,7 +2247,7 @@ void World::selectCutUncached(const Camera& camera, const CutParams& params,
         }
 
         outCut = w.cut;
-        w.cut = CutSink{};
+        w.cut = CutResultSink{};
         if (usage)
             for (const uint32_t slot : w.touched) recordPageUsage(*usage, slot);
         view.stats_ = w.stats;
@@ -2184,8 +2279,10 @@ void World::selectCutUncached(const Camera& camera, const CutParams& params,
         w.trackTouches = usage != nullptr;
         w.uniqueTouches = false;
         w.cutBuf.clear();
-        w.cut = CutSink(w.cutBuf);
+        w.cut = CutResultSink(w.cutBuf);
         w.stats = CutStats{};
+        w.bar = params.threshold;
+        w.barInv = params.threshold > 0.0f ? 1.0f / params.threshold : 0.0f;
     }
 
     config_.context.parallelFor(
@@ -2207,7 +2304,12 @@ void World::selectCutUncached(const Camera& camera, const CutParams& params,
     for (uint32_t k = 0; k < workerCount; ++k)
     {
         Worker& w = scratch.workers[k];
-        for (const CutEntry& e : w.cutBuf) outCut.push(e);
+        outCut.shared.pushRange(w.cutBuf.shared.data(),
+                                uint32_t(w.cutBuf.shared.size()));
+        outCut.currentOnly.pushRange(w.cutBuf.currentOnly.data(),
+                                     uint32_t(w.cutBuf.currentOnly.size()));
+        outCut.idealOnly.pushRange(w.cutBuf.idealOnly.data(),
+                                   uint32_t(w.cutBuf.idealOnly.size()));
         if (usage)
             for (const uint32_t slot : w.touched) recordPageUsage(*usage, slot);
 #ifdef HLOD_STATS
@@ -2217,7 +2319,7 @@ void World::selectCutUncached(const Camera& camera, const CutParams& params,
         view.stats_.wideBlocksTested += w.stats.wideBlocksTested;
         view.stats_.lanesSurvived += w.stats.lanesSurvived;
 #endif
-        w.cut = CutSink{};
+        w.cut = CutResultSink{};
     }
 }
 
@@ -2274,15 +2376,16 @@ void View::compact()
         if (r.validUntil <= travel_ + r.kSlope * kTravel_ || r.epoch != epoch_)
         {
             // Not reusable anyway: drop the block rather than move it.
-            r.capacity = r.count = 0;
+            r.capacity = r.counts = 0;
             continue;
         }
-        if (r.count)
+        const uint32_t count = cutTotal(r.counts);
+        if (count)
             std::memcpy(packed.data() + w, store_.data() + r.begin,
-                        size_t(r.count) * sizeof(CutEntry));
+                        size_t(count) * sizeof(CutEntry));
         r.begin = w;
-        r.capacity = r.count;
-        w += r.count;
+        r.capacity = count;
+        w += count;
     }
     store_.swap(packed);
     used_ = w;
@@ -2291,7 +2394,7 @@ void View::compact()
 
 void World::selectCutCached(const Camera& camera, const CutParams& params,
                             View& ctx, PageUsageContext* usage,
-                            CutSink& outCut) const
+                            CutResultSink& outCut) const
 {
     ViewScratch& scratch = *ctx.scratch_;
     ctx.stats_ = CutStats{};
@@ -2353,6 +2456,7 @@ void World::selectCutCached(const Camera& camera, const CutParams& params,
     w.trackTouches = true;
     w.uniqueTouches = true;
     w.bar = params.threshold;
+    w.barInv = params.threshold > 0.0f ? 1.0f / params.threshold : 0.0f;
 
     const uint32_t nVis = uint32_t(scratch.visible.size());
 
@@ -2404,14 +2508,20 @@ void World::selectCutCached(const Camera& camera, const CutParams& params,
             // recorded entries out is ~1.5% of the call at 80k instances, and
             // handing back a descriptor instead measured no better while
             // costing the caller an indirection: see View.
-            outCut.pushRange(ctx.store_.data() + r.begin, r.count);
+            const uint32_t shared = cutCount(r.counts, 0);
+            const uint32_t current = cutCount(r.counts, 1);
+            const uint32_t ideal = cutCount(r.counts, 2);
+            const CutEntry* entries = ctx.store_.data() + r.begin;
+            outCut.shared.pushRange(entries, shared);
+            outCut.currentOnly.pushRange(entries + shared, current);
+            outCut.idealOnly.pushRange(entries + shared + current, ideal);
             ++ctx.reused_;
             continue;
         }
 
         // ---- walk it ----
         w.cutBuf.clear();
-        w.cut = CutSink(w.cutBuf);
+        w.cut = CutResultSink(w.cutBuf);
         w.touched.clear();
         w.margin = FLT_MAX;
         w.maxError = 0.0f;
@@ -2420,10 +2530,14 @@ void World::selectCutCached(const Camera& camera, const CutParams& params,
         w.trackMargin = false;
         for (const uint32_t slot : w.touched) recordUsage(slot);
 
+        const uint32_t nShared = uint32_t(w.cutBuf.shared.size());
+        const uint32_t nCurrent = uint32_t(w.cutBuf.currentOnly.size());
+        const uint32_t nIdeal = uint32_t(w.cutBuf.idealOnly.size());
+        const uint32_t n = nShared + nCurrent + nIdeal;
         const bool eligible = mask == 0 &&
-                              w.touched.size() <= View::kMaxDeps;
-
-        const uint32_t n = uint32_t(w.cutBuf.size());
+                              w.touched.size() <= View::kMaxDeps &&
+                              nShared <= 0x3ffu && nCurrent <= 0x3ffu &&
+                              nIdeal <= 0x3ffu;
         if (r.capacity < n)
         {
             ctx.garbage_ += r.capacity;
@@ -2434,9 +2548,17 @@ void World::selectCutCached(const Camera& camera, const CutParams& params,
             r.capacity = n;
             ctx.used_ += n;
         }
-        r.count = n;
-        if (n) std::memcpy(ctx.store_.data() + r.begin, w.cutBuf.data(),
-                           size_t(n) * sizeof(CutEntry));
+        r.counts = eligible ? packCutCounts(nShared, nCurrent, nIdeal) : 0;
+        CutEntry* dst = ctx.store_.data() + r.begin;
+        if (nShared)
+            std::memcpy(dst, w.cutBuf.shared.data(),
+                        size_t(nShared) * sizeof(CutEntry));
+        if (nCurrent)
+            std::memcpy(dst + nShared, w.cutBuf.currentOnly.data(),
+                        size_t(nCurrent) * sizeof(CutEntry));
+        if (nIdeal)
+            std::memcpy(dst + nShared + nCurrent, w.cutBuf.idealOnly.data(),
+                        size_t(nIdeal) * sizeof(CutEntry));
 
         if (eligible)
         {
@@ -2463,16 +2585,18 @@ void World::selectCutCached(const Camera& camera, const CutParams& params,
         }
 
         // From the walk buffer, not from the slab: same bytes, still hot.
-        outCut.pushRange(w.cutBuf.data(), n);
+        outCut.shared.pushRange(w.cutBuf.shared.data(), nShared);
+        outCut.currentOnly.pushRange(w.cutBuf.currentOnly.data(), nCurrent);
+        outCut.idealOnly.pushRange(w.cutBuf.idealOnly.data(), nIdeal);
         ++ctx.walked_;
     }
 
-    w.cut = CutSink{};
+    w.cut = CutResultSink{};
     ctx.stats_ = w.stats;
 }
 
 void View::selectCut(const World& world, const Camera& camera,
-                     const CutParams& params, CutSink& outCut)
+                     const CutParams& params, CutResultSink& outCut)
 {
     HLOD_CHECK(world_ == nullptr || world_ == &world,
                "View::selectCut: View belongs to another World; call reset()");
@@ -2485,7 +2609,7 @@ void View::selectCut(const World& world, const Camera& camera,
 
 void View::selectCut(const World& world, const Camera& camera,
                      const CutParams& params, PageUsageContext& usage,
-                     CutSink& outCut)
+                     CutResultSink& outCut)
 {
     HLOD_CHECK(world_ == nullptr || world_ == &world,
                "View::selectCut: View belongs to another World; call reset()");
@@ -2498,17 +2622,17 @@ void View::selectCut(const World& world, const Camera& camera,
 
 void View::selectCut(const World& world, const Camera& camera,
                      const CutParams& params,
-                     std::vector<CutEntry>& outCut)
+                     CutResults& outCut)
 {
-    CutSink cut(outCut);
+    CutResultSink cut(outCut);
     selectCut(world, camera, params, cut);
 }
 
 void View::selectCut(const World& world, const Camera& camera,
                      const CutParams& params, PageUsageContext& usage,
-                     std::vector<CutEntry>& outCut)
+                     CutResults& outCut)
 {
-    CutSink cut(outCut);
+    CutResultSink cut(outCut);
     selectCut(world, camera, params, usage, cut);
 }
 

@@ -13,50 +13,50 @@ using TA = World::TestAccess;
 
 namespace {
 
-std::map<UserId, float> cutMap(const std::vector<CutEntry>& v)
+std::map<UserId, uint8_t> cutMap(World& world, const CutResults& cut)
 {
-    std::map<UserId, float> m;
-    for (const auto& e : v)
-        if (inCurrentCut(e)) m.emplace(e.payload, e.err);
+    std::map<UserId, uint8_t> m;
+    for (const auto& e : currentCut(cut))
+        m.emplace(payloadOf(world, e), e.errorCode());
     return m;
 }
-std::map<UserId, std::pair<float, CutTag>> idealMap(const std::vector<CutEntry>& v)
+std::map<UserId, uint8_t> idealMap(World& world, const CutResults& cut)
 {
-    std::map<UserId, std::pair<float, CutTag>> m;
-    for (const auto& e : v)
-        if (inIdealCut(e)) m.emplace(e.payload, std::make_pair(e.err, e.tag));
+    std::map<UserId, uint8_t> m;
+    for (const auto& e : idealCut(cut))
+        m.emplace(payloadOf(world, e), e.errorCode());
     return m;
 }
 
-void expectSameCut(const std::vector<CutEntry>& got, const std::vector<CutEntry>& want)
+void expectSameCut(World& world, const CutResults& got, const CutResults& want)
 {
-    const auto g = cutMap(got), w = cutMap(want);
+    const auto g = cutMap(world, got), w = cutMap(world, want);
     ASSERT_EQ(g.size(), currentCutSize(got)) << "duplicate ids in current cut";
     ASSERT_EQ(g.size(), w.size());
-    for (const auto& [id, err] : w)
+    for (const auto& [id, error] : w)
     {
         auto it = g.find(id);
         ASSERT_NE(it, g.end()) << "missing id " << id;
-        EXPECT_NEAR(it->second, err, 1e-3f * std::max(1.0f, err)) << "id " << id;
+        EXPECT_EQ(it->second, error) << "id " << id;
     }
 }
 
-void expectSameIdeal(const std::vector<CutEntry>& got, const std::vector<CutEntry>& want)
+void expectSameIdeal(World& world, const CutResults& got, const CutResults& want)
 {
-    const auto g = idealMap(got), w = idealMap(want);
+    const auto g = idealMap(world, got), w = idealMap(world, want);
     ASSERT_EQ(g.size(), idealCutSize(got)) << "duplicate ids in ideal cut";
     ASSERT_EQ(g.size(), w.size());
-    for (const auto& [id, ew] : w)
+    for (const auto& [id, error] : w)
     {
         auto it = g.find(id);
         ASSERT_NE(it, g.end()) << "missing id " << id;
-        EXPECT_EQ(int(it->second.second), int(ew.second)) << "tag of id " << id;
+        EXPECT_EQ(it->second, error) << "error code of id " << id;
     }
 }
 
 struct Outputs
 {
-    std::vector<CutEntry> cut;
+    CutResults cut;
 };
 
 Outputs run(World& w, const Camera& v, const CutParams& p)
@@ -94,15 +94,11 @@ TEST(Cut, TownExample)
     const auto o = run(w, v, {4.0f, 0.0f});
 
     std::set<UserId> got;
-    for (const auto& e : o.cut)
-        if (inCurrentCut(e)) got.insert(e.payload);
+    for (const auto& e : currentCut(o.cut)) got.insert(payloadOf(w, e));
     EXPECT_EQ(got, (std::set<UserId>{10, 11, 12, 3}));   // walls + far building
 
     // Everything resident: ideal == current.
-    std::map<UserId, float> ideal;
-    for (const CutEntry& entry : o.cut)
-        if (inIdealCut(entry)) ideal.emplace(entry.payload, entry.err);
-    EXPECT_EQ(cutMap(o.cut), ideal);
+    EXPECT_EQ(cutMap(w, o.cut), idealMap(w, o.cut));
 }
 
 // ---------------------------------------------------------------------------
@@ -165,13 +161,12 @@ TEST(Cut, IsAntichain)
     const auto o = run(w, v, {6.0f, 0.0f});
 
     std::set<UserId> inCut;
-    for (const auto& e : o.cut)
-        if (inCurrentCut(e)) inCut.insert(e.payload);
-    for (const auto& e : o.cut)
+    for (const auto& e : currentCut(o.cut)) inCut.insert(payloadOf(w, e));
+    for (const auto& e : currentCut(o.cut))
     {
-        if (!inCurrentCut(e)) continue;
-        for (UserId anc : TA::ancestorIds(w, e.payload))
-            EXPECT_FALSE(inCut.count(anc)) << "node " << e.payload << " and ancestor " << anc;
+        const UserId id = payloadOf(w, e);
+        for (UserId anc : TA::ancestorIds(w, id))
+            EXPECT_FALSE(inCut.count(anc)) << "node " << id << " and ancestor " << anc;
     }
 }
 
@@ -244,8 +239,8 @@ TEST(Cut, MatchesBruteForceReference)
         const RefResult want = TA::referenceCut(w, v, p);
 
         SCOPED_TRACE("iter " + std::to_string(iter));
-        expectSameCut(got.cut, want.cut);
-        expectSameIdeal(got.cut, want.cut);
+        expectSameCut(w, got.cut, want.cut);
+        expectSameIdeal(w, got.cut, want.cut);
     }
 }
 
@@ -270,7 +265,7 @@ TEST(Cut, StableAcrossFrames)
     {
         w.applyUpdates();
         const auto o = run(w, v, {5.0f, 0.0f});
-        expectSameCut(o.cut, first.cut);
+        expectSameCut(w, o.cut, first.cut);
     }
 }
 
@@ -318,7 +313,7 @@ struct DampFixture
         w.applyUpdates();
         const Outputs o = run(w, v, p);
         const auto current = currentCut(o.cut);
-        return current.size() == 1 && current[0].payload == 1;
+        return current.size() == 1 && payloadOf(w, current[0]) == 1;
     }
 };
 
@@ -442,10 +437,9 @@ TEST(Cut, ContributionCulling)
     const auto with = run(w, v, {4.0f, 0.5f});
 
     std::set<UserId> withoutIds, withIds;
-    for (const auto& e : without.cut)
-        if (inCurrentCut(e)) withoutIds.insert(e.payload);
-    for (const auto& e : with.cut)
-        if (inCurrentCut(e)) withIds.insert(e.payload);
+    for (const auto& e : currentCut(without.cut))
+        withoutIds.insert(payloadOf(w, e));
+    for (const auto& e : currentCut(with.cut)) withIds.insert(payloadOf(w, e));
 
     bool farInWithout = false, farInWith = false;
     for (UserId id : farIds)
