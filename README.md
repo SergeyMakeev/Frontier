@@ -71,54 +71,56 @@ contribution is smaller than that value; zero disables contribution culling.
 
 ## Performance at a glance
 
-The representative workload is a moving camera in a large, partly dynamic
-world. It is intended to resemble a forest, city, or prop field rather than an
-isolated algorithm microbenchmark:
+The representative workload resembles a forest, city, or prop field:
 
-- 80,000 instances share one fully resident 85-node asset (four children per
-  node, three edges from root to leaf). Instance origins are spread over a
-  roughly 6.8 km square.
-- The camera flies continuously through the world for 600 frames with no cuts
-  or teleports. It uses a 1080p, 16:9 perspective view.
-- Every frame, 5% of the population (4,000 instances) receives an updated
-  transform around its home position. After those updates and the associated
-  TLAS maintenance, the benchmark begins the frame, flushes pending bounds
-  work, and selects the cut.
-- Selection uses a 4-pixel error threshold and `minPix=0`, so the TLAS still
-  performs frustum culling but does not discard small visible instances. Only
-  the actual render cut is requested; ideal-cut and streaming-request outputs
-  are disabled.
-- The test is single-threaded. It does not include rendering, asset IO,
-  payload-residency changes, or instance spawning and removal.
+- 80,000 instances share one fully resident 85-node asset and are spread over
+  a roughly 6.8 km square.
+- A per-view `SelectionContext` is always used. Selection requests only the
+  actual render cut, with a 4-pixel error threshold and `minPix=0`.
+- Moving-camera cases use the same continuous 600-frame fly-through at 1080p
+  and 16:9, with no camera cuts or teleports.
+- Moving-object cases update 5% of the population (4,000 transforms) every
+  frame.
+- The benchmark is single-threaded. It excludes rendering, asset IO,
+  residency changes, and instance spawning or removal.
 
-Two supported selection modes run the same deterministic camera path and
-instance motion. **Stateless** selection walks the hierarchy of every visible
-instance each frame. A per-view **`SelectionContext`** instead reuses a recorded
-instance cut only while conservative camera, projection, asset, residency, and
-motion checks prove that the result cannot have changed. Moving instances are
-therefore re-walked; unchanged instances can still be reused while the camera
-moves.
+Measurements are medians of ten randomly interleaved 600-frame runs on a
+64-hardware-thread, 2.4 GHz EPYC, using one thread, MSVC 19.51, Release
+`/O2 /arch:AVX2`, on 2026-08-05.
 
-The numbers below are means of five 600-frame runs on a 64-hardware-thread,
-2.4 GHz EPYC, using one thread, MSVC 19.51, Release `/O2 /arch:AVX2`, measured
-on 2026-08-05:
+### Startup
 
-| Per-frame result | Stateless | `SelectionContext` |
-|---|---:|---:|
-| Complete benchmark loop (4,000 moves, frame/bounds maintenance, selection, and result consumption) | 3.27 ms | 2.61 ms |
-| `selectCut` portion after bounds are flushed | 2.87 ms | 2.16 ms |
-| Visible instance cuts reused | 0% | 92.4% |
-| Context memory for this view | 0 | 7.66 MiB |
-| Average visible instances | about 21,919 | about 21,919 |
-| Average actual-cut entries | 24,986 | 24,986 |
-| Entries per visible instance | 1.14 | 1.14 |
+| Operation | Time | Included work |
+|---|---:|---|
+| Create the world | 10.7 ms | Build and register the shared asset, add 80,000 instances, and mark its payloads resident |
+| First `selectCut` | 52.5-59.0 ms | Build the initial quality TLAS, query it, walk visible hierarchies, produce the first cut, and populate the `SelectionContext` |
 
-Both modes return the same render cut; the context changes how much traversal
-is repeated, not the answer. These are point estimates for scale, not platform
-promises. Selection remains output-sensitive, so visibility, cut size,
-residency, page layout, and memory locality can matter more than the total
-authored node count. See [ARCHITECTURE.md](ARCHITECTURE.md) for benchmark
-methodology and specialized measurements.
+World creation does not force the initial quality TLAS build; that work is
+deferred until the first query. Applications can therefore treat the first cut
+as part of level warm-up rather than expecting steady-frame latency from it.
+
+### Steady-frame breakdown
+
+| HLodTree work per frame | Camera and 4,000 objects moving | Static camera, 4,000 objects moving | Moving camera, static objects |
+|---|---:|---:|---:|
+| Apply transform updates and maintain the TLAS | 0.34 ms | 0.32 ms | n/a |
+| `beginFrame` and flush pending node-bound changes | <0.001 ms | <0.001 ms | <0.001 ms |
+| `selectCut` | 1.71 ms | 1.76 ms | 0.60 ms |
+| **Total HLodTree frame work** | **2.05 ms** | **2.08 ms** | **0.60 ms** |
+
+The moving-camera cases average about 21,919 visible instances and a
+24,986-entry render cut. With objects moving, the context reuses 92.6% of
+visible instance cuts; with static objects it reuses 97.6%. The fixed-camera
+case averages 19,602 visible instances, a 22,872-entry cut, and 94.1% reuse.
+The context occupies 7.66 MiB after the fly-through and 4.16 MiB for the fixed
+view.
+
+The main distinction is visible immediately: creating the quality TLAS is a
+one-time cost, transform updates are relatively small, and invalidating cuts
+through object motion costs more than camera motion alone in this workload.
+These are scale estimates rather than platform promises; selection remains
+output-sensitive. See [ARCHITECTURE.md](ARCHITECTURE.md) for specialized
+measurements and methodology.
 
 ## What selection returns
 

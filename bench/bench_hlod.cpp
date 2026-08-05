@@ -1807,6 +1807,131 @@ BENCHMARK(BM_SelectionContext_FlyThrough)
     ->Iterations(600)
     ->Unit(benchmark::kMicrosecond);
 
+// Operation-level breakdown for the representative README workload. This is
+// deliberately SelectionContext-only: the three arms separate object motion
+// from camera motion while keeping the world, view, and 600-frame route fixed.
+//
+// arg0 = percent of instances moved per frame
+// arg1 = 0 fixed camera / 1 continuous fly-through
+static void BM_SelectionContext_Breakdown(benchmark::State& state)
+{
+    using clock = std::chrono::steady_clock;
+
+    constexpr int count = 80000;
+    const int movePct = int(state.range(0));
+    const bool cameraMoves = state.range(1) != 0;
+
+    const auto init0 = clock::now();
+    TreeGen gen;
+    gen.fanout = 4;
+    gen.depth = 3;
+    Page proto = gen.makeRootPage(unitRegion(3.0f), 2.0f, 0);
+    const uint32_t nodes = proto.nodeCount();
+
+    World w;
+    const AssetHandle asset = w.registerAsset(std::move(proto));
+    const float half = 12.0f * std::sqrt(float(count));
+    std::mt19937 rng(4242);
+    std::uniform_real_distribution<float> uni(-half, half);
+    std::vector<World::InstanceRef> insts;
+    std::vector<float4> home;
+    insts.reserve(count);
+    home.reserve(count);
+    for (int i = 0; i < count; ++i)
+    {
+        home.push_back(float4::point(uni(rng), 0, uni(rng)));
+        insts.push_back(w.addInstance(asset, home.back()));
+    }
+    markAllResident(w, w.assetRootPage(asset), nodes);
+    const auto init1 = clock::now();
+
+    const auto viewAt = [&](size_t frame)
+    {
+        const float t = float(frame % 600) / 600.0f;
+        const float z = cameraMoves ? (t * 2.0f - 1.0f) * half * 0.8f : 0.0f;
+        return makePerspectiveView(
+            float4::point(0, 2.0f, z), float4::vec(0.0f, 0.0f, 1.0f),
+            float4::vec(0, 1, 0), 1.0f, 16.0f / 9.0f, 1080.0f, 0.1f, 1.0e9f);
+    };
+
+    SelectionContext context;
+    std::vector<CutEntry> cut;
+    const CutParams params{4.0f, 0.0f};
+
+    // The cold cut performs any deferred initial TLAS build and populates the
+    // context. Steady-frame counters below start from a realistic warm state.
+    w.beginFrame();
+    w.flushBounds();
+    const CullView coldView = viewAt(0);
+    const auto cold0 = clock::now();
+    w.selectCut(coldView, params, context, cut);
+    const auto cold1 = clock::now();
+
+    const int movers = count * movePct / 100;
+    XorShift32 fast;
+    double moveNs = 0.0;
+    double maintenanceNs = 0.0;
+    double cutNs = 0.0;
+    double totalNs = 0.0;
+    double reuse = 0.0;
+    double entries = 0.0;
+    double visible = 0.0;
+    size_t frames = 0;
+
+    for (auto _ : state)
+    {
+        const CullView view = viewAt(frames);
+        const auto frame0 = clock::now();
+
+        const auto move0 = frame0;
+        for (int i = 0; i < movers; ++i)
+            w.moveInstance(insts[i], home[i] + float4::vec(fast.uniform(-0.4f, 0.4f), 0,
+                                                           fast.uniform(-0.4f, 0.4f)));
+        const auto move1 = clock::now();
+
+        w.beginFrame();
+        w.flushBounds();
+        const auto maintenance1 = clock::now();
+
+        w.selectCut(view, params, context, cut);
+        const auto cut1 = clock::now();
+
+        moveNs += std::chrono::duration<double, std::nano>(move1 - move0).count();
+        maintenanceNs +=
+            std::chrono::duration<double, std::nano>(maintenance1 - move1).count();
+        cutNs += std::chrono::duration<double, std::nano>(cut1 - maintenance1).count();
+        totalNs += std::chrono::duration<double, std::nano>(cut1 - frame0).count();
+
+        const double n = double(context.reused() + context.walked());
+        reuse += n > 0.0 ? 100.0 * double(context.reused()) / n : 0.0;
+        entries += double(cut.size());
+        visible += n;
+        benchmark::DoNotOptimize(cut.data());
+        ++frames;
+    }
+
+    const double f = double(frames ? frames : 1);
+    state.counters["init_ms"] =
+        std::chrono::duration<double, std::milli>(init1 - init0).count();
+    state.counters["cold_ms"] =
+        std::chrono::duration<double, std::milli>(cold1 - cold0).count();
+    state.counters["move_us"] = moveNs / f / 1000.0;
+    state.counters["maint_us"] = maintenanceNs / f / 1000.0;
+    state.counters["cut_us"] = cutNs / f / 1000.0;
+    state.counters["total_us"] = totalNs / f / 1000.0;
+    state.counters["reuse%"] = reuse / f;
+    state.counters["visible"] = visible / f;
+    state.counters["avg_cut"] = entries / f;
+    state.counters["cache_MB"] = double(context.bytes()) / (1024.0 * 1024.0);
+}
+BENCHMARK(BM_SelectionContext_Breakdown)
+    ->Args({5, 1})   // moving camera, 5% moving objects
+    ->Args({5, 0})   // static camera, 5% moving objects
+    ->Args({0, 1})   // moving camera, static objects
+    ->ArgNames({"move_pct", "camera_moves"})
+    ->Iterations(600)
+    ->Unit(benchmark::kMicrosecond);
+
 // ---------------------------------------------------------------------------
 // Projection-scale motion under damping. Every flip point sits at
 // eff * k / threshold; the cache stores a conservative per-record slope and
