@@ -1431,6 +1431,61 @@ BENCHMARK(BM_TlasScale)
     ->Arg(200000)->Arg(500000)
     ->Unit(benchmark::kMicrosecond);
 
+// Rebuild after a world has shrunk far below its historical peak. Instance
+// slots are recycled rather than erased, so a rebuild that scans capacity pays
+// for the peak population forever; the dense live-id list should make this
+// scale with the 10% that remain.
+static void BM_TlasSparseRebuild(benchmark::State& state)
+{
+    using clock = std::chrono::steady_clock;
+    const int peak = int(state.range(0));
+    const int live = peak / 10;
+
+    WorldConfig config;
+    config.tlasCountDrift = 2.0f;   // let edit budget request a Morton rebuild
+    World w(config);
+
+    TreeGen gen;
+    gen.fanout = 4;
+    gen.depth = 1;
+    Page proto = gen.makeRootPage(unitRegion(5.0f), 16.0f, 0);
+    const uint32_t nodes = proto.nodeCount();
+    const AssetHandle asset = w.registerAsset(std::move(proto));
+
+    const float half = 40.0f * std::sqrt(float(peak));
+    std::mt19937 rng(1717);
+    std::uniform_real_distribution<float> uni(-half, half);
+    std::vector<World::InstanceRef> refs;
+    refs.reserve(peak);
+    for (int i = 0; i < peak; ++i)
+        refs.push_back(w.addInstance(asset, float4::point(uni(rng), 0, uni(rng))));
+    markAllResident(w, w.assetRootPage(asset), nodes);
+
+    std::vector<CutEntry> cut;
+    const CutParams params{4.0f, 1.0f};
+    const CullView view = orbitView(0.0f, half * 0.25f);
+    w.selectCut(view, params, cut);   // establish the peak-quality tree
+    for (int i = live; i < peak; ++i) w.removeInstance(refs[i]);
+
+    const auto t0 = clock::now();
+    w.selectCut(view, params, cut);   // sparse Morton rebuild
+    const auto t1 = clock::now();
+    const double rebuildMs =
+        std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+    for (auto _ : state)
+    {
+        w.beginFrame();
+        w.selectCut(view, params, cut);
+        benchmark::DoNotOptimize(cut.data());
+    }
+    state.counters["cut"] = double(cut.size());
+    state.counters["live"] = double(live);
+    state.counters["peak"] = double(peak);
+    state.counters["rebuild_ms"] = rebuildMs;
+}
+BENCHMARK(BM_TlasSparseRebuild)->Arg(100000)->Unit(benchmark::kMicrosecond);
+
 // ---------------------------------------------------------------------------
 // Asset sharing vs. cloning: the SAME scene and the SAME cut, built two ways.
 // arg0 0 = every instance owns a private copy of the page (N assets, N
@@ -1695,27 +1750,18 @@ BENCHMARK(BM_SelectionContext_FlyThrough)
     ->Unit(benchmark::kMicrosecond);
 
 // ---------------------------------------------------------------------------
-// The zoom cliff: what a change in k costs a SelectionContext, and how much
-// damping amplifies it.
-//
-// Every recorded margin is a distance to a flip point, and a flip point sits at
-// eff * k / threshold, so a change in k moves all of them and voids the whole
-// cache at once (one epoch bump, no per-record work). That much is by
-// construction and costs exactly one frame.
-//
-// Damping is what makes it interesting. ViewDamper relaxes k toward the current
-// value alongside the envelope, so ONE zoom keystroke produces a DIFFERENT k
-// every frame until the relaxation settles -- and each of those frames voids the
-// cache again. This measures how wide that hole really is.
+// Projection-scale motion under damping. Every flip point sits at
+// eff * k / threshold; the cache stores a conservative per-record slope and
+// charges absolute k travel against the recorded margin. This benchmark guards
+// the old failure mode where every tiny relaxation step bumped a global epoch.
 //
 // arg0 = damper half-life in frames, arg1 = frames between zoom steps (0 =
 // never). Nothing moves; every instance is otherwise permanently reusable, so
 // what is left in the numbers is the zoom and only the zoom.
 //
-// Read stall_f: frames that reused nothing at all -- the cliff, in frames per
-// 600. Measured, it is 1 per zoom undamped and ~190 per zoom-OUT damped at
-// halfLife 8, because the relaxation stops at float equality rather than at the
-// half-life. Zoom IN is free: kMax_ takes the max, so it arrives at once.
+// Read stall_f as frames that reused nothing at all, out of 600. With the slope
+// budget it should reflect actual exhausted margins, not the full ~190-frame
+// relaxation tail of a halfLife-8 zoom-out.
 //
 // Do NOT read Time across different zoom periods. Zooming in narrows the
 // frustum, so fewer instances are visible and the arm is cheaper for a reason
@@ -1789,6 +1835,49 @@ BENCHMARK(BM_SelectionContext_Zoom)
     ->Args({0, 300})->Args({8, 300})
     ->Iterations(600)
     ->Unit(benchmark::kMicrosecond);
+
+// Camera-cut/reset latency. A reset forgets reuse and damping state, but the
+// same view immediately starts filling the context again; retaining its
+// buffers avoids turning that normal cycle into allocator traffic.
+static void BM_SelectionContext_Reset(benchmark::State& state)
+{
+    const int count = int(state.range(0));
+    TreeGen gen;
+    gen.fanout = 4;
+    gen.depth = 3;
+    Page proto = gen.makeRootPage(unitRegion(3.0f), 2.0f, 0);
+    const uint32_t nodes = proto.nodeCount();
+
+    World w;
+    const AssetHandle asset = w.registerAsset(std::move(proto));
+    const float half = 12.0f * std::sqrt(float(count));
+    std::mt19937 rng(4242);
+    std::uniform_real_distribution<float> uni(-half, half);
+    for (int i = 0; i < count; ++i)
+        w.addInstance(asset, float4::point(uni(rng), 0, uni(rng)));
+    markAllResident(w, w.assetRootPage(asset), nodes);
+
+    SelectionContext ctx(6.0f);
+    std::vector<CutEntry> cut;
+    const CutParams params{4.0f, 0.0f};
+    const CullView view = makePerspectiveView(
+        float4::point(0, 2.0f, 0), float4::vec(0, 0, 1), float4::vec(0, 1, 0),
+        1.0f, 16.0f / 9.0f, 1080.0f, 0.1f, 1.0e9f);
+
+    // Allocate once before timing. The benchmark measures whether reset keeps
+    // or discards that reusable storage.
+    w.selectCut(view, params, ctx, cut);
+    for (auto _ : state)
+    {
+        ctx.reset();
+        w.beginFrame();
+        w.selectCut(view, params, ctx, cut);
+        benchmark::DoNotOptimize(cut.data());
+    }
+    state.counters["cut"] = double(cut.size());
+    state.counters["ctx_MB"] = double(ctx.bytes()) / (1024.0 * 1024.0);
+}
+BENCHMARK(BM_SelectionContext_Reset)->Arg(20000)->Unit(benchmark::kMicrosecond);
 
 // ---------------------------------------------------------------------------
 // What does ONE spawn cost?

@@ -98,7 +98,7 @@ struct World::TestAccess
     {
         w.flushBounds();
         const Instance* inst = w.resolveInstance(ref);
-        return inst ? inst->worldBox : AABB::empty();
+        return inst ? w.instanceTlas_[ref.id].worldBox : AABB::empty();
     }
     // The runtime state a mount holds, which every instance of the asset
     // shares: used to assert that deforming one instance does not fork it.
@@ -128,6 +128,20 @@ struct World::TestAccess
         size_t alive = 0;
         for (const World::Instance& i : w.instances_)
             if (i.alive) ++alive;
+        if (w.instanceTlas_.size() != w.instances_.size())
+            return "instance hot/cold arrays differ in size";
+        if (w.liveInstances_.size() != alive)
+            return "dense live list count disagrees with instance slots";
+        std::vector<uint8_t> listed(w.instances_.size(), 0);
+        for (uint32_t dense = 0; dense < uint32_t(w.liveInstances_.size()); ++dense)
+        {
+            const uint32_t id = w.liveInstances_[dense];
+            if (id >= w.instances_.size()) return "dense live list names no instance";
+            if (!w.instances_[id].alive) return "dense live list contains dead instance";
+            if (listed[id]++) return "dense live list contains an instance twice";
+            if (w.instanceTlas_[id].liveIndex != dense)
+                return "dense live-list back-pointer disagrees";
+        }
         if (w.tlasRoot_ < 0)
             return alive == 0 ? "" : "empty tree with " + std::to_string(alive) +
                                          " live instances";
@@ -152,15 +166,16 @@ struct World::TestAccess
                     const uint32_t id = uint32_t(~n.child[l]);
                     if (id >= w.instances_.size()) return "lane names no instance";
                     const World::Instance& inst = w.instances_[id];
+                    const World::InstanceTlas& spatial = w.instanceTlas_[id];
                     if (!inst.alive) return "dead instance still in the tree";
                     if (seen[id]++) return "instance in the tree twice";
-                    if (inst.tlasNode != uint32_t(ni) || inst.tlasLane != l)
+                    if (spatial.tlasNode != uint32_t(ni) || spatial.tlasLane != l)
                         return "instance back-pointer disagrees with its lane";
-                    if (!lane.contains(inst.worldBox))
+                    if (!lane.contains(spatial.worldBox))
                         return "lane does not contain its instance";
-                    if ((n.laneMask[l] & inst.mask) != inst.mask)
+                    if ((n.laneMask[l] & spatial.mask) != spatial.mask)
                         return "lane mask drops layers its instance is on";
-                    if (n.maxErr.v[l] < inst.maxErrWorld)
+                    if (n.maxErr.v[l] < spatial.maxErrWorld)
                         return "lane error below its instance's";
                     ++found;
                 }
@@ -211,17 +226,19 @@ struct World::TestAccess
     {
         w.flushBounds();
         RefResult out;
-        for (const Instance& inst : w.instances_)
+        for (uint32_t id = 0; id < uint32_t(w.instances_.size()); ++id)
         {
+            const Instance& inst = w.instances_[id];
             if (!inst.alive) continue;
+            const InstanceTlas& spatial = w.instanceTlas_[id];
             uint8_t mask = kAllPlanes;
-            if (testAabb(inst.worldBox, view.frustum, mask) == CullState::Outside)
+            if (testAabb(spatial.worldBox, view.frustum, mask) == CullState::Outside)
                 continue;
             if (p.minPix > 0.0f)
             {
                 const float e = screenError(
-                    inst.maxErrWorld, view.k,
-                    distanceToBox(inst.worldBox, view.queryMin(), view.queryMax()));
+                    spatial.maxErrWorld, view.k,
+                    distanceToBox(spatial.worldBox, view.queryMin(), view.queryMax()));
                 if (e < p.minPix) continue;
             }
             const CullView local = toLocal(view, inst.pos, inst.scale);

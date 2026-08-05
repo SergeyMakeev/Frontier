@@ -217,6 +217,50 @@ TEST(Contracts, DeterministicAcrossIdenticalWorlds)
     }
 }
 
+// Parallel workers deduplicate requests locally while walking shared page
+// state. The merge must also collapse requests reached by different chunks,
+// preserving the serial order and the highest priority.
+TEST(Contracts, ParallelSelectionMatchesSerialRequests)
+{
+    TreeGen gen;
+    gen.fanout = 4;
+    gen.depth = 2;
+    const Page proto = gen.makeRootPage(unitRegion(20.0f), 64.0f, 0);
+
+    World serial;
+    WorldConfig config;
+    config.context.workerCount = 4;
+    config.parallelInstanceThreshold = 1;
+    World parallel(config);
+
+    const AssetHandle serialAsset = serial.registerAsset(proto.clone());
+    const AssetHandle parallelAsset = parallel.registerAsset(proto.clone());
+    for (uint32_t i = 0; i < 16; ++i)
+    {
+        const float4 pos = float4::point(float(i & 3u) * 2.0f, 0.0f,
+                                         float(i >> 2) * 2.0f);
+        serial.addInstance(serialAsset, pos);
+        parallel.addInstance(parallelAsset, pos);
+    }
+
+    serial.beginFrame();
+    parallel.beginFrame();
+    const CullView view = makeLookAtView(float4::point(3, 8, -40),
+                                         float4::point(3, 0, 3));
+    const CutParams params{0.25f, 0.0f};
+    const Outputs a = run(serial, view, params);
+    const Outputs b = run(parallel, view, params);
+
+    ASSERT_FALSE(a.reqs.empty());
+    ASSERT_EQ(b.reqs.size(), a.reqs.size());
+    for (size_t i = 0; i < a.reqs.size(); ++i)
+    {
+        EXPECT_EQ(b.reqs[i].payload, a.reqs[i].payload);
+        EXPECT_EQ(b.reqs[i].node.index, a.reqs[i].node.index);
+        EXPECT_EQ(b.reqs[i].priority, a.reqs[i].priority);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Multiple damped views share the world but not each other's history: each
 // view's memory lives entirely in its own ViewDamper, and selectCut is a pure

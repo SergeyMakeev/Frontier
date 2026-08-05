@@ -387,6 +387,7 @@ World::InstanceRef World::addInstanceInternal(uint32_t asset, const InstanceDesc
     else
     {
         instances_.emplace_back();
+        instanceTlas_.emplace_back();
         id = InstanceId(instances_.size() - 1);
     }
 
@@ -402,16 +403,19 @@ World::InstanceRef World::addInstanceInternal(uint32_t asset, const InstanceDesc
     ++assets_[asset].instanceRefs;
 
     Instance& inst = instances_[id];
+    InstanceTlas& spatial = instanceTlas_[id];
     inst = Instance{};
+    spatial = InstanceTlas{};
     inst.pos = desc.pos;
     inst.scale = desc.scale;
     inst.rootSlot = slot;
-    inst.asset = asset;
     inst.tag = desc.tag == kAutoTag ? id : desc.tag;
-    inst.mask = desc.mask;
+    spatial.asset = asset;
+    spatial.mask = desc.mask;
     inst.alive = true;
     inst.generation = ++generationCounter_;
-    inst.tlasNode = kInvalidIndex;
+    spatial.liveIndex = uint32_t(liveInstances_.size());
+    liveInstances_.push_back(id);
     // Bounds first, then insert: the insert descends on worldBox. Going through
     // refreshInstanceBounds here would hand a not-yet-inserted instance to the
     // motion refit, whose kInvalidIndex case exists to catch exactly that as a
@@ -469,7 +473,7 @@ World::Instance* World::resolveInstance(InstanceRef ref)
 // then it takes the quality tier because it is rare and long-lived.
 void World::markTlasStructuralChange()
 {
-    const uint64_t alive = instances_.size() - freeInstances_.size();
+    const uint64_t alive = liveInstances_.size();
     const uint64_t drift = alive > tlasQualityCount_ ? alive - tlasQualityCount_
                                                      : tlasQualityCount_ - alive;
     if (float(drift) > float(tlasQualityCount_) * config_.tlasCountDrift)
@@ -484,10 +488,16 @@ void World::removeInstance(InstanceRef ref)
     Instance* inst = resolveInstance(ref);
     if (!inst) return;   // stale ref: the instance is already gone
     const InstanceId id = ref.id;
-    const uint32_t   asset = inst->asset;
+    const uint32_t   asset = instanceTlas_[id].asset;
 
     freeOverlays(*inst);
     tlasRemove(id);
+    const uint32_t liveIndex = instanceTlas_[id].liveIndex;
+    const InstanceId moved = liveInstances_.back();
+    liveInstances_[liveIndex] = moved;
+    instanceTlas_[moved].liveIndex = liveIndex;
+    liveInstances_.pop_back();
+    instanceTlas_[id].liveIndex = kInvalidIndex;
     instances_[id].alive = false;
     freeInstances_.push_back(id);
     markTlasStructuralChange();
@@ -527,10 +537,13 @@ void World::refreshInstanceBounds(InstanceId id)
 void World::recomputeInstanceBounds(InstanceId id)
 {
     Instance& inst = instances_[id];
-    ++inst.cutVersion;   // any SelectionContext record for this instance is void
+    InstanceTlas& spatial = instanceTlas_[id];
+    // Globally unique rather than per-instance so a recycled slot can never
+    // match the previous occupant's SelectionContext record.
+    inst.cutVersion = ++generationCounter_;
     const PageRt& rt = slots_[inst.rootSlot];
     const AABB* bbox = boundsFor(inst, inst.rootSlot, rt);
-    inst.worldBox = toWorld(bbox[0], inst.pos, inst.scale);
+    spatial.worldBox = toWorld(bbox[0], inst.pos, inst.scale);
 
     float maxErr = 0.0f;
     uint32_t c = 1;
@@ -539,7 +552,7 @@ void World::recomputeInstanceBounds(InstanceId id)
         maxErr = std::max(maxErr, std::min(rt.page.geometricError[c], rt.errClamp));
         c += rt.page.subtreeSize[c];
     }
-    inst.maxErrWorld = maxErr * inst.scale;
+    spatial.maxErrWorld = maxErr * inst.scale;
 }
 
 // ============================================================================
@@ -742,7 +755,7 @@ void World::applyBoundsChange(InstanceId id, uint32_t slot, uint32_t index,
     // never reach another instance -- one counter on the instance is the whole
     // invalidation. Bumped here rather than deeper because a change that stops
     // early (the ancestor box already contained it) still moved this node.
-    ++instances_[id].cutVersion;
+    instances_[id].cutVersion = ++generationCounter_;
 
     while (true)
     {
@@ -949,7 +962,7 @@ void World::tlasNoteEdit()
 void World::tlasInsert(InstanceId id)
 {
     if (tlasDirty_) return;   // the pending rebuild will enumerate this instance
-    Instance& inst = instances_[id];
+    InstanceTlas& inst = instanceTlas_[id];
     if (tlasRoot_ < 0)
     {
         tlasDirty_ = true;    // no tree yet; let a build make the first one
@@ -1038,7 +1051,7 @@ void World::tlasInsert(InstanceId id)
 void World::tlasRemove(InstanceId id)
 {
     if (tlasDirty_) return;
-    Instance& inst = instances_[id];
+    InstanceTlas& inst = instanceTlas_[id];
     if (inst.tlasNode == kInvalidIndex) return;
 
     uint32_t nodeIdx = inst.tlasNode;
@@ -1081,7 +1094,7 @@ void World::tlasRemove(InstanceId id)
 void World::tlasOnInstanceMoved(InstanceId id)
 {
     if (tlasDirty_) return;
-    Instance& inst = instances_[id];
+    InstanceTlas& inst = instanceTlas_[id];
     if (inst.tlasNode == kInvalidIndex)
     {
         tlasDirty_ = true;
@@ -1133,7 +1146,8 @@ int World::tlasSplit(std::vector<uint32_t>& items, int lo, int hi)
     if (count <= 1) return hi;
 
     AABB cb = AABB::empty();
-    for (int k = lo; k < hi; ++k) cb.expand(instances_[items[k]].worldBox.center());
+    for (int k = lo; k < hi; ++k)
+        cb.expand(instanceTlas_[items[k]].worldBox.center());
     const float4 ext = cb.mx - cb.mn;
 
     if (config_.tlasQuality == TlasQuality::BinnedSAH)
@@ -1154,7 +1168,7 @@ int World::tlasSplit(std::vector<uint32_t>& items, int lo, int hi)
             for (int i = 0; i < kBins; ++i) binBox[i] = AABB::empty();
             for (int k = lo; k < hi; ++k)
             {
-                const Instance& in = instances_[items[k]];
+                const InstanceTlas& in = instanceTlas_[items[k]];
                 int b = int((axisOf(in.worldBox.center(), axis) - base) * scale);
                 b = b < 0 ? 0 : (b >= kBins ? kBins - 1 : b);
                 binBox[b].expand(in.worldBox);
@@ -1203,7 +1217,7 @@ int World::tlasSplit(std::vector<uint32_t>& items, int lo, int hi)
                 [&](uint32_t idx)
                 {
                     int b = int(
-                        (axisOf(instances_[idx].worldBox.center(), bestAxis) - base) *
+                        (axisOf(instanceTlas_[idx].worldBox.center(), bestAxis) - base) *
                         scale);
                     b = b < 0 ? 0 : (b >= kBins ? kBins - 1 : b);
                     return b < bestBin;
@@ -1218,8 +1232,8 @@ int World::tlasSplit(std::vector<uint32_t>& items, int lo, int hi)
     std::nth_element(items.begin() + lo, items.begin() + mid, items.begin() + hi,
                      [&](uint32_t a, uint32_t b)
                      {
-                         return axisOf(instances_[a].worldBox.center(), axis) <
-                                axisOf(instances_[b].worldBox.center(), axis);
+                         return axisOf(instanceTlas_[a].worldBox.center(), axis) <
+                                axisOf(instanceTlas_[b].worldBox.center(), axis);
                      });
     return mid;
 }
@@ -1246,7 +1260,7 @@ int32_t World::tlasBuildRange(std::vector<uint32_t>& items, int lo, int hi, int3
         for (int k = 0; k < count; ++k)
         {
             const uint32_t instIdx = items[lo + k];
-            Instance& inst = instances_[instIdx];
+            InstanceTlas& inst = instanceTlas_[instIdx];
             TlasNode& n = tlasNodes_[idx];
             n.bounds.setLane(uint32_t(k), inst.worldBox);
             n.maxErr.v[k] = inst.maxErrWorld;
@@ -1320,9 +1334,7 @@ void World::tlasRebuild()
     if (quality)
     {
         std::vector<uint32_t>& items = tlasItemsTmp_;
-        items.clear();
-        for (uint32_t i = 0; i < uint32_t(instances_.size()); ++i)
-            if (instances_[i].alive) items.push_back(i);
+        items.assign(liveInstances_.begin(), liveInstances_.end());
         tlasLeafCount_ = uint32_t(items.size());
         tlasQualityCount_ = tlasLeafCount_;
         if (!items.empty())
@@ -1332,17 +1344,16 @@ void World::tlasRebuild()
     {
         tlasKeys_.clear();
         AABB cb = AABB::empty();
-        for (uint32_t i = 0; i < uint32_t(instances_.size()); ++i)
-            if (instances_[i].alive) cb.expand(instances_[i].worldBox.center());
+        for (const InstanceId i : liveInstances_)
+            cb.expand(instanceTlas_[i].worldBox.center());
         const float4 lo = cb.mn;
         const float4 ext = cb.extent();
         const float sx = ext.x > 0.0f ? 2097151.0f / ext.x : 0.0f;
         const float sy = ext.y > 0.0f ? 2097151.0f / ext.y : 0.0f;
         const float sz = ext.z > 0.0f ? 2097151.0f / ext.z : 0.0f;
-        for (uint32_t i = 0; i < uint32_t(instances_.size()); ++i)
+        for (const InstanceId i : liveInstances_)
         {
-            if (!instances_[i].alive) continue;
-            const float4 c = instances_[i].worldBox.center();
+            const float4 c = instanceTlas_[i].worldBox.center();
             const uint64_t kx = expandBits21(uint64_t((c.x - lo.x) * sx));
             const uint64_t ky = expandBits21(uint64_t((c.y - lo.y) * sy));
             const uint64_t kz = expandBits21(uint64_t((c.z - lo.z) * sz));
@@ -1373,7 +1384,7 @@ void World::tlasRebuild()
                 for (uint32_t k = 0; k < cnt; ++k)
                 {
                     const uint32_t instIdx = tlasKeys_[base + k].second;
-                    Instance& inst = instances_[instIdx];
+                    InstanceTlas& inst = instanceTlas_[instIdx];
                     n.bounds.setLane(k, inst.worldBox);
                     n.maxErr.v[k] = inst.maxErrWorld;
                     n.child[k] = ~int32_t(instIdx);
@@ -1476,8 +1487,8 @@ void World::tlasQuery(const CullView& view, float minPix,
 
         if (minPix > 0.0f)
         {
-            const float8 dist = distanceToBoxes(n.bounds, qmn, qmx);
-            const float8 errs = screenError8(n.maxErr, view.k, dist);
+            const float8 d2 = distanceToBoxesSq(n.bounds, qmn, qmx);
+            const float8 errs = screenErrorFromSq8(n.maxErr, view.k, d2);
             for (uint32_t l = 0; l < kWide; ++l)
                 if (errs.v[l] < minPix) survivors &= ~(1u << l);
         }
@@ -1522,6 +1533,7 @@ void World::lruPushFront(uint32_t slot)
 void World::lruTouch(uint32_t slot)
 {
     PageRt& rt = slots_[slot];
+    if (rt.lastTouched == frame_) return;
     rt.lastTouched = frame_;
     if (rt.pinned || lruHead_ == slot) return;
     lruUnlink(slot);
@@ -1641,6 +1653,7 @@ void World::wideVisit(const WorkItem& item, const PageView& pg, float errClamp,
             // before this instance's cut could differ. See SelectionContext.
             if (w.trackMargin)
             {
+                w.maxError = std::max(w.maxError, eff.v[l]);
                 const float flipAt = eff.v[l] * local.k / w.bar;
                 const float d = std::sqrt(d2.v[l]);
                 const float slack = d > flipAt ? d - flipAt : flipAt - d;
@@ -1808,6 +1821,10 @@ void World::selectCut(const CullView& view, const CutParams& params, CutSink& ou
     const uint32_t workerCount = config_.context.workerCount;
     const bool parallel = config_.parallelInstanceThreshold > 0 && workerCount > 1 &&
                           nVis >= config_.parallelInstanceThreshold;
+    // One request-stamp epoch per worker plus one for the post-join merge.
+    // The extra stride keeps the merge epoch distinct from the next call's
+    // worker zero epoch.
+    const uint32_t epochBase = selectEpoch_ * (workerCount + 1);
 
     if (!parallel)
     {
@@ -1816,7 +1833,7 @@ void World::selectCut(const CullView& view, const CutParams& params, CutSink& ou
         w.nodeStack.clear();
         w.touched.clear();
         w.deferTouch = false;
-        w.epoch = selectEpoch_ * workerCount;
+        w.epoch = epochBase;
         w.cut = outCut;
         if (wantIdeal) w.ideal = *outIdealCut;
         if (wantRequests) w.requests = *outRequests;
@@ -1880,7 +1897,7 @@ void World::selectCut(const CullView& view, const CutParams& params, CutSink& ou
         w.nodeStack.clear();
         w.touched.clear();
         w.deferTouch = true;
-        w.epoch = selectEpoch_ * workerCount + k;
+        w.epoch = epochBase + k;
         w.cutBuf.clear();
         w.idealBuf.clear();
         w.reqBuf.clear();
@@ -1907,6 +1924,7 @@ void World::selectCut(const CullView& view, const CutParams& params, CutSink& ou
         },
         &chunk, config_.context.user);
 
+    const uint64_t mergeEpoch = uint64_t(epochBase + workerCount) << 32;
     for (uint32_t k = 0; k < workerCount; ++k)
     {
         Worker& w = workers_[k];
@@ -1914,7 +1932,23 @@ void World::selectCut(const CullView& view, const CutParams& params, CutSink& ou
         if (wantIdeal)
             for (const IdealEntry& e : w.idealBuf) outIdealCut->push(e);
         if (wantRequests)
-            for (const LoadRequest& e : w.reqBuf) outRequests->push(e);
+            for (const LoadRequest& e : w.reqBuf)
+            {
+                PageRt& rt = slots_[e.node.slot];
+                std::atomic_ref<uint64_t> stamp(rt.reqStamp[e.node.index]);
+                const uint64_t prev = stamp.load(std::memory_order_relaxed);
+                if ((prev & 0xFFFFFFFF00000000ull) == mergeEpoch)
+                {
+                    if (LoadRequest* prior = outRequests->at(uint32_t(prev)))
+                        if (prior->priority < e.priority) prior->priority = e.priority;
+                }
+                else
+                {
+                    stamp.store(mergeEpoch | uint64_t(outRequests->count()),
+                                std::memory_order_relaxed);
+                    outRequests->push(e);
+                }
+            }
         for (const uint32_t slot : w.touched) lruTouch(slot);
 #ifdef HLOD_STATS
         stats_.instancesVisited += w.stats.instancesVisited;
@@ -1933,12 +1967,11 @@ void World::selectCut(const CullView& view, const CutParams& params, CutSink& ou
 void SelectionContext::reset()
 {
     rec_.clear();
-    rec_.shrink_to_fit();
     store_.clear();
-    store_.shrink_to_fit();
     used_ = garbage_ = reused_ = walked_ = 0;
-    travel_ = 0.0f;
+    travel_ = kTravel_ = 0.0f;
     primed_ = false;
+    k_ = bar_ = 0.0f;
     ++epoch_;
     // The half-life is configuration and survives; the accumulated window is
     // state and does not. This is the half that reset() exists for: records
@@ -1957,22 +1990,30 @@ size_t SelectionContext::bytes() const
 // outweigh the live data. Records keep their contents; only `begin` moves.
 void SelectionContext::compact()
 {
+    // Record ids and slab-allocation order are unrelated (the latter follows
+    // TLAS traversal order).  Compacting in-place while iterating rec_ could
+    // therefore move one run over the still-unread source of another run.
+    // Compaction is deliberately rare, so use a same-sized scratch slab and
+    // keep the existing allocation headroom while making the copy order moot.
+    std::vector<CutEntry> packed(store_.size());
     uint32_t w = 0;
     for (Rec& r : rec_)
     {
         if (r.capacity == 0) continue;
-        if (r.validUntil <= travel_ || r.epoch != epoch_)
+        if (r.validUntil <= travel_ + r.kSlope * kTravel_ || r.epoch != epoch_)
         {
             // Not reusable anyway: drop the block rather than move it.
             r.capacity = r.count = 0;
             continue;
         }
-        std::memmove(store_.data() + w, store_.data() + r.begin,
-                     size_t(r.count) * sizeof(CutEntry));
+        if (r.count)
+            std::memcpy(packed.data() + w, store_.data() + r.begin,
+                        size_t(r.count) * sizeof(CutEntry));
         r.begin = w;
         r.capacity = r.count;
         w += r.count;
     }
+    store_.swap(packed);
     used_ = w;
     garbage_ = 0;
 }
@@ -2018,21 +2059,19 @@ void World::selectCut(const CullView& view, const CutParams& params,
     ctx.lastQmx_ = qmx;
     ctx.primed_ = true;
 
-    // A different projection scale or threshold moves every flip point, so
-    // every margin measured against the old ones is void.
-    //
-    // Note this is the DAMPED k, and that this is the sharpest edge in the
-    // whole mechanism: a zoom OUT leaves the damper relaxing k for ~24
-    // half-lives (it stops at float equality, not at the half-life), and every
-    // one of those frames lands here and voids the cache. Measured at 1.57x on
-    // the cut. See the note on SelectionContext for why it is sound anyway and
-    // what fixing it would cost.
-    if (ctx.k_ != dv.k || ctx.bar_ != params.threshold)
+    // Threshold changes alter every record's slope and still invalidate the
+    // cache in O(1). Projection-scale changes instead feed an odometer: each
+    // record bounds how far any flip point can move per unit k, so gradual
+    // damped zoom consumes its margin instead of voiding the whole cache.
+    if (ctx.bar_ != params.threshold)
     {
         ++ctx.epoch_;
-        ctx.k_ = dv.k;
         ctx.bar_ = params.threshold;
+        ctx.kTravel_ = 0.0f;
     }
+    else
+        ctx.kTravel_ += std::fabs(dv.k - ctx.k_);
+    ctx.k_ = dv.k;
 
     // The one safe moment to squeeze the slab: before any offset recorded this
     // pass could be moved out from under us.
@@ -2041,7 +2080,7 @@ void World::selectCut(const CullView& view, const CutParams& params,
     Worker& w = workers_[0];
     w.work.clear();
     w.nodeStack.clear();
-    w.epoch = selectEpoch_ * config_.context.workerCount;
+    w.epoch = selectEpoch_ * (config_.context.workerCount + 1);
     w.ideal = ideal;
     w.requests = req;
     w.stats = CutStats{};
@@ -2063,9 +2102,9 @@ void World::selectCut(const CullView& view, const CutParams& params,
         // line. `mask == 0` is the frustum condition: this instance is wholly
         // inside, so no plane was tested anywhere within it and camera
         // rotation cannot matter. `travel_ < validUntil` is the margin.
-        bool hit = !wantIdeal && mask == 0 && ctx.travel_ < r.validUntil &&
-                   r.epoch == ctx.epoch_ && r.generation == inst.generation &&
-                   r.cutVersion == inst.cutVersion;
+        bool hit = !wantIdeal && mask == 0 &&
+                   ctx.travel_ + r.kSlope * ctx.kTravel_ < r.validUntil &&
+                   r.epoch == ctx.epoch_ && r.cutVersion == inst.cutVersion;
         if (hit)
             for (uint32_t d = 0; d < r.depCount; ++d)
             {
@@ -2094,6 +2133,7 @@ void World::selectCut(const CullView& view, const CutParams& params,
         w.cut = CutSink(w.cutBuf);
         w.touched.clear();
         w.margin = FLT_MAX;
+        w.maxError = 0.0f;
         w.trackMargin = true;
         const uint32_t reqBefore = wantRequests ? w.requests.count() : 0;
         runInstance(instIdx, dv, params, mask, w, wantIdeal, wantRequests);
@@ -2129,9 +2169,10 @@ void World::selectCut(const CullView& view, const CutParams& params,
             // scale it across. Anything non-finite (nothing was ever decided,
             // so nothing can flip) becomes an unbounded budget.
             const float m = w.margin * inst.scale;
-            r.validUntil = m >= FLT_MAX ? FLT_MAX : ctx.travel_ + m;
+            r.kSlope = w.maxError * inst.scale / params.threshold;
+            const float consumed = ctx.travel_ + r.kSlope * ctx.kTravel_;
+            r.validUntil = m >= FLT_MAX - consumed ? FLT_MAX : consumed + m;
             r.epoch = ctx.epoch_;
-            r.generation = inst.generation;
             r.cutVersion = inst.cutVersion;
             r.depCount = uint32_t(w.touched.size());
             for (uint32_t d = 0; d < r.depCount; ++d)

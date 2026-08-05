@@ -597,6 +597,35 @@ bisection — the refit code is byte-identical across those commits and all
 variants sit inside the same noisy band. Only deltas well above 20%, or ones
 confirmed with repetitions and low CV, are treated as real in this journal.
 
+### O. Follow-up hot-path audit -- KEPT
+
+The 2026-08-05 audit tightened the architecture without changing its external
+model:
+
+- `Instance` is now one 64-byte cut-path cache line. Bounds, masks, asset id and
+  TLAS back-pointers occupy a parallel 64-byte `InstanceTlas` stream, so a cut
+  does not fetch spatial-maintenance state it never reads. This improved the
+  measured 80k selection cases by 5.8-6.7% and a 50k motion case by 7.8%.
+- A dense `liveInstances_` list makes TLAS rebuild enumeration proportional to
+  current population rather than historical slot count. With 100k peak slots
+  and 10k survivors, rebuild time fell 9.0%; selection remained neutral.
+- TLAS contribution culling now uses squared box distance and
+  `screenErrorFromSq8`, matching the page walk's reciprocal-square-root path and
+  improving the focused 50k-200k cases by 3.0-3.5%.
+- A page already LRU-touched this frame is left linked in place, eliminating
+  repeated unlink/relink work when many reused instances share an asset.
+- Parallel workers still use private request epochs while walking, but the join
+  performs a page-stamped deduplication. Request order and priority now match
+  serial selection as well as the cut itself.
+- `SelectionContext` budgets both camera-envelope travel and projection-scale
+  travel. Each 48-byte record stores a conservative flip-point slope, avoiding
+  the old all-cache invalidation throughout damped zoom-out. The affected 20k
+  benchmark improved 38.9%. Reset retains warm storage, improving reset+cold
+  selection 21.9%.
+
+See `HANDOFF.md` section 14 for the interleaved A/B methodology, rejected margin
+vectorization, and detailed measurements.
+
 ---
 
 ## 3. Ideas considered and left for later

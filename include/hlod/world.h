@@ -248,27 +248,20 @@ using RequestSink = Sink<LoadRequest>;
 // the discontinuity for both halves, and the pairing cannot be got wrong.
 //
 // It also makes one coupling visible instead of hidden, which is the other
-// reason to keep them together. The damper relaxes k as well as position, and a
-// change in k voids every recorded margin at once (see epoch_), so:
+// reason to keep them together. The damper relaxes projection scale k as well
+// as position. A flip point lies at `geometricError * k / threshold`, so the
+// maximum error observed while recording a cut gives a conservative slope for
+// how far any of its decisions can move per unit k. The context accumulates
+// absolute k travel and charges that per-record slope against the same validity
+// margin used for camera travel.
 //
-//   ZOOMING OUT WITH DAMPING ON COSTS THE WHOLE CACHE FOR ~24 HALF-LIVES.
-//
-// Not one frame, and not one half-life. kMax_ takes the max of the relaxed and
-// current k, so a zoom IN arrives in a single frame and costs a single frame.
-// A zoom OUT relaxes multiplicatively and only STOPS when the gap underflows
-// float equality, which for a 2x zoom is ~24 half-lives -- ~190 frames at
-// halfLife 8, every one of them a different k and therefore a fresh epoch.
-// Measured (BM_SelectionContext_Zoom, 20k instances, nothing moving): reuse
-// 94.8% -> 56.5% and the cut 1.57x slower, at one zoom-out per 120 frames.
-//
-// This is honest as far as it goes -- k really is different on each of those
-// frames, and a smaller k moves every flip point inward, so decisions really
-// can flip. What is wrong is the granularity: position hysteresis relaxes
-// asymptotically too, but the odometer absorbs its tiny per-frame steps into a
-// budget, while k has only an all-or-nothing epoch. Giving k a budget as well
-// needs a per-record bound on the flip distance, which does not fit in 48
-// bytes; quantising the damped k would fix it without new state. Neither is
-// done. Until one is, prefer halfLife 0 on views that zoom, or accept the loss.
+// This matters most for damped zoom-out: k changes a little for roughly 24
+// half-lives. The old all-or-nothing epoch invalidated the whole cache on each
+// of those frames. The slope budget keeps unaffected records reusable while
+// preserving the exact node set. Measured by BM_SelectionContext_Zoom at 20k
+// instances, halfLife 8 and a zoom step every 120 frames, it removes 39% of the
+// cut time without growing the 48-byte record. Threshold changes still bump an
+// epoch because they change every stored slope at once.
 //
 // Damping and reuse each stay optional and free when unused: halfLife 0 makes
 // the arithmetic bit-identical to an undamped query, and the storage below is
@@ -385,18 +378,18 @@ private:
     // either a scalar or absent:
     //  - no camera envelope: validity is a single scalar budget against the
     //    view's accumulated travel (see travel_);
-    //  - no k / threshold: those are per-call, held once on the context, and a
-    //    change bumps epoch_ instead of being stored per instance;
+    //  - no per-record k / threshold copies: threshold changes bump epoch_,
+    //    while k motion consumes the scalar slope budget below;
     //  - no page generations: contentVersion is bumped on attach too, so it
     //    alone distinguishes a recycled slot.
     struct Rec
     {
-        // Reusable while the view's travel has not passed this. Set to
-        // travel + margin when recorded; 0 means no usable record.
+        // Reusable while positionTravel + kSlope * kTravel has not passed
+        // this. Set from that same expression plus the measured margin.
         float    validUntil = 0.0f;
-        uint32_t epoch = 0;          // cache epoch (k / threshold generation)
-        uint32_t generation = 0;     // instance generation when recorded
-        uint32_t cutVersion = 0;     // instance transform/deform version
+        float    kSlope = 0.0f;      // max world-space flip travel per unit k
+        uint32_t epoch = 0;          // cache epoch (threshold generation)
+        uint32_t cutVersion = 0;     // unique instance transform/deform version
         uint32_t begin = 0;          // block in store_
         uint32_t count = 0;
         uint32_t capacity = 0;
@@ -418,18 +411,19 @@ private:
     uint32_t              garbage_ = 0;
 
     // Distance the damped query envelope has travelled since this context was
-    // created, accumulated per call. A record taken at travel t with margin m
-    // is good while travel < t + m: the path length bounds the displacement
-    // from any earlier position, which is what the margin argument needs. It
-    // is conservative for a camera that doubles back, and it replaces storing
-    // a position per instance with a single compare -- the reason the record
-    // fits in 48 bytes. A teleport simply adds a large step and invalidates
-    // everything, which is the correct answer.
+    // created, accumulated per call. kTravel_ similarly accumulates absolute
+    // projection-scale motion. A record taken with margin m remains valid
+    // while positionTravel + kSlope * kTravel stays below its saved budget:
+    // both path lengths conservatively bound movement of every LOD flip point.
+    // This replaces storing a camera and projection value per instance with
+    // two scalar odometers and one per-record slope, keeping Rec at 48 bytes.
+    // Doubling back is conservative; a teleport consumes the budget at once.
     float    travel_ = 0.0f;
+    float    kTravel_ = 0.0f;
     float4   lastQmn_{}, lastQmx_{};
     bool     primed_ = false;
-    // Bumped when the projection scale or the error threshold changes, which
-    // invalidates every record at once without touching any of them.
+    // Bumped when the error threshold changes, invalidating every record in
+    // O(1). Projection-scale changes consume kTravel_ instead.
     uint32_t epoch_ = 1;
     float    k_ = 0.0f, bar_ = 0.0f;
     uint32_t reused_ = 0;
@@ -797,58 +791,42 @@ private:
         uint32_t index;
     };
 
-    // 128 bytes, and deliberately SPLIT DOWN THE MIDDLE: everything the
-    // per-instance walk and the reuse check read lives in the first 64, and
-    // nothing else does. `alignas` is what makes that a promise rather than a
-    // hope -- at 16-byte alignment a 128-byte record starts anywhere in a line,
-    // so the hot half would straddle two lines about as often as not.
-    //
-    // The walk reads pos, scale, rootSlot, tag and `overlays.empty()`; the
-    // SelectionContext check reads generation and cutVersion, and nothing else,
-    // for every visible instance. That is 60 bytes. worldBox, maxErrWorld,
-    // mask, asset and the TLAS lane back-pointers are touched by the TLAS build
-    // and refit only, which walk different instances in a different order and
-    // do not care.
-    //
-    // This matters because the instance loop is a chain of dependent loads and
-    // the prefetch in selectCut can only reach the first line of the record.
-    // 128 bytes. Reordering this so that everything the cut path reads (pos,
-    // scale, rootSlot, tag, overlays.empty(), and generation/cutVersion for the
-    // reuse check -- 60 bytes in total) sits in the first cache line, with
-    // alignas(64) to guarantee it, was measured and bought NOTHING: 11
-    // interleaved rounds gave 0.98x on one configuration and 1.01-1.02x at 80k,
-    // with the win counts saying drift.
-    //
-    // The reason is worth knowing before trying it again: the two lines of a
-    // 128-byte aligned record are an adjacent pair, and the L2 adjacent-line
-    // prefetcher fetches the buddy of any line it fetches. The second line
-    // arrives whether the layout needs it or not. Confining the hot fields to
-    // one line cannot help while the record is 128 bytes -- the fix would be to
-    // get the record UNDER 64 bytes, which means moving worldBox, maxErrWorld,
-    // mask, asset and the TLAS lane back-pointers (53 bytes, all touched only by
-    // TLAS build and refit) into a parallel array. That halves the bytes the
-    // instance loop pulls in; a reorder moves them around inside the same fetch.
+    // Exactly one cache line containing everything the cut walk and
+    // SelectionContext read per visible instance. TLAS-only state lives in the
+    // parallel InstanceTlas array below, so the instance prefetch no longer
+    // drags a second line into the latency-bound walk.
     struct Instance
     {
         float4   pos{};
+        std::vector<OverlayRef> overlays;   // sorted by slot; usually empty
         float    scale = 1.0f;
         uint32_t rootSlot = kInvalidIndex;
-        uint32_t asset = kInvalidIndex;
         uint32_t tag = 0;
-        uint32_t mask = ~0u;
-        AABB     worldBox;
-        float    maxErrWorld = 0.0f;
-        bool     alive = false;
         uint32_t generation = 0;   // stamps InstanceRefs; bumped per reuse
         // Bumped when this instance moves, is rescaled, or is deformed. A
         // deform always privatises bounds into this instance's own overlay, so
         // geometry changes never reach past the instance that caused them and
         // this one counter covers all of them.
         uint32_t cutVersion = 0;
+        bool     alive = false;
+    };
+    static_assert(sizeof(Instance) == 64, "cut-path Instance must stay one cache line");
+
+    // State used only while building, editing, or refitting the TLAS. Keeping
+    // it parallel preserves dense indexing without charging the cut loop for
+    // bytes it never reads.
+    struct InstanceTlas
+    {
+        AABB     worldBox;
+        float    maxErrWorld = 0.0f;
+        uint32_t asset = kInvalidIndex;
+        uint32_t mask = ~0u;
         uint32_t tlasNode = kInvalidIndex;
         uint32_t tlasLane = 0;
-        std::vector<OverlayRef> overlays;   // sorted by slot; usually empty
+        uint32_t liveIndex = kInvalidIndex;
     };
+    static_assert(sizeof(InstanceTlas) == 64,
+                  "TLAS instance state should stay one cache line");
 
     // nullptr when the ref is stale (slot recycled) or invalid.
     Instance* resolveInstance(InstanceRef ref);
@@ -913,6 +891,7 @@ private:
         // selection, and the branch is invariant for a whole call.
         bool  trackMargin = false;
         float margin = FLT_MAX;   // min distance to a decision flip so far
+        float maxError = 0.0f;    // max effective error among decided nodes
         float bar = 0.0f;         // params.threshold, for the margin arithmetic
     };
 
@@ -1010,6 +989,8 @@ private:
     uint32_t              generationCounter_ = 0;
 
     std::vector<Instance> instances_;
+    std::vector<InstanceTlas> instanceTlas_;
+    std::vector<InstanceId> liveInstances_;
     std::vector<uint32_t> freeInstances_;
 
     std::vector<Overlay>  overlays_;

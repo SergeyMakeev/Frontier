@@ -1,8 +1,9 @@
 # HLodTree rework — handoff
 
-Status as of 2026-08-04 (second session). This document describes an
-**uncommitted but now complete and verified** rework of HLodTree. The library,
-all tests and the benchmark suite compile and run.
+Status as of 2026-08-05 (third session). This document is a cumulative
+performance journal: older sections preserve the evidence available when they
+were written, while section 14 records the latest follow-up and supersedes the
+open performance findings in sections 10.7 and 11.2-11.5.
 
 ---
 
@@ -18,12 +19,12 @@ all tests and the benchmark suite compile and run.
 | `tests/test_contracts.cpp` | Done (`MultiViewDamperIsolation` replaces scratch isolation) |
 | `tests/test_cache.cpp` | New — SelectionContext equivalence, damping, churn, multi-view |
 | `bench/bench_hlod.cpp` | Done (+ `BM_DeepTree_FlyThroughDamped`, `BM_AssetSharing_CutCost`, `BM_DeformedCutCost`, `BM_SelectionContext_FlyThrough`) |
-| Test run | **86/86 green** (pre-rework baseline was 56/56; the rework and the audit added tests) |
+| Test run | **87/87 green** (pre-rework baseline was 56/56; the rework and audits added tests) |
 | §8 measurements | **Done**, results below — one real regression found (refit +28%) |
 | Cut-path optimisation | **Done** — five theories A/B tested, one kept (§9) |
 | `WideBlock` 288 -> 256 bytes | **Done** — blob version 2; up to 10% wherever the working set exceeds cache (§9.5) |
 | `SelectionContext` (stateful selection) | **New** — up to 2.9x on a mostly-static world; owns its view's `ViewDamper`; hands back a flat cut (§10) |
-| Known cliff | Zoom out + damping voids the cache for ~24 half-lives. Measured and root-caused, not fixed (§10.7) |
+| Damped zoom cliff | **Fixed** with a conservative per-record projection slope; 39% faster in the affected case (§14) |
 | Biggest flaw found, fixed | One spawn forced a full TLAS rebuild (+2.1 ms at 20k, +9.5 ms at 80k, same as 500 spawns). Add/remove are now in-place, O(depth): 5.4-5.7x, one spawn is free (§11.1) |
 
 Environment notes: the shell works again (the first session's dead-shell
@@ -1016,8 +1017,8 @@ pick two.
   (a converged instance emits none). Storing 8 more bytes per entry would lift
   this; it was not worth doubling the slab for a first version.
 - Reuse is **serial**. Parallel selection and the cache have not been combined.
-- **Zooming out with damping on voids the cache for ~24 half-lives.** Measured,
-  root-caused, not fixed; see 10.7. Prefer `halfLife` 0 on views that zoom.
+- Projection-scale motion is budgeted by a conservative per-record slope; the
+  former damped zoom-out cliff is fixed without enlarging the 48-byte record.
 - `CutEntry::err` on a reused entry is the value from the recorded camera
   position, stale by at most the margin. The **node set is exact**; `err` is
   not. `tests/test_cache.cpp` compares `(payload, instance)` multisets against
@@ -1025,7 +1026,10 @@ pick two.
   damping, and through streaming and instance churn -- and deliberately does not
   compare `err`.
 
-### 10.7 The zoom cliff: measured, root-caused, not fixed
+### 10.7 The zoom cliff: historical diagnosis
+
+**Current status:** fixed in the 2026-08-05 follow-up; see section 14. The
+remainder of this subsection preserves the pre-fix measurements and reasoning.
 
 Merging the damper into the context made one interaction visible that was
 invisible while they were two objects, and it is worse than it looks from either
@@ -1197,7 +1201,11 @@ extent grows lane areas enough to trip `tlasAreaDrift`, and rebuilds. That is
 right -- a tree whose root just grew by a factor is a bad fit -- but it does mean
 a spawn is only cheap when it lands somewhere the tree already covers.
 
-### 11.2 Confining Instance's hot fields to one cache line buys NOTHING
+### 11.2 Reordering Instance fields bought nothing (hot/cold split later kept)
+
+**Current status:** the field-order-only experiment below was correctly
+reverted. The stronger parallel-array split proposed at its end was later
+implemented and produced repeatable 5-8% wins; see section 14.
 
 The cut path reads `pos`, `scale`, `rootSlot`, `tag`, `overlays.empty()`, and for
 the reuse check `generation` and `cutVersion`: 60 bytes of a 128-byte record,
@@ -1227,6 +1235,9 @@ parallel array. That halves the bytes the instance loop pulls in. Not done.
 
 ### 11.3 The margin tracker does a scalar sqrt and divide per inner node
 
+**Current status:** both proposed vector forms were A/B tested in the follow-up
+and were neutral within noise, so the simpler scalar code remains.
+
 `wideVisit` is otherwise disciplined about this: it computes squared distances
 and uses one reciprocal square root, never a `sqrt` and never a divide
 (`screenErrorFromSq8`). The margin tracking added for `SelectionContext` then does
@@ -1249,7 +1260,10 @@ eight scalar sqrt-plus-divide pairs. Unmeasured, but it is the leading suspect f
 the ~7% the context costs when reuse is 0% (`FT/20000/1/100`: 2,441 us against
 2,287 us stateless).
 
-### 11.4 The parallel path emits duplicate load requests
+### 11.4 The parallel path emitted duplicate load requests -- FIXED
+
+**Current status:** the merge now performs a final page-stamp deduplication,
+preserving serial order and maximum priority. A contract test pins equivalence.
 
 Request dedup stamps a node with the pass epoch, which correctly collapses the
 thousands of identical requests that thousands of instances of one shared asset
@@ -1266,6 +1280,9 @@ and not for the requests, and §12 states it without that exception. Either dedu
 across workers on the merge, or write the exception down.
 
 ### 11.5 Small, confirmed
+
+**Current status:** the TLAS squared-distance substitution and dense live-id
+rebuild enumeration are both implemented and measured in section 14.
 
 - **`PageView` was documented as 64 bytes and is 88.** It is embedded in every
   `PageRt`, so it sets the residency table's stride. Now pinned by a
@@ -1320,3 +1337,74 @@ across workers on the merge, or write the exception down.
 - **Handles are validated by generation stamp.** Mutating calls on a stale handle
   are quiet no-ops; queries report absent. This is the normal race between
   streaming completion and GC, not an error.
+
+---
+
+## 14. 2026-08-05 performance follow-up
+
+This pass started from the completed rework above and revisited the concrete
+open findings in sections 10.7 and 11.2-11.5. Every performance change was built
+as a separate MSVC `/O2 /arch:AVX2` binary, run in alternating baseline/candidate
+order for seven rounds, and judged by the median plus win count. Untouched
+controls were included where practical. This host has substantial frequency and
+background-load noise, so small one-off movements were treated as noise rather
+than wins.
+
+### 14.1 Retained changes and measurements
+
+| Change | Focused benchmark | Candidate / baseline | Result |
+|---|---|---:|---:|
+| TLAS `minPix` squared distance + reciprocal sqrt | 50k shallow instances | 0.970 | 3.0% faster |
+| same | 200k TLAS scale | 0.965 | 3.5% faster |
+| split 128-byte `Instance` into 64-byte cut + 64-byte TLAS streams | 20k cached static | 0.949 | 5.1% faster |
+| same | 80k stateless / cached | 0.933 / 0.942 | 6.7% / 5.8% faster |
+| same | 50k instances, 1k moving | 0.922 | 7.8% faster |
+| skip repeated same-frame LRU unlink/relink | 20k cached static | 0.972 | 2.8% faster |
+| projection-scale validity budget | damped zoom, 20k, halfLife 8 | 146.7 / 240.1 us | 38.9% faster |
+| retain `SelectionContext` buffers on reset | reset + cold select, 20k | 560.7 / 715.2 us | 21.9% faster |
+| dense live-instance ids for rebuild | 100k peak, 10k live | 1.237 / 1.358 ms | 9.0% faster rebuild |
+
+The dense live-id benchmark's steady selection was 1.004x baseline, confirming
+that the extra add/remove bookkeeping does not move the hot query path. The
+hot/cold split was also neutral for spawn and leaf-refit controls. These results
+are not additive: several changes accelerate overlapping work in selection.
+
+The zoom fix replaces the global `k` epoch cliff with a per-record `kSlope` and
+a context-wide absolute-`k` odometer. For a node, the LOD flip distance is
+`effectiveError * k / threshold`, so the maximum effective error tested while
+recording a cut conservatively bounds flip-point motion for later `k` changes.
+The saved record remains exactly 48 bytes: its redundant instance generation
+was removed, and `cutVersion` is now globally unique. Continuous zoom is covered
+by the stateless-equivalence damping test. Threshold changes still invalidate
+all records in O(1), because they change the slope denominator.
+
+Parallel request output now gets a final post-join deduplication using page
+stamps. It preserves first serial order and maximum priority, closing the old
+contract gap where the cut matched serial output but shared pages could produce
+one load request per worker. `Contracts.ParallelSelectionMatchesSerialRequests`
+pins this behavior.
+
+`SelectionContext::reset()` now clears logical state and the damper but retains
+vector capacity. This makes camera cuts allocator-free after warm-up; `bytes()`
+continues to report retained capacity. Slab compaction uses a scratch slab rather
+than an in-place copy because record-id order is unrelated to allocation order;
+the rare allocation buys straightforward, order-independent correctness.
+
+### 14.2 Rejected experiment
+
+The section 11.3 margin rewrite was tried in two vector forms: first with a
+vector divide, then with a precomputed reciprocal scale. Both passed the cache
+equivalence tests, but both tracked their untouched control within roughly 0.4%
+and won only four of seven rounds. The scalar square root/divide remains because
+the proposed version added SIMD bookkeeping without a measurable benefit.
+
+### 14.3 Remaining opportunities
+
+- A radix sort for the 63-bit Morton keys remains the clearest rebuild-only
+  opportunity; dense live enumeration removes dead-slot scans but not sort cost.
+- `SelectionContext` reuse remains serial. Combining it with parallel instance
+  traversal needs deterministic flat-output ordering and is not a mechanical
+  merge of the two existing overloads.
+- Grown TLAS bounds are still tightened by budget-triggered rebuilds rather than
+  a small continuous shrink pass. Profile long-running teleport-heavy workloads
+  before adding that machinery.

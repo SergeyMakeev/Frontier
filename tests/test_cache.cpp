@@ -215,8 +215,11 @@ TEST(Cache, MatchesStatelessUnderDamping)
     for (int f = 0; f < 120; ++f)
     {
         // Drift plus jitter: the envelope both travels and breathes.
-        const CullView raw = viewAt(float4::vec(float(f) * 1.5f + jit(rng), jit(rng),
-                                                float(f) * 6.0f + jit(rng)));
+        CullView raw = viewAt(float4::vec(float(f) * 1.5f + jit(rng), jit(rng),
+                                          float(f) * 6.0f + jit(rng)));
+        // Continuous zoom exercises the projection-scale odometer at the same
+        // time as camera and damping-envelope travel.
+        raw.k *= 0.75f + 0.2f * std::sin(float(f) * 0.13f);
 
         std::vector<CutEntry> ref;
         sc.world->selectCut(refDamper.damp(raw), p, ref);
@@ -321,9 +324,9 @@ TEST(Cache, MultipleViewsDoNotInterfere)
     }
 }
 
-// Changing the threshold or the projection scale invalidates every record: the
-// margin was measured against a particular bar.
-TEST(Cache, ThresholdAndProjectionChangesInvalidate)
+// A threshold change alters every slope bound, so it invalidates every record
+// in O(1). Projection changes are budgeted and covered by the damping test.
+TEST(Cache, ThresholdChangesInvalidate)
 {
     Scene sc;
     SelectionContext cache;
@@ -444,8 +447,10 @@ TEST(Cache, ResetForgetsEverythingAndStaysCorrect)
     sc.world->selectCut(v, p, cache, cut);
     ASSERT_EQ(cache.walked(), 0u);
 
+    const size_t allocated = cache.bytes();
+    ASSERT_GT(allocated, 0u);
     cache.reset();
-    EXPECT_EQ(cache.bytes(), 0u);
+    EXPECT_EQ(cache.bytes(), allocated);   // forget state, retain reusable storage
 
     std::vector<CutEntry> ref;
     sc.world->selectCut(v, p, ref);
