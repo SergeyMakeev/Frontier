@@ -7,18 +7,28 @@ the current API contract and lifecycle rules.
 
 ## 1. Current architecture
 
-The runtime has two spatial levels, analogous to a ray tracer's BLAS/TLAS
-split:
+The runtime has two spatial levels, analogous in structure to a ray tracer's
+BLAS/TLAS split. The names describe runtime roles, not object-versus-world
+scale:
 
-- **Immutable page assets.** `HLodBuilder` emits a versioned blob containing
-  preorder arrays and 8-lane child blocks. Expansion points connect separately
-  streamed pages. Instances of one registered root asset share its page bytes,
-  residency, and attachment graph. Deformed instances keep sharing those bytes
-  and acquire bounds-only copy-on-write overlays.
-- **Dynamic wide TLAS.** An 8-wide BVH over translated, uniformly scaled root
-  instances handles coarse frustum/layer/contribution culling, motion, and
-  incremental insert/remove. Initial and repair builds can use a quality
-  splitter; frequent motion/edit rebuilds use a cheaper Morton hierarchy.
+- **Renderable BLAS hierarchies in immutable pages.** A BLAS is any
+  independently rooted authored hierarchy: it may be a city block, a building,
+  a terrain region, a reusable prop, or a single flat object. Every real node
+  carries its own renderable `UserPayload`, so the cut may stop at any level.
+  `HLodBuilder` emits versioned page blobs containing preorder arrays and
+  8-lane child blocks; expansion points connect separately streamed pages.
+  Instances of one registered root share its page bytes, residency, and
+  attachment graph. Deformed instances keep sharing those bytes and acquire
+  bounds-only copy-on-write overlays. The API term *asset* names this unit of
+  registered storage and sharing; it does not imply one object.
+- **Non-renderable dynamic wide TLAS.** An 8-wide BVH over translated,
+  uniformly scaled placements of independent BLAS roots handles coarse
+  frustum/layer/contribution culling, motion, and incremental insert/remove.
+  Its internal nodes are acceleration data and never appear in a cut. Keeping
+  many BLAS roots avoids an artificial whole-map root and allows large
+  hierarchical regions to coexist with one-node vehicles, characters, and
+  props. Initial and repair builds can use a quality splitter; frequent
+  motion/edit rebuilds use a cheaper Morton hierarchy.
 
 `View::selectCut` queries the TLAS, walks only surviving page regions, and emits
 three compact vectors: entries shared by the current and ideal cuts, plus each
@@ -79,12 +89,16 @@ through the host's blocking `parallelFor` without changing that contract.
 10. **Fully-resident fast path.** An 8-byte per-mount summary propagates whether
    every attached page is recursively resident. Such instances use a
    shared-only traversal with no residency or current/ideal branching.
-11. **Direct flat-instance emission.** After the first exact one-node asset,
-    the World lazily allocates a compact 4-byte root marker per instance. Once
-    the TLAS reports a flat instance, selection
-    retests the precise world box and emits the pinned root directly, without
-    loading the 64-byte `Instance` or its 256-byte page block. Worlds with no
-    flat instances take the original hierarchical loop unchanged.
+11. **TLAS root decisions and direct flat-instance emission.** A leaf lane
+    compactly marks a hierarchical BLAS with one renderable root. Uncached
+    queries vector-test those roots and, when the result is promising, retest
+    the exact instance box and emit the pinned root without transforming the
+    camera or entering a page. The query enables this work only while enough
+    visible roots terminate there and otherwise probes periodically. Cached
+    queries keep the universal TLAS loop lean and test roots only on misses.
+    Exact one-node BLASes retain their still-cheaper path: after the first one,
+    the World lazily allocates a 4-byte root marker per instance and emits it
+    without loading the 64-byte `Instance` or its 256-byte page block.
 12. **Deferred, camera-selective GC feedback.** Optional `PageUsageContext`
     objects collect page touches without writing the World. `collect` consumes
     only the important cameras chosen by the caller, updates the intrusive LRU,
@@ -108,8 +122,8 @@ The runtime's multiplied structures have exact compile-time size contracts on
 | `Instance` + `InstanceTlas` | 64 B + 48 B | selection-hot and spatial-maintenance streams stay separate |
 | instance cut version / flat-root marker | 4 B / 0 or 4 B | the flat marker stream is allocated only after the first flat asset |
 | `Overlay` header | 56 B | two retained vectors; bounds storage is allocated only after deformation |
-| `TlasNode` | 320 B | 296 B of SIMD lanes/metadata rounded to 32-byte alignment |
-| visible hit / TLAS stack item | 4 B / 4 B | 24-bit id or node index + plane mask |
+| `TlasNode` | 320 B | 296 B of SIMD lanes/metadata rounded to 32-byte alignment; single-root leaf flags occupy unused valid-mask bits |
+| visible hit / TLAS stack item | 4 B / 4 B | 24-bit id or node index + plane mask; a spare hit bit carries the root candidate |
 | node / page DFS item | 8 B / 24 B | existing 20-bit node and mount limits carry traversal flags |
 | queued bounds edit | 48 B | one `AABB`, compact `NodeHandle`, instance id and generation |
 | Morton sort item | 12 B | 63-bit key as two words + instance id, without pair padding |
@@ -131,12 +145,12 @@ least five repetitions.
 
 | Scenario | Current time | Relevant output/state |
 |---|---:|---|
-| 10k instances, 700 assets, moving camera / 1k moving | 0.106 ms selection | 82.4% reused; 27.8% visible; 5,920-entry cut; 1.87 MiB `View` |
-| Same 10k world, static camera / 1k moving | 0.091 ms selection | 85.8% reused; 25.0% visible; 5,792 entries; 0.45 MiB `View` |
-| Same 10k world, moving camera / static objects | 0.064 ms selection | 93.3% reused; 5,920 entries |
-| 80k instances, moving camera / 5% moving | 0.449 ms selection | 92.6% reused; 24,986 entries; 5.98 MiB `View` |
-| Same 80k world, static camera / 5% moving | 0.338 ms selection | 94.1% reused; 22,872 entries; 3.22 MiB `View` |
-| Same 80k world, moving camera / static objects | 0.334 ms selection | 97.6% reused; 24,986 entries |
+| 10k instances, 700 assets, moving camera / 1k moving | 0.089 ms selection | 82.4% reused; 27.8% visible; 5,920-entry cut; 1.87 MiB `View` |
+| Same 10k world, static camera / 1k moving | 0.074 ms selection | 85.8% reused; 25.0% visible; 5,792 entries; 0.45 MiB `View` |
+| Same 10k world, moving camera / static objects | 0.063 ms selection | 93.3% reused; 5,920 entries |
+| 80k instances, moving camera / 5% moving | 0.400 ms selection | 92.6% reused; 24,986 entries; 5.98 MiB `View` |
+| Same 80k world, static camera / 5% moving | 0.296 ms selection | 94.1% reused; 22,872 entries; 3.22 MiB `View` |
+| Same 80k world, moving camera / static objects | 0.330 ms selection | 97.6% reused; 24,986 entries |
 | Six 80k views, static objects, serial / concurrent | 2.50 / 0.445 ms wall time | 5.6× on six persistent workers |
 | Six 80k views, 5% moving, serial / concurrent | 2.99 / 0.538 ms wall time | 5.6× on six persistent workers |
 
@@ -175,6 +189,18 @@ hierarchical instance and one per flat instance. Best of five repeats:
 | 50% | 50% | 62,500 | 1.83 ms | 0.377 ms |
 | 80% | 20% | 40,000 | 0.902 ms | 0.330 ms |
 | 100% | 0% | 25,000 | 0.265 ms | 0.290 ms |
+
+`BM_RootDecisionForest100k` isolates the hierarchical-root shortcut with
+25,000 visible depth-3 BLAS instances. The near arm must refine each root to
+four entries; the far arm accepts one renderable root. Five-repeat medians
+before and after the shortcut show both the win and its no-win control:
+
+| Root decision | Output entries | Before | Current | Change |
+|---|---:|---:|---:|---:|
+| Near, refine roots, uncached | 100,000 | 3.432 ms | 3.432 ms | flat |
+| Far, accept roots, uncached | 25,000 | 1.923 ms | 0.649 ms | -66.3% |
+| Near, warm `View` | 100,000 | 0.439 ms | 0.436 ms | -0.7% |
+| Far, warm `View` | 25,000 | 0.289 ms | 0.277 ms | -4.2% |
 
 These are scale indicators, not guarantees. Output size and cache locality can
 dominate population size, and contended runs on this host can be much slower.
@@ -917,6 +943,32 @@ Against the original pre-audit binary, the retained combination improves the
 (6/7). The deep single-instance control moved +3.1% with only 2/7 wins for the
 final binary, consistent with the host's known whole-binary layout noise; the
 focused retained experiments have their own controls and unanimous wins.
+
+### X. TLAS hierarchical-root decision kept; temporal frontier reverted
+
+Two larger selection changes were tested together and then separated.
+
+**Renderable BLAS roots in TLAS leaves -- KEPT.** A hierarchical root does not
+need a page walk when it already meets the error threshold. Single-root flags
+fit in unused high bits of each TLAS node's valid-lane word, and the candidate
+bit fits in the existing 4-byte visible hit. The query tests eight candidate
+errors together, followed by an exact box/error check before emission; no
+`TlasNode`, hit, instance, or cut-entry layout grew. Uncached views disable the
+extra query work unless at least one quarter of visible instances terminate at
+the root, probing every 32 calls for a coherent move back to distance. Cached
+views test the root only on misses. The focused 25k-visible result is the
+66.3% far-root win in the current table above, while the near/refined control
+is unchanged.
+
+**Search around the previous cut -- REVERTED.** A temporal-frontier prototype
+started cache misses near the last selected nodes for fully resident,
+single-page hierarchies. The tempting version was not a valid proof: a leaf
+can remain spatially valid while the parent's LOD decision has changed. The
+correct version revalidated the relevant ancestor decision before descending.
+Only about 0.5-1.2% of visible instances then used the shortcut in the moving
+camera workloads. The 20k cases were effectively flat versus the root-only
+binary, while the 80k moving-camera/5%-mover case rose to about 0.519 ms from
+roughly 0.47 ms. All frontier state and traversal branches were removed.
 
 ---
 

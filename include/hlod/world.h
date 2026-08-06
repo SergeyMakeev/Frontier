@@ -1,8 +1,8 @@
 #pragma once
 // Runtime side of HLodTree (see hlod_design.md):
-//  - assets: immutable page trees, registered once, shared by every instance
-//    and every attachment that names them
-//  - instances of those assets over a wide dynamic top-level BVH
+//  - BLASes: independently rooted renderable hierarchies in immutable pages;
+//    a BLAS may represent anything from one flat object to a city block
+//  - instances of those BLAS roots over a non-renderable dynamic TLAS
 //  - topology streaming (attach/detach pages under expansion points)
 //  - payload residency with incrementally propagated subtree coverage
 //  - single-pass pruned cut selection, with no required per-node view scratch
@@ -60,7 +60,8 @@ namespace hlod {
 class World;
 struct ViewScratch;
 
-// Registered page asset: the unit of sharing. Returned by registerAsset().
+// Registered BLAS page asset: the unit of storage and sharing, not necessarily
+// one object. Returned by registerAsset().
 struct AssetHandle
 {
     uint32_t slot = kInvalidIndex;
@@ -609,6 +610,13 @@ private:
     const World* world_ = nullptr;
     bool reuseEnabled_ = true;
 
+    // Uncached selection samples whether enough hierarchical TLAS leaves can
+    // terminate at their BLAS root to repay the vector root test. A view that
+    // currently sees mostly refined roots runs the original lean query and
+    // probes periodically so a coherent move back to distance is discovered.
+    bool     rootQueryEnabled_ = true;
+    uint8_t  rootProbeCountdown_ = 0;
+
     // Mutable query scratch. Opaque so traversal
     // implementation details do not become part of the public API.
     std::unique_ptr<ViewScratch> scratch_;
@@ -1064,12 +1072,35 @@ private:
     // Wide top-level BVH node; lanes are children (inner nodes or instances).
     struct TlasNode
     {
+        static constexpr uint32_t kValidLaneMask = (1u << kWide) - 1u;
+        static constexpr uint32_t kSingleRootShift = kWide;
+
         WideBounds bounds;
         float8     maxErr{};
         int32_t    child[kWide];   // >= 0: node index; < 0: instance ~child
         uint32_t   laneMask[kWide];// union of the lane subtree's instance masks
+        // Low eight bits are valid lanes. The next eight mark leaf lanes whose
+        // root page has exactly one renderable BLAS root. Packing the flags
+        // here preserves the five-cache-line node layout.
         uint32_t   validMask = 0;
         int32_t    parent = -1;
+
+        uint32_t validLanes() const { return validMask & kValidLaneMask; }
+        bool singleRoot(uint32_t lane) const
+        {
+            return (validMask & (1u << (kSingleRootShift + lane))) != 0;
+        }
+        void setLeafLane(uint32_t lane, bool hasSingleRoot)
+        {
+            validMask |= 1u << lane;
+            if (hasSingleRoot)
+                validMask |= 1u << (kSingleRootShift + lane);
+        }
+        void clearLane(uint32_t lane)
+        {
+            validMask &= ~((1u << lane) |
+                           (1u << (kSingleRootShift + lane)));
+        }
     };
     static_assert(sizeof(TlasNode) == 320,
                   "SIMD TLAS node must stay five cache lines");
@@ -1079,15 +1110,21 @@ private:
     // A TLAS hit is a 24-bit dense instance id plus its six-bit plane mask.
     struct VisibleItem
     {
+        static constexpr uint32_t kRootSelected = 1u << 30;
         uint32_t packed = 0;
 
         VisibleItem() = default;
-        VisibleItem(InstanceId instance, uint8_t mask)
+        VisibleItem(InstanceId instance, uint8_t mask, bool rootSelected = false)
             : packed((instance & kInstanceIdMask) |
-                     (uint32_t(mask & kAllPlanes) << kInstanceIdBits))
+                     (uint32_t(mask & kAllPlanes) << kInstanceIdBits) |
+                     (rootSelected ? kRootSelected : 0u))
         {}
         InstanceId instance() const { return packed & kInstanceIdMask; }
-        uint8_t mask() const { return uint8_t(packed >> kInstanceIdBits); }
+        uint8_t mask() const
+        {
+            return uint8_t((packed >> kInstanceIdBits) & kAllPlanes);
+        }
+        bool rootSelected() const { return (packed & kRootSelected) != 0; }
     };
     static_assert(sizeof(VisibleItem) == 4, "visible TLAS hit must stay 4 bytes");
 
@@ -1247,13 +1284,14 @@ private:
     void tlasRebuild();
     int32_t tlasBuildRange(std::vector<uint32_t>& items, int lo, int hi, int32_t parent);
     int  tlasSplit(std::vector<uint32_t>& items, int lo, int hi);
-    void tlasQuery(const Camera& view, float minPix,
+    void tlasQuery(const Camera& view, float minPix, float rootThreshold,
                    std::vector<VisibleItem>& outVisible,
                    std::vector<TlasItem>& stack) const;
-    template<bool UseMask, bool UseMinPix>
-    void tlasQueryImpl(const Camera& view, float minPix,
+    template<bool UseMask, bool UseMinPix, bool SelectRoots>
+    void tlasQueryImpl(const Camera& view, float minPix, float rootThreshold,
                        std::vector<VisibleItem>& outVisible,
                        std::vector<TlasItem>& stack) const;
+    bool instanceHasSingleRoot(InstanceId id) const;
     void recomputeInstanceBounds(InstanceId id);
     void tlasOnInstanceMoved(InstanceId id);
     void tlasNoteGrowth(float addedArea);
@@ -1279,7 +1317,7 @@ private:
     bool pageTreeFullyResident(uint32_t slot) const;
     void propagateFullResidency(uint32_t slot, bool wasFullyResident);
     void runInstance(uint32_t instIdx, const Camera& view, const CutParams& params,
-                     uint8_t mask, Worker& w) const;
+                     uint8_t mask, bool tryRoot, Worker& w) const;
     void runFlatInstance(uint32_t instIdx, const Camera& view,
                          uint8_t mask, Worker& w) const;
     template<bool FullyResident>

@@ -14,6 +14,25 @@ buildings, and stream deeper topology only where the camera needs it. The
 library owns no meshes, materials, jobs, or renderer state, so it can sit in
 front of an existing asset and rendering system.
 
+### BLAS and TLAS terminology
+
+BLAS describes an independently rooted **renderable hierarchy**, not
+necessarily one object or one reusable mesh. A BLAS can represent a city
+block, a skyscraper whose children are floors and walls, a terrain region, or
+a conventional reusable asset. Every node has its own renderable
+`UserPayload`, so selection may stop at any level. A one-node BLAS is equally
+valid and is useful for things such as vehicles, characters, and other content
+with no authored hierarchy.
+
+The TLAS is the dynamic spatial acceleration structure over placements of
+those independent BLAS roots. Its internal nodes provide bounds, layer masks,
+and coarse contribution information; they are not renderable proxies and do
+not appear in a cut. This lets a world mix large authored regions, reusable
+hierarchies, and flat objects without imposing one artificial root for the
+whole map. In API names such as `AssetHandle`, *asset* means a registered unit
+of immutable page storage and sharing; it does not constrain what part of the
+world that hierarchy represents.
+
 Streaming has two independent dimensions. **Residency** says whether a known
 node's render payload is loaded. The nearest resident fallback remains in the
 current cut until more detailed resident nodes completely cover the visible
@@ -28,8 +47,8 @@ HLodTree to own an IO system.
 
 ## Minimal example
 
-This one-node asset is intentionally small so the complete build, instance,
-view, and selection loop is visible. Real assets add children with
+This one-node BLAS is intentionally small so the complete build, instance,
+view, and selection loop is visible. Real hierarchies add children with
 `HLodBuilder::createNode` and split large hierarchies at expansion points.
 
 ```cpp
@@ -100,8 +119,8 @@ algorithm's uncontended cost; real frame time can be higher under host load.
 
 | Operation | Time | Included work |
 |---|---:|---|
-| Create the world | 10.2-11.5 ms | Build and register the shared asset, add 80,000 instances, and mark its payloads resident |
-| First published selection cycle | 51.3-60.1 ms | `applyUpdates` builds the initial quality TLAS; `selectCut` queries it, produces the first cut, and populates the `View` |
+| Create the world | 10.2-11.4 ms | Build and register the shared asset, add 80,000 instances, and mark its payloads resident |
+| First published selection cycle | 53.1-58.0 ms | `applyUpdates` builds the initial quality TLAS; `selectCut` queries it, produces the first cut, and populates the `View` |
 
 World creation does not force the initial quality TLAS build; the first
 `applyUpdates` performs it before publishing the read-only snapshot. Treat the
@@ -111,10 +130,10 @@ first published selection cycle as level warm-up rather than steady latency.
 
 | HLodTree work per frame | Camera and 4,000 objects moving | Static camera, 4,000 objects moving | Moving camera, static objects |
 |---|---:|---:|---:|
-| Submit 4,000 instance transforms | 0.139 ms | 0.136 ms | n/a |
+| Submit 4,000 instance transforms | 0.144 ms | 0.139 ms | n/a |
 | Publish updates and maintain the TLAS | <0.001 ms | <0.001 ms | <0.001 ms |
-| `selectCut` | 0.449 ms | 0.338 ms | 0.334 ms |
-| **Total HLodTree frame work** | **0.590 ms** | **0.475 ms** | **0.334 ms** |
+| `selectCut` | 0.400 ms | 0.296 ms | 0.330 ms |
+| **Total HLodTree frame work** | **0.544 ms** | **0.435 ms** | **0.330 ms** |
 
 The moving-camera cases average about 21,919 visible instances and a
 24,986-entry render cut. With objects moving, the `View` reuses 92.6% of
@@ -135,16 +154,16 @@ The smaller test uses 10,000 instances spread over a roughly 2.4 km square.
 They draw from 700 separately registered, fully resident 85-node assets with
 maximum depth 3, instead of sharing one asset across the entire world. The
 moving-object cases update exactly 1,000 instances per frame. Creating and
-populating this world takes 14.1-15.2 ms; its first published selection cycle,
+populating this world takes 13.1-14.5 ms; its first published selection cycle,
 including the initial quality TLAS build and `View` population, takes
-5.7-7.5 ms.
+5.4-6.3 ms.
 
 | HLodTree work per frame | Camera and 1,000 objects moving | Static camera, 1,000 objects moving | Moving camera, static objects |
 |---|---:|---:|---:|
 | Submit 1,000 instance transforms | 34 µs | 34 µs | n/a |
 | Publish updates and maintain the TLAS | <0.1 µs | <0.1 µs | <0.1 µs |
-| `selectCut` | 106 µs | 91 µs | 64 µs |
-| **Total HLodTree frame work** | **140 µs** | **126 µs** | **64 µs** |
+| `selectCut` | 89 µs | 74 µs | 63 µs |
+| **Total HLodTree frame work** | **123 µs** | **108 µs** | **63 µs** |
 
 The moving-camera cases average about 2,782 visible instances (27.8% of the
 world) and a 5,920-entry cut. Reuse is 82.4% with 1,000 movers and 93.3% with
@@ -212,11 +231,15 @@ mutations using it become safe no-ops.
 
 ## Runtime model
 
-- Immutable, versioned page blobs hold preorder node arrays and 8-lane wide
-  child blocks. A registered asset can be instanced thousands of times while
-  sharing page bytes, residency, and its attachment graph.
-- A dynamic wide TLAS owns instance placement, layer masks, coarse frustum and
-  contribution culling, and incremental spawn/remove edits.
+- Immutable, versioned page blobs hold each BLAS's preorder node arrays and
+  8-lane wide child blocks. A registered hierarchy can be instanced thousands
+  of times while sharing page bytes, residency, and its attachment graph.
+- A dynamic wide TLAS owns placement of independent BLAS roots, layer masks,
+  coarse frustum and contribution culling, and incremental spawn/remove edits.
+  TLAS leaves may reference either deep hierarchies or one-node BLASes. When a
+  hierarchical root already satisfies the view's error threshold, selection
+  can emit that renderable root before entering its page hierarchy; the TLAS
+  itself remains non-renderable.
 - Expansion points connect independently streamed pages. Residency changes
   propagate complete descendant coverage upward. Selection can therefore skip
   a missing intermediate proxy when resident descendants cover the visible

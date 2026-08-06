@@ -244,6 +244,41 @@ TEST(Cut, MatchesBruteForceReference)
     }
 }
 
+// A far hierarchical BLAS can terminate at its renderable root directly from
+// the TLAS leaf. Moving the camera closer must still refine normally. This
+// guards both sides of the shortcut against the scalar reference.
+TEST(Cut, TlasRootDecisionMatchesReference)
+{
+    TreeGen gen;
+    gen.fanout = 4;
+    gen.depth = 3;
+    Page page = gen.makeRootPage(unitRegion(3.0f), 16.0f, 0);
+    const auto ids = pageIds(page);
+
+    World w;
+    w.addInstance(std::move(page), float4::point(0, 0, 0));
+    markAllResident(w, ids);
+    w.applyUpdates();
+
+    const CutParams params{4.0f, 0.0f};
+    const Camera far = makeLookAtCamera(float4::point(0, 0, -5000),
+                                        float4::point(0, 0, 0));
+    const auto farGot = run(w, far, params);
+    const RefResult farWant = TA::referenceCut(w, far, params);
+    expectSameCut(w, farGot.cut, farWant.cut);
+    expectSameIdeal(w, farGot.cut, farWant.cut);
+    ASSERT_EQ(farGot.cut.shared.size(), 1u);
+    EXPECT_EQ(payloadOf(w, farGot.cut.shared.front()), ids.front());
+
+    const Camera near = makeLookAtCamera(float4::point(0, 0, -1000),
+                                         float4::point(0, 0, 0));
+    const auto nearGot = run(w, near, params);
+    const RefResult nearWant = TA::referenceCut(w, near, params);
+    expectSameCut(w, nearGot.cut, nearWant.cut);
+    expectSameIdeal(w, nearGot.cut, nearWant.cut);
+    EXPECT_GT(nearGot.cut.size(), 1u);
+}
+
 // ---------------------------------------------------------------------------
 // Temporal coherence: identical frames produce identical cuts (epoch stamps
 // must not leak stale state between frames).

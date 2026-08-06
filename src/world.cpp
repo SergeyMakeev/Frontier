@@ -1167,6 +1167,14 @@ AABB World::tlasNodeExtent(const TlasNode& n, float& maxErr, uint32_t& laneMask)
     return u;
 }
 
+bool World::instanceHasSingleRoot(InstanceId id) const
+{
+    const Instance& inst = instances_[id];
+    const bool flat = !instanceFlatSlots_.empty() &&
+                      instanceFlatSlots_[id] != kInvalidIndex;
+    return !flat && pageView(slots_[inst.rootSlot]).childCount(0) == 1;
+}
+
 int32_t World::tlasAllocNode()
 {
     if (!tlasFreeNodes_.empty())
@@ -1251,7 +1259,7 @@ void World::tlasInsert(InstanceId id)
 
     const uint32_t full = (1u << kWide) - 1;
     uint32_t host = cur;
-    if (tlasNodes_[cur].validMask == full)
+    if (tlasNodes_[cur].validLanes() == full)
     {
         // Split. The new node replaces `cur` wherever `cur` was referenced, and
         // adopts it, so nothing above needs to know the difference.
@@ -1292,7 +1300,7 @@ void World::tlasInsert(InstanceId id)
     h.maxErr.v[lane] = inst.maxErrWorld;
     h.child[lane] = ~int32_t(id);
     h.laneMask[lane] = inst.mask;
-    h.validMask |= 1u << lane;
+    h.setLeafLane(lane, instanceHasSingleRoot(id));
     inst.setTlasPlacement(host, lane);
     ++tlasLeafCount_;
 
@@ -1324,11 +1332,11 @@ void World::tlasRemove(InstanceId id)
         if (tlasEscapes_) --tlasEscapes_;
         inst.setEscapedSinceBuild(false);
     }
-    tlasNodes_[nodeIdx].validMask &= ~(1u << lane);
+    tlasNodes_[nodeIdx].clearLane(lane);
     inst.clearTlasPlacement();
     if (tlasLeafCount_) --tlasLeafCount_;
 
-    while (tlasNodes_[nodeIdx].validMask == 0)
+    while (tlasNodes_[nodeIdx].validLanes() == 0)
     {
         const int32_t parent = tlasNodes_[nodeIdx].parent;
         if (parent < 0)
@@ -1341,7 +1349,7 @@ void World::tlasRemove(InstanceId id)
         for (uint32_t l = 0; l < kWide; ++l)
             if ((p.validMask & (1u << l)) && p.child[l] == int32_t(nodeIdx))
             {
-                p.validMask &= ~(1u << l);
+                p.clearLane(l);
                 break;
             }
         tlasFreeNodes_.push_back(int32_t(nodeIdx));
@@ -1571,7 +1579,7 @@ int32_t World::tlasBuildRange(std::vector<uint32_t>& items, int lo, int hi, int3
             n.maxErr.v[k] = inst.maxErrWorld;
             n.child[k] = ~int32_t(instIdx);
             n.laneMask[k] = inst.mask;
-            n.validMask |= 1u << k;
+            n.setLeafLane(uint32_t(k), instanceHasSingleRoot(instIdx));
             inst.setTlasPlacement(uint32_t(idx), uint32_t(k));
         }
         return idx;
@@ -1690,7 +1698,7 @@ void World::tlasRebuild()
                     n.maxErr.v[k] = inst.maxErrWorld;
                     n.child[k] = ~int32_t(instIdx);
                     n.laneMask[k] = inst.mask;
-                    n.validMask |= 1u << k;
+                    n.setLeafLane(k, instanceHasSingleRoot(instIdx));
                     inst.setTlasPlacement(uint32_t(idx), k);
                 }
                 cur.push_back(idx);
@@ -1745,8 +1753,8 @@ void World::tlasRebuild()
             if (n.validMask & (1u << l)) tlasBaseArea_ += surfaceArea(n.bounds.lane(l));
 }
 
-template<bool UseMask, bool UseMinPix>
-void World::tlasQueryImpl(const Camera& view, float minPix,
+template<bool UseMask, bool UseMinPix, bool SelectRoots>
+void World::tlasQueryImpl(const Camera& view, float minPix, float rootThreshold,
                           std::vector<VisibleItem>& outVisible,
                           std::vector<TlasItem>& stack) const
 {
@@ -1770,7 +1778,7 @@ void World::tlasQueryImpl(const Camera& view, float minPix,
         uint32_t survivors = inMask
                                  ? testWideAabb(n.bounds, view.frustum, inMask,
                                                 outMasks) & n.validMask
-                                 : n.validMask;
+                                 : n.validLanes();
         if (!survivors) continue;
 
         // Query-level dispatch removes this block entirely for the default
@@ -1790,6 +1798,29 @@ void World::tlasQueryImpl(const Camera& view, float minPix,
                 if (errs.v[l] < minPix) survivors &= ~(1u << l);
         }
 
+        uint32_t rootCandidates = 0;
+        if constexpr (SelectRoots)
+        {
+            uint32_t singleRoots =
+                ((n.validMask >> TlasNode::kSingleRootShift) &
+                 TlasNode::kValidLaneMask) & survivors;
+            if (singleRoots)
+            {
+                // One vector distance/error evaluation per TLAS leaf node.
+                // The exact root test below the query remains authoritative,
+                // so the rsqrt approximation can only miss an optimization
+                // opportunity, never change the selected cut.
+                const float8 d2 = distanceToBoxesSq(n.bounds, qmn, qmx);
+                const float8 errs = screenErrorFromSq8(n.maxErr, view.k, d2);
+                while (singleRoots)
+                {
+                    const uint32_t l = uint32_t(std::countr_zero(singleRoots));
+                    singleRoots &= singleRoots - 1;
+                    if (errs.v[l] <= rootThreshold) rootCandidates |= 1u << l;
+                }
+            }
+        }
+
         while (survivors)
         {
             const uint32_t l = uint32_t(std::countr_zero(survivors));
@@ -1798,8 +1829,11 @@ void World::tlasQueryImpl(const Camera& view, float minPix,
             if (c >= 0)
                 stack.push_back({c, inMask ? outMasks[l] : uint8_t(0)});
             else
+            {
                 outVisible.emplace_back(uint32_t(~c),
-                                        inMask ? outMasks[l] : uint8_t(0));
+                                        inMask ? outMasks[l] : uint8_t(0),
+                                        (rootCandidates & (1u << l)) != 0);
+            }
         }
     }
 }
@@ -1908,23 +1942,46 @@ void World::recordPageUsage(PageUsageContext& usage, uint32_t slot) const
     }
 }
 
-void World::tlasQuery(const Camera& view, float minPix,
+void World::tlasQuery(const Camera& view, float minPix, float rootThreshold,
                       std::vector<VisibleItem>& outVisible,
                       std::vector<TlasItem>& stack) const
 {
     const bool useMask = view.viewMask != ~0u;
     const bool useMinPix = minPix > 0.0f;
-    if (useMask)
+    const bool selectRoots = rootThreshold >= 0.0f;
+    if (selectRoots && useMask)
     {
         if (useMinPix)
-            tlasQueryImpl<true, true>(view, minPix, outVisible, stack);
+            tlasQueryImpl<true, true, true>(view, minPix, rootThreshold,
+                                            outVisible, stack);
         else
-            tlasQueryImpl<true, false>(view, minPix, outVisible, stack);
+            tlasQueryImpl<true, false, true>(view, minPix, rootThreshold,
+                                             outVisible, stack);
+    }
+    else if (selectRoots)
+    {
+        if (useMinPix)
+            tlasQueryImpl<false, true, true>(view, minPix, rootThreshold,
+                                             outVisible, stack);
+        else
+            tlasQueryImpl<false, false, true>(view, minPix, rootThreshold,
+                                              outVisible, stack);
+    }
+    else if (useMask)
+    {
+        if (useMinPix)
+            tlasQueryImpl<true, true, false>(view, minPix, rootThreshold,
+                                             outVisible, stack);
+        else
+            tlasQueryImpl<true, false, false>(view, minPix, rootThreshold,
+                                              outVisible, stack);
     }
     else if (useMinPix)
-        tlasQueryImpl<false, true>(view, minPix, outVisible, stack);
+        tlasQueryImpl<false, true, false>(view, minPix, rootThreshold,
+                                          outVisible, stack);
     else
-        tlasQueryImpl<false, false>(view, minPix, outVisible, stack);
+        tlasQueryImpl<false, false, false>(view, minPix, rootThreshold,
+                                           outVisible, stack);
 }
 
 size_t World::collect(size_t maxAttachedPages, uint32_t minAge,
@@ -2259,11 +2316,62 @@ void World::runPage(const WorkItem& item, const Instance& inst, const Camera& lo
 }
 
 void World::runInstance(uint32_t instIdx, const Camera& view, const CutParams& params,
-                        uint8_t mask, Worker& w) const
+                        uint8_t mask, bool tryRoot, Worker& w) const
 {
     const Instance& inst = instances_[instIdx];
-    const Camera local = toLocal(view, inst.pos, inst.scale);
     HLOD_STAT(w, instancesVisited, 1);
+
+    // A root page normally contains one BLAS root. The TLAS already maintains
+    // that root's exact world box and maximum effective error, so a distant
+    // root can be selected before transforming the view or touching its wide
+    // page data. Root payloads are pinned, making this entry shared by the
+    // current and ideal cuts. Multi-root page forests take the ordinary walk.
+    const PageRt& rootRt = slots_[inst.rootSlot];
+    const PageView& rootPage = pageView(rootRt);
+    if (tryRoot && rootPage.childCount(0) == 1)
+    {
+        const InstanceTlas& spatial = instanceTlas_[instIdx];
+        if (mask == 0 ||
+            testAabb(spatial.worldBox, view.frustum, mask) != CullState::Outside)
+        {
+            const float worldDistance =
+                spatial.maxErrWorld > 0.0f
+                    ? distanceToBox(spatial.worldBox, view.queryMin(),
+                                    view.queryMax())
+                    : 0.0f;
+            const float error = spatial.maxErrWorld > 0.0f
+                                    ? screenError(spatial.maxErrWorld, view.k,
+                                                  worldDistance)
+                                    : 0.0f;
+            if (error <= params.threshold)
+            {
+                if (w.trackMargin && spatial.maxErrWorld > 0.0f)
+                {
+                    const float worldFlip =
+                        spatial.maxErrWorld * view.k / w.bar;
+                    const float worldSlack = worldDistance > worldFlip
+                                                 ? worldDistance - worldFlip
+                                                 : worldFlip - worldDistance;
+                    w.margin = std::min(w.margin, worldSlack / inst.scale);
+                    w.maxError = std::max(
+                        w.maxError, spatial.maxErrWorld / inst.scale);
+                }
+                if (w.trackTouches &&
+                    (!w.uniqueTouches ||
+                     std::find(w.touched.begin(), w.touched.end(), inst.rootSlot) ==
+                         w.touched.end()))
+                    w.touched.push_back(inst.rootSlot);
+                w.cut.shared.push(makeCutEntry(
+                    NodeHandle{inst.rootSlot, 1, rootRt.generation}, error,
+                    w.bar, w.barInv, instIdx));
+                return;
+            }
+        }
+        else
+            return;
+    }
+
+    const Camera local = toLocal(view, inst.pos, inst.scale);
     w.work.push_back({inst.rootSlot,
                       wideBoundsFor(inst, inst.rootSlot, slots_[inst.rootSlot]),
                       1, 1, mask});
@@ -2332,9 +2440,25 @@ void World::selectCutUncached(const Camera& camera, const CutParams& params,
     }
 
     const Camera damped = view.damper_.damp(camera);
-    tlasQuery(damped, params.minPix, scratch.visible, scratch.tlasStack);
+    const bool testRoots = view.rootQueryEnabled_ || view.rootProbeCountdown_ == 0;
+    tlasQuery(damped, params.minPix, testRoots ? params.threshold : -1.0f,
+              scratch.visible, scratch.tlasStack);
 
     const uint32_t nVis = uint32_t(scratch.visible.size());
+    if (testRoots)
+    {
+        uint32_t roots = 0;
+        for (const VisibleItem item : scratch.visible)
+            roots += item.rootSelected() ? 1u : 0u;
+        // The query-side vector test costs roughly one eighth of a normal
+        // root-page visit. Require a comfortable margin rather than enabling
+        // it for a sparse handful of distant instances.
+        view.rootQueryEnabled_ = nVis != 0 && roots >= (nVis + 3u) / 4u;
+        view.rootProbeCountdown_ = view.rootQueryEnabled_ ? 0u : 31u;
+    }
+    else
+        --view.rootProbeCountdown_;
+
     view.walked_ = nVis;
     const uint32_t workerCount = config_.context.workerCount;
     const bool parallel = config_.parallelInstanceThreshold > 0 && workerCount > 1 &&
@@ -2371,7 +2495,8 @@ void World::selectCutUncached(const Camera& camera, const CutParams& params,
                     HLOD_PREFETCH(nextPage.payload);
                 }
                 runInstance(scratch.visible[i].instance(), damped, params,
-                            scratch.visible[i].mask(), w);
+                            scratch.visible[i].mask(),
+                            scratch.visible[i].rootSelected(), w);
             }
         }
         else if (flatInstanceCount_ == liveInstances_.size())
@@ -2424,7 +2549,8 @@ void World::selectCutUncached(const Camera& camera, const CutParams& params,
                     runFlatInstance(instIdx, damped, scratch.visible[i].mask(), w);
                 else
                     runInstance(instIdx, damped, params,
-                                scratch.visible[i].mask(), w);
+                                scratch.visible[i].mask(),
+                                scratch.visible[i].rootSelected(), w);
             }
         }
 
@@ -2485,7 +2611,8 @@ void World::selectCutUncached(const Camera& camera, const CutParams& params,
             {
                 for (uint32_t i = lo; i < hi; ++i)
                     world.runInstance(c->scratch->visible[i].instance(), *c->camera,
-                                      *c->params, c->scratch->visible[i].mask(), w);
+                                      *c->params, c->scratch->visible[i].mask(),
+                                      c->scratch->visible[i].rootSelected(), w);
             }
             else if (c->flatMode == 2)
             {
@@ -2506,7 +2633,8 @@ void World::selectCutUncached(const Camera& camera, const CutParams& params,
                                               c->scratch->visible[i].mask(), w);
                     else
                         world.runInstance(instIdx, *c->camera, *c->params,
-                                          c->scratch->visible[i].mask(), w);
+                                          c->scratch->visible[i].mask(),
+                                          c->scratch->visible[i].rootSelected(), w);
                 }
             }
         },
@@ -2550,6 +2678,8 @@ void View::reset()
     k_ = bar_ = 0.0f;
     stats_ = CutStats{};
     world_ = nullptr;
+    rootQueryEnabled_ = true;
+    rootProbeCountdown_ = 0;
     ++epoch_;
     // The half-life is configuration and survives; the accumulated window is
     // state and does not. This is the half that reset() exists for: records
@@ -2631,7 +2761,9 @@ void World::selectCutCached(const Camera& camera, const CutParams& params,
     // rather than about the camera.
     const Camera dv = ctx.damper_.damp(camera);
 
-    tlasQuery(dv, params.minPix, scratch.visible, scratch.tlasStack);
+    // Whole-cut cache hits already avoid the BLAS walk. Keep the universal
+    // TLAS query lean and test the root only on the smaller miss population.
+    tlasQuery(dv, params.minPix, -1.0f, scratch.visible, scratch.tlasStack);
 
     ctx.reused_ = ctx.walked_ = 0;
     if (ctx.rec_.size() < instances_.size())
@@ -2762,7 +2894,7 @@ void World::selectCutCached(const Camera& camera, const CutParams& params,
             instanceFlatSlots_[instIdx] != kInvalidIndex)
             runFlatInstance(instIdx, dv, mask, w);
         else
-            runInstance(instIdx, dv, params, mask, w);
+            runInstance(instIdx, dv, params, mask, true, w);
         w.trackMargin = false;
         for (const uint32_t slot : w.touched) recordUsage(slot);
 

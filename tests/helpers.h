@@ -62,7 +62,7 @@ struct World::TestAccess
     static size_t queryTlas(World& w, const Camera& camera, float minPix,
                             TlasQueryScratch& scratch)
     {
-        w.tlasQuery(camera, minPix, scratch.visible, scratch.stack);
+        w.tlasQuery(camera, minPix, -1.0f, scratch.visible, scratch.stack);
         return scratch.visible.size();
     }
 
@@ -165,7 +165,7 @@ struct World::TestAccess
         std::vector<std::pair<uint32_t, uint8_t>> out;
         std::vector<World::VisibleItem> packed;
         std::vector<World::TlasItem> stack;
-        w.tlasQuery(v, minPix, packed, stack);
+        w.tlasQuery(v, minPix, -1.0f, packed, stack);
         out.reserve(packed.size());
         for (const World::VisibleItem item : packed)
             out.emplace_back(item.instance(), item.mask());
@@ -221,7 +221,7 @@ struct World::TestAccess
             if (visited[size_t(ni)]) return "node reachable twice";
             visited[size_t(ni)] = 1;
             const World::TlasNode& n = w.tlasNodes_[size_t(ni)];
-            if (n.validMask == 0) return "reachable node with no valid lane";
+            if (n.validLanes() == 0) return "reachable node with no valid lane";
             for (uint32_t l = 0; l < kWide; ++l)
             {
                 if (!(n.validMask & (1u << l))) continue;
@@ -242,10 +242,14 @@ struct World::TestAccess
                         return "lane mask drops layers its instance is on";
                     if (n.maxErr.v[l] < spatial.maxErrWorld)
                         return "lane error below its instance's";
+                    if (n.singleRoot(l) != w.instanceHasSingleRoot(id))
+                        return "lane single-root flag disagrees with its instance";
                     ++found;
                 }
                 else
                 {
+                    if (n.singleRoot(l))
+                        return "inner lane carries a leaf single-root flag";
                     const World::TlasNode& c = w.tlasNodes_[size_t(n.child[l])];
                     if (c.parent != ni) return "child's parent link is wrong";
                     float childErr = 0.0f;

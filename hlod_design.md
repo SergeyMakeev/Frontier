@@ -12,6 +12,16 @@ costs one submission per wall. In a hierarchical LOD tree, every node is a
 complete proxy for its descendants: the root may draw the town, a child may
 draw one building, and leaves may draw individual walls.
 
+This document calls each independently rooted renderable hierarchy a BLAS.
+That is a role, not an object-size restriction: one BLAS may describe a city
+block, a skyscraper with floors and interiors, a terrain region, a reusable
+asset, or one flat vehicle or character. Every real node carries a renderable
+`UserPayload`, so selection can stop anywhere in the hierarchy. The dynamic
+TLAS spatially indexes placements of these independent BLAS roots. TLAS
+internal nodes are acceleration data rather than renderable representations;
+they do not appear in the cut. Consequently the world needs no common
+whole-map hierarchy and can freely mix BLASes of very different scopes.
+
 A selection is a ragged antichain through that tree:
 
 ```text
@@ -49,13 +59,15 @@ envelope, providing LOD hysteresis without sticky state on every node.
 
 The runtime has four distinct concepts:
 
-- A `Page` or `PageView` is an immutable, packed hierarchy fragment.
-- An `AssetHandle` names page bytes registered with a `World` for reuse.
+- A `Page` or `PageView` is an immutable, packed BLAS fragment.
+- An `AssetHandle` names page bytes registered with a `World` for reuse. Here
+  *asset* is an API/storage term and does not mean that the BLAS represents one
+  object.
 - A page mount places an asset at an instance root or below an expansion point;
   a `PageHandle` names that mount.
-- An instance applies a translation and positive uniform scale to one root
-  asset. `World::InstanceRef` also contains a generation and its root page
-  handle.
+- An instance applies a translation and positive uniform scale to one
+  independent BLAS root. `World::InstanceRef` also contains a generation and
+  its root page handle.
 
 `NodeHandle{slot, index, generation}` names a node in a mounted page and packs
 those fields into 64 bits: 20 bits each for mount slot and page-local index,
@@ -334,20 +346,25 @@ build or repair. Selection then proceeds against that stable snapshot:
 
 1. Walk the wide TLAS with tri-state frustum and optional `minPix` contribution
    culling.
-2. For an exact one-node asset, retest its precise world box and emit its pinned
+2. A TLAS leaf compactly marks a hierarchical BLAS whose root page has one
+   renderable root. When a vector error test says that root may satisfy the
+   threshold, retest its precise world box and error and emit the pinned root
+   directly into `shared`. Uncached views enable this query work adaptively;
+   cached views do the exact root test only for cache misses.
+3. For an exact one-node BLAS, retest its precise world box and emit its pinned
    root directly into `shared`. A compact per-instance marker identifies this
    case without fetching the normal instance/page traversal state.
-3. For hierarchical assets, transform the view into each surviving instance's
-   local space.
-4. Walk attached pages with an explicit DFS stack, carrying current- and
+4. For hierarchical BLASes that did not terminate at the root, transform the
+   view into each surviving instance's local space.
+5. Walk attached pages with an explicit DFS stack, carrying current- and
    ideal-cut liveness together. Propagated coverage answers most current-cut
    descent decisions in O(1); only partially visible uncovered regions need a
    recursive visible-coverage probe. A recursively fully-resident mount tree
    instead takes a specialized path in which every emitted entry is `shared`.
-5. Test up to eight children together. Fully outside lanes disappear; fully
+6. Test up to eight children together. Fully outside lanes disappear; fully
    inside lanes clear their remaining plane masks; partial lanes carry only
    undecided planes.
-6. Emit plain leaves directly from their parent's wide test. Interior and
+7. Emit plain leaves directly from their parent's wide test. Interior and
    expansion nodes carry error, plane mask, and both membership paths on the
    DFS stack. Shared nodes are emitted once.
 
@@ -435,9 +452,12 @@ ones. No selection may overlap a World mutation, another `applyUpdates`, or
 
 ## 9. TLAS lifecycle
 
-The top level is an 8-wide dynamic BVH over live instances. It stores world
-bounds, maximum effective error, layer masks, and parent/lane back-pointers in
-maintenance arrays separate from the cut-path instance record.
+The top level is an 8-wide dynamic BVH over live placements of independent
+BLAS roots, including one-node BLASes. It stores world bounds, maximum
+effective error, layer masks, and parent/lane back-pointers in maintenance
+arrays separate from the cut-path instance record. TLAS nodes have no
+renderable payload and are never selected; after coarse culling, a surviving
+leaf identifies the BLAS instance whose renderable hierarchy is evaluated.
 
 The first `applyUpdates` builds the configured quality tier before publishing
 the selection snapshot:

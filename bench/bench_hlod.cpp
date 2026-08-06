@@ -1710,6 +1710,84 @@ BENCHMARK(BM_MixedForest100k)
     ->ArgNames({"flat_pct", "cached"})
     ->Unit(benchmark::kMicrosecond);
 
+// Root-decision control: the same 100k-instance, 25%-visible hierarchy as the
+// hierarchical arm above. The near camera refines every visible root to four
+// entries; the far camera accepts the one renderable BLAS root. This separates
+// a TLAS-leaf root decision from the ordinary page walk while keeping output
+// size and View behavior explicit.
+//
+// arg0 = 0: near/refined roots, 1: far/accepted roots
+// arg1 = 0: uncached View, 1: warm cached View
+static void BM_RootDecisionForest100k(benchmark::State& state)
+{
+    constexpr uint32_t kInstances = 100000;
+    constexpr uint32_t kVisible = kInstances / 4;
+    const bool far = state.range(0) != 0;
+    const bool cached = state.range(1) != 0;
+
+    TreeGen treeGen;
+    treeGen.fanout = 4;
+    treeGen.depth = 3;
+    Page hierarchy = treeGen.makeRootPage(unitRegion(3.0f), 16.0f, 0);
+    const uint32_t hierarchyNodes = hierarchy.nodeCount();
+
+    World world;
+    const AssetHandle hierarchyAsset = world.registerAsset(std::move(hierarchy));
+    const auto gridPosition = [](uint32_t index, uint32_t count, float zBase)
+    {
+        const uint32_t columns =
+            uint32_t(std::ceil(std::sqrt(double(std::max(1u, count)))));
+        const uint32_t row = index / columns;
+        const uint32_t column = index - row * columns;
+        const float x = (float(column) - 0.5f * float(columns - 1)) * 6.0f;
+        return float4::point(x, 0.0f, zBase + float(row) * 6.0f);
+    };
+
+    for (uint32_t i = 0; i < kInstances; ++i)
+    {
+        const bool visible = i < kVisible;
+        const uint32_t clusterIndex = visible ? i : i - kVisible;
+        const uint32_t clusterCount = visible ? kVisible : kInstances - kVisible;
+        world.addInstance(
+            hierarchyAsset,
+            gridPosition(clusterIndex, clusterCount, visible ? 0.0f : -10000.0f));
+    }
+    markAllResident(world, world.assetRootPage(hierarchyAsset), hierarchyNodes);
+
+    const Camera camera = makePerspectiveCamera(
+        float4::point(0, 100, far ? -4000.0f : -2000.0f),
+        float4::vec(0, -0.05f, 1), float4::vec(0, 1, 0), 1.2f,
+        16.0f / 9.0f, 1080.0f, 0.1f, 6000.0f);
+    const CutParams params{4.0f, 0.0f};
+
+    world.applyUpdates();
+    View view;
+    view.setReuseEnabled(cached);
+    CutResults cut;
+    view.selectCut(world, camera, params, cut);
+    size_t visible = view.reused() + view.walked();
+
+    for (auto _ : state)
+    {
+        view.selectCut(world, camera, params, cut);
+        visible = view.reused() + view.walked();
+        consumeCut(cut);
+    }
+
+    state.SetItemsProcessed(state.iterations() * int64_t(visible));
+    state.counters["visible"] = double(visible);
+    state.counters["cut"] = double(cut.size());
+    state.counters["entries/visible"] =
+        visible != 0 ? double(cut.size()) / double(visible) : 0.0;
+    state.counters["view_MB"] =
+        cached ? double(view.bytes()) / (1024.0 * 1024.0) : 0.0;
+}
+BENCHMARK(BM_RootDecisionForest100k)
+    ->Args({0, 0})->Args({0, 1})
+    ->Args({1, 0})->Args({1, 1})
+    ->ArgNames({"far", "cached"})
+    ->Unit(benchmark::kMicrosecond);
+
 // End-to-end Morton rebuild cost. After one quality build, move one instance
 // between opposite corners on every iteration. A zero escape budget forces the
 // next cut to rebuild through the fast Morton tier; the area budget is disabled
