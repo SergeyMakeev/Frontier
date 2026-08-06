@@ -334,16 +334,20 @@ build or repair. Selection then proceeds against that stable snapshot:
 
 1. Walk the wide TLAS with tri-state frustum and optional `minPix` contribution
    culling.
-2. Transform the view into each surviving instance's local space.
-3. Walk attached pages with an explicit DFS stack, carrying current- and
+2. For an exact one-node asset, retest its precise world box and emit its pinned
+   root directly into `shared`. A compact per-instance marker identifies this
+   case without fetching the normal instance/page traversal state.
+3. For hierarchical assets, transform the view into each surviving instance's
+   local space.
+4. Walk attached pages with an explicit DFS stack, carrying current- and
    ideal-cut liveness together. Propagated coverage answers most current-cut
    descent decisions in O(1); only partially visible uncovered regions need a
    recursive visible-coverage probe. A recursively fully-resident mount tree
    instead takes a specialized path in which every emitted entry is `shared`.
-4. Test up to eight children together. Fully outside lanes disappear; fully
+5. Test up to eight children together. Fully outside lanes disappear; fully
    inside lanes clear their remaining plane masks; partial lanes carry only
    undecided planes.
-5. Emit plain leaves directly from their parent's wide test. Interior and
+6. Emit plain leaves directly from their parent's wide test. Interior and
    expansion nodes carry error, plane mask, and both membership paths on the
    DFS stack. Shared nodes are emitted once.
 

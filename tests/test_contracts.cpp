@@ -214,6 +214,11 @@ TEST(Contracts, ParallelSelectionMatchesSerialBucketedCut)
     gen.fanout = 4;
     gen.depth = 2;
     const Page proto = gen.makeRootPage(unitRegion(20.0f), 64.0f, 0);
+    HLodBuilder flatBuilder;
+    flatBuilder.createRoot(
+        9000, 0.0f,
+        AABB::fromCenterExtent(float4::point(0, 0, 0), float4::vec(1, 1, 1)));
+    const Page flatProto = flatBuilder.build();
 
     World serial;
     WorldConfig config;
@@ -223,12 +228,14 @@ TEST(Contracts, ParallelSelectionMatchesSerialBucketedCut)
 
     const AssetHandle serialAsset = serial.registerAsset(proto.clone());
     const AssetHandle parallelAsset = parallel.registerAsset(proto.clone());
+    const AssetHandle serialFlat = serial.registerAsset(flatProto.clone());
+    const AssetHandle parallelFlat = parallel.registerAsset(flatProto.clone());
     for (uint32_t i = 0; i < 16; ++i)
     {
         const float4 pos = float4::point(float(i & 3u) * 2.0f, 0.0f,
                                          float(i >> 2) * 2.0f);
-        serial.addInstance(serialAsset, pos);
-        parallel.addInstance(parallelAsset, pos);
+        serial.addInstance((i & 1u) ? serialFlat : serialAsset, pos);
+        parallel.addInstance((i & 1u) ? parallelFlat : parallelAsset, pos);
     }
 
     serial.applyUpdates();

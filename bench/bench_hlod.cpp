@@ -12,6 +12,7 @@
 //   - multi-view frames (marginal cost of extra views)
 //   - streaming convergence latency (frames to ideal == current)
 //   - TLAS at 200k-500k instances + level-load burst
+//   - 100k flat forests: TLAS-only vs cached/uncached result materialization
 //   - adversarial shapes (stacked instances, max-width node, deep page chain)
 //
 // All setup happens outside the timed loop; iterations time selectCut plus
@@ -1497,6 +1498,216 @@ static void BM_TlasScale(benchmark::State& state)
 }
 BENCHMARK(BM_TlasScale)
     ->Arg(200000)->Arg(500000)
+    ->Unit(benchmark::kMicrosecond);
+
+// Flat-forest control: 100k instances whose entire hierarchy is one
+// renderable node. This separates the BVH8 query from the per-visible
+// materialization that currently still enters the page traversal.
+//
+// arg0 = 1: one shared flat asset, 0: one anonymous flat asset per instance
+// arg1 = target visible population percentage (25 or 100)
+// arg2 = 0: TLAS query only, 1: uncached selectCut, 2: cached selectCut
+static void BM_FlatForest100k(benchmark::State& state)
+{
+    constexpr uint32_t kInstances = 100000;
+    const bool sharedAsset = state.range(0) != 0;
+    const uint32_t visibleTarget =
+        kInstances * uint32_t(state.range(1)) / 100u;
+    const int mode = int(state.range(2));
+
+    HLodBuilder builder;
+    builder.createRoot(
+        1, 0.0f,
+        AABB::fromCenterExtent(float4::point(0, 0, 0), float4::vec(1, 1, 1)));
+    Page prototype = builder.build();
+
+    World world;
+    AssetHandle shared;
+    if (sharedAsset) shared = world.registerAsset(prototype.clone());
+
+    const auto gridPosition = [](uint32_t index, uint32_t count, float zBase)
+    {
+        const uint32_t columns =
+            uint32_t(std::ceil(std::sqrt(double(std::max(1u, count)))));
+        const uint32_t row = index / columns;
+        const uint32_t column = index - row * columns;
+        const float x = (float(column) - 0.5f * float(columns - 1)) * 6.0f;
+        return float4::point(x, 0.0f, zBase + float(row) * 6.0f);
+    };
+
+    for (uint32_t i = 0; i < kInstances; ++i)
+    {
+        float4 position;
+        if (i < visibleTarget)
+            position = gridPosition(i, visibleTarget, 0.0f);
+        else
+            // A separate cluster behind the camera lets the quality TLAS
+            // reject the invisible 75% high in the tree.
+            position = gridPosition(i - visibleTarget,
+                                    kInstances - visibleTarget, -10000.0f);
+        if (sharedAsset)
+            world.addInstance(shared, position);
+        else
+            world.addInstance(prototype.clone(), position);
+    }
+
+    const Camera camera = makePerspectiveCamera(
+        float4::point(0, 100, -2000), float4::vec(0, -0.05f, 1),
+        float4::vec(0, 1, 0), 1.2f, 16.0f / 9.0f, 1080.0f, 0.1f, 5000.0f);
+    const CutParams params{4.0f, 0.0f};
+
+    const auto build0 = std::chrono::steady_clock::now();
+    world.applyUpdates();
+    const auto build1 = std::chrono::steady_clock::now();
+    const double buildMs =
+        std::chrono::duration<double, std::milli>(build1 - build0).count();
+    World::TestAccess::TlasQueryScratch tlasScratch;
+    View view;
+    view.setReuseEnabled(mode == 2);
+    CutResults cut;
+
+    size_t visible = 0;
+    if (mode == 0)
+        visible = World::TestAccess::queryTlas(world, camera, params.minPix,
+                                               tlasScratch);
+    else
+    {
+        // Warm output and View capacities; the benchmark measures steady
+        // culling/materialization rather than first-use allocation.
+        view.selectCut(world, camera, params, cut);
+        visible = view.reused() + view.walked();
+    }
+
+    for (auto _ : state)
+    {
+        if (mode == 0)
+        {
+            visible = World::TestAccess::queryTlas(world, camera, params.minPix,
+                                                   tlasScratch);
+            benchmark::DoNotOptimize(tlasScratch.visible.data());
+        }
+        else
+        {
+            view.selectCut(world, camera, params, cut);
+            visible = view.reused() + view.walked();
+            consumeCut(cut);
+        }
+    }
+
+    state.SetItemsProcessed(state.iterations() * int64_t(visible));
+    state.counters["visible"] = double(visible);
+    state.counters["visible%"] = 100.0 * double(visible) / double(kInstances);
+    state.counters["cut"] = mode == 0 ? 0.0 : double(cut.size());
+    state.counters["view_MB"] =
+        mode == 2 ? double(view.bytes()) / (1024.0 * 1024.0) : 0.0;
+    state.counters["build_ms"] = buildMs;
+    state.counters["pages"] = double(world.attachedPageCount());
+    state.counters["tlas_nodes"] =
+        double(World::TestAccess::tlasNodeCount(world));
+}
+BENCHMARK(BM_FlatForest100k)
+    ->Args({1, 25, 0})->Args({1, 25, 1})->Args({1, 25, 2})
+    ->Args({1, 100, 0})->Args({1, 100, 1})->Args({1, 100, 2})
+    ->Args({0, 25, 0})->Args({0, 25, 1})->Args({0, 25, 2})
+    ->Args({0, 100, 0})->Args({0, 100, 1})->Args({0, 100, 2})
+    ->ArgNames({"shared", "visible_pct", "mode"})
+    ->Unit(benchmark::kMicrosecond);
+
+// Mixed-forest control: one shared flat asset and one shared, fully resident
+// 85-node hierarchy. Exactly 25% of both populations are visible, and the
+// flat/hierarchical assignment is interleaved so every ratio sees the same
+// spatial distribution.
+//
+// arg0 = percentage of instances using the single-node asset
+// arg1 = 0: uncached View, 1: warm cached View
+static void BM_MixedForest100k(benchmark::State& state)
+{
+    constexpr uint32_t kInstances = 100000;
+    constexpr uint32_t kVisible = kInstances / 4;
+    const uint32_t flatPercent = uint32_t(state.range(0));
+    const bool cached = state.range(1) != 0;
+
+    HLodBuilder flatBuilder;
+    flatBuilder.createRoot(
+        1, 0.0f,
+        AABB::fromCenterExtent(float4::point(0, 0, 0), float4::vec(1, 1, 1)));
+
+    TreeGen treeGen;
+    treeGen.fanout = 4;
+    treeGen.depth = 3;
+    Page hierarchy = treeGen.makeRootPage(unitRegion(3.0f), 16.0f, 0);
+    const uint32_t hierarchyNodes = hierarchy.nodeCount();
+
+    World world;
+    const AssetHandle flatAsset = world.registerAsset(flatBuilder.build());
+    const AssetHandle hierarchyAsset = world.registerAsset(std::move(hierarchy));
+
+    const auto gridPosition = [](uint32_t index, uint32_t count, float zBase)
+    {
+        const uint32_t columns =
+            uint32_t(std::ceil(std::sqrt(double(std::max(1u, count)))));
+        const uint32_t row = index / columns;
+        const uint32_t column = index - row * columns;
+        const float x = (float(column) - 0.5f * float(columns - 1)) * 6.0f;
+        return float4::point(x, 0.0f, zBase + float(row) * 6.0f);
+    };
+
+    uint32_t visibleFlat = 0;
+    for (uint32_t i = 0; i < kInstances; ++i)
+    {
+        const bool visible = i < kVisible;
+        const uint32_t clusterIndex = visible ? i : i - kVisible;
+        const uint32_t clusterCount = visible ? kVisible : kInstances - kVisible;
+        const float zBase = visible ? 0.0f : -10000.0f;
+        const float4 position = gridPosition(clusterIndex, clusterCount, zBase);
+        const bool flat = (i % 100u) < flatPercent;
+        if (visible && flat) ++visibleFlat;
+        world.addInstance(flat ? flatAsset : hierarchyAsset, position);
+    }
+    if (flatPercent != 100)
+        markAllResident(world, world.assetRootPage(hierarchyAsset), hierarchyNodes);
+
+    const Camera camera = makePerspectiveCamera(
+        float4::point(0, 100, -2000), float4::vec(0, -0.05f, 1),
+        float4::vec(0, 1, 0), 1.2f, 16.0f / 9.0f, 1080.0f, 0.1f, 5000.0f);
+    const CutParams params{4.0f, 0.0f};
+
+    const auto build0 = std::chrono::steady_clock::now();
+    world.applyUpdates();
+    const auto build1 = std::chrono::steady_clock::now();
+    const double buildMs =
+        std::chrono::duration<double, std::milli>(build1 - build0).count();
+
+    View view;
+    view.setReuseEnabled(cached);
+    CutResults cut;
+    view.selectCut(world, camera, params, cut);
+    size_t visible = view.reused() + view.walked();
+
+    for (auto _ : state)
+    {
+        view.selectCut(world, camera, params, cut);
+        visible = view.reused() + view.walked();
+        consumeCut(cut);
+    }
+
+    state.SetItemsProcessed(state.iterations() * int64_t(visible));
+    state.counters["visible"] = double(visible);
+    state.counters["flat_visible"] = double(visibleFlat);
+    state.counters["cut"] = double(cut.size());
+    state.counters["entries/visible"] =
+        visible != 0 ? double(cut.size()) / double(visible) : 0.0;
+    state.counters["view_MB"] =
+        cached ? double(view.bytes()) / (1024.0 * 1024.0) : 0.0;
+    state.counters["build_ms"] = buildMs;
+}
+BENCHMARK(BM_MixedForest100k)
+    ->Args({0, 0})->Args({0, 1})
+    ->Args({20, 0})->Args({20, 1})
+    ->Args({50, 0})->Args({50, 1})
+    ->Args({80, 0})->Args({80, 1})
+    ->Args({100, 0})->Args({100, 1})
+    ->ArgNames({"flat_pct", "cached"})
     ->Unit(benchmark::kMicrosecond);
 
 // End-to-end Morton rebuild cost. After one quality build, move one instance

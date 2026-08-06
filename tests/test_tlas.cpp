@@ -481,6 +481,39 @@ TEST(Tlas, MovingAnIncrementallyInsertedInstanceRefitsCorrectly)
     EXPECT_TRUE(instanceIdsOf(cut).count(r.id)) << "moved after insertion and lost";
 }
 
+// Flat instances bypass the page walk, but a grow-only TLAS leaf still keeps
+// its old extent after motion. The direct path must retest the precise world
+// box or it would emit the object in both its old and new locations.
+TEST(Tlas, FlatInstanceRetestsExactBoundsAfterMotion)
+{
+    World w(neverRebuild());
+    HLodBuilder builder;
+    builder.createRoot(
+        77, 6.0f,
+        AABB::fromCenterExtent(float4::point(0, 0, 0), float4::vec(1, 1, 1)));
+    const AssetHandle asset = w.registerAsset(builder.build());
+    const World::InstanceRef instance =
+        w.addInstance(asset, float4::point(0, 0, 0));
+    w.applyUpdates();
+
+    const Camera oldView = viewFrom(0.0f, 0.0f, 12.0f);
+    CutResults cut;
+    selectCutUncached(w, oldView, kParams, cut);
+    ASSERT_EQ(currentCut(cut).size(), 1u);
+    const RefResult reference = TAX::referenceCut(w, oldView, kParams);
+    ASSERT_EQ(currentCut(reference.cut).size(), 1u);
+    EXPECT_EQ(currentCut(cut)[0].errorCode(),
+              currentCut(reference.cut)[0].errorCode());
+
+    w.moveInstance(instance, float4::point(300.0f, 0, 0));
+    w.applyUpdates();
+    ASSERT_FALSE(TAX::tlasDirty(w));
+    EXPECT_EQ(TAX::tlasValidate(w), "");
+
+    selectCutUncached(w, oldView, kParams, cut);
+    EXPECT_TRUE(cut.empty());
+}
+
 // The radix rebuild must also handle the worst Morton distribution: almost
 // every centroid quantises to the same key. Stable scatter keeps that cohort
 // deterministic without needing a comparison sort inside the equal-key run.

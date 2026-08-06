@@ -91,6 +91,8 @@ float decodeCutError(uint8_t code, float threshold)
 
 namespace {
 
+inline constexpr uint32_t kFlatZeroError = 1u << 31;
+
 inline CutEntry makeCutEntry(NodeHandle node, float error, float threshold,
                              float thresholdInv, InstanceId instance)
 {
@@ -665,6 +667,25 @@ World::InstanceRef World::addInstanceInternal(uint32_t asset, const InstanceDesc
     inst.generation = ++generationCounter_;
     spatial.liveIndex = uint32_t(liveInstances_.size());
     liveInstances_.push_back(id);
+    const PageView& rootPage = assets_[asset].page;
+    const bool flat = rootPage.nodeCount() == 2 && rootPage.childCount(0) == 1 &&
+                      rootPage.childCount(1) == 0 && !rootPage.isExpansion(1);
+    if (flat)
+    {
+        if (instanceFlatSlots_.empty())
+            instanceFlatSlots_.resize(instances_.size(), kInvalidIndex);
+        else if (instanceFlatSlots_.size() < instances_.size())
+            instanceFlatSlots_.resize(instances_.size(), kInvalidIndex);
+        instanceFlatSlots_[id] =
+            slot | (rootPage.geometricError[1] > 0.0f ? 0u : kFlatZeroError);
+        ++flatInstanceCount_;
+    }
+    else if (!instanceFlatSlots_.empty())
+    {
+        if (instanceFlatSlots_.size() < instances_.size())
+            instanceFlatSlots_.resize(instances_.size(), kInvalidIndex);
+        instanceFlatSlots_[id] = kInvalidIndex;
+    }
     // Bounds first, then insert: the insert descends on worldBox. Going through
     // refreshInstanceBounds here would hand a not-yet-inserted instance to the
     // motion refit, whose kInvalidIndex case exists to catch exactly that as a
@@ -738,6 +759,14 @@ void World::removeInstance(InstanceRef ref)
     if (!inst) return;   // stale ref: the instance is already gone
     const InstanceId id = ref.id;
     const uint32_t   asset = slots_[inst->rootSlot].asset;
+
+    if (!instanceFlatSlots_.empty() &&
+        instanceFlatSlots_[id] != kInvalidIndex)
+    {
+        HLOD_CHECK(flatInstanceCount_ != 0, "World: flat-instance count underflow");
+        --flatInstanceCount_;
+        instanceFlatSlots_[id] = kInvalidIndex;
+    }
 
     freeOverlays(*inst);
     tlasRemove(id);
@@ -2227,6 +2256,43 @@ void World::runInstance(uint32_t instIdx, const Camera& view, const CutParams& p
     }
 }
 
+void World::runFlatInstance(uint32_t instIdx, const Camera& view,
+                            uint8_t mask, Worker& w) const
+{
+    const uint32_t flatMarker = instanceFlatSlots_[instIdx];
+    const uint32_t slot = flatMarker & NodeHandle::kSlotMask;
+    const bool zeroError = (flatMarker & kFlatZeroError) != 0;
+    const InstanceTlas* spatial = nullptr;
+
+    // Grow-only TLAS lanes can be looser than an instance after motion. The
+    // ordinary page walk retests its exact child box, so the direct path must
+    // do the same before emitting the sole node.
+    uint8_t exactMask = mask;
+    if (exactMask != 0 || !zeroError)
+    {
+        spatial = &instanceTlas_[instIdx];
+        if (exactMask != 0 &&
+            testAabb(spatial->worldBox, view.frustum, exactMask) == CullState::Outside)
+            return;
+    }
+
+    HLOD_STAT(w, instancesVisited, 1);
+    const PageRt& rt = slots_[slot];
+    if (w.trackTouches &&
+        (!w.uniqueTouches ||
+         std::find(w.touched.begin(), w.touched.end(), slot) == w.touched.end()))
+        w.touched.push_back(slot);
+
+    const float error = !zeroError && spatial->maxErrWorld > 0.0f
+                            ? screenError(
+                                  spatial->maxErrWorld, view.k,
+                                  distanceToBox(spatial->worldBox, view.queryMin(),
+                                                view.queryMax()))
+                            : 0.0f;
+    w.cut.shared.push(makeCutEntry(NodeHandle{slot, 1, rt.generation}, error,
+                                   w.bar, w.barInv, instIdx));
+}
+
 void World::selectCutUncached(const Camera& camera, const CutParams& params,
                               View& view, PageUsageContext* usage,
                               CutResultSink& outCut) const
@@ -2263,26 +2329,80 @@ void World::selectCutUncached(const Camera& camera, const CutParams& params,
         w.bar = params.threshold;
         w.barInv = params.threshold > 0.0f ? 1.0f / params.threshold : 0.0f;
 
-        // The per-instance walk is a chain of dependent loads (Instance ->
-        // page slot -> wide block); with tens of thousands of visible
-        // instances that chain is memory-latency-bound. Pipeline it: prefetch
-        // instance i+2's record and instance i+1's root page while working on
-        // instance i.
-        for (uint32_t i = 0; i < nVis; ++i)
+        if (flatInstanceCount_ == 0)
         {
-            if (i + 2 < nVis)
-                HLOD_PREFETCH(&instances_[scratch.visible[i + 2].instance()]);
-            if (i + 1 < nVis)
+            // Preserve the original hierarchical loop exactly: worlds with
+            // no one-node assets pay only this call-level dispatch.
+            for (uint32_t i = 0; i < nVis; ++i)
             {
-                const Instance& next = instances_[scratch.visible[i + 1].instance()];
-                const PageRt& nrt = slots_[next.rootSlot];
-                const PageView& nextPage = pageView(nrt);
-                HLOD_PREFETCH(nextPage.wide);
-                HLOD_PREFETCH(nextPage.meta);
-                HLOD_PREFETCH(nextPage.payload);
+                if (i + 2 < nVis)
+                    HLOD_PREFETCH(&instances_[scratch.visible[i + 2].instance()]);
+                if (i + 1 < nVis)
+                {
+                    const Instance& next =
+                        instances_[scratch.visible[i + 1].instance()];
+                    const PageRt& nrt = slots_[next.rootSlot];
+                    const PageView& nextPage = pageView(nrt);
+                    HLOD_PREFETCH(nextPage.wide);
+                    HLOD_PREFETCH(nextPage.meta);
+                    HLOD_PREFETCH(nextPage.payload);
+                }
+                runInstance(scratch.visible[i].instance(), damped, params,
+                            scratch.visible[i].mask(), w);
             }
-            runInstance(scratch.visible[i].instance(), damped, params,
-                        scratch.visible[i].mask(), w);
+        }
+        else if (flatInstanceCount_ == liveInstances_.size())
+        {
+            // A flat-only forest does not need Instance or page-topology
+            // prefetches. Lead the one cold stream that direct emission reads.
+            constexpr uint32_t kFlatPrefetchDistance = 8;
+            for (uint32_t i = 0; i < nVis; ++i)
+            {
+                if (i + kFlatPrefetchDistance < nVis)
+                {
+                    const VisibleItem next =
+                        scratch.visible[i + kFlatPrefetchDistance];
+                    const uint32_t marker = instanceFlatSlots_[next.instance()];
+                    if (next.mask() != 0 || (marker & kFlatZeroError) == 0)
+                        HLOD_PREFETCH(&instanceTlas_[next.instance()]);
+                }
+                const uint32_t instIdx = scratch.visible[i].instance();
+                runFlatInstance(instIdx, damped, scratch.visible[i].mask(), w);
+            }
+        }
+        else
+        {
+            // The hierarchical walk is a chain of dependent loads (Instance
+            // -> page slot -> wide block). Pipeline it, but in a mixed forest
+            // do not fetch those records for flat objects that bypass them.
+            for (uint32_t i = 0; i < nVis; ++i)
+            {
+                if (i + 2 < nVis)
+                {
+                    const uint32_t next = scratch.visible[i + 2].instance();
+                    if (instanceFlatSlots_[next] == kInvalidIndex)
+                        HLOD_PREFETCH(&instances_[next]);
+                }
+                if (i + 1 < nVis)
+                {
+                    const uint32_t nextIdx = scratch.visible[i + 1].instance();
+                    if (instanceFlatSlots_[nextIdx] == kInvalidIndex)
+                    {
+                        const Instance& next = instances_[nextIdx];
+                        const PageRt& nrt = slots_[next.rootSlot];
+                        const PageView& nextPage = pageView(nrt);
+                        HLOD_PREFETCH(nextPage.wide);
+                        HLOD_PREFETCH(nextPage.meta);
+                        HLOD_PREFETCH(nextPage.payload);
+                    }
+                }
+                const uint32_t instIdx = scratch.visible[i].instance();
+                if (instanceFlatSlots_[instIdx] != kInvalidIndex)
+                    runFlatInstance(instIdx, damped, scratch.visible[i].mask(), w);
+                else
+                    runInstance(instIdx, damped, params,
+                                scratch.visible[i].mask(), w);
+            }
         }
 
         outCut = w.cut;
@@ -2307,7 +2427,11 @@ void World::selectCutUncached(const Camera& camera, const CutParams& params,
         const CutParams* params;
         uint32_t         nVis;
         uint32_t         workerCount;
-    } chunk{this, &scratch, &damped, &params, nVis, workerCount};
+        uint32_t         flatMode;   // 0 none, 1 mixed, 2 all
+    } chunk{this, &scratch, &damped, &params, nVis, workerCount,
+            flatInstanceCount_ == 0
+                ? 0u
+                : (flatInstanceCount_ == liveInstances_.size() ? 2u : 1u)};
 
     for (uint32_t k = 0; k < workerCount; ++k)
     {
@@ -2334,9 +2458,34 @@ void World::selectCutUncached(const Camera& camera, const CutParams& params,
             const uint32_t lo = std::min(k * per, c->nVis);
             const uint32_t hi = std::min(lo + per, c->nVis);
             Worker& w = c->scratch->workers[k];
-            for (uint32_t i = lo; i < hi; ++i)
-                world.runInstance(c->scratch->visible[i].instance(), *c->camera,
-                                  *c->params, c->scratch->visible[i].mask(), w);
+            if (c->flatMode == 0)
+            {
+                for (uint32_t i = lo; i < hi; ++i)
+                    world.runInstance(c->scratch->visible[i].instance(), *c->camera,
+                                      *c->params, c->scratch->visible[i].mask(), w);
+            }
+            else if (c->flatMode == 2)
+            {
+                for (uint32_t i = lo; i < hi; ++i)
+                {
+                    const uint32_t instIdx = c->scratch->visible[i].instance();
+                    world.runFlatInstance(instIdx, *c->camera,
+                                          c->scratch->visible[i].mask(), w);
+                }
+            }
+            else
+            {
+                for (uint32_t i = lo; i < hi; ++i)
+                {
+                    const uint32_t instIdx = c->scratch->visible[i].instance();
+                    if (world.instanceFlatSlots_[instIdx] != kInvalidIndex)
+                        world.runFlatInstance(instIdx, *c->camera,
+                                              c->scratch->visible[i].mask(), w);
+                    else
+                        world.runInstance(instIdx, *c->camera, *c->params,
+                                          c->scratch->visible[i].mask(), w);
+                }
+            }
         },
         &chunk, config_.context.user);
 
@@ -2586,7 +2735,11 @@ void World::selectCutCached(const Camera& camera, const CutParams& params,
         w.margin = FLT_MAX;
         w.maxError = 0.0f;
         w.trackMargin = true;
-        runInstance(instIdx, dv, params, mask, w);
+        if (flatInstanceCount_ != 0 &&
+            instanceFlatSlots_[instIdx] != kInvalidIndex)
+            runFlatInstance(instIdx, dv, mask, w);
+        else
+            runInstance(instIdx, dv, params, mask, w);
         w.trackMargin = false;
         for (const uint32_t slot : w.touched) recordUsage(slot);
 

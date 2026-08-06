@@ -75,7 +75,13 @@ through the host's blocking `parallelFor` without changing that contract.
 10. **Fully-resident fast path.** An 8-byte per-mount summary propagates whether
    every attached page is recursively resident. Such instances use a
    shared-only traversal with no residency or current/ideal branching.
-11. **Deferred, camera-selective GC feedback.** Optional `PageUsageContext`
+11. **Direct flat-instance emission.** After the first exact one-node asset,
+    the World lazily allocates a compact 4-byte root marker per instance. Once
+    the TLAS reports a flat instance, selection
+    retests the precise world box and emits the pinned root directly, without
+    loading the 64-byte `Instance` or its 256-byte page block. Worlds with no
+    flat instances take the original hierarchical loop unchanged.
+12. **Deferred, camera-selective GC feedback.** Optional `PageUsageContext`
     objects collect page touches without writing the World. `collect` consumes
     only the important cameras chosen by the caller, updates the intrusive LRU,
     and detaches aged leaf mounts; pinned roots are outside the budget and list.
@@ -96,6 +102,7 @@ The runtime's multiplied structures have exact compile-time size contracts on
 | per mounted page residency summary | 8 B | recursively identifies fully-resident mount trees without scanning nodes |
 | per mounted node | 3 B | one packed residency/coverage byte + 16-bit covered-child count |
 | `Instance` + `InstanceTlas` | 64 B + 48 B | selection-hot and spatial-maintenance streams stay separate |
+| instance cut version / flat-root marker | 4 B / 0 or 4 B | the flat marker stream is allocated only after the first flat asset |
 | `Overlay` header | 56 B | two retained vectors; bounds storage is allocated only after deformation |
 | `TlasNode` | 320 B | 296 B of SIMD lanes/metadata rounded to 32-byte alignment |
 | visible hit / TLAS stack item | 4 B / 4 B | 24-bit id or node index + plane mask |
@@ -128,6 +135,42 @@ least five repetitions.
 | Same 80k world, moving camera / static objects | 0.348 ms selection | 97.6% reused; 24,986 entries |
 | Six 80k views, static objects, serial / concurrent | 2.49 / 0.472 ms wall time | 5.3× on six persistent workers |
 | Six 80k views, 5% moving, serial / concurrent | 3.11 / 0.729 ms wall time | 4.3× on six persistent workers |
+
+The `BM_FlatForest100k` diagnostic isolates a forest in which every instance
+contains exactly one fully-resident renderable node. The view is static, output
+and cache capacity are warm, and setup is excluded. `TLAS only` calls the
+internal BVH8 query without materializing cut entries; the other columns run
+the public selection path. Values are the best of three repeats after direct
+flat-instance emission:
+
+| Flat forest | Visible | TLAS only | Uncached selection | Warm `View` selection |
+|---|---:|---:|---:|---:|
+| One shared asset | 25,000 (25%) | 0.175 ms | 0.306 ms | 0.330 ms |
+| 100k unique pages | 25,000 (25%) | 0.175 ms | 0.353 ms | 0.446 ms |
+| One shared asset | 100,000 (100%) | 0.405 ms | 0.947 ms | 1.04 ms |
+| 100k unique pages | 100,000 (100%) | 0.404 ms | 1.47 ms | 1.98 ms |
+
+The initial 100k quality TLAS build takes 38.8-40.5 ms and produces
+37,449-39,675 BVH8 nodes for these two spatial layouts. The 25%-visible warm
+`View` uses 3.91 MiB; the all-visible case uses 5.46 MiB. The equal TLAS-only
+times for shared and unique content confirm that page identity does not affect
+spatial culling. The remaining gap above TLAS-only is precise-box validation,
+compact entry construction, and output writes; unique mounts additionally
+require scattered page-generation reads for the returned node handles.
+
+`BM_MixedForest100k` holds geometry and visibility constant while varying the
+content mix. Exactly 25,000 instances are visible. The hierarchical half uses
+one shared, fully resident 85-node, 4-ary depth-3 asset; the flat half uses one
+shared one-node asset. The 4-pixel threshold selects four entries per visible
+hierarchical instance and one per flat instance. Best of five repeats:
+
+| One-node instances | Hierarchical instances | Cut entries | Uncached selection | Warm `View` selection |
+|---:|---:|---:|---:|---:|
+| 0% | 100% | 100,000 | 3.41 ms | 0.473 ms |
+| 20% | 80% | 85,000 | 2.84 ms | 0.457 ms |
+| 50% | 50% | 62,500 | 1.91 ms | 0.408 ms |
+| 80% | 20% | 40,000 | 0.958 ms | 0.366 ms |
+| 100% | 0% | 25,000 | 0.307 ms | 0.331 ms |
 
 These are scale indicators, not guarantees. Output size and cache locality can
 dominate population size, and contended runs on this host can be much slower.
@@ -796,6 +839,40 @@ cache work dominate it. The targeted deep fully-resident fly-through improved
 control that forced the generic traversal showed no transition penalty: the
 enabled build was 5.1% faster at best and 2.7% faster at median as resident
 regions became eligible during the run.
+
+### V. Direct one-node instance emission — KEPT; broader cache/TLAS variants REVERTED
+
+Theory: a one-node asset has no cut decision to make. The TLAS already performs
+coarse instance culling, its root payload is pinned, and the sole authored node
+is necessarily in `shared`. Re-entering the normal page traversal therefore
+loaded a 64-byte `Instance`, a 112-byte mount header, and part of a 256-byte
+wide block only to emit one known node.
+
+The kept path lazily records a 4-byte flat-root marker per instance. Uncached walks
+and cache misses use the exact world box already maintained for the TLAS,
+retest it against any unresolved frustum planes (required because grow-only
+TLAS lanes can be loose after motion), compute the node's error, and emit its
+generation-stamped handle directly. A call-level dispatch preserves the old
+loop exactly when the world contains no flat instances. Zero-error roots also
+skip the distance calculation.
+
+On the fixed 100k-instance, 25%-visible mixed benchmark, best-of-five uncached
+times changed as follows; warm `View` times were effectively unchanged:
+
+| Flat / hierarchical mix | Before | After | Change |
+|---|---:|---:|---:|
+| 0% / 100% control | 3.41 ms | 3.41 ms | noise |
+| 20% / 80% | 3.06 ms | 2.84 ms | -7.0% |
+| 50% / 50% | 2.53 ms | 1.91 ms | -24.6% |
+| 80% / 20% | 1.98 ms | 0.958 ms | -51.7% |
+| 100% / 0% | 1.63 ms | 0.307 ms | -81.1% |
+
+The unique-page stress control improved even more: 25k visible flat instances
+fell from 2.53 ms to 0.353 ms, while 100k visible fell from 20.97 ms to
+1.47 ms. A variant that bypassed `View` caching for flat hits was reverted: it
+made warm selection 12-61% slower across the mixed ratios. Tagging every TLAS
+leaf and visible hit as flat was also reverted; the sub-1% mixed-case change
+did not justify adding work to the universal TLAS query.
 
 ---
 

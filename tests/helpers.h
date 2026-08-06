@@ -53,6 +53,19 @@ inline void selectCutUncached(World& world, const Camera& camera,
 // over the attached pages (findByScan) — deliberately slow, tests only.
 struct World::TestAccess
 {
+    struct TlasQueryScratch
+    {
+        std::vector<VisibleItem> visible;
+        std::vector<TlasItem> stack;
+    };
+
+    static size_t queryTlas(World& w, const Camera& camera, float minPix,
+                            TlasQueryScratch& scratch)
+    {
+        w.tlasQuery(camera, minPix, scratch.visible, scratch.stack);
+        return scratch.visible.size();
+    }
+
     static NodeHandle findByScan(World& w, UserPayload payload)
     {
         for (uint32_t s = 0; s < uint32_t(w.slots_.size()); ++s)
@@ -171,8 +184,17 @@ struct World::TestAccess
         size_t alive = 0;
         for (const World::Instance& i : w.instances_)
             if (i.alive) ++alive;
-        if (w.instanceTlas_.size() != w.instances_.size())
+        if (w.instanceTlas_.size() != w.instances_.size() ||
+            (!w.instanceFlatSlots_.empty() &&
+             w.instanceFlatSlots_.size() != w.instances_.size()))
             return "instance hot/cold arrays differ in size";
+        size_t flat = 0;
+        for (uint32_t id = 0; id < uint32_t(w.instances_.size()); ++id)
+            if (!w.instanceFlatSlots_.empty() && w.instances_[id].alive &&
+                w.instanceFlatSlots_[id] != kInvalidIndex)
+                ++flat;
+        if (flat != w.flatInstanceCount_)
+            return "flat-instance count disagrees with instance slots";
         if (w.liveInstances_.size() != alive)
             return "dense live list count disagrees with instance slots";
         std::vector<uint8_t> listed(w.instances_.size(), 0);

@@ -1276,6 +1276,8 @@ private:
     void propagateFullResidency(uint32_t slot, bool wasFullyResident);
     void runInstance(uint32_t instIdx, const Camera& view, const CutParams& params,
                      uint8_t mask, Worker& w) const;
+    void runFlatInstance(uint32_t instIdx, const Camera& view,
+                         uint8_t mask, Worker& w) const;
     template<bool FullyResident>
     void runPage(const WorkItem& item, const Instance& inst, const Camera& local,
                  const CutParams& params, Worker& w) const;
@@ -1308,6 +1310,13 @@ private:
 
     std::vector<Instance> instances_;
     std::vector<InstanceTlas> instanceTlas_;
+    // Root mount for exact one-node assets, kInvalidIndex otherwise; a cold
+    // high bit also records the common zero-error case. Keeping this as a
+    // lazily allocated compact stream lets mixed forests bypass the 64-byte
+    // Instance and 256-byte WideBlock records for flat objects. Worlds that
+    // have never contained a flat instance allocate no stream at all.
+    std::vector<uint32_t> instanceFlatSlots_;
+    size_t                flatInstanceCount_ = 0;
     // Cache hits need only this stamp, not the 64-byte Instance record. It is
     // parallel to instances_ and bumped for transform or deformation changes.
     std::vector<uint32_t> instanceCutVersions_;
