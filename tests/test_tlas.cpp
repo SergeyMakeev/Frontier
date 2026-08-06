@@ -253,12 +253,14 @@ TEST(Tlas, InsertionPropagatesLayerMasksUpTheTree)
     ASSERT_FALSE(TAX::tlasDirty(f.w));
     EXPECT_EQ(TAX::tlasValidate(f.w), "");
 
-    selectCutUncached(f.w, viewFrom(0, 0, 60.0f, 0x4u), kParams, cut);
+    CutParams filteredParams = kParams;
+    filteredParams.minPix = 0.5f;   // layer mask + contribution-culling path
+    selectCutUncached(f.w, viewFrom(0, 0, 60.0f, 0x4u), filteredParams, cut);
     EXPECT_TRUE(instanceIdsOf(cut).count(odd.id))
         << "the layer filter culled a freshly inserted instance";
 
     // And a view on the layer it is not on must not pick it up.
-    selectCutUncached(f.w, viewFrom(0, 0, 60.0f, 0x1u), kParams, cut);
+    selectCutUncached(f.w, viewFrom(0, 0, 60.0f, 0x1u), filteredParams, cut);
     EXPECT_EQ(instanceIdsOf(cut).count(odd.id), 0u);
 }
 

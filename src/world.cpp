@@ -1745,16 +1745,16 @@ void World::tlasRebuild()
             if (n.validMask & (1u << l)) tlasBaseArea_ += surfaceArea(n.bounds.lane(l));
 }
 
-void World::tlasQuery(const Camera& view, float minPix,
-                      std::vector<VisibleItem>& outVisible,
-                      std::vector<TlasItem>& stack) const
+template<bool UseMask, bool UseMinPix>
+void World::tlasQueryImpl(const Camera& view, float minPix,
+                          std::vector<VisibleItem>& outVisible,
+                          std::vector<TlasItem>& stack) const
 {
     outVisible.clear();
     HLOD_CHECK(!tlasDirty_ && pendingMoves_.empty(),
                "View::selectCut: call applyUpdates() after world changes");
     if (tlasRoot_ < 0) return;
 
-    const bool useMask = view.viewMask != ~0u;
     const float4 qmn = view.queryMin(), qmx = view.queryMax();
 
     stack.clear();
@@ -1765,21 +1765,24 @@ void World::tlasQuery(const Camera& view, float minPix,
         stack.pop_back();
         const TlasNode& n = tlasNodes_[it.node()];
 
+        const uint8_t inMask = it.mask();
         uint8_t outMasks[kWide];
-        uint32_t survivors =
-            testWideAabb(n.bounds, view.frustum, it.mask(), outMasks) & n.validMask;
+        uint32_t survivors = inMask
+                                 ? testWideAabb(n.bounds, view.frustum, inMask,
+                                                outMasks) & n.validMask
+                                 : n.validMask;
         if (!survivors) continue;
 
-        // Layer visibility. Skipped entirely for the default all-ones view
-        // mask, so callers that do not use layers pay one compare per node.
-        if (useMask)
+        // Query-level dispatch removes this block entirely for the default
+        // all-ones view mask.
+        if constexpr (UseMask)
         {
             for (uint32_t l = 0; l < kWide; ++l)
                 if (!(n.laneMask[l] & view.viewMask)) survivors &= ~(1u << l);
             if (!survivors) continue;
         }
 
-        if (minPix > 0.0f)
+        if constexpr (UseMinPix)
         {
             const float8 d2 = distanceToBoxesSq(n.bounds, qmn, qmx);
             const float8 errs = screenErrorFromSq8(n.maxErr, view.k, d2);
@@ -1793,9 +1796,10 @@ void World::tlasQuery(const Camera& view, float minPix,
             survivors &= survivors - 1;
             const int32_t c = n.child[l];
             if (c >= 0)
-                stack.push_back({c, outMasks[l]});
+                stack.push_back({c, inMask ? outMasks[l] : uint8_t(0)});
             else
-                outVisible.emplace_back(uint32_t(~c), outMasks[l]);
+                outVisible.emplace_back(uint32_t(~c),
+                                        inMask ? outMasks[l] : uint8_t(0));
         }
     }
 }
@@ -1902,6 +1906,25 @@ void World::recordPageUsage(PageUsageContext& usage, uint32_t slot) const
         rec.setPending(true);
         usage.dirty_.push_back(slot);
     }
+}
+
+void World::tlasQuery(const Camera& view, float minPix,
+                      std::vector<VisibleItem>& outVisible,
+                      std::vector<TlasItem>& stack) const
+{
+    const bool useMask = view.viewMask != ~0u;
+    const bool useMinPix = minPix > 0.0f;
+    if (useMask)
+    {
+        if (useMinPix)
+            tlasQueryImpl<true, true>(view, minPix, outVisible, stack);
+        else
+            tlasQueryImpl<true, false>(view, minPix, outVisible, stack);
+    }
+    else if (useMinPix)
+        tlasQueryImpl<false, true>(view, minPix, outVisible, stack);
+    else
+        tlasQueryImpl<false, false>(view, minPix, outVisible, stack);
 }
 
 size_t World::collect(size_t maxAttachedPages, uint32_t minAge,

@@ -1250,6 +1250,10 @@ private:
     void tlasQuery(const Camera& view, float minPix,
                    std::vector<VisibleItem>& outVisible,
                    std::vector<TlasItem>& stack) const;
+    template<bool UseMask, bool UseMinPix>
+    void tlasQueryImpl(const Camera& view, float minPix,
+                       std::vector<VisibleItem>& outVisible,
+                       std::vector<TlasItem>& stack) const;
     void recomputeInstanceBounds(InstanceId id);
     void tlasOnInstanceMoved(InstanceId id);
     void tlasNoteGrowth(float addedArea);

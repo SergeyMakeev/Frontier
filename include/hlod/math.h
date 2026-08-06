@@ -843,19 +843,20 @@ inline Camera makeLookAtCamera(float4 pos, float4 target,
 inline Camera toLocal(const Camera& v, float4 instPos, float instScale)
 {
     assert(instScale > 0.0f);
+    const float invScale = 1.0f / instScale;
     Camera local;
-    local.pos = (v.pos - instPos) / instScale;
+    local.pos = (v.pos - instPos) * invScale;
     local.k   = v.k;
     local.viewMask = v.viewMask;
     // The envelope is a pair of offsets from pos, so the translation cancels
     // and only the uniform scale applies. Non-negativity survives (scale > 0).
-    local.envLo = v.envLo / instScale;
-    local.envHi = v.envHi / instScale;
+    local.envLo = v.envLo * invScale;
+    local.envHi = v.envHi * invScale;
     for (uint32_t p = 0; p < 6; ++p)
     {
         const float4 pl = v.frustum.plane[p];
         local.frustum.plane[p] = {pl.x, pl.y, pl.z,
-                                  (dot3(pl, instPos) + pl.w) / instScale};
+                                  (dot3(pl, instPos) + pl.w) * invScale};
     }
     return local;
 }

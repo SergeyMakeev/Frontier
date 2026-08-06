@@ -40,7 +40,9 @@ through the host's blocking `parallelFor` without changing that contract.
 2. **Eight-lane layout on every backend.** A parent tests eight child bounds and
    errors from one 256-byte `WideBlock`. AVX2 handles eight lanes directly;
    SSE2 and NEON use two four-lane halves; scalar builds retain the same blob
-   layout. The TLAS uses the same logical width.
+   layout. The TLAS uses the same logical width, dispatches optional layer and
+   `minPix` policy once per query, and skips child-mask materialization after a
+   subtree becomes fully inside the frustum.
 3. **Leaf fast path.** A side-array mask identifies plain leaves, which are
    emitted directly from the parent's wide test without a metadata read or DFS
    stack round trip. At fanout eight, most authored nodes are leaves.
@@ -49,6 +51,8 @@ through the host's blocking `parallelFor` without changing that contract.
    maintenance state occupies a separate 48-byte array. Uncached selection
    prefetches the next instance and root page; cached selection pipelines
    its spatially ordered random instance/view-record reads eight entries ahead.
+   World-to-local camera conversion computes one reciprocal per instance and
+   uses multiplication for every position, envelope, and plane transform.
 5. **Compact handle-only output.** The world has no payload index or node hash
    table. A cut entry is 12 bytes: an 8-byte generation-stamped handle plus a
    packed 24-bit instance id and 8-bit error. Stale asynchronous completions
@@ -127,14 +131,14 @@ least five repetitions.
 
 | Scenario | Current time | Relevant output/state |
 |---|---:|---|
-| 10k instances, 700 assets, moving camera / 1k moving | 0.110 ms selection | 82.4% reused; 27.8% visible; 5,920-entry cut; 1.87 MiB `View` |
-| Same 10k world, static camera / 1k moving | 0.094 ms selection | 85.8% reused; 25.0% visible; 5,792 entries; 0.45 MiB `View` |
-| Same 10k world, moving camera / static objects | 0.067 ms selection | 93.3% reused; 5,920 entries |
-| 80k instances, moving camera / 5% moving | 0.462 ms selection | 92.6% reused; 24,986 entries; 5.98 MiB `View` |
-| Same 80k world, static camera / 5% moving | 0.357 ms selection | 94.1% reused; 22,872 entries; 3.22 MiB `View` |
-| Same 80k world, moving camera / static objects | 0.348 ms selection | 97.6% reused; 24,986 entries |
-| Six 80k views, static objects, serial / concurrent | 2.49 / 0.472 ms wall time | 5.3× on six persistent workers |
-| Six 80k views, 5% moving, serial / concurrent | 3.11 / 0.729 ms wall time | 4.3× on six persistent workers |
+| 10k instances, 700 assets, moving camera / 1k moving | 0.106 ms selection | 82.4% reused; 27.8% visible; 5,920-entry cut; 1.87 MiB `View` |
+| Same 10k world, static camera / 1k moving | 0.091 ms selection | 85.8% reused; 25.0% visible; 5,792 entries; 0.45 MiB `View` |
+| Same 10k world, moving camera / static objects | 0.064 ms selection | 93.3% reused; 5,920 entries |
+| 80k instances, moving camera / 5% moving | 0.449 ms selection | 92.6% reused; 24,986 entries; 5.98 MiB `View` |
+| Same 80k world, static camera / 5% moving | 0.338 ms selection | 94.1% reused; 22,872 entries; 3.22 MiB `View` |
+| Same 80k world, moving camera / static objects | 0.334 ms selection | 97.6% reused; 24,986 entries |
+| Six 80k views, static objects, serial / concurrent | 2.50 / 0.445 ms wall time | 5.6× on six persistent workers |
+| Six 80k views, 5% moving, serial / concurrent | 2.99 / 0.538 ms wall time | 5.6× on six persistent workers |
 
 The `BM_FlatForest100k` diagnostic isolates a forest in which every instance
 contains exactly one fully-resident renderable node. The view is static, output
@@ -145,12 +149,12 @@ flat-instance emission:
 
 | Flat forest | Visible | TLAS only | Uncached selection | Warm `View` selection |
 |---|---:|---:|---:|---:|
-| One shared asset | 25,000 (25%) | 0.175 ms | 0.306 ms | 0.330 ms |
-| 100k unique pages | 25,000 (25%) | 0.175 ms | 0.353 ms | 0.446 ms |
-| One shared asset | 100,000 (100%) | 0.405 ms | 0.947 ms | 1.04 ms |
-| 100k unique pages | 100,000 (100%) | 0.404 ms | 1.47 ms | 1.98 ms |
+| One shared asset | 25,000 (25%) | 0.133 ms | 0.265 ms | 0.291 ms |
+| 100k unique pages | 25,000 (25%) | 0.133 ms | 0.304 ms | 0.346 ms |
+| One shared asset | 100,000 (100%) | 0.324 ms | 0.872 ms | 0.967 ms |
+| 100k unique pages | 100,000 (100%) | 0.324 ms | 1.42 ms | 1.96 ms |
 
-The initial 100k quality TLAS build takes 38.8-40.5 ms and produces
+The initial 100k quality TLAS build takes 38.7-41.4 ms and produces
 37,449-39,675 BVH8 nodes for these two spatial layouts. The 25%-visible warm
 `View` uses 3.91 MiB; the all-visible case uses 5.46 MiB. The equal TLAS-only
 times for shared and unique content confirm that page identity does not affect
@@ -166,11 +170,11 @@ hierarchical instance and one per flat instance. Best of five repeats:
 
 | One-node instances | Hierarchical instances | Cut entries | Uncached selection | Warm `View` selection |
 |---:|---:|---:|---:|---:|
-| 0% | 100% | 100,000 | 3.41 ms | 0.473 ms |
-| 20% | 80% | 85,000 | 2.84 ms | 0.457 ms |
-| 50% | 50% | 62,500 | 1.91 ms | 0.408 ms |
-| 80% | 20% | 40,000 | 0.958 ms | 0.366 ms |
-| 100% | 0% | 25,000 | 0.307 ms | 0.331 ms |
+| 0% | 100% | 100,000 | 3.30 ms | 0.444 ms |
+| 20% | 80% | 85,000 | 2.75 ms | 0.432 ms |
+| 50% | 50% | 62,500 | 1.83 ms | 0.377 ms |
+| 80% | 20% | 40,000 | 0.902 ms | 0.330 ms |
+| 100% | 0% | 25,000 | 0.265 ms | 0.290 ms |
 
 These are scale indicators, not guarantees. Output size and cache locality can
 dominate population size, and contended runs on this host can be much slower.
@@ -874,12 +878,52 @@ made warm selection 12-61% slower across the mixed ratios. Tagging every TLAS
 leaf and visible hit as flat was also reverted; the sub-1% mixed-case change
 did not justify adding work to the universal TLAS query.
 
+### W. Five-query hot-path audit — THREE KEPT, TWO REVERTED
+
+Five independent theories were implemented and measured against interleaved
+baseline binaries. Each focused comparison used seven paired rounds and an
+unaffected or weakly affected control; the final absolute tables above use
+fresh three- or five-repeat runs.
+
+1. **Skip instance-version reads when the World is unchanged — REVERTED.** A
+   call-level generation snapshot avoided the random `instanceCutVersions_`
+   stream on static frames. Static fly-through was neutral (1.0007×, 3/7
+   wins), the static mixed forest regressed 0.9%, and the moving control
+   regressed 2.0%. The extra state and branch did not repay the cached read.
+2. **Dispatch TLAS query policy once — KEPT.** Four template instantiations
+   hoist default/layer-mask and zero/nonzero-`minPix` policy out of the node
+   loop. The 25%-visible and all-visible flat TLAS queries improved 21.1% and
+   16.6%; the `minPix` scale case improved 2.2%. All three won 7/7 rounds.
+3. **Bypass zero-plane mask materialization — TLAS KEPT, PAGE WALK REVERTED.**
+   Once a TLAS item is fully inside the frustum, its children inherit mask zero
+   without initializing eight output masks. The narrowed TLAS-only change won
+   7/7 rounds and improved the focused query 3.6%, while hierarchical and RNG
+   controls were neutral. Applying the same branch inside every page block
+   regressed the 100k hierarchical walk 2.1%, so that half was removed.
+4. **Hoist instance-scale reciprocal — KEPT.** `toLocal` now computes one
+   reciprocal and multiplies position, damping envelope, and six plane offsets.
+   The 100k hierarchical walk improved 2.1%, and the 20k uncached fly-through
+   improved 3.2% with static objects and 3.0% with movers; every subject won
+   7/7 rounds. The flat-instance control, which bypasses `toLocal`, was flat.
+5. **Specialize fully resident pages with no expansion nodes — REVERTED.** An
+   immutable per-asset flag selected a metadata-light traversal. The 100k
+   hierarchical case was 1.0003×, fly-through was 1.0025×, and the
+   expansion-heavy streaming control was neutral. The flag, asset scan, and
+   extra template instantiation were removed.
+
+Against the original pre-audit binary, the retained combination improves the
+25%-visible flat TLAS query 24.1% (7/7), the 100k hierarchical uncached case
+2.7% (7/7), the 20k uncached fly-through 3.3% (7/7), and its cached arm 2.3%
+(6/7). The deep single-instance control moved +3.1% with only 2/7 wins for the
+final binary, consistent with the host's known whole-binary layout noise; the
+focused retained experiments have their own controls and unanimous wins.
+
 ---
 
 ## 3. Current constraints and possible follow-up
 
 - **Cached parallelism is across views, not within one cached walk.**
-  Six representative 80k views fall from 2.49-3.11 ms serial to 0.472-0.729 ms
+  Six representative 80k views fall from 2.50-2.99 ms serial to 0.445-0.538 ms
   on six persistent workers and occupy about 36 MiB of view state. An uncached
   View can still parallelize one call across visible instances. Combining
   both forms would add nested scheduling and merge costs; profile a production

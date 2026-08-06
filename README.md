@@ -100,8 +100,8 @@ algorithm's uncontended cost; real frame time can be higher under host load.
 
 | Operation | Time | Included work |
 |---|---:|---|
-| Create the world | 10.1-11.4 ms | Build and register the shared asset, add 80,000 instances, and mark its payloads resident |
-| First published selection cycle | 51.1-58.7 ms | `applyUpdates` builds the initial quality TLAS; `selectCut` queries it, produces the first cut, and populates the `View` |
+| Create the world | 10.2-11.5 ms | Build and register the shared asset, add 80,000 instances, and mark its payloads resident |
+| First published selection cycle | 51.3-60.1 ms | `applyUpdates` builds the initial quality TLAS; `selectCut` queries it, produces the first cut, and populates the `View` |
 
 World creation does not force the initial quality TLAS build; the first
 `applyUpdates` performs it before publishing the read-only snapshot. Treat the
@@ -111,10 +111,10 @@ first published selection cycle as level warm-up rather than steady latency.
 
 | HLodTree work per frame | Camera and 4,000 objects moving | Static camera, 4,000 objects moving | Moving camera, static objects |
 |---|---:|---:|---:|
-| Submit 4,000 instance transforms | 0.139 ms | 0.137 ms | n/a |
+| Submit 4,000 instance transforms | 0.139 ms | 0.136 ms | n/a |
 | Publish updates and maintain the TLAS | <0.001 ms | <0.001 ms | <0.001 ms |
-| `selectCut` | 0.462 ms | 0.357 ms | 0.348 ms |
-| **Total HLodTree frame work** | **0.601 ms** | **0.494 ms** | **0.349 ms** |
+| `selectCut` | 0.449 ms | 0.338 ms | 0.334 ms |
+| **Total HLodTree frame work** | **0.590 ms** | **0.475 ms** | **0.334 ms** |
 
 The moving-camera cases average about 21,919 visible instances and a
 24,986-entry render cut. With objects moving, the `View` reuses 92.6% of
@@ -135,16 +135,16 @@ The smaller test uses 10,000 instances spread over a roughly 2.4 km square.
 They draw from 700 separately registered, fully resident 85-node assets with
 maximum depth 3, instead of sharing one asset across the entire world. The
 moving-object cases update exactly 1,000 instances per frame. Creating and
-populating this world takes 13.0-14.4 ms; its first published selection cycle,
+populating this world takes 14.1-15.2 ms; its first published selection cycle,
 including the initial quality TLAS build and `View` population, takes
-5.4-6.6 ms.
+5.7-7.5 ms.
 
 | HLodTree work per frame | Camera and 1,000 objects moving | Static camera, 1,000 objects moving | Moving camera, static objects |
 |---|---:|---:|---:|
 | Submit 1,000 instance transforms | 34 µs | 34 µs | n/a |
 | Publish updates and maintain the TLAS | <0.1 µs | <0.1 µs | <0.1 µs |
-| `selectCut` | 110 µs | 94 µs | 67 µs |
-| **Total HLodTree frame work** | **144 µs** | **128 µs** | **67 µs** |
+| `selectCut` | 106 µs | 91 µs | 64 µs |
+| **Total HLodTree frame work** | **140 µs** | **126 µs** | **64 µs** |
 
 The moving-camera cases average about 2,782 visible instances (27.8% of the
 world) and a 5,920-entry cut. Reuse is 82.4% with 1,000 movers and 93.3% with
@@ -160,9 +160,9 @@ six selections is:
 
 | Execution | Static objects | 4,000 moving objects |
 |---|---:|---:|
-| Six views, serial | 2.49 ms | 3.11 ms |
-| Six views, concurrent | 0.472 ms | 0.729 ms |
-| **Speedup** | **5.3×** | **4.3×** |
+| Six views, serial | 2.50 ms | 2.99 ms |
+| Six views, concurrent | 0.445 ms | 0.538 ms |
+| **Speedup** | **5.6×** | **5.6×** |
 
 Object transforms are applied once before these selections and are not included
 in the table. The concurrent arms use six persistent worker threads; thread
