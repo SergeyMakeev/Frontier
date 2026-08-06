@@ -62,12 +62,25 @@ cmake "${configure_args[@]}"
 echo "Building hlod_bench..."
 cmake --build "${BUILD_DIR}" --config Release --target hlod_bench --parallel
 
+# Multi-config generators (notably Xcode) put each configuration in its own
+# directory. Never fall back from Release/ to a top-level executable there: it
+# may be a stale Debug binary from another generator or an earlier build.
+cache_file="${BUILD_DIR}/CMakeCache.txt"
+if grep -Eq '^CMAKE_CONFIGURATION_TYPES:[^=]*=.+$' "${cache_file}"; then
+    bench_dir="${BUILD_DIR}/bench/Release"
+else
+    build_type="$(sed -n 's/^CMAKE_BUILD_TYPE:[^=]*=//p' "${cache_file}")"
+    if [[ "${build_type}" != "Release" ]]; then
+        echo "ERROR: Expected a Release build, but CMAKE_BUILD_TYPE is '${build_type}'." >&2
+        exit 1
+    fi
+    bench_dir="${BUILD_DIR}/bench"
+fi
+
 bench_exe=""
 for candidate in \
-    "${BUILD_DIR}/bench/hlod_bench" \
-    "${BUILD_DIR}/bench/Release/hlod_bench" \
-    "${BUILD_DIR}/bench/hlod_bench.exe" \
-    "${BUILD_DIR}/bench/Release/hlod_bench.exe"
+    "${bench_dir}/hlod_bench" \
+    "${bench_dir}/hlod_bench.exe"
 do
     if [[ -x "${candidate}" || -f "${candidate}" ]]; then
         bench_exe="${candidate}"
@@ -76,9 +89,11 @@ do
 done
 
 if [[ -z "${bench_exe}" ]]; then
-    echo "ERROR: Built benchmark executable was not found under ${BUILD_DIR}/bench." >&2
+    echo "ERROR: Release benchmark executable was not found under ${bench_dir}." >&2
     exit 1
 fi
+
+echo "Using Release benchmark: ${bench_exe}"
 
 if (( $# > 0 )); then
     echo "Running hlod_bench with caller-supplied arguments..."
