@@ -668,7 +668,7 @@ World::InstanceRef World::addInstanceInternal(uint32_t asset, const InstanceDesc
     inst.scale = desc.scale;
     inst.rootSlot = slot;
     spatial.mask = desc.mask;
-    inst.alive = true;
+    inst.setAlive(true);
     inst.generation = ++generationCounter_;
     spatial.liveIndex = uint32_t(liveInstances_.size());
     liveInstances_.push_back(id);
@@ -736,7 +736,7 @@ World::Instance* World::resolveInstance(InstanceRef ref)
 {
     if (ref.id >= instances_.size()) return nullptr;
     Instance& inst = instances_[ref.id];
-    if (!inst.alive || inst.generation != ref.generation) return nullptr;
+    if (!inst.alive() || inst.generation != ref.generation) return nullptr;
     return &inst;
 }
 
@@ -782,7 +782,7 @@ void World::removeInstance(InstanceRef ref)
     instanceTlas_[moved].liveIndex = liveIndex;
     liveInstances_.pop_back();
     instanceTlas_[id].liveIndex = kInvalidIndex;
-    instances_[id].alive = false;
+    instances_[id].setAlive(false);
     freeInstances_.push_back(id);
     markTlasStructuralChange();
 
@@ -853,11 +853,12 @@ void World::recomputeInstanceBounds(InstanceId id)
 
 const World::Overlay* World::findOverlay(const Instance& inst, uint32_t slot) const
 {
-    if (inst.overlays.empty()) return nullptr;   // the common case, one compare
+    if (!inst.hasOverlayList()) return nullptr;   // common case, one compare
+    const std::vector<OverlayRef>& refs = overlayLists_[inst.overlayList()].refs;
     const auto it = std::lower_bound(
-        inst.overlays.begin(), inst.overlays.end(), slot,
+        refs.begin(), refs.end(), slot,
         [](const OverlayRef& r, uint32_t s) { return r.slot < s; });
-    if (it == inst.overlays.end() || it->slot != slot) return nullptr;
+    if (it == refs.end() || it->slot != slot) return nullptr;
     const Overlay& ov = overlays_[it->index];
     // The mount may have been detached (and its slot reused) since the
     // overlay was taken, in which case it describes a page that is gone.
@@ -870,17 +871,77 @@ void World::initOverlay(Overlay& ov, uint32_t slot, const PageRt& rt)
     const PageView& pg = pageView(rt);
     ov.generation = pageStamps_[slot].generation();
     ov.bbox.assign(pg.bbox, pg.bbox + pg.nodeCount());
-    ov.wide.resize(pg.wideCount());
-    for (uint32_t b = 0; b < pg.wideCount(); ++b) ov.wide[b] = pg.wide[b].bounds;
+    if (pg.wideCount() >= Overlay::kSparseWideMinBlocks)
+    {
+        std::vector<WideBounds>().swap(ov.wide);
+        ov.widePatch.assign(pg.wideCount(), kInvalidIndex);
+        ov.patchedWide.clear();
+    }
+    else
+    {
+        ov.wide.resize(pg.wideCount());
+        for (uint32_t b = 0; b < pg.wideCount(); ++b)
+            ov.wide[b] = pg.wide[b].bounds;
+        std::vector<uint32_t>().swap(ov.widePatch);
+        std::vector<WideBounds>().swap(ov.patchedWide);
+    }
+}
+
+WideBounds& World::mutableWideBounds(Overlay& ov, const PageView& pg,
+                                     uint32_t block)
+{
+    if (!ov.sparseWide()) return ov.wide[block];
+
+    const uint32_t patch = ov.widePatch[block];
+    if (patch != kInvalidIndex) return ov.patchedWide[patch];
+
+    // Once edits cover a sixteenth of the blocks, dense storage removes the
+    // sparse lookup from future selections and refits.
+    if ((ov.patchedWide.size() + 1) *
+            Overlay::kSparsePromotionDenominator >
+        pg.wideCount())
+    {
+        ov.wide.resize(pg.wideCount());
+        for (uint32_t b = 0; b < pg.wideCount(); ++b)
+            ov.wide[b] = pg.wide[b].bounds;
+        for (uint32_t b = 0; b < pg.wideCount(); ++b)
+            if (ov.widePatch[b] != kInvalidIndex)
+                ov.wide[b] = ov.patchedWide[ov.widePatch[b]];
+        std::vector<uint32_t>().swap(ov.widePatch);
+        std::vector<WideBounds>().swap(ov.patchedWide);
+        return ov.wide[block];
+    }
+
+    ov.widePatch[block] = uint32_t(ov.patchedWide.size());
+    ov.patchedWide.push_back(pg.wide[block].bounds);
+    return ov.patchedWide.back();
 }
 
 uint32_t World::ensureOverlay(Instance& inst, uint32_t slot)
 {
+    if (!inst.hasOverlayList())
+    {
+        uint32_t list;
+        if (!freeOverlayLists_.empty())
+        {
+            list = freeOverlayLists_.back();
+            freeOverlayLists_.pop_back();
+        }
+        else
+        {
+            HLOD_CHECK(overlayLists_.size() < Instance::kOverlayListMask,
+                       "World: exhausted overlay-list index space");
+            overlayLists_.emplace_back();
+            list = uint32_t(overlayLists_.size() - 1);
+        }
+        inst.setOverlayList(list);
+    }
+    std::vector<OverlayRef>& refs = overlayLists_[inst.overlayList()].refs;
     const auto it = std::lower_bound(
-        inst.overlays.begin(), inst.overlays.end(), slot,
+        refs.begin(), refs.end(), slot,
         [](const OverlayRef& r, uint32_t s) { return r.slot < s; });
 
-    if (it != inst.overlays.end() && it->slot == slot)
+    if (it != refs.end() && it->slot == slot)
     {
         const uint32_t idx = it->index;
         Overlay& ov = overlays_[idx];
@@ -904,13 +965,15 @@ uint32_t World::ensureOverlay(Instance& inst, uint32_t slot)
     ov.slot = slot;
     initOverlay(ov, slot, slots_[slot]);
     ++liveOverlays_;
-    inst.overlays.insert(it, OverlayRef{slot, idx});
+    refs.insert(it, OverlayRef{slot, idx});
     return idx;
 }
 
 void World::freeOverlays(Instance& inst)
 {
-    for (const OverlayRef& r : inst.overlays)
+    if (!inst.hasOverlayList()) return;
+    std::vector<OverlayRef>& refs = overlayLists_[inst.overlayList()].refs;
+    for (const OverlayRef& r : refs)
     {
         Overlay& ov = overlays_[r.index];
         if (!ov.inUse()) continue;
@@ -918,7 +981,9 @@ void World::freeOverlays(Instance& inst)
         freeOverlays_.push_back(r.index);
         --liveOverlays_;
     }
-    inst.overlays.clear();
+    refs.clear();
+    freeOverlayLists_.push_back(inst.overlayList());
+    inst.clearOverlayList();
 }
 
 const AABB* World::boundsFor(const Instance& inst, uint32_t slot, const PageRt& rt) const
@@ -929,11 +994,28 @@ const AABB* World::boundsFor(const Instance& inst, uint32_t slot, const PageRt& 
 }
 
 WideBoundsRef World::wideBoundsFor(const Instance& inst, uint32_t slot,
-                                   const PageRt& rt) const
+                                   const PageRt& rt, uint32_t* sparseOverlay) const
 {
     if (const Overlay* ov = findOverlay(inst, slot))
+    {
+        if (ov->sparseWide())
+        {
+            *sparseOverlay = uint32_t(ov - overlays_.data());
+            return pageView(rt).wideBounds();
+        }
         return WideBoundsRef::packed(ov->wide.data());
+    }
     return pageView(rt).wideBounds();
+}
+
+World::WorkItem World::makeWorkItem(uint32_t slot, const Instance& inst,
+                                    uint8_t current, uint8_t ideal,
+                                    uint8_t mask) const
+{
+    uint32_t sparse = kInvalidIndex;
+    const WideBoundsRef wide =
+        wideBoundsFor(inst, slot, slots_[slot], &sparse);
+    return WorkItem{slot, wide, current, ideal, mask, sparse};
 }
 
 bool World::mountBelongsTo(const Instance& inst, uint32_t slot) const
@@ -954,7 +1036,10 @@ size_t World::overlayBytes() const
     size_t n = 0;
     for (const Overlay& ov : overlays_)
         if (ov.inUse())
-            n += ov.bbox.size() * sizeof(AABB) + ov.wide.size() * sizeof(WideBounds);
+            n += ov.bbox.size() * sizeof(AABB) +
+                 ov.wide.size() * sizeof(WideBounds) +
+                 ov.widePatch.size() * sizeof(uint32_t) +
+                 ov.patchedWide.size() * sizeof(WideBounds);
     return n;
 }
 
@@ -1001,11 +1086,11 @@ void World::flushBounds()
     // that already contains the change, so a shared parent is grown once
     // and merely re-checked by the rest. Stale entries (instance removed,
     // page detached, slot reused) self-invalidate via the generation stamps.
-    for (const auto& m : pendingMoves_)
+    for (const PendingMove& m : pendingMoves_)
     {
         if (m.instance >= instances_.size()) continue;
         const Instance& inst = instances_[m.instance];
-        if (!inst.alive || inst.generation != m.instGeneration) continue;
+        if (!inst.alive() || inst.generation != m.instGeneration) continue;
         if (!resolve(m.node)) continue;
         applyBoundsChange(m.instance, m.node.slot(), m.node.index(), m.box);
     }
@@ -1033,8 +1118,8 @@ void World::applyBoundsChange(InstanceId id, uint32_t slot, uint32_t index,
         // the owner too, so exactly the ancestor path is privatised.
         const uint32_t oi = ensureOverlay(instances_[id], curSlot);
         const PageView& pg = pageView(slots_[curSlot]);
-        AABB* bbox = overlays_[oi].bbox.data();
-        const MutWideBoundsRef wide = MutWideBoundsRef::packed(overlays_[oi].wide.data());
+        Overlay& overlay = overlays_[oi];
+        AABB* bbox = overlay.bbox.data();
 
         if (exact)
         {
@@ -1045,14 +1130,14 @@ void World::applyBoundsChange(InstanceId id, uint32_t slot, uint32_t index,
             if (bbox[cur].contains(curBox)) return;   // ancestors already conservative
             bbox[cur].expand(curBox);
         }
-        if (cur != 0) patchParentLane(pg, bbox, wide, cur);
+        if (cur != 0) patchParentLane(pg, bbox, overlay, cur);
 
         while (cur != 0)
         {
             const uint32_t p = pg.parent[cur];
             if (bbox[p].contains(bbox[cur])) return;
             bbox[p].expand(bbox[cur]);             // grow immediately, shrink lazily
-            if (p != 0) patchParentLane(pg, bbox, wide, p);
+            if (p != 0) patchParentLane(pg, bbox, overlay, p);
             cur = p;
         }
 
@@ -1073,7 +1158,7 @@ void World::applyBoundsChange(InstanceId id, uint32_t slot, uint32_t index,
 // Update a node's lane in its parent's wide block (the hot mirror of bbox).
 // Which lane holds the node is immutable authored data, so it is read from
 // the shared page; only the box is written, into the instance's overlay.
-void World::patchParentLane(const PageView& pg, AABB* bbox, MutWideBoundsRef wide,
+void World::patchParentLane(const PageView& pg, AABB* bbox, Overlay& overlay,
                             uint32_t index)
 {
     const uint32_t p = pg.parent[index];
@@ -1087,7 +1172,7 @@ void World::patchParentLane(const PageView& pg, AABB* bbox, MutWideBoundsRef wid
         {
             if ((valid & (1u << l)) && blk.child[l] == index)
             {
-                wide[b].setLane(l, bbox[index]);
+                mutableWideBounds(overlay, pg, b).setLane(l, bbox[index]);
                 return;
             }
         }
@@ -2041,11 +2126,10 @@ size_t World::collect(std::initializer_list<PageUsageContext*> usage,
 // surviving interior/expansion nodes go onto the DFS stack with their err and
 // narrowed plane mask carried along.
 //
-// Bounds come through item.wide, which already points at either the page's
-// own boxes or this instance's overlay. Everything else is read from the
-// shared page. There is no per-block branch for the overlay case: the two
-// layouts differ only in stride.
-template<bool FullyResident>
+// Normal and dense-overlay bounds come through item.wide without a per-block
+// branch. The sparse-overlay instantiation consults its compact patch table;
+// template dispatch happens once per page rather than once per block.
+template<bool FullyResident, bool SparseOverlay>
 void World::wideVisit(const WorkItem& item, const PageView& pg, float errClamp,
                       uint32_t gen, InstanceId instance, uint32_t node, uint8_t mask,
                       uint8_t currentKids, uint8_t idealKids,
@@ -2060,8 +2144,19 @@ void World::wideVisit(const WorkItem& item, const PageView& pg, float errClamp,
     const float4 qmn = local.queryMin(), qmx = local.queryMax();
     for (uint32_t base = 0; base < cc; base += kWide, ++b)
     {
-        const WideBlock&  blk = pg.wide[b];
-        const WideBounds& wb  = item.wide[b];
+        const WideBlock& blk = pg.wide[b];
+        const WideBounds& wb = [&]() -> const WideBounds&
+        {
+            if constexpr (!SparseOverlay)
+                return item.wide[b];
+            else
+            {
+                const Overlay& ov = overlays_[item.sparseOverlay];
+                const uint32_t patch = ov.widePatch[b];
+                return patch == kInvalidIndex ? pg.wide[b].bounds
+                                              : ov.patchedWide[patch];
+            }
+        }();
         // One load carries both lane masks. `survivors` never exceeds 8 bits,
         // so ANDing it with the whole word keeps exactly the valid lanes and
         // the leaf lanes in the high half come along for free.
@@ -2186,6 +2281,17 @@ template<bool FullyResident>
 void World::runPage(const WorkItem& item, const Instance& inst, const Camera& local,
                     const CutParams& params, Worker& w) const
 {
+    if (item.sparseOverlay == kInvalidIndex)
+        runPageImpl<FullyResident, false>(item, inst, local, params, w);
+    else
+        runPageImpl<FullyResident, true>(item, inst, local, params, w);
+}
+
+template<bool FullyResident, bool SparseOverlay>
+void World::runPageImpl(const WorkItem& item, const Instance& inst,
+                        const Camera& local, const CutParams& params,
+                        Worker& w) const
+{
     const PageRt& rt = slots_[item.slot()];
     if (w.trackTouches &&
         (!w.uniqueTouches ||
@@ -2202,8 +2308,9 @@ void World::runPage(const WorkItem& item, const Instance& inst, const Camera& lo
     const float bar = params.threshold;
 
     w.nodeStack.clear();
-    wideVisit<FullyResident>(item, pg, rt.errClamp, gen, instance, 0, item.mask(),
-                             item.current(), item.ideal(), local, w);
+    wideVisit<FullyResident, SparseOverlay>(
+        item, pg, rt.errClamp, gen, instance, 0, item.mask(), item.current(),
+        item.ideal(), local, w);
 
     while (!w.nodeStack.empty())
     {
@@ -2233,13 +2340,12 @@ void World::runPage(const WorkItem& item, const Instance& inst, const Camera& lo
                         makeCutEntry(here, e.err, bar, w.barInv, instance));
                 else
                     w.work.push_back(
-                        {childSlot,
-                         wideBoundsFor(inst, childSlot, slots_[childSlot]),
-                         1, 1, e.planes()});
+                        makeWorkItem(childSlot, inst, 1, 1, e.planes()));
             }
             else
-                wideVisit<true>(item, pg, rt.errClamp, gen, instance, i,
-                                e.planes(), 1, 1, local, w);
+                wideVisit<true, SparseOverlay>(item, pg, rt.errClamp, gen,
+                                               instance, i, e.planes(), 1, 1,
+                                               local, w);
         }
         else
         {
@@ -2314,13 +2420,13 @@ void World::runPage(const WorkItem& item, const Instance& inst, const Camera& lo
             {
                 HLOD_CHECK(childSlot != kInvalidIndex,
                            "View::selectCut: uncovered expansion subtree");
-                w.work.push_back({childSlot,
-                                  wideBoundsFor(inst, childSlot, slots_[childSlot]),
-                                  nextCurrent, nextIdeal, e.planes()});
+                w.work.push_back(makeWorkItem(childSlot, inst, nextCurrent,
+                                              nextIdeal, e.planes()));
             }
             else
-                wideVisit<false>(item, pg, rt.errClamp, gen, instance, i,
-                                 e.planes(), nextCurrent, nextIdeal, local, w);
+                wideVisit<false, SparseOverlay>(
+                    item, pg, rt.errClamp, gen, instance, i, e.planes(),
+                    nextCurrent, nextIdeal, local, w);
         }
     }
 }
@@ -2382,9 +2488,7 @@ void World::runInstance(uint32_t instIdx, const Camera& view, const CutParams& p
     }
 
     const Camera local = toLocal(view, inst.pos, inst.scale);
-    w.work.push_back({inst.rootSlot,
-                      wideBoundsFor(inst, inst.rootSlot, slots_[inst.rootSlot]),
-                      1, 1, mask});
+    w.work.push_back(makeWorkItem(inst.rootSlot, inst, 1, 1, mask));
     const bool fullyResident = pageTreeFullyResident(inst.rootSlot);
     while (!w.work.empty())
     {
@@ -2889,7 +2993,7 @@ void World::selectCutCached(const Camera& camera, const CutParams& params,
         }
 
         // ---- walk it ----
-        // Hits deliberately never fetch the 64-byte Instance record. Once a
+        // Hits deliberately never fetch the 32-byte Instance record. Once a
         // miss is known, start that read before resetting the worker scratch;
         // the bookkeeping below gives the cache line a little useful lead.
         HLOD_PREFETCH(&instances_[instIdx]);

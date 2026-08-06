@@ -414,7 +414,7 @@ Important limits are explicit:
 Each per-instance cache record is split into 32 hot bytes and 4 cold bytes,
 plus an optional 8-byte second-page dependency allocated only after a
 cacheable walk actually touches two pages. The common hit reads the hot record
-and a parallel 4-byte instance-version stream; it does not fetch the 64-byte
+and a parallel 4-byte instance-version stream; it does not fetch the 32-byte
 instance record. Recorded cut entries remain separate slab storage.
 `reset()` clears logical state and its damping window but retains capacity,
 which is appropriate for camera cuts and teleports. `setHalfLife(0)` disables
@@ -499,16 +499,22 @@ the README when budgeting a loading transition.
 The instance argument is essential: immutable topology and payload data remain
 shared, while bounds become instance-specific.
 
-The first deformation of an `(instance, page mount)` pair copies only source
-and wide bounds into an overlay. Further edits reuse it. Propagation across a
-page boundary creates overlays only along the path to that instance root;
-siblings that use the same asset keep seeing the original bounds.
+The first deformation of an `(instance, page mount)` pair copies source bounds
+into an overlay. Small-page wide bounds are copied densely. Pages with at least
+64 wide blocks instead start with only a block-to-patch table and modified wide
+blocks, then promote to dense storage after more than one sixteenth changes.
+Further edits reuse the overlay. Propagation across a page boundary creates
+overlays only along the path to that instance root; siblings that use the same
+asset keep seeing the original bounds. Overlay-reference vector headers live in
+a cold pool, so undeformed instances retain only a 32-byte hot record.
 
 Submissions are appended to a flat queue. `applyUpdates`, `nodeBounds`, or an
 explicit `flushBounds()` applies them in order. A node's own box ends at the
 last submitted value. Ancestors grow conservatively and stop at the first box
 that already contains the change; that early-out cheaply coalesces shared
-ancestors and repeated moves without a dirty-node table.
+ancestors and repeated moves without a dirty-node table. Grouping submissions
+by instance or page preserves overlay locality; the library does not sort them
+because the measured sort cost exceeded the recovered locality.
 
 Ancestor page bounds do not currently shrink after deformation. Long-running
 large teleports can therefore make culling looser, never incorrect. TLAS

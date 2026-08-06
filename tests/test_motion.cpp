@@ -233,6 +233,37 @@ TEST(Motion, DeformingOneInstanceLeavesSiblingsAlone)
     EXPECT_EQ(w.overlayBytes(), 0u);
 }
 
+TEST(Motion, LargeLightlyDeformedPageUsesSparseWideOverlay)
+{
+    TreeGen gen;
+    gen.fanout = 8;
+    gen.depth = 3;
+    Page pg = gen.makeRootPage(unitRegion(5.0f), 64.0f, 0);
+    const auto ids = pageIds(pg);
+
+    World w;
+    const auto inst = w.addInstance(std::move(pg), float4::point(0, 0, 0));
+    markAllResident(w, ids);
+    const Camera camera = makeLookAtCamera(float4::point(0, 200, -200),
+                                           float4::point(0, 0, 0));
+    const std::set<UserId> before = cutIds(w, frame(w, camera, {4.0f, 0.0f}));
+
+    const UserId leaf = ids.back();
+    const NodeHandle handle = handleOf(w, leaf);
+    w.setNodeBounds(inst, handle, w.nodeBounds(inst, handle));
+    w.flushBounds();
+
+    const PageView& page = TA::pageOf(w, leaf);
+    const size_t denseBytes = size_t(page.nodeCount()) * sizeof(AABB) +
+                              size_t(page.wideCount()) * sizeof(WideBounds);
+    EXPECT_TRUE(TA::overlayIsSparse(w, inst, handle.slot()));
+    EXPECT_LT(w.overlayBytes(), denseBytes);
+
+    const std::set<UserId> after = cutIds(w, frame(w, camera, {4.0f, 0.0f}));
+    EXPECT_EQ(after, before);
+    EXPECT_TRUE(TA::overlayIsSparse(w, inst, handle.slot()));
+}
+
 // ---------------------------------------------------------------------------
 // Instance motion: the top-level BVH follows rigid moves; the whole tree
 // renders at the new location, nothing at the old one.

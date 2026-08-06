@@ -801,9 +801,9 @@ public:
     // of a first move. Stale handles are dropped at flush time via the
     // generation stamps.
     //
-    // The first deformation of a given (instance, page) pair copies that
-    // page's bounds into a per-instance overlay; everything else about the
-    // page stays shared. Subsequent moves write straight into the overlay.
+    // The first deformation of a given (instance, page) pair takes a private
+    // bounds overlay; large pages keep wide bounds sparse until edits justify
+    // a dense copy. Everything else about the page stays shared.
     // Propagation up the ancestor chain promotes overlays as it crosses page
     // boundaries, so only the pages on the path from the moved node to the
     // instance root are ever privatised.
@@ -1075,14 +1075,23 @@ private:
     // the resulting growth propagates into.
     struct Overlay
     {
+        static constexpr uint32_t kSparseWideMinBlocks = 64;
+        static constexpr uint32_t kSparsePromotionDenominator = 16;
+
         uint32_t slot = kInvalidIndex;   // mount this shadows
         uint32_t generation = 0;         // that mount's generation when taken
         std::vector<AABB>       bbox;    // nodeCount
-        std::vector<WideBounds> wide;    // wideCount (bounds only; the rest of
-                                         // each WideBlock stays shared)
+        // Large-page wide bounds begin sparse: a dense block->patch table plus
+        // only the modified blocks. Once a sixteenth of the blocks change,
+        // `wide` is materialized and the sparse storage is released. Smaller
+        // pages start dense because their setup/lookup cost outweighs savings.
+        std::vector<WideBounds> wide;          // dense after promotion
+        std::vector<uint32_t>   widePatch;     // block -> patchedWide index
+        std::vector<WideBounds> patchedWide;   // sparse modified blocks
         bool inUse() const { return slot != kInvalidIndex; }
+        bool sparseWide() const { return !widePatch.empty(); }
     };
-    static_assert(sizeof(Overlay) == 56, "bounds overlay header must stay 56 bytes");
+    static_assert(sizeof(Overlay) == 104, "bounds overlay header must stay 104 bytes");
 
     // (mount slot -> overlay index), kept sorted by slot on each instance so
     // the traversal can binary search it. Empty for undeformed instances,
@@ -1094,20 +1103,54 @@ private:
     };
     static_assert(sizeof(OverlayRef) == 8, "overlay reference must stay 8 bytes");
 
-    // Exactly one cache line containing everything the cut walk and
-    // View read per visible instance. TLAS-only state lives in the
-    // parallel InstanceTlas array below, so the instance prefetch no longer
-    // drags a second line into the latency-bound walk.
+    struct OverlayList
+    {
+        std::vector<OverlayRef> refs;   // sorted by mount slot
+    };
+    static_assert(sizeof(OverlayList) == 24,
+                  "cold overlay-list header must stay 24 bytes");
+
+    // The cut walk's common per-instance state. Overlay-list headers live in a
+    // cold pool allocated only for deformed instances; the high bit in that
+    // pool index is the live flag. TLAS-only state remains in InstanceTlas.
     struct Instance
     {
+        static constexpr uint32_t kAlive = 1u << 31;
+        static constexpr uint32_t kOverlayListMask = kInvalidInstanceId;
+
         float4   pos{};
-        std::vector<OverlayRef> overlays;   // sorted by slot; usually empty
         float    scale = 1.0f;
         uint32_t rootSlot = kInvalidIndex;
         uint32_t generation = 0;   // stamps InstanceRefs; bumped per reuse
-        bool     alive = false;
+        uint32_t overlayListAndAlive = kOverlayListMask;
+
+        bool alive() const { return (overlayListAndAlive & kAlive) != 0; }
+        void setAlive(bool value)
+        {
+            if (value) overlayListAndAlive |= kAlive;
+            else overlayListAndAlive &= ~kAlive;
+        }
+        bool hasOverlayList() const
+        {
+            return (overlayListAndAlive & kOverlayListMask) != kOverlayListMask;
+        }
+        uint32_t overlayList() const
+        {
+            return overlayListAndAlive & kOverlayListMask;
+        }
+        void setOverlayList(uint32_t index)
+        {
+            HLOD_ASSERT(index < kOverlayListMask,
+                        "World: exhausted overlay-list index space");
+            overlayListAndAlive = (overlayListAndAlive & kAlive) | index;
+        }
+        void clearOverlayList()
+        {
+            overlayListAndAlive = (overlayListAndAlive & kAlive) |
+                                  kOverlayListMask;
+        }
     };
-    static_assert(sizeof(Instance) == 64, "cut-path Instance must stay one cache line");
+    static_assert(sizeof(Instance) == 32, "cut-path Instance must stay 32 bytes");
 
     // State used only while building, editing, or refitting the TLAS. Keeping
     // it parallel preserves dense indexing without charging the cut loop for
@@ -1205,23 +1248,28 @@ private:
     };
     static_assert(sizeof(VisibleItem) == 4, "visible TLAS hit must stay 4 bytes");
 
-    // One page queued on an instance walk. Which bounds this instance sees is
-    // resolved once, when the page is pushed, so the inner loop never asks
-    // whether there is an overlay — it just reads through a stride.
+    // One page queued on an instance walk. Dense bounds are resolved when the
+    // page is pushed; sparse overlays carry an index in the existing padding
+    // and use a separately instantiated inner loop.
     struct WorkItem
     {
-        WideBoundsRef wide;   // page's (interleaved) or overlay's (packed)
+        WideBoundsRef wide;   // shared bounds, or a dense overlay's packed bounds
         // slot[20] | plane mask[6] | current[1] | ideal[1]
         uint32_t      state = 0;
+        // Sparse overlay index, or kInvalidIndex. This occupies WorkItem's old
+        // tail padding, so sparse support does not grow the traversal stack.
+        uint32_t      sparseOverlay = kInvalidIndex;
 
         WorkItem() = default;
         WorkItem(uint32_t slot, WideBoundsRef bounds, uint8_t current,
-                 uint8_t ideal, uint8_t mask)
+                 uint8_t ideal, uint8_t mask,
+                 uint32_t sparse = kInvalidIndex)
             : wide(bounds),
               state((slot & NodeHandle::kSlotMask) |
                     (uint32_t(mask & 0x3fu) << NodeHandle::kSlotBits) |
                     (uint32_t(current != 0) << 26) |
-                    (uint32_t(ideal != 0) << 27))
+                    (uint32_t(ideal != 0) << 27)),
+              sparseOverlay(sparse)
         {}
         uint32_t slot() const { return state & NodeHandle::kSlotMask; }
         uint8_t mask() const
@@ -1343,15 +1391,21 @@ private:
     // boundary.
     uint32_t       ensureOverlay(Instance& inst, uint32_t slot);
     void           initOverlay(Overlay& ov, uint32_t slot, const PageRt& rt);
+    WideBounds&    mutableWideBounds(Overlay& ov, const PageView& page,
+                                     uint32_t block);
     void           freeOverlays(Instance& inst);
     // Effective bounds for a walk of `slot` by `inst`.
     const AABB*    boundsFor(const Instance& inst, uint32_t slot, const PageRt& rt) const;
-    WideBoundsRef  wideBoundsFor(const Instance& inst, uint32_t slot, const PageRt& rt) const;
+    WideBoundsRef  wideBoundsFor(const Instance& inst, uint32_t slot,
+                                 const PageRt& rt, uint32_t* sparseOverlay) const;
+    WorkItem       makeWorkItem(uint32_t slot, const Instance& inst,
+                                uint8_t current, uint8_t ideal,
+                                uint8_t mask) const;
     // Debug-only: is `slot` reachable from this instance's root mount?
     bool mountBelongsTo(const Instance& inst, uint32_t slot) const;
 
     void applyBoundsChange(InstanceId id, uint32_t slot, uint32_t index, const AABB& box);
-    void patchParentLane(const PageView& pg, AABB* bbox, MutWideBoundsRef wide,
+    void patchParentLane(const PageView& pg, AABB* bbox, Overlay& overlay,
                          uint32_t index);
     void refreshInstanceBounds(InstanceId id);
 
@@ -1400,7 +1454,11 @@ private:
     template<bool FullyResident>
     void runPage(const WorkItem& item, const Instance& inst, const Camera& local,
                  const CutParams& params, Worker& w) const;
-    template<bool FullyResident>
+    template<bool FullyResident, bool SparseOverlay>
+    void runPageImpl(const WorkItem& item, const Instance& inst,
+                     const Camera& local, const CutParams& params,
+                     Worker& w) const;
+    template<bool FullyResident, bool SparseOverlay>
     void wideVisit(const WorkItem& item, const PageView& pg, float errClamp,
                    uint32_t gen, InstanceId instance, uint32_t node, uint8_t mask,
                    uint8_t currentKids, uint8_t idealKids,
@@ -1437,7 +1495,7 @@ private:
     // have never contained a flat instance allocate no stream at all.
     std::vector<uint32_t> instanceFlatSlots_;
     size_t                flatInstanceCount_ = 0;
-    // Cache hits need only this stamp, not the 64-byte Instance record. It is
+    // Cache hits need only this stamp, not the 32-byte Instance record. It is
     // parallel to instances_ and bumped for transform or deformation changes.
     std::vector<uint32_t> instanceCutVersions_;
     std::vector<InstanceId> liveInstances_;
@@ -1445,6 +1503,8 @@ private:
 
     std::vector<Overlay>  overlays_;
     std::vector<uint32_t> freeOverlays_;
+    std::vector<OverlayList> overlayLists_;
+    std::vector<uint32_t> freeOverlayLists_;
     size_t                liveOverlays_ = 0;
 
     std::vector<TlasNode> tlasNodes_;

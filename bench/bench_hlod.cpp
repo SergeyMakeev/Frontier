@@ -1984,7 +1984,7 @@ BENCHMARK(BM_AssetSharing_CutCost)
 // takes the overlay before it inspects anything, so that allocates the copy
 // without moving any geometry: the cut is identical at every deform fraction
 // and the only variable is where the walk reads bounds from — interleaved in
-// the shared WideBlocks, or packed in a per-instance overlay.
+// the shared WideBlocks, or sparse/dense in a per-instance overlay.
 //
 // Bounds are 192 of a WideBlock's 256 bytes, so a deformed instance stops
 // sharing about two thirds of the hot block and its walk splits into two
@@ -2049,6 +2049,68 @@ BENCHMARK(BM_DeformedCutCost)
     ->Args({1000, 0})->Args({1000, 1})->Args({1000, 10})
     ->Args({1000, 50})->Args({1000, 100})
     ->Args({4000, 0})->Args({4000, 10})->Args({4000, 100})
+    ->Unit(benchmark::kMicrosecond);
+
+// Submission-locality control for deformation refit. Overlay storage is
+// allocated in instance order before timing; the timed stream then visits it
+// either in that same order or through one fixed random permutation.
+static void BM_DeformationSubmissionOrder(benchmark::State& state)
+{
+    using clock = std::chrono::steady_clock;
+    const int count = int(state.range(0));
+    const bool shuffled = state.range(1) != 0;
+
+    TreeGen gen;
+    gen.fanout = 4;
+    gen.depth = 1;
+    const Page proto = gen.makeRootPage(unitRegion(2.0f), 4.0f, 0);
+    uint32_t leaf = 1;
+    while (leaf < proto.nodeCount() && proto.childCount(leaf) != 0) ++leaf;
+    const AABB leafBox = proto.bbox[leaf];
+
+    World w;
+    const AssetHandle asset = w.registerAsset(proto.clone());
+    std::vector<World::InstanceRef> insts;
+    insts.reserve(size_t(count));
+    for (int i = 0; i < count; ++i)
+        insts.push_back(w.addInstance(asset, float4::point(float(i) * 5.0f, 0, 0)));
+    w.applyUpdates();
+
+    // Warm overlays in dense instance order so their pool layout is known.
+    for (int i = 0; i < count; ++i)
+        w.setNodeBounds(insts[i], nodeAt(insts[i].rootPage, leaf), leafBox);
+    w.flushBounds();
+
+    std::vector<uint32_t> order(static_cast<size_t>(count), 0u);
+    for (uint32_t i = 0; i < uint32_t(count); ++i) order[i] = i;
+    if (shuffled)
+    {
+        std::mt19937 rng(7331);
+        std::shuffle(order.begin(), order.end(), rng);
+    }
+
+    double submitNs = 0.0;
+    double flushNs = 0.0;
+    for (auto _ : state)
+    {
+        const auto t0 = clock::now();
+        for (const uint32_t i : order)
+            w.setNodeBounds(insts[i], nodeAt(insts[i].rootPage, leaf), leafBox);
+        const auto t1 = clock::now();
+        w.flushBounds();
+        const auto t2 = clock::now();
+        submitNs += std::chrono::duration<double, std::nano>(t1 - t0).count();
+        flushNs += std::chrono::duration<double, std::nano>(t2 - t1).count();
+    }
+    state.SetItemsProcessed(int64_t(state.iterations()) * count);
+    state.counters["submit_us"] = submitNs / (1000.0 * double(state.iterations()));
+    state.counters["flush_us"] = flushNs / (1000.0 * double(state.iterations()));
+    state.counters["ov_MB"] = double(w.overlayBytes()) / (1024.0 * 1024.0);
+}
+BENCHMARK(BM_DeformationSubmissionOrder)
+    ->Args({20000, 0})->Args({20000, 1})
+    ->Args({80000, 0})->Args({80000, 1})
+    ->ArgNames({"instances", "shuffled"})
     ->Unit(benchmark::kMicrosecond);
 
 // ---------------------------------------------------------------------------

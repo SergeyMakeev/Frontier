@@ -57,7 +57,7 @@ through the host's blocking `parallelFor` without changing that contract.
    emitted directly from the parent's wide test without a metadata read or DFS
    stack round trip. At fanout eight, most authored nodes are leaves.
 4. **Shared immutable working sets.** Thousands of identical instances can walk
-   one hot page. The cut-path `Instance` record is one cache line, while TLAS
+   one hot page. The cut-path `Instance` record is 32 bytes, while TLAS
    maintenance state occupies a separate 48-byte array. Uncached selection
    prefetches the next instance and root page; cached selection pipelines
    its spatially ordered random instance/view-record reads eight entries ahead.
@@ -120,9 +120,10 @@ The runtime's multiplied structures have exact compile-time size contracts on
 | per mounted page validation stamp | 8 B | dense content version plus generation/live flag for cache-friendly validation |
 | per mounted page residency summary | 8 B | recursively identifies fully-resident mount trees without scanning nodes |
 | per mounted node | 3 B | one packed residency/coverage byte + 16-bit covered-child count |
-| `Instance` + `InstanceTlas` | 64 B + 48 B | selection-hot and spatial-maintenance streams stay separate |
+| `Instance` + `InstanceTlas` | 32 B + 48 B | overlay-list headers and spatial-maintenance state stay out of the common cut stream |
 | instance cut version / flat-root marker | 4 B / 0 or 4 B | the flat marker stream is allocated only after the first flat asset |
-| `Overlay` header | 56 B | two retained vectors; bounds storage is allocated only after deformation |
+| `Overlay` header | 104 B | allocated only after deformation; large-page wide bounds start sparse and promote to dense |
+| per-deformed-instance overlay-list header | 24 B | cold pooled vector; undeformed instances allocate none |
 | `TlasNode` | 320 B | 296 B of SIMD lanes/metadata rounded to 32-byte alignment; single-root leaf flags occupy unused valid-mask bits |
 | visible hit / TLAS stack item | 4 B / 4 B | 24-bit id or node index + plane mask; a spare hit bit carries the root candidate |
 | node / page DFS item | 8 B / 24 B | existing 20-bit node and mount limits carry traversal flags |
@@ -997,6 +998,37 @@ changed +0.2% and +0.1%; six representative view-update controls ranged from
 -1.4% to +0.2%. The largest root-decision control movement was +1.4% with only
 2/7 candidate wins, consistent with run/layout noise rather than a systematic
 regression.
+
+### Z. Mobile-memory follow-up -- TWO KEPT, AUTOMATIC GROUPING REVERTED
+
+Three isolated experiments followed the page-stamp result. First, the
+24-byte overlay-reference vector header moved out of every `Instance` and into
+a cold pool allocated only for deformed instances. The live flag shares the
+high bit of that pool index, reducing `Instance` from 64 to 32 bytes. The first
+isolated seven-round pass improved the 80k cached fly-through 7.3% (6/7 wins),
+the 50k moving-instance case 3.7% (6/7), and the 200k TLAS-scale case 16.1%
+(6/7). A stricter final combined single-P-core run was more conservative:
+80k cached/uncached fly-through improved 1.7%/2.1%, 200k TLAS scale improved
+4.6%, and the moving-instance case was neutral. The direction plus halved
+common state justified the localized pool; hierarchy controls stayed flat.
+
+Second, large bounds overlays now keep a block-to-patch table and only the
+modified `WideBounds`. Pages below 64 wide blocks stay on the original dense
+path; large sparse overlays promote to dense after more than one sixteenth of
+their blocks change. `WorkItem` stores the sparse overlay index in existing
+tail padding, and template dispatch keeps the normal and dense inner loops
+branch-free. In the 4k-instance one-leaf deformation case, overlay storage fell
+from 125.7 to 73.4 MiB and selection improved 22.1% in 7/7 rounds. A stricter
+single-P-core check measured 25.7% in 9/9. Contiguous 100k refits and ordinary
+small-page forest controls were neutral.
+
+Finally, a submission-order benchmark proved the remaining locality effect but
+rejected automatic sorting. With 80k warmed overlays, grouped submissions took
+4.02 ms while one fixed random permutation took 11.12 ms; flush alone was
+3.38 versus 9.35 ms. Stable grouping inside `flushBounds` made 20k shuffled
+updates 73% slower and did not improve the 80k flush (9.35 to 9.48 ms), so it
+was removed. Callers should submit deformation updates grouped by instance or
+page when practical; the library preserves submission order and pays no sort.
 
 ---
 
