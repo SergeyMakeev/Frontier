@@ -43,10 +43,15 @@ inline uint32_t cutTotal(uint32_t counts)
     return cutCount(counts, 0) + cutCount(counts, 1) + cutCount(counts, 2);
 }
 
-inline uint32_t packCutCounts(uint32_t shared, uint32_t currentOnly,
-                              uint32_t idealOnly)
+inline uint32_t cutDepCount(uint32_t counts)
 {
-    return shared | (currentOnly << 10) | (idealOnly << 20);
+    return counts >> 30;
+}
+
+inline uint32_t packCutCounts(uint32_t shared, uint32_t currentOnly,
+                              uint32_t idealOnly, uint32_t depCount)
+{
+    return shared | (currentOnly << 10) | (idealOnly << 20) | (depCount << 30);
 }
 
 inline uint8_t encodeCutErrorRatio(float ratio, bool above)
@@ -103,9 +108,9 @@ inline CutEntry makeCutEntry(NodeHandle node, float error, float threshold,
 // ownership by View is what makes every query a read-only World operation.
 struct ViewScratch
 {
-    std::vector<World::Worker>                       workers{1};
-    std::vector<std::pair<uint32_t, uint8_t>>        visible;
-    std::vector<World::TlasItem>                     tlasStack;
+    std::vector<World::Worker>      workers{1};
+    std::vector<World::VisibleItem> visible;
+    std::vector<World::TlasItem>    tlasStack;
 
     size_t bytes() const
     {
@@ -166,8 +171,8 @@ const World::PageRt* World::resolve(NodeHandle h) const
     const uint32_t index = h.index();
     if (slot >= slots_.size()) return nullptr;
     const PageRt& rt = slots_[slot];
-    if (!rt.inUse || rt.generation != h.generation()) return nullptr;   // stale
-    if (index == 0 || index >= rt.page.nodeCount()) return nullptr;
+    if (!rt.inUse() || rt.generation != h.generation()) return nullptr;   // stale
+    if (index == 0 || index >= pageView(rt).nodeCount()) return nullptr;
     return &rt;
 }
 
@@ -175,7 +180,7 @@ const World::AssetRt* World::resolveAsset(AssetHandle h) const
 {
     if (h.slot >= assets_.size()) return nullptr;
     const AssetRt& as = assets_[h.slot];
-    if (!as.inUse || as.generation != h.generation) return nullptr;
+    if (!as.inUse() || as.generation != h.generation) return nullptr;
     return &as;
 }
 
@@ -195,18 +200,16 @@ uint32_t World::allocAsset()
     return uint32_t(assets_.size() - 1);
 }
 
-uint32_t World::createAsset(Page&& owned, PageView borrowed, bool registered)
+uint32_t World::createAsset(Page&& page, bool registered)
 {
     const uint32_t a = allocAsset();
     AssetRt& as = assets_[a];
     as = AssetRt{};
-    as.owned = std::move(owned);
-    // The view points into the blob, not into the AssetRt, so it survives the
-    // assets_ vector reallocating underneath it.
-    as.view       = as.owned.valid() ? static_cast<const PageView&>(as.owned) : borrowed;
+    // Every pointer in Page points into the blob, not into AssetRt, so moving
+    // this vector never invalidates mounted page data.
+    as.page       = std::move(page);
     as.generation = ++generationCounter_;
-    as.registered = registered;
-    as.inUse      = true;
+    as.setRegistered(registered);
     ++liveAssets_;
     return a;
 }
@@ -214,8 +217,8 @@ uint32_t World::createAsset(Page&& owned, PageView borrowed, bool registered)
 void World::destroyAssetIfUnused(uint32_t a)
 {
     AssetRt& as = assets_[a];
-    if (!as.inUse) return;
-    if (as.registered || as.mountRefs > 0 || as.instanceRefs > 0) return;
+    if (!as.inUse()) return;
+    if (as.registered() || as.mountRefs() > 0 || as.instanceRefs > 0) return;
     as = AssetRt{};   // releases the blob if the World owned it
     freeAssets_.push_back(a);
     --liveAssets_;
@@ -224,7 +227,7 @@ void World::destroyAssetIfUnused(uint32_t a)
 AssetHandle World::registerAsset(Page&& page)
 {
     HLOD_CHECK(page.nodeCount() > 1, "World::registerAsset: empty page");
-    const uint32_t a = createAsset(std::move(page), PageView{}, true);
+    const uint32_t a = createAsset(std::move(page), true);
     return AssetHandle{a, assets_[a].generation};
 }
 
@@ -232,7 +235,7 @@ AssetHandle World::registerAsset(PageView borrowedPage)
 {
     HLOD_CHECK(borrowedPage.valid() && borrowedPage.nodeCount() > 1,
                "World::registerAsset: empty page");
-    const uint32_t a = createAsset(Page{}, borrowedPage, true);
+    const uint32_t a = createAsset(Page::borrow(borrowedPage), true);
     return AssetHandle{a, assets_[a].generation};
 }
 
@@ -242,7 +245,7 @@ void World::releaseAsset(AssetHandle h)
     const uint32_t a = h.slot;
     HLOD_CHECK(assets_[a].instanceRefs == 0,
                "World::releaseAsset: instances still reference this asset");
-    assets_[a].registered = false;
+    assets_[a].setRegistered(false);
     if (assets_[a].rootMount != kInvalidIndex)
     {
         const uint32_t root = assets_[a].rootMount;
@@ -285,14 +288,12 @@ uint32_t World::registerPage(uint32_t asset, NodeRef owner, bool pinned)
     AssetRt& as = assets_[asset];
     PageRt& rt = slots_[slot];
 
-    HLOD_CHECK(as.view.nodeCount() <= (1u << NodeHandle::kIndexBits),
+    HLOD_CHECK(as.page.nodeCount() <= (1u << NodeHandle::kIndexBits),
                "World: page exceeds the 20-bit page-local node space");
-    rt.page     = as.view;
     rt.asset    = asset;
     rt.errClamp = FLT_MAX;
-    rt.resident.assign(rt.page.nodeCount(), 0);
-    rt.covered.assign(rt.page.nodeCount(), 0);
-    rt.coveredChildren.assign(rt.page.nodeCount(), 0);
+    rt.nodeState.assign(as.page.nodeCount(), 0);
+    rt.coveredChildren.assign(as.page.nodeCount(), 0);
     rt.expSlot.clear();
     rt.generation = nextPageGeneration(rt.generation);
     // Bumped here as well as on every content change, so that a slot which was
@@ -301,12 +302,11 @@ uint32_t World::registerPage(uint32_t asset, NodeRef owner, bool pinned)
     // single word instead of a (generation, version) pair.
     ++rt.contentVersion;
     rt.lastTouched = frame_;
-    rt.attachedChildPages = 0;
-    rt.pinned = pinned;
-    rt.inUse  = true;
+    rt.attachedChildrenAndPinned = 0;
+    rt.setPinned(pinned);
     rt.owner = owner;
 
-    ++as.mountRefs;
+    as.addMountRef();
     ++attachedPages_;
     // Pinned pages can never be collected, so they never enter the LRU list;
     // that turns lruTouch into a single compare for them (a big deal for
@@ -320,12 +320,13 @@ void World::pinRootPayloads(uint32_t slot)
 {
     // Pin the roots' payloads: the base case of invariant (F).
     PageRt& rt = slots_[slot];
+    const PageView& page = pageView(rt);
     uint32_t c = 1;
-    for (uint32_t k = 0; k < rt.page.childCount(0); ++k)
+    for (uint32_t k = 0; k < page.childCount(0); ++k)
     {
-        rt.resident[c] = 1;
+        rt.setResident(c, true);
         propagateCoverage(slot, c);
-        c += rt.page.subtreeSize[c];
+        c += page.subtreeSize[c];
     }
 }
 
@@ -342,20 +343,20 @@ PageHandle World::attachPage(NodeHandle expansionNode, AssetHandle assetHandle)
     const NodeRef owner{expansionNode.slot(), expansionNode.index()};
     {
         const PageRt& ownerRt = slots_[owner.slot];
-        HLOD_CHECK(ownerRt.page.isExpansion(owner.index),
+        HLOD_CHECK(pageView(ownerRt).isExpansion(owner.index),
                    "World::attachPage: not an expansion point");
         HLOD_CHECK(ownerRt.expSlot.empty() || ownerRt.expSlot[owner.index] == kInvalidIndex,
                    "World::attachPage: already attached");
     }
-    HLOD_CHECK(assets_[asset].view.nodeCount() > 1, "World::attachPage: empty page");
+    HLOD_CHECK(assets_[asset].page.nodeCount() > 1, "World::attachPage: empty page");
 
     // (C) across the boundary: the owner must contain the page's content.
     // Growing the owner here is not an option — its bytes back every instance
     // of the owning asset, so the growth would have to ripple into all of
     // their top-level bounds, and a streaming event would silently become an
     // O(instances) write. Author expansion bounds that contain what attaches.
-    HLOD_CHECK(slots_[owner.slot].page.bbox[owner.index].contains(
-                   assets_[asset].view.bbox[0]),
+    HLOD_CHECK(pageView(slots_[owner.slot]).bbox[owner.index].contains(
+                   assets_[asset].page.bbox[0]),
                "World::attachPage: the attached page escapes the expansion node's "
                "authored bounds — author conservative expansion bounds at build time");
 
@@ -365,7 +366,7 @@ PageHandle World::attachPage(NodeHandle expansionNode, AssetHandle assetHandle)
     // same asset can hang under a dozen different expansion points, each with
     // its own ceiling, and attach stays O(1) instead of O(nodeCount).
     const float childClamp =
-        std::min(slots_[owner.slot].page.geometricError[owner.index],
+        std::min(pageView(slots_[owner.slot]).geometricError[owner.index],
                  slots_[owner.slot].errClamp);
 
     // NOTE: registerPage can reallocate slots_, so nothing above may be held
@@ -374,9 +375,10 @@ PageHandle World::attachPage(NodeHandle expansionNode, AssetHandle assetHandle)
     slots_[slot].errClamp = childClamp;
 
     PageRt& ort = slots_[owner.slot];
-    if (ort.expSlot.empty()) ort.expSlot.assign(ort.page.nodeCount(), kInvalidIndex);
+    if (ort.expSlot.empty())
+        ort.expSlot.assign(pageView(ort).nodeCount(), kInvalidIndex);
     ort.expSlot[owner.index] = slot;
-    ort.attachedChildPages++;
+    ort.addAttachedChild();
     ++ort.contentVersion;   // this page now refines further than it did
 
     return PageHandle{slot, slots_[slot].generation};
@@ -389,7 +391,7 @@ PageHandle World::attachPage(NodeHandle expansionNode, Page&& page)
     if (!resolve(expansionNode)) return PageHandle{};
     HLOD_CHECK(page.nodeCount() > 1, "World::attachPage: empty page");
 
-    const uint32_t a = createAsset(std::move(page), PageView{}, false);
+    const uint32_t a = createAsset(std::move(page), false);
     const PageHandle h = attachPage(expansionNode, AssetHandle{a, assets_[a].generation});
     if (!h.valid()) destroyAssetIfUnused(a);
     return h;
@@ -404,9 +406,9 @@ void World::detachPage(NodeHandle expansionNode)
                                : ownerRt->expSlot[expansionNode.index()];
     HLOD_CHECK(child != kInvalidIndex, "World::detachPage: not attached");
     PageRt& rt = slots_[child];
-    HLOD_CHECK(rt.attachedChildPages == 0,
+    HLOD_CHECK(rt.attachedChildPages() == 0,
                "World::detachPage: attached child pages remain");
-    HLOD_CHECK(!rt.pinned, "World::detachPage: page is pinned");
+    HLOD_CHECK(!rt.pinned(), "World::detachPage: page is pinned");
     detachSlot(child, nullptr);
 }
 
@@ -421,18 +423,18 @@ void World::detachSlot(uint32_t slot, std::vector<UserPayload>* freedPayloads)
 {
     PageRt& rt = slots_[slot];
     if (freedPayloads)
-        for (uint32_t i = 1; i < rt.page.nodeCount(); ++i)
-            if (rt.resident[i]) freedPayloads->push_back(rt.page.payload[i]);
+        for (uint32_t i = 1; i < pageView(rt).nodeCount(); ++i)
+            if (rt.isResident(i)) freedPayloads->push_back(pageView(rt).payload[i]);
     if (rt.owner.valid())
     {
         PageRt& ownerRt = slots_[rt.owner.slot];
         ownerRt.expSlot[rt.owner.index] = kInvalidIndex;
-        ownerRt.attachedChildPages--;
+        ownerRt.removeAttachedChild();
         ++ownerRt.contentVersion;   // it collapses back to a leaf here
         propagateCoverage(rt.owner.slot, rt.owner.index);
     }
     lruUnlink(slot);
-    if (rt.pinned) --pinnedPages_;
+    if (rt.pinned()) --pinnedPages_;
     const uint32_t asset = rt.asset;
     const uint32_t generation = rt.generation;
     const uint32_t contentVersion = rt.contentVersion;
@@ -452,7 +454,7 @@ void World::detachSlot(uint32_t slot, std::vector<UserPayload>* freedPayloads)
     if (asset != kInvalidIndex)
     {
         AssetRt& as = assets_[asset];
-        --as.mountRefs;
+        as.removeMountRef();
         if (as.rootMount == slot) as.rootMount = kInvalidIndex;
         destroyAssetIfUnused(asset);
     }
@@ -460,7 +462,7 @@ void World::detachSlot(uint32_t slot, std::vector<UserPayload>* freedPayloads)
 
 void World::detachMountTree(uint32_t rootSlot, std::vector<UserPayload>* freedPayloads)
 {
-    if (rootSlot == kInvalidIndex || !slots_[rootSlot].inUse) return;
+    if (rootSlot == kInvalidIndex || !slots_[rootSlot].inUse()) return;
     // Collect the page tree from its root (preorder via the expansion-slot
     // links), then detach in reverse — children before their owners.
     // O(this tree's pages), independent of the world's size.
@@ -479,19 +481,20 @@ void World::detachMountTree(uint32_t rootSlot, std::vector<UserPayload>* freedPa
 bool World::descendantsCovered(uint32_t slot, uint32_t node) const
 {
     const PageRt& rt = slots_[slot];
-    if (node != 0 && rt.page.isExpansion(node))
+    if (node != 0 && pageView(rt).isExpansion(node))
     {
         const uint32_t child = rt.expSlot.empty() ? kInvalidIndex : rt.expSlot[node];
-        return child != kInvalidIndex && slots_[child].inUse && slots_[child].covered[0];
+        return child != kInvalidIndex && slots_[child].inUse() &&
+               slots_[child].isCovered(0);
     }
-    const uint32_t count = rt.page.childCount(node);
+    const uint32_t count = pageView(rt).childCount(node);
     return count != 0 && rt.coveredChildren[node] == count;
 }
 
 bool World::computeCovered(uint32_t slot, uint32_t node) const
 {
     const PageRt& rt = slots_[slot];
-    return (node != 0 && rt.resident[node]) || descendantsCovered(slot, node);
+    return (node != 0 && rt.isResident(node)) || descendantsCovered(slot, node);
 }
 
 void World::propagateCoverage(uint32_t slot, uint32_t node)
@@ -499,10 +502,10 @@ void World::propagateCoverage(uint32_t slot, uint32_t node)
     for (;;)
     {
         PageRt& rt = slots_[slot];
-        const bool was = rt.covered[node] != 0;
+        const bool was = rt.isCovered(node);
         const bool now = computeCovered(slot, node);
         if (was == now) return;
-        rt.covered[node] = uint8_t(now);
+        rt.setCovered(node, now);
 
         if (node == 0)
         {
@@ -514,7 +517,7 @@ void World::propagateCoverage(uint32_t slot, uint32_t node)
             continue;
         }
 
-        const uint32_t parent = rt.page.parent[node];
+        const uint32_t parent = pageView(rt).parent[node];
         if (now)
             ++rt.coveredChildren[parent];
         else
@@ -528,8 +531,8 @@ void World::markResident(NodeHandle h)
     PageRt* rt = resolve(h);
     if (!rt) return;   // page collected while the payload was loading
     const uint32_t index = h.index();
-    if (rt->resident[index]) return;
-    rt->resident[index] = 1;
+    if (rt->isResident(index)) return;
+    rt->setResident(index, true);
     ++rt->contentVersion;
     propagateCoverage(h.slot(), index);
 }
@@ -539,10 +542,10 @@ void World::markNonResident(NodeHandle h)
     PageRt* rt = resolve(h);
     if (!rt) return;
     const uint32_t index = h.index();
-    HLOD_CHECK(!(rt->pinned && rt->page.parent[index] == 0),
+    HLOD_CHECK(!(rt->pinned() && pageView(*rt).parent[index] == 0),
                "World::markNonResident: pinned root");
-    if (!rt->resident[index]) return;
-    rt->resident[index] = 0;
+    if (!rt->isResident(index)) return;
+    rt->setResident(index, false);
     ++rt->contentVersion;
     propagateCoverage(h.slot(), index);
 }
@@ -550,14 +553,14 @@ void World::markNonResident(NodeHandle h)
 bool World::isResident(NodeHandle h) const
 {
     const PageRt* rt = resolve(h);
-    return rt && rt->resident[h.index()] != 0;
+    return rt && rt->isResident(h.index());
 }
 
 bool World::tryGetPayload(NodeHandle h, UserPayload& outPayload) const
 {
     const PageRt* rt = resolve(h);
     if (!rt) return false;
-    outPayload = rt->page.payload[h.index()];
+    outPayload = pageView(*rt).payload[h.index()];
     return true;
 }
 
@@ -602,7 +605,6 @@ World::InstanceRef World::addInstanceInternal(uint32_t asset, const InstanceDesc
     inst.pos = desc.pos;
     inst.scale = desc.scale;
     inst.rootSlot = slot;
-    spatial.asset = asset;
     spatial.mask = desc.mask;
     inst.alive = true;
     inst.generation = ++generationCounter_;
@@ -636,7 +638,7 @@ World::InstanceRef World::addInstance(AssetHandle asset, float4 pos, float scale
 World::InstanceRef World::addInstance(Page&& page, const InstanceDesc& desc)
 {
     HLOD_CHECK(page.nodeCount() > 1, "World::addInstance: empty page");
-    const uint32_t a = createAsset(std::move(page), PageView{}, false);
+    const uint32_t a = createAsset(std::move(page), false);
     return addInstanceInternal(a, desc);
 }
 
@@ -680,7 +682,7 @@ void World::removeInstance(InstanceRef ref)
     Instance* inst = resolveInstance(ref);
     if (!inst) return;   // stale ref: the instance is already gone
     const InstanceId id = ref.id;
-    const uint32_t   asset = instanceTlas_[id].asset;
+    const uint32_t   asset = slots_[inst->rootSlot].asset;
 
     freeOverlays(*inst);
     tlasRemove(id);
@@ -739,10 +741,11 @@ void World::recomputeInstanceBounds(InstanceId id)
 
     float maxErr = 0.0f;
     uint32_t c = 1;
-    for (uint32_t k = 0; k < rt.page.childCount(0); ++k)
+    const PageView& page = pageView(rt);
+    for (uint32_t k = 0; k < page.childCount(0); ++k)
     {
-        maxErr = std::max(maxErr, std::min(rt.page.geometricError[c], rt.errClamp));
-        c += rt.page.subtreeSize[c];
+        maxErr = std::max(maxErr, std::min(page.geometricError[c], rt.errClamp));
+        c += page.subtreeSize[c];
     }
     spatial.maxErrWorld = maxErr * inst.scale;
 }
@@ -768,22 +771,17 @@ const World::Overlay* World::findOverlay(const Instance& inst, uint32_t slot) co
     const Overlay& ov = overlays_[it->index];
     // The mount may have been detached (and its slot reused) since the
     // overlay was taken, in which case it describes a page that is gone.
-    if (!ov.inUse || ov.generation != slots_[slot].generation) return nullptr;
+    if (!ov.inUse() || ov.generation != slots_[slot].generation) return nullptr;
     return &ov;
 }
 
 void World::initOverlay(Overlay& ov, const PageRt& rt)
 {
-    const PageView& pg = rt.page;
+    const PageView& pg = pageView(rt);
     ov.generation = rt.generation;
-    ov.inUse = true;
-#ifdef HLOD_OVERLAY_FULL_PAGE
-    ov.page = Page::fromBytes(pg.data(), pg.byteSize(), config_.context);
-#else
     ov.bbox.assign(pg.bbox, pg.bbox + pg.nodeCount());
     ov.wide.resize(pg.wideCount());
     for (uint32_t b = 0; b < pg.wideCount(); ++b) ov.wide[b] = pg.wide[b].bounds;
-#endif
 }
 
 uint32_t World::ensureOverlay(Instance& inst, uint32_t slot)
@@ -796,7 +794,7 @@ uint32_t World::ensureOverlay(Instance& inst, uint32_t slot)
     {
         const uint32_t idx = it->index;
         Overlay& ov = overlays_[idx];
-        if (!ov.inUse || ov.generation != slots_[slot].generation)
+        if (!ov.inUse() || ov.generation != slots_[slot].generation)
             initOverlay(ov, slots_[slot]);   // stale: retake from the new page
         return idx;
     }
@@ -825,7 +823,7 @@ void World::freeOverlays(Instance& inst)
     for (const OverlayRef& r : inst.overlays)
     {
         Overlay& ov = overlays_[r.index];
-        if (!ov.inUse) continue;
+        if (!ov.inUse()) continue;
         ov = Overlay{};
         freeOverlays_.push_back(r.index);
         --liveOverlays_;
@@ -836,24 +834,16 @@ void World::freeOverlays(Instance& inst)
 const AABB* World::boundsFor(const Instance& inst, uint32_t slot, const PageRt& rt) const
 {
     if (const Overlay* ov = findOverlay(inst, slot))
-#ifdef HLOD_OVERLAY_FULL_PAGE
-        return ov->page.bbox;
-#else
         return ov->bbox.data();
-#endif
-    return rt.page.bbox;
+    return pageView(rt).bbox;
 }
 
 WideBoundsRef World::wideBoundsFor(const Instance& inst, uint32_t slot,
                                    const PageRt& rt) const
 {
     if (const Overlay* ov = findOverlay(inst, slot))
-#ifdef HLOD_OVERLAY_FULL_PAGE
-        return ov->page.wideBounds();   // interleaved again, like the shared page
-#else
         return WideBoundsRef::packed(ov->wide.data());
-#endif
-    return rt.page.wideBounds();
+    return pageView(rt).wideBounds();
 }
 
 bool World::mountBelongsTo(const Instance& inst, uint32_t slot) const
@@ -873,12 +863,8 @@ size_t World::overlayBytes() const
 {
     size_t n = 0;
     for (const Overlay& ov : overlays_)
-        if (ov.inUse)
-#ifdef HLOD_OVERLAY_FULL_PAGE
-            n += ov.page.byteSize();
-#else
+        if (ov.inUse())
             n += ov.bbox.size() * sizeof(AABB) + ov.wide.size() * sizeof(WideBounds);
-#endif
     return n;
 }
 
@@ -902,8 +888,7 @@ void World::setNodeBounds(InstanceRef ref, NodeHandle h, const AABB& localBounds
     if (!resolve(h)) return;   // stale handle: the page was detached or collected
     HLOD_ASSERT(mountBelongsTo(*inst, h.slot()),
                 "World::setNodeBounds: the node is not in this instance's page tree");
-    pendingMoves_.push_back(
-        {ref.id, ref.generation, h.slot(), h.generation(), h.index(), localBounds});
+    pendingMoves_.push_back({localBounds, h, ref.id, ref.generation});
 }
 
 void World::applyUpdates()
@@ -931,8 +916,8 @@ void World::flushBounds()
         if (m.instance >= instances_.size()) continue;
         const Instance& inst = instances_[m.instance];
         if (!inst.alive || inst.generation != m.instGeneration) continue;
-        if (!resolve(NodeHandle{m.slot, m.index, m.generation})) continue;
-        applyBoundsChange(m.instance, m.slot, m.index, m.box);
+        if (!resolve(m.node)) continue;
+        applyBoundsChange(m.instance, m.node.slot(), m.node.index(), m.box);
     }
     pendingMoves_.clear();
 }
@@ -957,18 +942,9 @@ void World::applyBoundsChange(InstanceId id, uint32_t slot, uint32_t index,
         // this page — and only this page. Crossing a boundary below promotes
         // the owner too, so exactly the ancestor path is privatised.
         const uint32_t oi = ensureOverlay(instances_[id], curSlot);
-#ifdef HLOD_OVERLAY_FULL_PAGE
-        // Topology comes from the private copy too, so the whole walk below
-        // stays inside one blob instead of straddling page and overlay.
-        const PageView& pg = overlays_[oi].page;
-        AABB* bbox = const_cast<AABB*>(overlays_[oi].page.bbox);
-        const MutWideBoundsRef wide =
-            MutWideBoundsRef::interleaved(const_cast<WideBlock*>(overlays_[oi].page.wide));
-#else
-        const PageView& pg = slots_[curSlot].page;
+        const PageView& pg = pageView(slots_[curSlot]);
         AABB* bbox = overlays_[oi].bbox.data();
         const MutWideBoundsRef wide = MutWideBoundsRef::packed(overlays_[oi].wide.data());
-#endif
 
         if (exact)
         {
@@ -1125,6 +1101,8 @@ int32_t World::tlasAllocNode()
         }
         return idx;
     }
+    HLOD_CHECK(tlasNodes_.size() < kInvalidInstanceId,
+               "World: exhausted the 24-bit TLAS node space");
     const int32_t idx = int32_t(tlasNodes_.size());
     TlasNode& n = tlasNodes_.emplace_back();
     n.bounds = WideBounds::allEmpty();
@@ -1231,9 +1209,7 @@ void World::tlasInsert(InstanceId id)
     h.child[lane] = ~int32_t(id);
     h.laneMask[lane] = inst.mask;
     h.validMask |= 1u << lane;
-    inst.tlasNode = host;
-    inst.tlasLane = lane;
-    inst.escapedSinceBuild = false;
+    inst.setTlasPlacement(host, lane);
     ++tlasLeafCount_;
 
     tlasNoteGrowth(tlasGrowUp(host, inst.worldBox, inst.maxErrWorld, inst.mask));
@@ -1247,10 +1223,10 @@ void World::tlasRemove(InstanceId id)
 {
     if (tlasDirty_) return;
     InstanceTlas& inst = instanceTlas_[id];
-    if (inst.tlasNode == kInvalidIndex) return;
+    if (inst.tlasNode() == kInvalidInstanceId) return;
 
-    uint32_t nodeIdx = inst.tlasNode;
-    const uint32_t lane = inst.tlasLane;
+    uint32_t nodeIdx = inst.tlasNode();
+    const uint32_t lane = inst.tlasLane();
     if (nodeIdx >= tlasNodes_.size() ||
         !(tlasNodes_[nodeIdx].validMask & (1u << lane)) ||
         tlasNodes_[nodeIdx].child[lane] != ~int32_t(id))
@@ -1259,13 +1235,13 @@ void World::tlasRemove(InstanceId id)
         return;
     }
 
-    if (inst.escapedSinceBuild)
+    if (inst.escapedSinceBuild())
     {
         if (tlasEscapes_) --tlasEscapes_;
-        inst.escapedSinceBuild = false;
+        inst.setEscapedSinceBuild(false);
     }
     tlasNodes_[nodeIdx].validMask &= ~(1u << lane);
-    inst.tlasNode = kInvalidIndex;
+    inst.clearTlasPlacement();
     if (tlasLeafCount_) --tlasLeafCount_;
 
     while (tlasNodes_[nodeIdx].validMask == 0)
@@ -1295,7 +1271,7 @@ void World::tlasOnInstanceMoved(InstanceId id)
 {
     if (tlasDirty_) return;
     InstanceTlas& inst = instanceTlas_[id];
-    if (inst.tlasNode == kInvalidIndex)
+    if (inst.tlasNode() == kInvalidInstanceId)
     {
         tlasDirty_ = true;
         return;
@@ -1304,16 +1280,16 @@ void World::tlasOnInstanceMoved(InstanceId id)
     // Grow-only lane refit up the parent chain. The rebuild budget counts
     // distinct escaped leaves, not escape events: a bounded moving cohort
     // should not force periodic rebuilds merely because it moves every frame.
-    const uint32_t nodeIdx = inst.tlasNode;
-    const uint32_t lane = inst.tlasLane;
+    const uint32_t nodeIdx = inst.tlasNode();
+    const uint32_t lane = inst.tlasLane();
     TlasNode& node = tlasNodes_[nodeIdx];
     if (node.bounds.lane(lane).contains(inst.worldBox) &&
         node.maxErr.v[lane] >= inst.maxErrWorld)
         return;
 
-    if (!inst.escapedSinceBuild)
+    if (!inst.escapedSinceBuild())
     {
-        inst.escapedSinceBuild = true;
+        inst.setEscapedSinceBuild(true);
         ++tlasEscapes_;
     }
     AABB grown = node.bounds.lane(lane);
@@ -1347,10 +1323,10 @@ static inline uint64_t expandBits21(uint64_t v)
 // sort into linear streaming passes. Equal coordinates retain live-instance
 // order; their order is immaterial to the tree and stability keeps it fully
 // deterministic without paying for a second comparison sort.
-static void radixSortMorton(
-    std::vector<std::pair<uint64_t, uint32_t>>& keys,
-    std::vector<std::pair<uint64_t, uint32_t>>& scratch,
-    uint64_t keyVariation)
+template <class Item>
+static void radixSortMorton(std::vector<Item>& keys,
+                            std::vector<Item>& scratch,
+                            uint64_t keyVariation)
 {
     if (keys.size() < 1024)
     {
@@ -1372,7 +1348,7 @@ static void radixSortMorton(
         if (((keyVariation >> shift) & kMask) == 0) continue;
         offsets.fill(0);
         for (const auto& item : *src)
-            ++offsets[size_t((item.first >> shift) & kMask)];
+            ++offsets[size_t((item.key() >> shift) & kMask)];
 
         uint32_t next = 0;
         for (uint32_t& count : offsets)
@@ -1383,7 +1359,7 @@ static void radixSortMorton(
         }
 
         for (const auto& item : *src)
-            (*dst)[offsets[size_t((item.first >> shift) & kMask)]++] = item;
+            (*dst)[offsets[size_t((item.key() >> shift) & kMask)]++] = item;
         std::swap(src, dst);
     }
     if (src != &keys) keys.swap(scratch);
@@ -1496,16 +1472,8 @@ int World::tlasSplit(std::vector<uint32_t>& items, int lo, int hi)
 // rebuilds (instances added/removed), which are rare and long-lived.
 int32_t World::tlasBuildRange(std::vector<uint32_t>& items, int lo, int hi, int32_t parent)
 {
-    const int32_t idx = int32_t(tlasNodes_.size());
-    tlasNodes_.emplace_back();
+    const int32_t idx = tlasAllocNode();
     tlasNodes_[idx].parent = parent;
-    for (uint32_t l = 0; l < kWide; ++l)
-    {
-        tlasNodes_[idx].child[l] = 0;
-        tlasNodes_[idx].laneMask[l] = 0;
-    }
-    tlasNodes_[idx].bounds = WideBounds::allEmpty();
-    tlasNodes_[idx].maxErr = float8::splat(0.0f);
 
     const int count = hi - lo;
     if (count <= int(kWide))
@@ -1520,9 +1488,7 @@ int32_t World::tlasBuildRange(std::vector<uint32_t>& items, int lo, int hi, int3
             n.child[k] = ~int32_t(instIdx);
             n.laneMask[k] = inst.mask;
             n.validMask |= 1u << k;
-            inst.tlasNode = uint32_t(idx);
-            inst.tlasLane = uint32_t(k);
-            inst.escapedSinceBuild = false;
+            inst.setTlasPlacement(uint32_t(idx), uint32_t(k));
         }
         return idx;
     }
@@ -1628,30 +1594,20 @@ void World::tlasRebuild()
             cur.clear();
             for (size_t base = 0; base < tlasKeys_.size(); base += kWide)
             {
-                const int32_t idx = int32_t(tlasNodes_.size());
-                TlasNode& n = tlasNodes_.emplace_back();
-                n.bounds = WideBounds::allEmpty();
-                n.maxErr = float8::splat(0.0f);
-                n.parent = -1;
-                for (uint32_t l = 0; l < kWide; ++l)
-                {
-                    n.child[l] = 0;
-                    n.laneMask[l] = 0;
-                }
+                const int32_t idx = tlasAllocNode();
+                TlasNode& n = tlasNodes_[idx];
                 const uint32_t cnt =
                     uint32_t(std::min<size_t>(kWide, tlasKeys_.size() - base));
                 for (uint32_t k = 0; k < cnt; ++k)
                 {
-                    const uint32_t instIdx = tlasKeys_[base + k].second;
+                    const uint32_t instIdx = tlasKeys_[base + k].instance;
                     InstanceTlas& inst = instanceTlas_[instIdx];
                     n.bounds.setLane(k, inst.worldBox);
                     n.maxErr.v[k] = inst.maxErrWorld;
                     n.child[k] = ~int32_t(instIdx);
                     n.laneMask[k] = inst.mask;
                     n.validMask |= 1u << k;
-                    inst.tlasNode = uint32_t(idx);
-                    inst.tlasLane = k;
-                    inst.escapedSinceBuild = false;
+                    inst.setTlasPlacement(uint32_t(idx), k);
                 }
                 cur.push_back(idx);
             }
@@ -1663,16 +1619,8 @@ void World::tlasRebuild()
                 next.clear();
                 for (size_t base = 0; base < cur.size(); base += kWide)
                 {
-                    const int32_t idx = int32_t(tlasNodes_.size());
-                    TlasNode& n = tlasNodes_.emplace_back();
-                    n.bounds = WideBounds::allEmpty();
-                    n.maxErr = float8::splat(0.0f);
-                    n.parent = -1;
-                    for (uint32_t l = 0; l < kWide; ++l)
-                    {
-                        n.child[l] = 0;
-                        n.laneMask[l] = 0;
-                    }
+                    const int32_t idx = tlasAllocNode();
+                    TlasNode& n = tlasNodes_[idx];
                     const uint32_t cnt =
                         uint32_t(std::min<size_t>(kWide, cur.size() - base));
                     for (uint32_t k = 0; k < cnt; ++k)
@@ -1714,7 +1662,7 @@ void World::tlasRebuild()
 }
 
 void World::tlasQuery(const Camera& view, float minPix,
-                      std::vector<std::pair<uint32_t, uint8_t>>& outVisible,
+                      std::vector<VisibleItem>& outVisible,
                       std::vector<TlasItem>& stack) const
 {
     outVisible.clear();
@@ -1731,11 +1679,11 @@ void World::tlasQuery(const Camera& view, float minPix,
     {
         const TlasItem it = stack.back();
         stack.pop_back();
-        const TlasNode& n = tlasNodes_[it.node];
+        const TlasNode& n = tlasNodes_[it.node()];
 
         uint8_t outMasks[kWide];
         uint32_t survivors =
-            testWideAabb(n.bounds, view.frustum, it.mask, outMasks) & n.validMask;
+            testWideAabb(n.bounds, view.frustum, it.mask(), outMasks) & n.validMask;
         if (!survivors) continue;
 
         // Layer visibility. Skipped entirely for the default all-ones view
@@ -1797,7 +1745,7 @@ void World::lruTouch(uint32_t slot, uint32_t epoch)
     PageRt& rt = slots_[slot];
     if (rt.lastTouched == epoch || int32_t(epoch - rt.lastTouched) <= 0) return;
     rt.lastTouched = epoch;
-    if (rt.pinned || lruHead_ == slot) return;
+    if (rt.pinned() || lruHead_ == slot) return;
     lruUnlink(slot);
     lruPushFront(slot);
 }
@@ -1830,10 +1778,10 @@ void World::consumePageUsage(std::initializer_list<PageUsageContext*> usages)
         {
             if (slot >= usage->rec_.size()) continue;
             PageUsageContext::Rec& rec = usage->rec_[slot];
-            rec.pending = false;
+            rec.setPending(false);
             if (slot >= slots_.size()) continue;
             const PageRt& rt = slots_[slot];
-            if (!rt.inUse || rt.generation != rec.generation) continue;
+            if (!rt.inUse() || rt.generation != rec.generation()) continue;
             events.push_back({slot, rec.lastUsed});
         }
         usage->dirty_.clear();
@@ -1856,18 +1804,18 @@ void World::recordPageUsage(PageUsageContext& usage, uint32_t slot) const
                "View::selectCut: PageUsageContext belongs to another World");
     usage.world_ = this;
     const PageRt& rt = slots_[slot];
-    if (rt.pinned) return;
+    if (rt.pinned()) return;
     if (usage.rec_.size() <= slot) usage.rec_.resize(size_t(slot) + 1);
     PageUsageContext::Rec& rec = usage.rec_[slot];
-    if (rec.generation != rt.generation)
+    if (rec.generation() != rt.generation)
     {
         rec = PageUsageContext::Rec{};
-        rec.generation = rt.generation;
+        rec.setGeneration(rt.generation);
     }
     rec.lastUsed = frame_;
-    if (!rec.pending)
+    if (!rec.pending())
     {
-        rec.pending = true;
+        rec.setPending(true);
         usage.dirty_.push_back(slot);
     }
 }
@@ -1881,7 +1829,8 @@ size_t World::collect(size_t maxAttachedPages, uint32_t minAge,
     {
         const uint32_t prev = slots_[slot].lruPrev;
         const PageRt& rt = slots_[slot];
-        const bool eligible = rt.inUse && !rt.pinned && rt.attachedChildPages == 0 &&
+        const bool eligible = rt.inUse() && !rt.pinned() &&
+                              rt.attachedChildPages() == 0 &&
                               (frame_ - rt.lastTouched) >= minAge;
         if (eligible)
         {
@@ -1943,15 +1892,9 @@ void World::wideVisit(const WorkItem& item, const PageView& pg, float errClamp,
         // the leaf lanes in the high half come along for free.
         const uint32_t lanes = pg.blockMask[b];
         HLOD_STAT(w, wideBlocksTested, 1);
-#ifdef HLOD_OPT_MASK64
-        uint64_t       outMasks = 0;
-        const uint32_t survivors =
-            testWideAabbPacked(wb, local.frustum, mask, outMasks) & lanes;
-#else
         uint8_t outMasks[kWide];
         const uint32_t survivors =
             testWideAabb(wb, local.frustum, mask, outMasks) & lanes;
-#endif
         if (!survivors) continue;
         HLOD_STAT(w, lanesSurvived, uint64_t(std::popcount(survivors)));
 
@@ -1973,7 +1916,7 @@ void World::wideVisit(const WorkItem& item, const PageView& pg, float errClamp,
             const uint32_t l = uint32_t(std::countr_zero(leaves));
             leaves &= leaves - 1;
             const uint32_t c = blk.child[l];
-            w.emit(makeCutEntry(NodeHandle{item.slot, c, gen}, errs.v[l], w.bar,
+            w.emit(makeCutEntry(NodeHandle{item.slot(), c, gen}, errs.v[l], w.bar,
                                 w.barInv, instance),
                    currentKids != 0, idealKids != 0);
         }
@@ -1984,11 +1927,7 @@ void World::wideVisit(const WorkItem& item, const PageView& pg, float errClamp,
             const uint32_t l = uint32_t(std::countr_zero(inner));
             inner &= inner - 1;
             const uint32_t c = blk.child[l];
-#ifdef HLOD_OPT_MASK64
-            const uint8_t planes = uint8_t(outMasks >> (8 * l));
-#else
             const uint8_t planes = outMasks[l];
-#endif
             w.nodeStack.push_back(
                 {c, errs.v[l], planes, currentKids, idealKids});
 
@@ -2027,7 +1966,7 @@ bool World::visibleDescendantsCovered(uint32_t slot, uint32_t node, uint8_t mask
     if (mask == 0) return false;
 
     const PageRt* rt = &slots_[slot];
-    if (node != 0 && rt->page.isExpansion(node))
+    if (node != 0 && pageView(*rt).isExpansion(node))
     {
         const uint32_t child = rt->expSlot.empty() ? kInvalidIndex : rt->expSlot[node];
         if (child == kInvalidIndex) return false;
@@ -2040,7 +1979,7 @@ bool World::visibleDescendantsCovered(uint32_t slot, uint32_t node, uint8_t mask
             touched->push_back(slot);
     }
 
-    const PageView& page = rt->page;
+    const PageView& page = pageView(*rt);
     const uint32_t count = page.childCount(node);
     if (count == 0) return false;
     const AABB* bounds = boundsFor(inst, slot, *rt);
@@ -2050,7 +1989,7 @@ bool World::visibleDescendantsCovered(uint32_t slot, uint32_t node, uint8_t mask
     {
         uint8_t childMask = mask;
         if (testAabb(bounds[child], local.frustum, childMask) != CullState::Outside &&
-            !rt->covered[child])
+            !rt->isCovered(child))
         {
             if (!visibleDescendantsCovered(slot, child, childMask, inst, local,
                                            touched, uniqueTouches))
@@ -2064,14 +2003,14 @@ bool World::visibleDescendantsCovered(uint32_t slot, uint32_t node, uint8_t mask
 void World::runPage(const WorkItem& item, const Instance& inst, const Camera& local,
                     const CutParams& params, Worker& w) const
 {
-    const PageRt& rt = slots_[item.slot];
+    const PageRt& rt = slots_[item.slot()];
     if (w.trackTouches &&
         (!w.uniqueTouches ||
-         std::find(w.touched.begin(), w.touched.end(), item.slot) == w.touched.end()))
-        w.touched.push_back(item.slot);
+         std::find(w.touched.begin(), w.touched.end(), item.slot()) == w.touched.end()))
+        w.touched.push_back(item.slot());
 
     HLOD_STAT(w, pagesVisited, 1);
-    const PageView& pg = rt.page;
+    const PageView& pg = pageView(rt);
     const uint32_t gen = rt.generation;
     const InstanceId instance = InstanceId(&inst - instances_.data());
     // One bar, no history: damping is already folded into the view's camera
@@ -2080,19 +2019,19 @@ void World::runPage(const WorkItem& item, const Instance& inst, const Camera& lo
     const float bar = params.threshold;
 
     w.nodeStack.clear();
-    wideVisit(item, pg, rt.errClamp, gen, instance, 0, item.mask, item.current,
-              item.ideal, local, w);
+    wideVisit(item, pg, rt.errClamp, gen, instance, 0, item.mask(), item.current(),
+              item.ideal(), local, w);
 
     while (!w.nodeStack.empty())
     {
         const NodeItem e = w.nodeStack.back();
         w.nodeStack.pop_back();
-        const uint32_t i = e.node;
+        const uint32_t i = e.node();
         HLOD_STAT(w, nodesVisited, 1);
 
-        const bool current = e.current != 0;
-        const bool ideal = e.ideal != 0;
-        const NodeHandle here{item.slot, i, gen};
+        const bool current = e.current();
+        const bool ideal = e.ideal();
+        const NodeHandle here{item.slot(), i, gen};
 
         uint8_t nextCurrent = 0;
         uint8_t nextIdeal = 0;
@@ -2103,7 +2042,7 @@ void World::runPage(const WorkItem& item, const Instance& inst, const Camera& lo
         // continue through the precomputed cover.
         if (!ideal)
         {
-            if (rt.resident[i])
+            if (rt.isResident(i))
             {
                 w.cut.currentOnly.push(
                     makeCutEntry(here, e.err, bar, w.barInv, instance));
@@ -2113,7 +2052,7 @@ void World::runPage(const WorkItem& item, const Instance& inst, const Camera& lo
         }
         else if (!(e.err > bar))
         {
-            const bool shared = current && rt.resident[i];
+            const bool shared = current && rt.isResident(i);
             const CutEntry entry =
                 makeCutEntry(here, e.err, bar, w.barInv, instance);
             w.emit(entry, shared, true);
@@ -2131,7 +2070,7 @@ void World::runPage(const WorkItem& item, const Instance& inst, const Camera& lo
 
         if (ideal && e.err > bar && exp && childSlot == kInvalidIndex)
         {
-            HLOD_CHECK(!current || rt.resident[i],
+            HLOD_CHECK(!current || rt.isResident(i),
                        "View::selectCut: non-resident current expansion proxy");
             const CutEntry entry =
                 makeCutEntry(here, e.err, bar, w.barInv, instance);
@@ -2143,12 +2082,12 @@ void World::runPage(const WorkItem& item, const Instance& inst, const Camera& lo
         {
             const bool canDescend =
                 !current ||
-                visibleDescendantsCovered(item.slot, i, e.planes, inst, local,
+                visibleDescendantsCovered(item.slot(), i, e.planes(), inst, local,
                                            w.trackTouches ? &w.touched : nullptr,
                                            w.uniqueTouches);
             if (current && !canDescend)
             {
-                HLOD_CHECK(rt.resident[i],
+                HLOD_CHECK(rt.isResident(i),
                            "View::selectCut: uncovered current subtree");
                 w.cut.currentOnly.push(
                     makeCutEntry(here, e.err, bar, w.barInv, instance));
@@ -2165,10 +2104,10 @@ void World::runPage(const WorkItem& item, const Instance& inst, const Camera& lo
                        "View::selectCut: uncovered expansion subtree");
             w.work.push_back({childSlot,
                               wideBoundsFor(inst, childSlot, slots_[childSlot]),
-                              nextCurrent, nextIdeal, e.planes});
+                              nextCurrent, nextIdeal, e.planes()});
         }
         else
-            wideVisit(item, pg, rt.errClamp, gen, instance, i, e.planes, nextCurrent,
+            wideVisit(item, pg, rt.errClamp, gen, instance, i, e.planes(), nextCurrent,
                       nextIdeal, local, w);
     }
 }
@@ -2233,17 +2172,19 @@ void World::selectCutUncached(const Camera& camera, const CutParams& params,
         // instance i.
         for (uint32_t i = 0; i < nVis; ++i)
         {
-            if (i + 2 < nVis) HLOD_PREFETCH(&instances_[scratch.visible[i + 2].first]);
+            if (i + 2 < nVis)
+                HLOD_PREFETCH(&instances_[scratch.visible[i + 2].instance()]);
             if (i + 1 < nVis)
             {
-                const Instance& next = instances_[scratch.visible[i + 1].first];
+                const Instance& next = instances_[scratch.visible[i + 1].instance()];
                 const PageRt& nrt = slots_[next.rootSlot];
-                HLOD_PREFETCH(nrt.page.wide);
-                HLOD_PREFETCH(nrt.page.meta);
-                HLOD_PREFETCH(nrt.page.payload);
+                const PageView& nextPage = pageView(nrt);
+                HLOD_PREFETCH(nextPage.wide);
+                HLOD_PREFETCH(nextPage.meta);
+                HLOD_PREFETCH(nextPage.payload);
             }
-            runInstance(scratch.visible[i].first, damped, params,
-                        scratch.visible[i].second, w);
+            runInstance(scratch.visible[i].instance(), damped, params,
+                        scratch.visible[i].mask(), w);
         }
 
         outCut = w.cut;
@@ -2296,8 +2237,8 @@ void World::selectCutUncached(const Camera& camera, const CutParams& params,
             const uint32_t hi = std::min(lo + per, c->nVis);
             Worker& w = c->scratch->workers[k];
             for (uint32_t i = lo; i < hi; ++i)
-                world.runInstance(c->scratch->visible[i].first, *c->camera, *c->params,
-                                  c->scratch->visible[i].second, w);
+                world.runInstance(c->scratch->visible[i].instance(), *c->camera,
+                                  *c->params, c->scratch->visible[i].mask(), w);
         },
         &chunk, config_.context.user);
 
@@ -2473,15 +2414,16 @@ void World::selectCutCached(const Camera& camera, const CutParams& params,
         constexpr uint32_t kPrefetchDistance = 8;
         if (i + kPrefetchDistance < nVis)
         {
-            const uint32_t next = scratch.visible[i + kPrefetchDistance].first;
+            const uint32_t next = scratch.visible[i + kPrefetchDistance].instance();
             HLOD_PREFETCH(&instances_[next]);
             HLOD_PREFETCH(&ctx.rec_[next]);
         }
 
-        const uint32_t instIdx = scratch.visible[i].first;
-        const uint8_t  mask = scratch.visible[i].second;
+        const uint32_t instIdx = scratch.visible[i].instance();
+        const uint8_t  mask = scratch.visible[i].mask();
         const Instance& inst = instances_[instIdx];
         View::Rec& r = ctx.rec_[instIdx];
+        const uint32_t depCount = cutDepCount(r.counts);
 
         // Everything the record was taken under, re-checked, in one cache
         // line. `mask == 0` is the frustum condition: this instance is wholly
@@ -2491,10 +2433,10 @@ void World::selectCutCached(const Camera& camera, const CutParams& params,
                    ctx.travel_ + r.kSlope * ctx.kTravel_ < r.validUntil &&
                    r.epoch == ctx.epoch_ && r.cutVersion == inst.cutVersion;
         if (hit)
-            for (uint32_t d = 0; d < r.depCount; ++d)
+            for (uint32_t d = 0; d < depCount; ++d)
             {
                 const PageRt& rt = slots_[r.depSlot[d]];
-                if (!rt.inUse || rt.contentVersion != r.depVersion[d])
+                if (!rt.inUse() || rt.contentVersion != r.depVersion[d])
                 {
                     hit = false;
                     break;
@@ -2503,7 +2445,7 @@ void World::selectCutCached(const Camera& camera, const CutParams& params,
 
         if (hit)
         {
-            for (uint32_t k = 0; k < r.depCount; ++k) recordUsage(r.depSlot[k]);
+            for (uint32_t k = 0; k < depCount; ++k) recordUsage(r.depSlot[k]);
             // The whole saving is the walk that did not happen. Copying the
             // recorded entries out is ~1.5% of the call at 80k instances, and
             // handing back a descriptor instead measured no better while
@@ -2548,7 +2490,10 @@ void World::selectCutCached(const Camera& camera, const CutParams& params,
             r.capacity = n;
             ctx.used_ += n;
         }
-        r.counts = eligible ? packCutCounts(nShared, nCurrent, nIdeal) : 0;
+        r.counts = eligible
+                       ? packCutCounts(nShared, nCurrent, nIdeal,
+                                       uint32_t(w.touched.size()))
+                       : 0;
         CutEntry* dst = ctx.store_.data() + r.begin;
         if (nShared)
             std::memcpy(dst, w.cutBuf.shared.data(),
@@ -2572,8 +2517,7 @@ void World::selectCutCached(const Camera& camera, const CutParams& params,
             r.validUntil = m >= FLT_MAX - consumed ? FLT_MAX : consumed + m;
             r.epoch = ctx.epoch_;
             r.cutVersion = inst.cutVersion;
-            r.depCount = uint32_t(w.touched.size());
-            for (uint32_t d = 0; d < r.depCount; ++d)
+            for (uint32_t d = 0; d < uint32_t(w.touched.size()); ++d)
             {
                 r.depSlot[d] = w.touched[d];
                 r.depVersion[d] = slots_[w.touched[d]].contentVersion;

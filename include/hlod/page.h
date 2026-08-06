@@ -10,8 +10,7 @@
 // instances share a single asset.
 //
 //   PageView — borrows a blob somebody else owns (mmap, a bundle file, an
-//              asset the World already holds). Trivially copyable, 88 bytes
-//              (asserted below, because it is embedded in every PageRt).
+//              asset the World already holds). Trivially copyable, 88 bytes.
 //   Page     — owns its blob and frees it through the context it came from.
 //              Move-only; copies must be spelled out with clone().
 
@@ -22,6 +21,8 @@
 #include "math.h"
 
 namespace hlod {
+
+class World;
 
 // Opaque 64-bit user payload carried per node: an id, a pointer, an index —
 // the World never interprets it, only echoes it back in selectCut outputs.
@@ -34,6 +35,8 @@ inline constexpr uint32_t    kInvalidIndex    = 0xFFFFFFFFu;
 // Fits in one word because pages are bounded; build() enforces the limits.
 inline constexpr uint32_t kMetaChildBits  = 9;                          // <= 511 children
 inline constexpr uint32_t kMaxChildren    = (1u << kMetaChildBits) - 1;
+static_assert(kMaxChildren <= UINT16_MAX,
+              "runtime covered-child count relies on a 16-bit counter");
 inline constexpr uint32_t kMetaExpansion  = 1u << kMetaChildBits;
 inline constexpr uint32_t kMetaOffsetShift = kMetaChildBits + 1;
 inline constexpr uint32_t kMaxWideOffset  = (1u << (32 - kMetaOffsetShift)) - 1;
@@ -59,18 +62,9 @@ struct WideBlock
     WideBounds bounds;              // children's bounds, one child per lane
     float8     error;               // children's geometric error
     uint32_t   child[kWide];        // children's local indices
-#ifdef HLOD_WIDE_PAD_288
-    // A/B scaffold only: pads the block back to the 288 bytes it occupied when
-    // the lane masks were inline, with every other line of code unchanged. That
-    // makes the stride the single variable, so a measurement across the two
-    // builds is the footprint effect and nothing else.
-    uint32_t   _pad[4] = {};
-#endif
 };
-#ifndef HLOD_WIDE_PAD_288
 static_assert(sizeof(WideBlock) == 256,
               "WideBlock must stay exactly four cache lines; see the note above");
-#endif
 
 // Lane masks for one wide block, packed into the side array.
 inline constexpr uint32_t kBlockLeafShift = 8;
@@ -240,11 +234,10 @@ protected:
     size_t           byteSize_ = 0;
 };
 
-// Pinned because a PageView is embedded in every PageRt, so its size sets the
-// stride of the residency table. The header comment above claimed 64 bytes long
-// after it had stopped being true.
+// Pinned because every registered asset carries one and accidental growth
+// multiplies with asset count.
 static_assert(sizeof(void*) != 8 || sizeof(PageView) == 88,
-              "PageView must stay 88 bytes; it is embedded in every PageRt");
+              "PageView must stay 88 bytes");
 
 // ---------------------------------------------------------------------------
 // Page — an owned page
@@ -286,10 +279,19 @@ public:
     Page clone(const HlodContext& ctx = defaultContext()) const;
 
 private:
+    friend class World;
+
+    // Wrap already-validated external storage without taking ownership. The
+    // World uses this so AssetRt needs one Page object for both owned and
+    // borrowed assets instead of storing a duplicate PageView beside it.
+    static Page borrow(PageView view);
+
     void release();
     void moveFrom(Page& o) noexcept;
 
     const HlodContext* ctx_ = nullptr;
 };
+static_assert(sizeof(void*) != 8 || sizeof(Page) == 96,
+              "Page must stay a 96-byte view plus ownership pointer");
 
 } // namespace hlod

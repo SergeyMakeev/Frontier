@@ -143,6 +143,13 @@ Page Page::adopt(void* blob, size_t bytes, const HlodContext& ctx)
     return p;
 }
 
+Page Page::borrow(PageView view)
+{
+    Page p;
+    static_cast<PageView&>(p) = view;
+    return p;
+}
+
 Page Page::fromBytes(const void* blob, size_t bytes, const HlodContext& ctx)
 {
     const PageView v = PageView::fromBytes(blob, bytes);

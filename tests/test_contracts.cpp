@@ -592,8 +592,30 @@ TEST(Contracts, MemoryBudgets)
     EXPECT_LE(p4.byteSize() / p4.nodeCount(), 176u);
 
 #ifdef NDEBUG
-    // Fixed per-page World overhead (slot bookkeeping, not page data).
+    // Fixed runtime layouts. These are hot-array strides or multiply by the
+    // number of assets/pages; recording them makes accidental padding growth
+    // visible in benchmark output as well as enforcing broad ceilings here.
+    RecordProperty("assetrt_bytes", int(TA::assetRtBytes()));
     RecordProperty("pagert_bytes", int(TA::pageRtBytes()));
-    EXPECT_LE(TA::pageRtBytes(), 512u);
+    RecordProperty("overlay_bytes", int(TA::overlayBytes()));
+    RecordProperty("instance_bytes", int(TA::instanceBytes()));
+    RecordProperty("instance_tlas_bytes", int(TA::instanceTlasBytes()));
+    RecordProperty("tlas_node_bytes", int(TA::tlasNodeBytes()));
+    RecordProperty("work_item_bytes", int(TA::workItemBytes()));
+    RecordProperty("node_item_bytes", int(TA::nodeItemBytes()));
+    RecordProperty("pending_move_bytes", int(TA::pendingMoveBytes()));
+    RecordProperty("tlas_item_bytes", int(TA::tlasItemBytes()));
+    RecordProperty("morton_item_bytes", int(TA::mortonItemBytes()));
+    EXPECT_EQ(TA::assetRtBytes(), 112u);
+    EXPECT_EQ(TA::pageRtBytes(), 112u);
+    EXPECT_EQ(TA::overlayBytes(), 56u);
+    EXPECT_EQ(TA::instanceBytes(), 64u);
+    EXPECT_EQ(TA::instanceTlasBytes(), 48u);
+    EXPECT_EQ(TA::tlasNodeBytes(), 320u);
+    EXPECT_EQ(TA::workItemBytes(), 24u);
+    EXPECT_EQ(TA::nodeItemBytes(), 8u);
+    EXPECT_EQ(TA::pendingMoveBytes(), 48u);
+    EXPECT_EQ(TA::tlasItemBytes(), 4u);
+    EXPECT_EQ(TA::mortonItemBytes(), 12u);
 #endif
 }

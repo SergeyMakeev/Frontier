@@ -36,6 +36,35 @@ std::set<UserId> cutIds(const Outputs& o)
 
 } // namespace
 
+TEST(Streaming, BorrowedAssetKeepsExternalOwnership)
+{
+    HLodBuilder builder;
+    builder.createRoot(
+        42, 0.0f,
+        AABB::fromCenterExtent(float4::point(0, 0, 0), float4::vec(1, 1, 1)));
+    Page backing = builder.build();
+    const void* const originalData = backing.data();
+
+    World world;
+    const AssetHandle asset =
+        world.registerAsset(static_cast<const PageView&>(backing));
+    const World::InstanceRef instance =
+        world.addInstance(asset, float4::point(0, 0, 0));
+
+    CutResults cut;
+    selectCutUncached(
+        world,
+        makeLookAtCamera(float4::point(0, 0, -8), float4::point(0, 0, 0)),
+        CutParams{4.0f, 0.0f}, cut);
+    ASSERT_EQ(cut.currentSize(), 1u);
+    EXPECT_EQ(payloadOf(world, currentCut(cut).front()), 42u);
+
+    world.removeInstance(instance);
+    world.releaseAsset(asset);
+    EXPECT_TRUE(backing.valid());
+    EXPECT_EQ(backing.data(), originalData);
+}
+
 // ---------------------------------------------------------------------------
 // All-or-nothing refinement: a parent refines only when EVERY child is
 // covered by resident cuts; ideal-only entries expose what the caller may load.

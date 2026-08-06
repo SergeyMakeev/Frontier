@@ -434,67 +434,6 @@ inline uint32_t testWideAabb(const WideBounds& b, const Frustum& fr,
     return alive & ((1u << kWide) - 1);
 }
 
-// Same test, but the eight per-lane plane masks are returned packed one byte
-// per lane in a single uint64 instead of written through a byte array.
-//
-// The byte-array form spends up to 8 dependent load-modify-stores per plane
-// clearing one bit at a time (48 per block in the worst case). Packed, the
-// same update is a lane-mask expand and one AND: `inside` (a bit per lane)
-// becomes 0xFF per set lane, and that selects which bytes lose plane bit p.
-// One 0xFF byte per set lane. Plain ALU rather than pdep: pdep is a single
-// fast op on some x86 generations and microcoded (tens of cycles) on others,
-// and this sits in the innermost loop.
-inline uint64_t laneBytes(uint32_t laneMask)
-{
-    // Broadcast, keep bit l in byte l, then saturate each nonzero byte to 0xFF.
-    uint64_t x = (uint64_t(laneMask) * 0x0101010101010101ull) & 0x8040201008040201ull;
-    x = (x + 0x7F7F7F7F7F7F7F7Full) & 0x8080808080808080ull;
-    return (x >> 7) * 0xFFull;
-}
-
-inline uint32_t testWideAabbPacked(const WideBounds& b, const Frustum& fr,
-                                  uint8_t inMask, uint64_t& outMasks)
-{
-    outMasks = laneBytes((1u << kWide) - 1) & (0x0101010101010101ull * inMask);
-    if (!inMask) return (1u << kWide) - 1;
-
-    const __m256 mnx = _mm256_load_ps(b.mnx.v), mny = _mm256_load_ps(b.mny.v);
-    const __m256 mnz = _mm256_load_ps(b.mnz.v), mxx = _mm256_load_ps(b.mxx.v);
-    const __m256 mxy = _mm256_load_ps(b.mxy.v), mxz = _mm256_load_ps(b.mxz.v);
-    const __m256 zero = _mm256_setzero_ps();
-
-    uint32_t alive = (1u << kWide) - 1;
-    uint64_t masks = outMasks;
-    for (uint32_t p = 0; p < 6; ++p)
-    {
-        if (!((inMask >> p) & 1)) continue;
-        const float4 pl = fr.plane[p];
-        const __m256 nx = _mm256_set1_ps(pl.x), ny = _mm256_set1_ps(pl.y);
-        const __m256 nz = _mm256_set1_ps(pl.z), d = _mm256_set1_ps(pl.w);
-        const __m256 sx = _mm256_cmp_ps(nx, zero, _CMP_LT_OQ);
-        const __m256 sy = _mm256_cmp_ps(ny, zero, _CMP_LT_OQ);
-        const __m256 sz = _mm256_cmp_ps(nz, zero, _CMP_LT_OQ);
-
-        const __m256 px = _mm256_blendv_ps(mxx, mnx, sx);
-        const __m256 py = _mm256_blendv_ps(mxy, mny, sy);
-        const __m256 pz = _mm256_blendv_ps(mxz, mnz, sz);
-        const __m256 dp = _mm256_fmadd_ps(
-            nx, px, _mm256_fmadd_ps(ny, py, _mm256_fmadd_ps(nz, pz, d)));
-        alive &= ~uint32_t(_mm256_movemask_ps(_mm256_cmp_ps(dp, zero, _CMP_LT_OQ)));
-
-        const __m256 qx = _mm256_blendv_ps(mnx, mxx, sx);
-        const __m256 qy = _mm256_blendv_ps(mny, mxy, sy);
-        const __m256 qz = _mm256_blendv_ps(mnz, mxz, sz);
-        const __m256 dn = _mm256_fmadd_ps(
-            nx, qx, _mm256_fmadd_ps(ny, qy, _mm256_fmadd_ps(nz, qz, d)));
-        const uint32_t inside =
-            uint32_t(_mm256_movemask_ps(_mm256_cmp_ps(dn, zero, _CMP_GE_OQ)));
-        masks &= ~(laneBytes(inside) & (0x0101010101010101ull << p));
-    }
-    outMasks = masks;
-    return alive & ((1u << kWide) - 1);
-}
-#define HLOD_HAVE_PACKED_WIDE_TEST 1
 #elif HLOD_SIMD_NEON
 inline uint32_t testWideAabb(const WideBounds& b, const Frustum& fr,
                              uint8_t inMask, uint8_t outMasks[kWide])
@@ -629,21 +568,6 @@ inline uint32_t testWideAabb(const WideBounds& b, const Frustum& fr,
             outMasks[l] = uint8_t(outMasks[l] & (dn >= 0.0f ? ~(1u << p) : 0xFFu));
         }
     }
-    return alive;
-}
-#endif
-
-#ifndef HLOD_HAVE_PACKED_WIDE_TEST
-// Portable stand-in: the byte array, then packed. Correct everywhere; the
-// point of the packed form is the AVX2 path above, where it is native.
-inline uint32_t testWideAabbPacked(const WideBounds& b, const Frustum& fr,
-                                   uint8_t inMask, uint64_t& outMasks)
-{
-    uint8_t        m[kWide];
-    const uint32_t alive = testWideAabb(b, fr, inMask, m);
-    uint64_t       packed = 0;
-    for (uint32_t l = 0; l < kWide; ++l) packed |= uint64_t(m[l]) << (8 * l);
-    outMasks = packed;
     return alive;
 }
 #endif

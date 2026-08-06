@@ -67,6 +67,7 @@ struct AssetHandle
     uint32_t generation = 0;
     bool valid() const { return slot != kInvalidIndex; }
 };
+static_assert(sizeof(AssetHandle) == 8, "AssetHandle must stay 64 bits");
 
 // Attached page (a "mount"): one placement of an asset in the world. Returned
 // by addInstance/attachPage. Compose node handles with nodeAt(); node indices
@@ -77,6 +78,7 @@ struct PageHandle
     uint32_t generation = 0;
     bool valid() const { return slot != kInvalidIndex; }
 };
+static_assert(sizeof(PageHandle) == 8, "PageHandle must stay 64 bits");
 
 // Resolved node reference: page slot + node index + generation stamp, packed
 // into 64 bits. A mount slot and a page-local node index each get 20 bits; the
@@ -337,10 +339,30 @@ private:
 
     struct Rec
     {
-        uint32_t generation = 0;
+        static constexpr uint32_t kPending = 1u << 31;
+
+        // Page generations already fit in 24 bits (NodeHandle). The otherwise
+        // unused high bit carries dirty-list membership, cutting this dense
+        // per-page array from 12 bytes to 8.
+        uint32_t generationAndPending = 0;
         uint32_t lastUsed = 0;
-        bool     pending = false;
+
+        uint32_t generation() const
+        {
+            return generationAndPending & NodeHandle::kGenerationMask;
+        }
+        bool pending() const { return (generationAndPending & kPending) != 0; }
+        void setGeneration(uint32_t generation)
+        {
+            generationAndPending = generation & NodeHandle::kGenerationMask;
+        }
+        void setPending(bool pending)
+        {
+            if (pending) generationAndPending |= kPending;
+            else generationAndPending &= ~kPending;
+        }
     };
+    static_assert(sizeof(Rec) == 8, "page-use record must stay 8 bytes");
 
     const World*     world_ = nullptr;
     std::vector<Rec> rec_;
@@ -381,7 +403,7 @@ private:
 // of those frames. The slope budget keeps unaffected records reusable while
 // preserving the exact node set. Measured by BM_View_Zoom at 20k
 // instances, halfLife 8 and a zoom step every 120 frames, it removes 39% of the
-// cut time without growing the 48-byte record. Threshold changes still bump an
+// cut time without growing the compact record. Threshold changes still bump an
 // epoch because they change every stored slope at once.
 //
 // Damping and reuse are independent. A half-life of 0 makes the arithmetic
@@ -499,7 +521,7 @@ private:
     // usually still streaming and being re-walked anyway.
     static constexpr uint32_t kMaxDeps = 2;
 
-    // EXACTLY 48 BYTES, and that is the whole design constraint.
+    // EXACTLY 44 BYTES, and that is the whole design constraint.
     //
     // This record is read for every visible instance, indexed by instance id,
     // so it is a random access per instance -- the one new memory stream the
@@ -524,15 +546,15 @@ private:
         uint32_t epoch = 0;          // cache epoch (threshold generation)
         uint32_t cutVersion = 0;     // unique instance transform/deform version
         uint32_t begin = 0;          // block in store_
-        // Three 10-bit counts for [shared, currentOnly, idealOnly]. A record
-        // with more than 1023 entries in any one bucket is simply not cached.
+        // Three 10-bit counts for [shared, currentOnly, idealOnly], plus the
+        // two-bit dependency count. A record with more than 1023 entries in
+        // any one bucket is simply not cached.
         uint32_t counts = 0;
         uint32_t capacity = 0;
         uint32_t depSlot[kMaxDeps]{};
         uint32_t depVersion[kMaxDeps]{};
-        uint32_t depCount = 0;
     };
-    static_assert(sizeof(Rec) == 48, "View::Rec must stay 48 bytes");
+    static_assert(sizeof(Rec) == 44, "View::Rec must stay 44 bytes");
 
     void compact();
 
@@ -551,7 +573,7 @@ private:
     // while positionTravel + kSlope * kTravel stays below its saved budget:
     // both path lengths conservatively bound movement of every LOD flip point.
     // This replaces storing a camera and projection value per instance with
-    // two scalar odometers and one per-record slope, keeping Rec at 48 bytes.
+    // two scalar odometers and one per-record slope, keeping Rec at 44 bytes.
     // Doubling back is conservative; a teleport consumes the budget at once.
     float    travel_ = 0.0f;
     float    kTravel_ = 0.0f;
@@ -816,27 +838,47 @@ private:
         uint32_t index = kInvalidIndex;
         bool valid() const { return slot != kInvalidIndex; }
     };
+    static_assert(sizeof(NodeRef) == 8, "internal node reference must stay 8 bytes");
 
-    // A registered page: the immutable bytes plus the bookkeeping that keeps
-    // them alive. `owned` is empty for borrowed pages.
+    // A registered page: one owning-or-borrowing wrapper around the immutable
+    // bytes plus the bookkeeping that keeps them alive. Page's null allocator
+    // marks borrowed storage, so no duplicate PageView is needed here.
     struct AssetRt
     {
-        PageView view;
-        Page     owned;
+        static constexpr uint32_t kRegistered = 1u << 31;
+
+        Page     page;
         uint32_t rootMount = kInvalidIndex;
         uint32_t generation = 0;
-        uint32_t mountRefs = 0;      // PageRt entries referencing these bytes
+        // Low 31 bits count PageRt references; the high bit records the
+        // caller's AssetHandle ownership. Page validity is the in-use flag.
+        uint32_t mountRefsAndRegistered = 0;
         uint32_t instanceRefs = 0;   // Instances rooted at rootMount
-        bool     registered = false; // user holds an AssetHandle
-        bool     inUse = false;
+
+        bool inUse() const { return page.valid(); }
+        bool registered() const
+        {
+            return (mountRefsAndRegistered & kRegistered) != 0;
+        }
+        uint32_t mountRefs() const
+        {
+            return mountRefsAndRegistered & ~kRegistered;
+        }
+        void setRegistered(bool registered)
+        {
+            if (registered) mountRefsAndRegistered |= kRegistered;
+            else mountRefsAndRegistered &= ~kRegistered;
+        }
+        void addMountRef() { ++mountRefsAndRegistered; }
+        void removeMountRef() { --mountRefsAndRegistered; }
     };
+    static_assert(sizeof(AssetRt) == 112, "asset runtime state must stay 112 bytes");
 
     // A mount: one placement of an asset's bytes, with the mutable state that
     // placement needs. There is exactly one mount per (asset, attachment
     // point) no matter how many instances walk it.
     struct PageRt
     {
-        PageView              page;           // borrowed from the asset
         uint32_t              asset = kInvalidIndex;
         // Effective error ceiling for every node in this page: the owning
         // expansion node's effective error, or FLT_MAX for a root page.
@@ -847,9 +889,15 @@ private:
         // min8. That is what lets a single page back many attachments — and
         // it turns attach from an O(nodeCount) write pass into O(1).
         float                 errClamp = FLT_MAX;
-        std::vector<uint8_t>  resident;        // this node's payload is loaded
-        std::vector<uint8_t>  covered;         // self or a complete resident descendant cut
-        std::vector<uint32_t> coveredChildren; // covered immediate children
+        // Two bits per node in one byte: payload residency and whether the
+        // node has a complete resident cut. Keeping them together halves the
+        // state bytes and removes one allocation per mounted page.
+        static constexpr uint8_t kResident = 1u << 0;
+        static constexpr uint8_t kCovered = 1u << 1;
+        std::vector<uint8_t> nodeState;
+        // A page node has at most kMaxChildren (511), so 16 bits are ample and
+        // halve this per-node propagation counter.
+        std::vector<uint16_t> coveredChildren;
         // Bumped by anything that can change what a walk of this page emits:
         // a child attaching or detaching, a payload becoming resident or
         // ceasing to be, a new error clamp. A View records this per
@@ -859,15 +907,50 @@ private:
         uint32_t   generation = 0;            // bumped per attach; invalidates handles
         uint32_t   lastTouched = 0;           // world frame of last walk touch
         uint32_t   lruPrev = kInvalidIndex, lruNext = kInvalidIndex;
-        uint32_t   attachedChildPages = 0;
-        bool       pinned = false;
-        bool       inUse  = false;
+        static constexpr uint32_t kPinned = 1u << 31;
+        uint32_t   attachedChildrenAndPinned = 0;
         NodeRef    owner;                     // expansion node above; invalid for root pages
         // Attached child slot per expansion node, kInvalidIndex when
         // collapsed. Allocated on the page's first child attach; this IS the
         // expansion link — there is no by-id index.
         std::vector<uint32_t> expSlot;
+
+        bool isResident(uint32_t node) const
+        {
+            return (nodeState[node] & kResident) != 0;
+        }
+        bool isCovered(uint32_t node) const
+        {
+            return (nodeState[node] & kCovered) != 0;
+        }
+        void setResident(uint32_t node, bool resident)
+        {
+            if (resident) nodeState[node] |= kResident;
+            else nodeState[node] &= uint8_t(~kResident);
+        }
+        void setCovered(uint32_t node, bool covered)
+        {
+            if (covered) nodeState[node] |= kCovered;
+            else nodeState[node] &= uint8_t(~kCovered);
+        }
+        bool inUse() const { return asset != kInvalidIndex; }
+        bool pinned() const
+        {
+            return (attachedChildrenAndPinned & kPinned) != 0;
+        }
+        void setPinned(bool pinned)
+        {
+            if (pinned) attachedChildrenAndPinned |= kPinned;
+            else attachedChildrenAndPinned &= ~kPinned;
+        }
+        uint32_t attachedChildPages() const
+        {
+            return attachedChildrenAndPinned & ~kPinned;
+        }
+        void addAttachedChild() { ++attachedChildrenAndPinned; }
+        void removeAttachedChild() { --attachedChildrenAndPinned; }
     };
+    static_assert(sizeof(PageRt) == 112, "mounted-page state must stay 112 bytes");
 
     // Copy-on-write bounds for one (instance, mount) pair: the only part of a
     // page a deformed instance stops sharing. Allocated on that instance's
@@ -877,20 +960,12 @@ private:
     {
         uint32_t slot = kInvalidIndex;   // mount this shadows
         uint32_t generation = 0;         // that mount's generation when taken
-#ifdef HLOD_OVERLAY_FULL_PAGE
-        // Experiment: privatise the WHOLE page on first deform rather than
-        // only its bounds. Topology and boxes land back in one contiguous
-        // blob, so refit walks a single region again — at the cost of the
-        // instance dropping out of sharing entirely. A/B it with
-        // BM_LeafRefit_* and BM_DeformedCutCost.
-        Page page;
-#else
         std::vector<AABB>       bbox;    // nodeCount
         std::vector<WideBounds> wide;    // wideCount (bounds only; the rest of
                                          // each WideBlock stays shared)
-#endif
-        bool inUse = false;
+        bool inUse() const { return slot != kInvalidIndex; }
     };
+    static_assert(sizeof(Overlay) == 56, "bounds overlay header must stay 56 bytes");
 
     // (mount slot -> overlay index), kept sorted by slot on each instance so
     // the traversal can binary search it. Empty for undeformed instances,
@@ -900,6 +975,7 @@ private:
         uint32_t slot;
         uint32_t index;
     };
+    static_assert(sizeof(OverlayRef) == 8, "overlay reference must stay 8 bytes");
 
     // Exactly one cache line containing everything the cut walk and
     // View read per visible instance. TLAS-only state lives in the
@@ -928,18 +1004,32 @@ private:
     {
         AABB     worldBox;
         float    maxErrWorld = 0.0f;
-        uint32_t asset = kInvalidIndex;
         uint32_t mask = ~0u;
-        uint32_t tlasNode = kInvalidIndex;
-        uint32_t tlasLane = 0;
+        // TLAS node[24] | lane[3] | escaped[1]. Node count is bounded by the
+        // same 24-bit population limit as InstanceId; the high bits were
+        // otherwise padding and cold flags.
+        uint32_t tlasPlacement = kInvalidInstanceId;
         uint32_t liveIndex = kInvalidIndex;
         // Escape budgeting is population-based: once this instance has grown
         // beyond its build-time lane, later growth before the next rebuild
         // must not charge the same leaf again.
-        bool     escapedSinceBuild = false;
+
+        uint32_t tlasNode() const { return tlasPlacement & kInstanceIdMask; }
+        uint32_t tlasLane() const { return (tlasPlacement >> 24) & 7u; }
+        bool escapedSinceBuild() const { return (tlasPlacement & (1u << 27)) != 0; }
+        void setTlasPlacement(uint32_t node, uint32_t lane)
+        {
+            tlasPlacement = (node & kInstanceIdMask) | ((lane & 7u) << 24);
+        }
+        void clearTlasPlacement() { tlasPlacement = kInvalidInstanceId; }
+        void setEscapedSinceBuild(bool escaped)
+        {
+            if (escaped) tlasPlacement |= 1u << 27;
+            else tlasPlacement &= ~(1u << 27);
+        }
     };
-    static_assert(sizeof(InstanceTlas) == 64,
-                  "TLAS instance state should stay one cache line");
+    static_assert(sizeof(InstanceTlas) == 48,
+                  "TLAS instance state must stay 48 bytes");
 
     // nullptr when the ref is stale (slot recycled) or invalid.
     Instance* resolveInstance(InstanceRef ref);
@@ -954,32 +1044,81 @@ private:
         uint32_t   validMask = 0;
         int32_t    parent = -1;
     };
+    static_assert(sizeof(TlasNode) == 320,
+                  "SIMD TLAS node must stay five cache lines");
 
     struct TlasItem;
+
+    // A TLAS hit is a 24-bit dense instance id plus its six-bit plane mask.
+    struct VisibleItem
+    {
+        uint32_t packed = 0;
+
+        VisibleItem() = default;
+        VisibleItem(InstanceId instance, uint8_t mask)
+            : packed((instance & kInstanceIdMask) |
+                     (uint32_t(mask & kAllPlanes) << kInstanceIdBits))
+        {}
+        InstanceId instance() const { return packed & kInstanceIdMask; }
+        uint8_t mask() const { return uint8_t(packed >> kInstanceIdBits); }
+    };
+    static_assert(sizeof(VisibleItem) == 4, "visible TLAS hit must stay 4 bytes");
 
     // One page queued on an instance walk. Which bounds this instance sees is
     // resolved once, when the page is pushed, so the inner loop never asks
     // whether there is an overlay — it just reads through a stride.
     struct WorkItem
     {
-        uint32_t      slot;
         WideBoundsRef wide;   // page's (interleaved) or overlay's (packed)
-        uint8_t       current;
-        uint8_t       ideal;
-        uint8_t       mask;
+        // slot[20] | plane mask[6] | current[1] | ideal[1]
+        uint32_t      state = 0;
+
+        WorkItem() = default;
+        WorkItem(uint32_t slot, WideBoundsRef bounds, uint8_t current,
+                 uint8_t ideal, uint8_t mask)
+            : wide(bounds),
+              state((slot & NodeHandle::kSlotMask) |
+                    (uint32_t(mask & 0x3fu) << NodeHandle::kSlotBits) |
+                    (uint32_t(current != 0) << 26) |
+                    (uint32_t(ideal != 0) << 27))
+        {}
+        uint32_t slot() const { return state & NodeHandle::kSlotMask; }
+        uint8_t mask() const
+        {
+            return uint8_t((state >> NodeHandle::kSlotBits) & 0x3fu);
+        }
+        bool current() const { return (state & (1u << 26)) != 0; }
+        bool ideal() const { return (state & (1u << 27)) != 0; }
     };
+    static_assert(sizeof(WorkItem) == 24, "page work item must stay 24 bytes");
 
     // Node visit carried on the walk's explicit DFS stack; err and planes are
     // computed by the parent's wide test; current/ideal identify which walks
     // still contain the node.
     struct NodeItem
     {
-        uint32_t node;
         float    err;
-        uint8_t  planes;
-        uint8_t  current;
-        uint8_t  ideal;
+        // node[20] | plane mask[6] | current[1] | ideal[1]
+        uint32_t state = 0;
+
+        NodeItem() = default;
+        NodeItem(uint32_t node, float error, uint8_t planes, uint8_t current,
+                 uint8_t ideal)
+            : err(error),
+              state((node & NodeHandle::kIndexMask) |
+                    (uint32_t(planes & 0x3fu) << NodeHandle::kIndexBits) |
+                    (uint32_t(current != 0) << 26) |
+                    (uint32_t(ideal != 0) << 27))
+        {}
+        uint32_t node() const { return state & NodeHandle::kIndexMask; }
+        uint8_t planes() const
+        {
+            return uint8_t((state >> NodeHandle::kIndexBits) & 0x3fu);
+        }
+        bool current() const { return (state & (1u << 26)) != 0; }
+        bool ideal() const { return (state & (1u << 27)) != 0; }
     };
+    static_assert(sizeof(NodeItem) == 8, "node work item must stay 8 bytes");
 
     // Everything one instance walk needs. Serial selection uses slot 0; a
     // parallel selection gives each worker its own, then concatenates in
@@ -1029,9 +1168,14 @@ private:
     }
 
     uint32_t allocAsset();
-    uint32_t createAsset(Page&& owned, PageView borrowed, bool registered);
+    uint32_t createAsset(Page&& page, bool registered);
     void     destroyAssetIfUnused(uint32_t asset);
     const AssetRt* resolveAsset(AssetHandle h) const;
+
+    const PageView& pageView(const PageRt& rt) const
+    {
+        return assets_[rt.asset].page;
+    }
 
     uint32_t allocSlot();
     uint32_t registerPage(uint32_t asset, NodeRef owner, bool pinned);
@@ -1077,7 +1221,7 @@ private:
     int32_t tlasBuildRange(std::vector<uint32_t>& items, int lo, int hi, int32_t parent);
     int  tlasSplit(std::vector<uint32_t>& items, int lo, int hi);
     void tlasQuery(const Camera& view, float minPix,
-                   std::vector<std::pair<uint32_t, uint8_t>>& outVisible,
+                   std::vector<VisibleItem>& outVisible,
                    std::vector<TlasItem>& stack) const;
     void recomputeInstanceBounds(InstanceId id);
     void tlasOnInstanceMoved(InstanceId id);
@@ -1159,16 +1303,53 @@ private:
     // the wrong page or the wrong instance.
     struct PendingMove
     {
-        uint32_t instance, instGeneration;
-        uint32_t slot, generation, index;
-        AABB     box;
+        AABB       box;
+        NodeHandle node;
+        uint32_t   instance;
+        uint32_t   instGeneration;
     };
+    static_assert(sizeof(PendingMove) == 48, "queued bounds edit must stay 48 bytes");
     std::vector<PendingMove> pendingMoves_;
 
     // Shared TLAS build scratch. Per-selection scratch lives in View.
-    struct TlasItem { int32_t node; uint8_t mask; };
-    std::vector<std::pair<uint64_t, uint32_t>> tlasKeys_;
-    std::vector<std::pair<uint64_t, uint32_t>> tlasKeysTmp_;
+    struct TlasItem
+    {
+        uint32_t packed = 0;
+
+        TlasItem() = default;
+        TlasItem(int32_t node, uint8_t mask)
+            : packed((uint32_t(node) & kInstanceIdMask) |
+                     (uint32_t(mask & kAllPlanes) << kInstanceIdBits))
+        {}
+        uint32_t node() const { return packed & kInstanceIdMask; }
+        uint8_t mask() const { return uint8_t(packed >> kInstanceIdBits); }
+    };
+    static_assert(sizeof(TlasItem) == 4, "TLAS stack item must stay 4 bytes");
+
+    // A normal {uint64 key, uint32 id} pair has 4 bytes of tail padding. Two
+    // word halves retain the full 63-bit key with a 12-byte stride in both
+    // radix-sort buffers.
+    struct MortonItem
+    {
+        uint32_t keyLo = 0;
+        uint32_t keyHi = 0;
+        InstanceId instance = 0;
+
+        MortonItem() = default;
+        MortonItem(uint64_t key, InstanceId id)
+            : keyLo(uint32_t(key)), keyHi(uint32_t(key >> 32)), instance(id)
+        {}
+        uint64_t key() const { return uint64_t(keyLo) | (uint64_t(keyHi) << 32); }
+        bool operator<(const MortonItem& other) const
+        {
+            const uint64_t a = key(), b = other.key();
+            return a < b || (a == b && instance < other.instance);
+        }
+    };
+    static_assert(sizeof(MortonItem) == 12, "Morton sort item must stay 12 bytes");
+
+    std::vector<MortonItem> tlasKeys_;
+    std::vector<MortonItem> tlasKeysTmp_;
     std::vector<int32_t>                       tlasLevelTmp_;
     std::vector<uint32_t>                      tlasItemsTmp_;
 };

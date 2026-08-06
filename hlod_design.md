@@ -230,11 +230,12 @@ when their last mount and instance reference disappear.
 
 Each mounted page has compact runtime arrays parallel to its nodes:
 
-- `resident[i]` says the caller has the payload available;
-- `covered[i]` says either that payload is resident or its descendants provide
-  a complete resident structural cover; and
-- `coveredChildren[i]` incrementally maintains that summary from immediate
-  children, including attached child pages.
+- one byte holds both `resident` (the caller has the payload available) and
+  `covered` (that payload or its descendants provide a complete resident
+  structural cover); and
+- one 16-bit `coveredChildren` count incrementally maintains that summary from
+  immediate children, including attached child pages. The authored fanout cap
+  is 511, so the count cannot overflow.
 
 Residency changes propagate coverage toward the root. A current-cut node may
 refine whenever more detailed resident nodes completely cover the region
@@ -379,7 +380,7 @@ Important limits are explicit:
 - A cached call walks its camera serially, but different views can run
   concurrently because all mutable query state is view-owned.
 
-Each per-instance record is 48 bytes plus storage for recorded cut entries.
+Each per-instance record is 44 bytes plus storage for recorded cut entries.
 `reset()` clears logical state and its damping window but retains capacity,
 which is appropriate for camera cuts and teleports. `setHalfLife(0)` disables
 damping exactly. `setReuseEnabled(false)` disables temporal cut reuse while

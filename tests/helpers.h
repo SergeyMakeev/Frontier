@@ -58,9 +58,10 @@ struct World::TestAccess
         for (uint32_t s = 0; s < uint32_t(w.slots_.size()); ++s)
         {
             const PageRt& rt = w.slots_[s];
-            if (!rt.inUse) continue;
-            for (uint32_t i = 1; i < rt.page.nodeCount(); ++i)
-                if (rt.page.payload[i] == payload)
+            if (!rt.inUse()) continue;
+            const PageView& page = w.pageView(rt);
+            for (uint32_t i = 1; i < page.nodeCount(); ++i)
+                if (page.payload[i] == payload)
                     return NodeHandle{s, i, rt.generation};
         }
         return NodeHandle{};
@@ -73,7 +74,7 @@ struct World::TestAccess
     }
     static const PageView& pageOf(World& w, UserPayload anyNodeInPage)
     {
-        return w.slots_[requireByScan(w, anyNodeInPage).slot()].page;
+        return w.pageView(w.slots_[requireByScan(w, anyNodeInPage).slot()]);
     }
     static uint32_t lastTouched(World& w, UserPayload anyNodeInPage)
     {
@@ -86,7 +87,17 @@ struct World::TestAccess
     static bool tlasDirty(World& w) { return w.tlasDirty_; }
     static uint32_t tlasEscapes(World& w) { return w.tlasEscapes_; }
     static size_t tlasNodeCount(World& w) { return w.tlasNodes_.size(); }
+    static size_t assetRtBytes() { return sizeof(AssetRt); }
     static size_t pageRtBytes() { return sizeof(PageRt); }
+    static size_t overlayBytes() { return sizeof(Overlay); }
+    static size_t instanceBytes() { return sizeof(Instance); }
+    static size_t instanceTlasBytes() { return sizeof(InstanceTlas); }
+    static size_t tlasNodeBytes() { return sizeof(TlasNode); }
+    static size_t workItemBytes() { return sizeof(WorkItem); }
+    static size_t nodeItemBytes() { return sizeof(NodeItem); }
+    static size_t pendingMoveBytes() { return sizeof(PendingMove); }
+    static size_t tlasItemBytes() { return sizeof(TlasItem); }
+    static size_t mortonItemBytes() { return sizeof(MortonItem); }
 
     // Invariant (D) across a page boundary is a per-mount scalar now, not a
     // rewrite of the child page's error array (page bytes are immutable).
@@ -134,8 +145,12 @@ struct World::TestAccess
                                                                float minPix)
     {
         std::vector<std::pair<uint32_t, uint8_t>> out;
+        std::vector<World::VisibleItem> packed;
         std::vector<World::TlasItem> stack;
-        w.tlasQuery(v, minPix, out, stack);
+        w.tlasQuery(v, minPix, packed, stack);
+        out.reserve(packed.size());
+        for (const World::VisibleItem item : packed)
+            out.emplace_back(item.instance(), item.mask());
         return out;
     }
 
@@ -192,7 +207,7 @@ struct World::TestAccess
                     const World::InstanceTlas& spatial = w.instanceTlas_[id];
                     if (!inst.alive) return "dead instance still in the tree";
                     if (seen[id]++) return "instance in the tree twice";
-                    if (spatial.tlasNode != uint32_t(ni) || spatial.tlasLane != l)
+                    if (spatial.tlasNode() != uint32_t(ni) || spatial.tlasLane() != l)
                         return "instance back-pointer disagrees with its lane";
                     if (!lane.contains(spatial.worldBox))
                         return "lane does not contain its instance";
@@ -233,15 +248,16 @@ struct World::TestAccess
         while (true)
         {
             const PageRt& rt = w.slots_[r.slot];
-            uint32_t i = rt.page.parent[r.index];
+            const PageView& page = w.pageView(rt);
+            uint32_t i = page.parent[r.index];
             while (i != 0)
             {
-                out.push_back(rt.page.payload[i]);
-                i = rt.page.parent[i];
+                out.push_back(page.payload[i]);
+                i = page.parent[i];
             }
             if (!rt.owner.valid()) return out;
             r = rt.owner;
-            out.push_back(w.slots_[r.slot].page.payload[r.index]);
+            out.push_back(w.pageView(w.slots_[r.slot]).payload[r.index]);
         }
     }
 
@@ -277,7 +293,7 @@ private:
                             const Camera& local,
                             const CutParams& p, RefResult& out)
     {
-        const PageView& pg = w.slots_[slot].page;
+        const PageView& pg = w.pageView(w.slots_[slot]);
         uint32_t c = node + 1;
         for (uint32_t k = 0; k < pg.childCount(node); ++k)
         {
@@ -293,7 +309,7 @@ private:
                         RefResult& out)
     {
         const PageRt& rt = w.slots_[slot];
-        const PageView& pg = rt.page;
+        const PageView& pg = w.pageView(rt);
         // Whatever bounds this instance sees: its overlay if it has been
         // deformed, the shared page otherwise.
         const AABB* bbox = w.boundsFor(inst, slot, rt);
@@ -311,7 +327,7 @@ private:
         const NodeHandle here{slot, i, rt.generation};
         if (!ideal)
         {
-            if (rt.resident[i])
+            if (rt.isResident(i))
             {
                 out.cut.currentOnly.emplace_back(here, err, p.threshold, instance);
                 return;
@@ -319,7 +335,7 @@ private:
         }
         else if (!wants)
         {
-            const bool shared = current && rt.resident[i];
+            const bool shared = current && rt.isResident(i);
             (shared ? out.cut.shared : out.cut.idealOnly)
                 .emplace_back(here, err, p.threshold, instance);
             if (!current || shared) return;
