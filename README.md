@@ -110,10 +110,11 @@ The representative workload resembles a forest, city, or prop field:
   calls with six persistent worker threads. Measurements exclude rendering,
   asset IO, residency changes, and instance spawning or removal.
 
-Times are the best observed values from at least five 600-frame runs on a noisy
-shared 64-hardware-thread, 2.4 GHz EPYC, using one thread, MSVC 19.51, Release
-`/O2 /arch:AVX2`, on 2026-08-05. Taking the best result estimates the
-algorithm's uncontended cost; real frame time can be higher under host load.
+The primary tables are the best observed values from at least five 600-frame
+runs on a noisy shared 64-hardware-thread, 2.4 GHz EPYC, using one thread,
+MSVC 19.51, Release `/O2 /arch:AVX2`, on 2026-08-05. Taking the best result
+estimates the algorithm's uncontended cost; real frame time can be higher under
+host load. A second machine is reported after the primary tables.
 
 ### Startup
 
@@ -188,6 +189,38 @@ in the table. The concurrent arms use six persistent worker threads; thread
 creation is excluded. Six `View` objects occupy about 36 MiB. Scaling is below 6×
 because the views share memory bandwidth and cache capacity, but the read-only
 selection phase removes serialization between them.
+
+### Second machine: Core i9-12900K, 128 GB
+
+The same committed benchmark suite was run on a Core i9-12900K with 128 GB of
+memory, Windows, MSVC 19.44, and Release `/O2 /arch:AVX2` on 2026-08-06. The
+run showed substantial scheduler and CPU-state variance, so these are the best
+of five captured repetitions, consistent with the methodology above.
+
+| Startup operation | Best time |
+|---|---:|
+| Create the 80,000-instance world | 8.1 ms |
+| First 80,000-instance published selection cycle | 52.8 ms |
+| Create the 10,000-instance / 700-asset world | 15.2 ms |
+| First 10,000-instance published selection cycle | 9.7 ms |
+
+Steady-frame results use the same cuts, visibility, reuse rates, and moving
+cohorts as the primary tables. `applyUpdates` remained below 0.001 ms per
+frame.
+
+| Scenario | Submit transforms | `selectCut` | Total HLodTree work |
+|---|---:|---:|---:|
+| 80k, moving camera and 4,000 objects | 0.667 ms | 0.659 ms | 1.326 ms |
+| 80k, static camera and 4,000 objects | 0.501 ms | 0.442 ms | 0.943 ms |
+| 80k, moving camera and static objects | n/a | 0.269 ms | 0.269 ms |
+| 10k, moving camera and 1,000 objects | 76 µs | 139 µs | 216 µs |
+| 10k, static camera and 1,000 objects | 82 µs | 128 µs | 210 µs |
+| 10k, moving camera and static objects | n/a | 91 µs | 91 µs |
+
+| Six-view selection | Serial | Concurrent | Speedup |
+|---|---:|---:|---:|
+| Static objects | 2.366 ms | 1.654 ms | 1.43× |
+| 4,000 moving objects | 4.161 ms | 1.765 ms | 2.36× |
 
 The main distinction is visible immediately: creating the quality TLAS is a
 one-time cost, transform updates are relatively small, and object motion makes
