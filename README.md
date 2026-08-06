@@ -110,31 +110,43 @@ The representative workload resembles a forest, city, or prop field:
   calls with six persistent worker threads. Measurements exclude rendering,
   asset IO, residency changes, and instance spawning or removal.
 
-The primary tables are the best observed values from at least five 600-frame
-runs on a noisy shared 64-hardware-thread, 2.4 GHz EPYC, using one thread,
-MSVC 19.51, Release `/O2 /arch:AVX2`, on 2026-08-05. Taking the best result
-estimates the algorithm's uncontended cost; real frame time can be higher under
-host load. A second machine is reported after the primary tables.
+All values are the best observed result from five 600-frame runs. Taking the
+best result estimates the algorithm's uncontended cost; real frame time can be
+higher under host load. Both builds use MSVC Release `/O2 /arch:AVX2`.
+
+| Label | Hardware | Compiler | Captured |
+|---|---|---|---|
+| EPYC | Shared 64-hardware-thread, 2.4 GHz EPYC host | MSVC 19.51 | 2026-08-05 |
+| i9-12900K | Core i9-12900K, 128 GB, Windows | MSVC 19.44 | 2026-08-06 |
+
+The i9-12900K run showed substantial scheduler and CPU-state variance; the
+same best-of-five rule is used for both machines.
 
 ### Startup
 
-| Operation | Time | Included work |
-|---|---:|---|
-| Create the world | 10.2-11.4 ms | Build and register the shared asset, add 80,000 instances, and mark its payloads resident |
-| First published selection cycle | 53.1-58.0 ms | `applyUpdates` builds the initial quality TLAS; `selectCut` queries it, produces the first cut, and populates the `View` |
+| Operation | EPYC | i9-12900K | Included work |
+|---|---:|---:|---|
+| Create the 80,000-instance world | 10.2 ms | 8.1 ms | Build and register the shared asset, add instances, and mark payloads resident |
+| First 80,000-instance selection cycle | 53.1 ms | 52.8 ms | Build the initial quality TLAS, publish, select the first cut, and populate the `View` |
+| Create the 10,000-instance / 700-asset world | 13.1 ms | 15.2 ms | Build and register 700 assets, add instances, and mark payloads resident |
+| First 10,000-instance selection cycle | 5.4 ms | 9.7 ms | Build the initial quality TLAS, publish, select the first cut, and populate the `View` |
 
 World creation does not force the initial quality TLAS build; the first
 `applyUpdates` performs it before publishing the read-only snapshot. Treat the
 first published selection cycle as level warm-up rather than steady latency.
 
-### Steady-frame breakdown
+### Steady-frame breakdown: 80,000-instance world
 
-| HLodTree work per frame | Camera and 4,000 objects moving | Static camera, 4,000 objects moving | Moving camera, static objects |
+| Machine / HLodTree work per frame | Camera and 4,000 objects moving | Static camera, 4,000 objects moving | Moving camera, static objects |
 |---|---:|---:|---:|
-| Submit 4,000 instance transforms | 0.144 ms | 0.139 ms | n/a |
-| Publish updates and maintain the TLAS | <0.001 ms | <0.001 ms | <0.001 ms |
-| `selectCut` | 0.400 ms | 0.296 ms | 0.330 ms |
-| **Total HLodTree frame work** | **0.544 ms** | **0.435 ms** | **0.330 ms** |
+| EPYC — submit transforms | 0.144 ms | 0.139 ms | 0 calls |
+| EPYC — publish updates and maintain TLAS | <0.001 ms | <0.001 ms | <0.001 ms |
+| EPYC — `selectCut` | 0.400 ms | 0.296 ms | 0.330 ms |
+| **EPYC — total HLodTree work** | **0.544 ms** | **0.435 ms** | **0.330 ms** |
+| i9-12900K — submit transforms | 0.667 ms | 0.501 ms | 0 calls |
+| i9-12900K — publish updates and maintain TLAS | <0.001 ms | <0.001 ms | <0.001 ms |
+| i9-12900K — `selectCut` | 0.659 ms | 0.442 ms | 0.269 ms |
+| **i9-12900K — total HLodTree work** | **1.326 ms** | **0.943 ms** | **0.269 ms** |
 
 The moving-camera cases average about 21,919 visible instances and a
 24,986-entry render cut. With objects moving, the `View` reuses 92.6% of
@@ -143,8 +155,8 @@ case averages 19,602 visible instances, a 22,872-entry cut, and 94.1% reuse.
 The `View` occupies 5.98 MiB after the fly-through and 3.22 MiB for the fixed
 view.
 
-Bounded motion of the same 5% cohort stays on the grow-only refit path in this
-run. The escape budget counts distinct leaves since the last TLAS build, so the
+Bounded motion of the same 5% cohort stays on the grow-only refit path in these
+runs. The escape budget counts distinct leaves since the last TLAS build, so the
 same movers do not periodically force a rebuild merely by moving every frame.
 If enough different instances escape, or accumulated lane area grows too far,
 the next `applyUpdates` repairs the TLAS before selection begins.
@@ -154,17 +166,18 @@ the next `applyUpdates` repairs the TLAS before selection begins.
 The smaller test uses 10,000 instances spread over a roughly 2.4 km square.
 They draw from 700 separately registered, fully resident 85-node assets with
 maximum depth 3, instead of sharing one asset across the entire world. The
-moving-object cases update exactly 1,000 instances per frame. Creating and
-populating this world takes 13.1-14.5 ms; its first published selection cycle,
-including the initial quality TLAS build and `View` population, takes
-5.4-6.3 ms.
+moving-object cases update exactly 1,000 instances per frame.
 
-| HLodTree work per frame | Camera and 1,000 objects moving | Static camera, 1,000 objects moving | Moving camera, static objects |
+| Machine / HLodTree work per frame | Camera and 1,000 objects moving | Static camera, 1,000 objects moving | Moving camera, static objects |
 |---|---:|---:|---:|
-| Submit 1,000 instance transforms | 34 µs | 34 µs | n/a |
-| Publish updates and maintain the TLAS | <0.1 µs | <0.1 µs | <0.1 µs |
-| `selectCut` | 89 µs | 74 µs | 63 µs |
-| **Total HLodTree frame work** | **123 µs** | **108 µs** | **63 µs** |
+| EPYC — submit transforms | 34 µs | 34 µs | 0 calls |
+| EPYC — publish updates and maintain TLAS | <0.1 µs | <0.1 µs | <0.1 µs |
+| EPYC — `selectCut` | 89 µs | 74 µs | 63 µs |
+| **EPYC — total HLodTree work** | **123 µs** | **108 µs** | **63 µs** |
+| i9-12900K — submit transforms | 76 µs | 82 µs | 0 calls |
+| i9-12900K — publish updates and maintain TLAS | <0.1 µs | <0.1 µs | <0.1 µs |
+| i9-12900K — `selectCut` | 139 µs | 128 µs | 91 µs |
+| **i9-12900K — total HLodTree work** | **216 µs** | **210 µs** | **91 µs** |
 
 The moving-camera cases average about 2,782 visible instances (27.8% of the
 world) and a 5,920-entry cut. Reuse is 82.4% with 1,000 movers and 93.3% with
@@ -178,49 +191,18 @@ Each view needs its own `View` and output. With the same
 moving-camera route and nearby view origins 24 metres apart, wall time for all
 six selections is:
 
-| Execution | Static objects | 4,000 moving objects |
-|---|---:|---:|
-| Six views, serial | 2.50 ms | 2.99 ms |
-| Six views, concurrent | 0.445 ms | 0.538 ms |
-| **Speedup** | **5.6×** | **5.6×** |
+| Machine | Object motion | Serial | Concurrent | Speedup |
+|---|---|---:|---:|---:|
+| EPYC | Static objects | 2.500 ms | 0.445 ms | 5.6× |
+| EPYC | 4,000 moving objects | 2.990 ms | 0.538 ms | 5.6× |
+| i9-12900K | Static objects | 2.366 ms | 1.654 ms | 1.43× |
+| i9-12900K | 4,000 moving objects | 4.161 ms | 1.765 ms | 2.36× |
 
 Object transforms are applied once before these selections and are not included
 in the table. The concurrent arms use six persistent worker threads; thread
 creation is excluded. Six `View` objects occupy about 36 MiB. Scaling is below 6×
 because the views share memory bandwidth and cache capacity, but the read-only
 selection phase removes serialization between them.
-
-### Second machine: Core i9-12900K, 128 GB
-
-The same committed benchmark suite was run on a Core i9-12900K with 128 GB of
-memory, Windows, MSVC 19.44, and Release `/O2 /arch:AVX2` on 2026-08-06. The
-run showed substantial scheduler and CPU-state variance, so these are the best
-of five captured repetitions, consistent with the methodology above.
-
-| Startup operation | Best time |
-|---|---:|
-| Create the 80,000-instance world | 8.1 ms |
-| First 80,000-instance published selection cycle | 52.8 ms |
-| Create the 10,000-instance / 700-asset world | 15.2 ms |
-| First 10,000-instance published selection cycle | 9.7 ms |
-
-Steady-frame results use the same cuts, visibility, reuse rates, and moving
-cohorts as the primary tables. `applyUpdates` remained below 0.001 ms per
-frame.
-
-| Scenario | Submit transforms | `selectCut` | Total HLodTree work |
-|---|---:|---:|---:|
-| 80k, moving camera and 4,000 objects | 0.667 ms | 0.659 ms | 1.326 ms |
-| 80k, static camera and 4,000 objects | 0.501 ms | 0.442 ms | 0.943 ms |
-| 80k, moving camera and static objects | n/a | 0.269 ms | 0.269 ms |
-| 10k, moving camera and 1,000 objects | 76 µs | 139 µs | 216 µs |
-| 10k, static camera and 1,000 objects | 82 µs | 128 µs | 210 µs |
-| 10k, moving camera and static objects | n/a | 91 µs | 91 µs |
-
-| Six-view selection | Serial | Concurrent | Speedup |
-|---|---:|---:|---:|
-| Static objects | 2.366 ms | 1.654 ms | 1.43× |
-| 4,000 moving objects | 4.161 ms | 1.765 ms | 2.36× |
 
 The main distinction is visible immediately: creating the quality TLAS is a
 one-time cost, transform updates are relatively small, and object motion makes
