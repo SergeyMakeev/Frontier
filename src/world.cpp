@@ -584,6 +584,7 @@ World::InstanceRef World::addInstanceInternal(uint32_t asset, const InstanceDesc
                    "World: exhausted the 24-bit InstanceId space");
         instances_.emplace_back();
         instanceTlas_.emplace_back();
+        instanceCutVersions_.emplace_back();
         id = InstanceId(instances_.size() - 1);
     }
 
@@ -734,7 +735,7 @@ void World::recomputeInstanceBounds(InstanceId id)
     InstanceTlas& spatial = instanceTlas_[id];
     // Globally unique rather than per-instance so a recycled slot can never
     // match the previous occupant's View record.
-    inst.cutVersion = ++generationCounter_;
+    instanceCutVersions_[id] = ++generationCounter_;
     const PageRt& rt = slots_[inst.rootSlot];
     const AABB* bbox = boundsFor(inst, inst.rootSlot, rt);
     spatial.worldBox = toWorld(bbox[0], inst.pos, inst.scale);
@@ -934,7 +935,7 @@ void World::applyBoundsChange(InstanceId id, uint32_t slot, uint32_t index,
     // never reach another instance -- one counter on the instance is the whole
     // invalidation. Bumped here rather than deeper because a change that stops
     // early (the ancestor box already contained it) still moved this node.
-    instances_[id].cutVersion = ++generationCounter_;
+    instanceCutVersions_[id] = ++generationCounter_;
 
     while (true)
     {
@@ -2271,6 +2272,8 @@ void World::selectCutUncached(const Camera& camera, const CutParams& params,
 void View::reset()
 {
     rec_.clear();
+    recCold_.clear();
+    secondDep_.clear();
     store_.clear();
     used_ = garbage_ = reused_ = walked_ = 0;
     travel_ = kTravel_ = 0.0f;
@@ -2295,7 +2298,10 @@ void View::setReuseEnabled(bool enabled)
 
 size_t View::bytes() const
 {
-    return rec_.capacity() * sizeof(Rec) + store_.capacity() * sizeof(CutEntry) +
+    return rec_.capacity() * sizeof(Rec) +
+           recCold_.capacity() * sizeof(RecCold) +
+           secondDep_.capacity() * sizeof(SecondDep) +
+           store_.capacity() * sizeof(CutEntry) +
            (scratch_ ? scratch_->bytes() : 0);
 }
 
@@ -2311,13 +2317,16 @@ void View::compact()
     // keep the existing allocation headroom while making the copy order moot.
     std::vector<CutEntry> packed(store_.size());
     uint32_t w = 0;
-    for (Rec& r : rec_)
+    for (size_t i = 0; i < rec_.size(); ++i)
     {
-        if (r.capacity == 0) continue;
+        Rec& r = rec_[i];
+        RecCold& cold = recCold_[i];
+        if (cold.capacity == 0) continue;
         if (r.validUntil <= travel_ + r.kSlope * kTravel_ || r.epoch != epoch_)
         {
             // Not reusable anyway: drop the block rather than move it.
-            r.capacity = r.counts = 0;
+            cold.capacity = 0;
+            r.counts = 0;
             continue;
         }
         const uint32_t count = cutTotal(r.counts);
@@ -2325,7 +2334,7 @@ void View::compact()
             std::memcpy(packed.data() + w, store_.data() + r.begin,
                         size_t(count) * sizeof(CutEntry));
         r.begin = w;
-        r.capacity = count;
+        cold.capacity = count;
         w += count;
     }
     store_.swap(packed);
@@ -2356,7 +2365,12 @@ void World::selectCutCached(const Camera& camera, const CutParams& params,
     tlasQuery(dv, params.minPix, scratch.visible, scratch.tlasStack);
 
     ctx.reused_ = ctx.walked_ = 0;
-    if (ctx.rec_.size() < instances_.size()) ctx.rec_.resize(instances_.size());
+    if (ctx.rec_.size() < instances_.size())
+    {
+        ctx.rec_.resize(instances_.size());
+        ctx.recCold_.resize(instances_.size());
+        if (!ctx.secondDep_.empty()) ctx.secondDep_.resize(instances_.size());
+    }
 
     // How far the query envelope moved since the last call, added to this
     // view's odometer. One number for the whole frame; every record's validity
@@ -2415,13 +2429,12 @@ void World::selectCutCached(const Camera& camera, const CutParams& params,
         if (i + kPrefetchDistance < nVis)
         {
             const uint32_t next = scratch.visible[i + kPrefetchDistance].instance();
-            HLOD_PREFETCH(&instances_[next]);
+            HLOD_PREFETCH(&instanceCutVersions_[next]);
             HLOD_PREFETCH(&ctx.rec_[next]);
         }
 
         const uint32_t instIdx = scratch.visible[i].instance();
         const uint8_t  mask = scratch.visible[i].mask();
-        const Instance& inst = instances_[instIdx];
         View::Rec& r = ctx.rec_[instIdx];
         const uint32_t depCount = cutDepCount(r.counts);
 
@@ -2431,21 +2444,24 @@ void World::selectCutCached(const Camera& camera, const CutParams& params,
         // rotation cannot matter. `travel_ < validUntil` is the margin.
         bool hit = mask == 0 &&
                    ctx.travel_ + r.kSlope * ctx.kTravel_ < r.validUntil &&
-                   r.epoch == ctx.epoch_ && r.cutVersion == inst.cutVersion;
-        if (hit)
-            for (uint32_t d = 0; d < depCount; ++d)
-            {
-                const PageRt& rt = slots_[r.depSlot[d]];
-                if (!rt.inUse() || rt.contentVersion != r.depVersion[d])
-                {
-                    hit = false;
-                    break;
-                }
-            }
+                   r.epoch == ctx.epoch_ &&
+                   r.cutVersion == instanceCutVersions_[instIdx];
+        if (hit && depCount != 0)
+        {
+            const PageRt& rt = slots_[r.depSlot];
+            hit = rt.inUse() && rt.contentVersion == r.depVersion;
+        }
+        if (hit && depCount == 2)
+        {
+            const View::SecondDep& dep = ctx.secondDep_[instIdx];
+            const PageRt& rt = slots_[dep.slot];
+            hit = rt.inUse() && rt.contentVersion == dep.version;
+        }
 
         if (hit)
         {
-            for (uint32_t k = 0; k < depCount; ++k) recordUsage(r.depSlot[k]);
+            if (depCount != 0) recordUsage(r.depSlot);
+            if (depCount == 2) recordUsage(ctx.secondDep_[instIdx].slot);
             // The whole saving is the walk that did not happen. Copying the
             // recorded entries out is ~1.5% of the call at 80k instances, and
             // handing back a descriptor instead measured no better while
@@ -2462,6 +2478,11 @@ void World::selectCutCached(const Camera& camera, const CutParams& params,
         }
 
         // ---- walk it ----
+        // Hits deliberately never fetch the 64-byte Instance record. Once a
+        // miss is known, start that read before resetting the worker scratch;
+        // the bookkeeping below gives the cache line a little useful lead.
+        HLOD_PREFETCH(&instances_[instIdx]);
+        const Instance& inst = instances_[instIdx];
         w.cutBuf.clear();
         w.cut = CutResultSink(w.cutBuf);
         w.touched.clear();
@@ -2480,16 +2501,19 @@ void World::selectCutCached(const Camera& camera, const CutParams& params,
                               w.touched.size() <= View::kMaxDeps &&
                               nShared <= 0x3ffu && nCurrent <= 0x3ffu &&
                               nIdeal <= 0x3ffu;
-        if (r.capacity < n)
+        View::RecCold& cold = ctx.recCold_[instIdx];
+        if (cold.capacity < n)
         {
-            ctx.garbage_ += r.capacity;
+            ctx.garbage_ += cold.capacity;
             if (size_t(ctx.used_) + n > ctx.store_.size())
                 ctx.store_.resize(
                     std::max<size_t>(size_t(ctx.used_) + n, ctx.store_.size() * 2 + 256));
             r.begin = ctx.used_;
-            r.capacity = n;
+            cold.capacity = n;
             ctx.used_ += n;
         }
+        if (eligible && w.touched.size() == 2 && ctx.secondDep_.empty())
+            ctx.secondDep_.resize(instances_.size());
         r.counts = eligible
                        ? packCutCounts(nShared, nCurrent, nIdeal,
                                        uint32_t(w.touched.size()))
@@ -2516,11 +2540,17 @@ void World::selectCutCached(const Camera& camera, const CutParams& params,
             const float consumed = ctx.travel_ + r.kSlope * ctx.kTravel_;
             r.validUntil = m >= FLT_MAX - consumed ? FLT_MAX : consumed + m;
             r.epoch = ctx.epoch_;
-            r.cutVersion = inst.cutVersion;
-            for (uint32_t d = 0; d < uint32_t(w.touched.size()); ++d)
+            r.cutVersion = instanceCutVersions_[instIdx];
+            if (!w.touched.empty())
             {
-                r.depSlot[d] = w.touched[d];
-                r.depVersion[d] = slots_[w.touched[d]].contentVersion;
+                r.depSlot = w.touched[0];
+                r.depVersion = slots_[w.touched[0]].contentVersion;
+            }
+            if (w.touched.size() == 2)
+            {
+                View::SecondDep& dep = ctx.secondDep_[instIdx];
+                dep.slot = w.touched[1];
+                dep.version = slots_[w.touched[1]].contentVersion;
             }
         }
         else

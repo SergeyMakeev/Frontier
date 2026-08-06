@@ -521,7 +521,7 @@ private:
     // usually still streaming and being re-walked anyway.
     static constexpr uint32_t kMaxDeps = 2;
 
-    // EXACTLY 44 BYTES, and that is the whole design constraint.
+    // EXACTLY 32 HOT BYTES, and that is the whole design constraint.
     //
     // This record is read for every visible instance, indexed by instance id,
     // so it is a random access per instance -- the one new memory stream the
@@ -550,11 +550,27 @@ private:
         // two-bit dependency count. A record with more than 1023 entries in
         // any one bucket is simply not cached.
         uint32_t counts = 0;
-        uint32_t capacity = 0;
-        uint32_t depSlot[kMaxDeps]{};
-        uint32_t depVersion[kMaxDeps]{};
+        // The overwhelmingly common one-page dependency stays inline. A
+        // second dependency lives in the cold spill array below.
+        uint32_t depSlot = 0;
+        uint32_t depVersion = 0;
     };
-    static_assert(sizeof(Rec) == 44, "View::Rec must stay 44 bytes");
+    static_assert(sizeof(Rec) == 32, "View::Rec hot state must stay 32 bytes");
+
+    // Allocation state is needed only when a record is replaced or the slab
+    // is compacted. Keeping it out of Rec prevents every hit from fetching it.
+    struct RecCold
+    {
+        uint32_t capacity = 0;
+    };
+    static_assert(sizeof(RecCold) == 4, "View cold record must stay 4 bytes");
+
+    struct SecondDep
+    {
+        uint32_t slot = 0;
+        uint32_t version = 0;
+    };
+    static_assert(sizeof(SecondDep) == 8, "second page dependency must stay 8 bytes");
 
     void compact();
 
@@ -562,7 +578,11 @@ private:
     // below measures the envelope it produces.
     CameraDamper damper_;
 
-    std::vector<Rec>      rec_;      // by InstanceId
+    std::vector<Rec>      rec_;      // hit-path state, by InstanceId
+    std::vector<RecCold>  recCold_;  // miss/compaction state, by InstanceId
+    // Allocated only after a cacheable walk actually touches two pages. The
+    // common one-page world therefore pays no dense second-dependency array.
+    std::vector<SecondDep> secondDep_;
     std::vector<CutEntry> store_;    // slab of recorded runs
     uint32_t              used_ = 0;
     uint32_t              garbage_ = 0;
@@ -573,7 +593,7 @@ private:
     // while positionTravel + kSlope * kTravel stays below its saved budget:
     // both path lengths conservatively bound movement of every LOD flip point.
     // This replaces storing a camera and projection value per instance with
-    // two scalar odometers and one per-record slope, keeping Rec at 44 bytes.
+    // two scalar odometers and one per-record slope, keeping hot Rec at 32 bytes.
     // Doubling back is conservative; a teleport consumes the budget at once.
     float    travel_ = 0.0f;
     float    kTravel_ = 0.0f;
@@ -988,11 +1008,6 @@ private:
         float    scale = 1.0f;
         uint32_t rootSlot = kInvalidIndex;
         uint32_t generation = 0;   // stamps InstanceRefs; bumped per reuse
-        // Bumped when this instance moves, is rescaled, or is deformed. A
-        // deform always privatises bounds into this instance's own overlay, so
-        // geometry changes never reach past the instance that caused them and
-        // this one counter covers all of them.
-        uint32_t cutVersion = 0;
         bool     alive = false;
     };
     static_assert(sizeof(Instance) == 64, "cut-path Instance must stay one cache line");
@@ -1276,6 +1291,9 @@ private:
 
     std::vector<Instance> instances_;
     std::vector<InstanceTlas> instanceTlas_;
+    // Cache hits need only this stamp, not the 64-byte Instance record. It is
+    // parallel to instances_ and bumped for transform or deformation changes.
+    std::vector<uint32_t> instanceCutVersions_;
     std::vector<InstanceId> liveInstances_;
     std::vector<uint32_t> freeInstances_;
 
