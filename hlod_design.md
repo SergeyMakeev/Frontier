@@ -237,6 +237,13 @@ Each mounted page has compact runtime arrays parallel to its nodes:
   immediate children, including attached child pages. The authored fanout cap
   is 511, so the count cannot overflow.
 
+Each mount also has an 8-byte summary outside the 112-byte `PageRt`: a resident
+node count and a count of recursively incomplete attached child mounts. It
+changes only with residency or topology and propagates upward only when a
+mount tree crosses the fully-resident boundary. Selection uses that proof to
+take a shared-only traversal that skips residency checks and current/ideal
+branching for the common fully-resident case.
+
 Residency changes propagate coverage toward the root. A current-cut node may
 refine whenever more detailed resident nodes completely cover the region
 selection needs. The intermediate proxy itself need not be resident: if a
@@ -331,7 +338,8 @@ build or repair. Selection then proceeds against that stable snapshot:
 3. Walk attached pages with an explicit DFS stack, carrying current- and
    ideal-cut liveness together. Propagated coverage answers most current-cut
    descent decisions in O(1); only partially visible uncovered regions need a
-   recursive visible-coverage probe.
+   recursive visible-coverage probe. A recursively fully-resident mount tree
+   instead takes a specialized path in which every emitted entry is `shared`.
 4. Test up to eight children together. Fully outside lanes disappear; fully
    inside lanes clear their remaining plane masks; partial lanes carry only
    undecided planes.
@@ -380,7 +388,11 @@ Important limits are explicit:
 - A cached call walks its camera serially, but different views can run
   concurrently because all mutable query state is view-owned.
 
-Each per-instance record is 44 bytes plus storage for recorded cut entries.
+Each per-instance cache record is split into 32 hot bytes and 4 cold bytes,
+plus an optional 8-byte second-page dependency allocated only after a
+cacheable walk actually touches two pages. The common hit reads the hot record
+and a parallel 4-byte instance-version stream; it does not fetch the 64-byte
+instance record. Recorded cut entries remain separate slab storage.
 `reset()` clears logical state and its damping window but retains capacity,
 which is appropriate for camera cuts and teleports. `setHalfLife(0)` disables
 damping exactly. `setReuseEnabled(false)` disables temporal cut reuse while

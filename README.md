@@ -100,8 +100,8 @@ algorithm's uncontended cost; real frame time can be higher under host load.
 
 | Operation | Time | Included work |
 |---|---:|---|
-| Create the world | 9.8-10.1 ms | Build and register the shared asset, add 80,000 instances, and mark its payloads resident |
-| First published selection cycle | 49.7-52.9 ms | `applyUpdates` builds the initial quality TLAS; `selectCut` queries it, produces the first cut, and populates the `View` |
+| Create the world | 10.1-11.4 ms | Build and register the shared asset, add 80,000 instances, and mark its payloads resident |
+| First published selection cycle | 51.1-58.7 ms | `applyUpdates` builds the initial quality TLAS; `selectCut` queries it, produces the first cut, and populates the `View` |
 
 World creation does not force the initial quality TLAS build; the first
 `applyUpdates` performs it before publishing the read-only snapshot. Treat the
@@ -111,16 +111,16 @@ first published selection cycle as level warm-up rather than steady latency.
 
 | HLodTree work per frame | Camera and 4,000 objects moving | Static camera, 4,000 objects moving | Moving camera, static objects |
 |---|---:|---:|---:|
-| Submit 4,000 instance transforms | 0.160 ms | 0.143 ms | n/a |
+| Submit 4,000 instance transforms | 0.139 ms | 0.137 ms | n/a |
 | Publish updates and maintain the TLAS | <0.001 ms | <0.001 ms | <0.001 ms |
-| `selectCut` | 0.516 ms | 0.382 ms | 0.418 ms |
-| **Total HLodTree frame work** | **0.676 ms** | **0.525 ms** | **0.418 ms** |
+| `selectCut` | 0.462 ms | 0.357 ms | 0.348 ms |
+| **Total HLodTree frame work** | **0.601 ms** | **0.494 ms** | **0.349 ms** |
 
 The moving-camera cases average about 21,919 visible instances and a
 24,986-entry render cut. With objects moving, the `View` reuses 92.6% of
 visible instance cuts; with static objects it reuses 97.6%. The fixed-camera
 case averages 19,602 visible instances, a 22,872-entry cut, and 94.1% reuse.
-The `View` occupies 6.59 MiB after the fly-through and 3.83 MiB for the fixed
+The `View` occupies 5.98 MiB after the fly-through and 3.22 MiB for the fixed
 view.
 
 Bounded motion of the same 5% cohort stays on the grow-only refit path in this
@@ -135,21 +135,21 @@ The smaller test uses 10,000 instances spread over a roughly 2.4 km square.
 They draw from 700 separately registered, fully resident 85-node assets with
 maximum depth 3, instead of sharing one asset across the entire world. The
 moving-object cases update exactly 1,000 instances per frame. Creating and
-populating this world takes 12.9-13.1 ms; its first published selection cycle,
+populating this world takes 13.0-14.4 ms; its first published selection cycle,
 including the initial quality TLAS build and `View` population, takes
-5.5-6.0 ms.
+5.4-6.6 ms.
 
 | HLodTree work per frame | Camera and 1,000 objects moving | Static camera, 1,000 objects moving | Moving camera, static objects |
 |---|---:|---:|---:|
-| Submit 1,000 instance transforms | 35 µs | 35 µs | n/a |
+| Submit 1,000 instance transforms | 34 µs | 34 µs | n/a |
 | Publish updates and maintain the TLAS | <0.1 µs | <0.1 µs | <0.1 µs |
-| `selectCut` | 121 µs | 105 µs | 74 µs |
-| **Total HLodTree frame work** | **156 µs** | **140 µs** | **74 µs** |
+| `selectCut` | 110 µs | 94 µs | 67 µs |
+| **Total HLodTree frame work** | **144 µs** | **128 µs** | **67 µs** |
 
 The moving-camera cases average about 2,782 visible instances (27.8% of the
 world) and a 5,920-entry cut. Reuse is 82.4% with 1,000 movers and 93.3% with
-static objects; the `View` occupies 1.95 MiB. The fixed-camera case averages
-2,501 visible instances (25.0%), a 5,792-entry cut, 85.8% reuse, and a 0.53 MiB
+static objects; the `View` occupies 1.87 MiB. The fixed-camera case averages
+2,501 visible instances (25.0%), a 5,792-entry cut, 85.8% reuse, and a 0.45 MiB
 of view state.
 
 ### Multiple views
@@ -160,13 +160,13 @@ six selections is:
 
 | Execution | Static objects | 4,000 moving objects |
 |---|---:|---:|
-| Six views, serial | 3.39 ms | 3.93 ms |
-| Six views, concurrent | 0.618 ms | 0.751 ms |
-| **Speedup** | **5.5×** | **5.2×** |
+| Six views, serial | 2.49 ms | 3.11 ms |
+| Six views, concurrent | 0.472 ms | 0.729 ms |
+| **Speedup** | **5.3×** | **4.3×** |
 
 Object transforms are applied once before these selections and are not included
 in the table. The concurrent arms use six persistent worker threads; thread
-creation is excluded. Six `View` objects occupy about 40 MiB. Scaling is below 6×
+creation is excluded. Six `View` objects occupy about 36 MiB. Scaling is below 6×
 because the views share memory bandwidth and cache capacity, but the read-only
 selection phase removes serialization between them.
 

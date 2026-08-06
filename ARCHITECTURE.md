@@ -67,11 +67,15 @@ through the host's blocking `parallelFor` without changing that contract.
    populations of at least 1,024, with retained scratch and only the 11-bit
    passes required by key variation. A dense live-id list avoids scanning dead
    historical slots.
-9. **Frame-coherent reuse.** A 44-byte `View` record proves when a
+9. **Frame-coherent reuse.** A 32-byte hot `View` record proves when a
    fully-inside instance's bucketed cut cannot change under camera-envelope or
-   projection-scale travel. Page versions cover topology and residency changes;
-   reused entries are copied without rewalking pages.
-10. **Deferred, camera-selective GC feedback.** Optional `PageUsageContext`
+   projection-scale travel. A 4-byte cold allocation record and an optional
+   second-page dependency stay off the hit path; a compact instance-version
+   stream avoids fetching the 64-byte instance record on hits.
+10. **Fully-resident fast path.** An 8-byte per-mount summary propagates whether
+   every attached page is recursively resident. Such instances use a
+   shared-only traversal with no residency or current/ideal branching.
+11. **Deferred, camera-selective GC feedback.** Optional `PageUsageContext`
     objects collect page touches without writing the World. `collect` consumes
     only the important cameras chosen by the caller, updates the intrusive LRU,
     and detaches aged leaf mounts; pinned roots are outside the budget and list.
@@ -84,10 +88,12 @@ The runtime's multiplied structures have exact compile-time size contracts on
 | Structure | Size | Why it has that shape |
 |---|---:|---|
 | `CutEntry` | 12 B | 64-bit node handle + packed 24-bit instance id / 8-bit error |
-| `View::Rec` | 44 B | three 10-bit bucket counts share a word with the two-bit dependency count |
+| `View::Rec` hot / cold | 32 B / 4 B | hits read only proof, version, counts, and the common one-page dependency |
+| optional second page dependency | 8 B/instance | allocated only after a cacheable record actually touches two pages |
 | `PageUsageContext::Rec` | 8 B | 24-bit page generation and pending flag share one word |
 | `AssetRt` | 112 B | one owning-or-borrowing `Page`; no duplicate `PageView` |
 | `PageRt` | 112 B | refers to immutable bytes through its asset index; flags share bounded counters |
+| per mounted page residency summary | 8 B | recursively identifies fully-resident mount trees without scanning nodes |
 | per mounted node | 3 B | one packed residency/coverage byte + 16-bit covered-child count |
 | `Instance` + `InstanceTlas` | 64 B + 48 B | selection-hot and spatial-maintenance streams stay separate |
 | `Overlay` header | 56 B | two retained vectors; bounds storage is allocated only after deformation |
@@ -114,14 +120,14 @@ least five repetitions.
 
 | Scenario | Current time | Relevant output/state |
 |---|---:|---|
-| 10k instances, 700 assets, moving camera / 1k moving | 0.121 ms selection | 82.4% reused; 27.8% visible; 5,920-entry cut; 1.95 MiB `View` |
-| Same 10k world, static camera / 1k moving | 0.105 ms selection | 85.8% reused; 25.0% visible; 5,792 entries |
-| Same 10k world, moving camera / static objects | 0.074 ms selection | 93.3% reused; 5,920 entries |
-| 80k instances, moving camera / 5% moving | 0.516 ms selection | 92.6% reused; 24,986 entries; 6.59 MiB `View` |
-| Same 80k world, static camera / 5% moving | 0.382 ms selection | 94.1% reused; 22,872 entries; 3.83 MiB `View` |
-| Same 80k world, moving camera / static objects | 0.418 ms selection | 97.6% reused; 24,986 entries |
-| Six 80k views, static objects, serial / concurrent | 3.39 / 0.618 ms wall time | 5.5× on six persistent workers |
-| Six 80k views, 5% moving, serial / concurrent | 3.93 / 0.751 ms wall time | 5.2× on six persistent workers |
+| 10k instances, 700 assets, moving camera / 1k moving | 0.110 ms selection | 82.4% reused; 27.8% visible; 5,920-entry cut; 1.87 MiB `View` |
+| Same 10k world, static camera / 1k moving | 0.094 ms selection | 85.8% reused; 25.0% visible; 5,792 entries; 0.45 MiB `View` |
+| Same 10k world, moving camera / static objects | 0.067 ms selection | 93.3% reused; 5,920 entries |
+| 80k instances, moving camera / 5% moving | 0.462 ms selection | 92.6% reused; 24,986 entries; 5.98 MiB `View` |
+| Same 80k world, static camera / 5% moving | 0.357 ms selection | 94.1% reused; 22,872 entries; 3.22 MiB `View` |
+| Same 80k world, moving camera / static objects | 0.348 ms selection | 97.6% reused; 24,986 entries |
+| Six 80k views, static objects, serial / concurrent | 2.49 / 0.472 ms wall time | 5.3× on six persistent workers |
+| Six 80k views, 5% moving, serial / concurrent | 3.11 / 0.729 ms wall time | 4.3× on six persistent workers |
 
 These are scale indicators, not guarantees. Output size and cache locality can
 dominate population size, and contended runs on this host can be much slower.
@@ -699,8 +705,8 @@ records. Payloads are resolved on demand instead of copied into every view.
 index, 24-bit generation). The dense instance id and threshold-relative error
 share one 32-bit word (24 + 8 bits), making `CutEntry` 12 bytes. The quantized
 error preserves the exact above/below-threshold decision and retains roughly
-eight priority levels per octave. After the later runtime-layout audit, the 80k
-moving-camera `View` footprint is 6.59 MiB; the tagged output at its measured
+eight priority levels per octave. After the later cache-state split, the 80k
+moving-camera `View` footprint is 5.98 MiB; the tagged output at its measured
 revision used 12.13 MiB in the same scenario.
 
 ### R. Runtime layout audit and dead experiment removal — KEPT
@@ -709,7 +715,7 @@ The follow-up memory audit removed storage that multiplied by assets, mounts,
 instances, visible hits, queued edits, or traversal depth. Exact 64-bit layout
 changes were:
 
-| Structure/state | Before | Current |
+| Structure/state | Before | After audit R |
 |---|---:|---:|
 | `AssetRt` | 208 B | 112 B |
 | `PageRt` | 232 B | 112 B |
@@ -740,20 +746,64 @@ overlays, byte-array plane masks, and the 256-byte block. Their original A/B
 evidence remains in the archived handoff; keeping dormant branches would make
 the supported implementation and its size contracts ambiguous.
 
-The current representative measurements are in section 1. Besides the memory
+The representative measurements at this revision were recorded before the
+later cache-state and fully-resident traversal work. Besides the memory
 reduction, the compact arrays improved the best observed 80k selection cases
 from 0.586/0.433/0.460 ms to 0.516/0.382/0.418 ms for moving-camera+movers,
 fixed-camera+movers, and moving-camera+static respectively. The 10k cases are
 0.121/0.105/0.074 ms. As throughout this journal, those are repeated best-case
 floors on a noisy shared host, not latency guarantees.
 
+### S. Split View hit state — KEPT
+
+The per-instance cache record was split into a 32-byte hot proof record and a
+4-byte cold slab-capacity record. The common first page dependency remains
+inline; an 8-byte second dependency array is allocated only if a cacheable walk
+actually touches two pages. A parallel 4-byte instance-version stream lets a
+cache hit avoid fetching the 64-byte `Instance`; misses prefetch that record
+after the hit decision.
+
+Interleaved A/B results on the representative 80k workload were deliberately
+mixed by reuse rate: moving camera plus 5% movers was effectively flat (best
++0.1%, median -1.3%), while moving camera plus static objects improved 4.7-5.2%.
+Across six serial views, static objects improved 11.4-13.6% and 5% movers
+improved 7.0-7.7%. The retained state fell from 6.59 to 5.98 MiB per moving
+view. Uncached selection regressed about 1%, an accepted trade because it does
+not use the cache hit path this change targets.
+
+### T. TLAS hot/cold split — REVERTED
+
+Reordering the existing 320-byte node to place default-query validity in the
+first four cache lines was neutral. A stronger experiment split it into a
+256-byte bounds/child stream and a parallel 64-byte mask/error stream, keeping
+total memory unchanged. End-to-end cached and uncached best times regressed by
+0.6% and 0.5%; medians were effectively flat. The added parallel-state
+maintenance was therefore removed, and `TlasNode` remains one 320-byte record.
+
+### U. Fully-resident shared-only traversal — KEPT
+
+Each mounted page now has an 8-byte parallel summary: resident node count and
+number of recursively incomplete attached children. Residency and attach/detach
+transitions propagate only when full-tree status changes. A fully-resident
+instance can therefore use a compile-time-specialized traversal that emits only
+`shared` entries and skips residency tests, cover probes, and current/ideal
+branching.
+
+The broad 80k moving-camera benchmark improved about 1-2%, because TLAS and
+cache work dominate it. The targeted deep fully-resident fly-through improved
+16.1% in both best and median time and won all 8 paired runs. The summary costs
+8 bytes per mounted page, not per node or instance. A streaming-convergence
+control that forced the generic traversal showed no transition penalty: the
+enabled build was 5.1% faster at best and 2.7% faster at median as resident
+regions became eligible during the run.
+
 ---
 
 ## 3. Current constraints and possible follow-up
 
 - **Cached parallelism is across views, not within one cached walk.**
-  Six representative 80k views fall from 3.39-3.93 ms serial to 0.618-0.751 ms
-  on six persistent workers and occupy about 40 MiB of view state. An uncached
+  Six representative 80k views fall from 2.49-3.11 ms serial to 0.472-0.729 ms
+  on six persistent workers and occupy about 36 MiB of view state. An uncached
   View can still parallelize one call across visible instances. Combining
   both forms would add nested scheduling and merge costs; profile a production
   need before doing so.
