@@ -249,12 +249,14 @@ Each mounted page has compact runtime arrays parallel to its nodes:
   immediate children, including attached child pages. The authored fanout cap
   is 511, so the count cannot overflow.
 
-Each mount also has an 8-byte summary outside the 112-byte `PageRt`: a resident
-node count and a count of recursively incomplete attached child mounts. It
-changes only with residency or topology and propagates upward only when a
-mount tree crosses the fully-resident boundary. Selection uses that proof to
-take a shared-only traversal that skips residency checks and current/ideal
-branching for the common fully-resident case.
+Each mount also has two compact 8-byte records outside the 104-byte `PageRt`.
+`PageStamp` holds the content version plus the generation/live stamp used by
+handles and cached-view dependency checks. The residency summary holds a
+resident node count and a count of recursively incomplete attached child
+mounts. It changes only with residency or topology and propagates upward only
+when a mount tree crosses the fully-resident boundary. Selection uses that
+proof to take a shared-only traversal that skips residency checks and
+current/ideal branching for the common fully-resident case.
 
 Residency changes propagate coverage toward the root. A current-cut node may
 refine whenever more detailed resident nodes completely cover the region

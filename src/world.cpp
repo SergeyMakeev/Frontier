@@ -172,8 +172,9 @@ const World::PageRt* World::resolve(NodeHandle h) const
     const uint32_t slot = h.slot();
     const uint32_t index = h.index();
     if (slot >= slots_.size()) return nullptr;
+    const PageStamp& stamp = pageStamps_[slot];
+    if (!stamp.inUse() || stamp.generation() != h.generation()) return nullptr;
     const PageRt& rt = slots_[slot];
-    if (!rt.inUse() || rt.generation != h.generation()) return nullptr;   // stale
     if (index == 0 || index >= pageView(rt).nodeCount()) return nullptr;
     return &rt;
 }
@@ -263,7 +264,7 @@ PageHandle World::assetRootPage(AssetHandle h) const
 {
     const AssetRt* as = resolveAsset(h);
     if (!as || as->rootMount == kInvalidIndex) return PageHandle{};
-    return PageHandle{as->rootMount, slots_[as->rootMount].generation};
+    return PageHandle{as->rootMount, pageStamps_[as->rootMount].generation()};
 }
 
 // ============================================================================
@@ -281,6 +282,7 @@ uint32_t World::allocSlot()
     HLOD_CHECK(slots_.size() < NodeHandle::kInvalidSlot,
                "World: exhausted the 20-bit page-mount slot space");
     slots_.emplace_back();
+    pageStamps_.emplace_back();
     pageResidency_.emplace_back();
     return uint32_t(slots_.size() - 1);
 }
@@ -290,6 +292,7 @@ uint32_t World::registerPage(uint32_t asset, NodeRef owner, bool pinned)
     const uint32_t slot = allocSlot();
     AssetRt& as = assets_[asset];
     PageRt& rt = slots_[slot];
+    PageStamp& stamp = pageStamps_[slot];
     pageResidency_[slot] = PageResidency{};
 
     HLOD_CHECK(as.page.nodeCount() <= (1u << NodeHandle::kIndexBits),
@@ -299,12 +302,15 @@ uint32_t World::registerPage(uint32_t asset, NodeRef owner, bool pinned)
     rt.nodeState.assign(as.page.nodeCount(), 0);
     rt.coveredChildren.assign(as.page.nodeCount(), 0);
     rt.expSlot.clear();
-    rt.generation = nextPageGeneration(rt.generation);
+    const uint32_t generation = nextPageGeneration(stamp.generation());
+    stamp.setGeneration(generation);
+    rt.setGeneration(generation);
     // Bumped here as well as on every content change, so that a slot which was
     // detached and reused can never present the same contentVersion as before.
     // That is what lets a View record identify a page's state with a
     // single word instead of a (generation, version) pair.
-    ++rt.contentVersion;
+    ++stamp.contentVersion;
+    stamp.setInUse(true);
     rt.lastTouched = frame_;
     rt.attachedChildrenAndPinned = 0;
     rt.setPinned(pinned);
@@ -387,9 +393,9 @@ PageHandle World::attachPage(NodeHandle expansionNode, AssetHandle assetHandle)
     ort.addAttachedChild();
     ++pageResidency_[owner.slot].incompleteChildren;
     propagateFullResidency(owner.slot, ownerWasFullyResident);
-    ++ort.contentVersion;   // this page now refines further than it did
+    ++pageStamps_[owner.slot].contentVersion;   // this page now refines further
 
-    return PageHandle{slot, slots_[slot].generation};
+    return PageHandle{slot, pageStamps_[slot].generation()};
 }
 
 PageHandle World::attachPage(NodeHandle expansionNode, Page&& page)
@@ -446,20 +452,19 @@ void World::detachSlot(uint32_t slot, std::vector<UserPayload>* freedPayloads)
         ownerRt.expSlot[rt.owner.index] = kInvalidIndex;
         ownerRt.removeAttachedChild();
         propagateFullResidency(rt.owner.slot, ownerWasFullyResident);
-        ++ownerRt.contentVersion;   // it collapses back to a leaf here
+        ++pageStamps_[rt.owner.slot].contentVersion;   // it collapses to a leaf
         propagateCoverage(rt.owner.slot, rt.owner.index);
     }
     lruUnlink(slot);
     if (rt.pinned()) --pinnedPages_;
     const uint32_t asset = rt.asset;
-    const uint32_t generation = rt.generation;
-    const uint32_t contentVersion = rt.contentVersion;
+    const uint32_t generation = rt.generation();
     rt = PageRt{};
-    // These counters belong to the slot, not to the mounted page. Preserving
-    // them across reset prevents a recycled slot from reviving either a stale
-    // compact handle or a View dependency record.
-    rt.generation = generation;
-    rt.contentVersion = contentVersion;
+    rt.setGeneration(generation);
+    // The compact stamps belong to the slot rather than the mounted page.
+    // Preserve both counters across reset, but make detached slots fail
+    // dependency validation until registerPage reuses them with a new version.
+    pageStamps_[slot].setInUse(false);
     pageResidency_[slot] = PageResidency{};
     freeSlots_.push_back(slot);
     --attachedPages_;
@@ -559,7 +564,7 @@ void World::propagateCoverage(uint32_t slot, uint32_t node)
         {
             if (!rt.owner.valid()) return;
             const NodeRef owner = rt.owner;
-            ++slots_[owner.slot].contentVersion;
+            ++pageStamps_[owner.slot].contentVersion;
             slot = owner.slot;
             node = owner.index;
             continue;
@@ -584,7 +589,7 @@ void World::markResident(NodeHandle h)
     rt->setResident(index, true);
     ++pageResidency_[h.slot()].residentNodes;
     propagateFullResidency(h.slot(), wasFullyResident);
-    ++rt->contentVersion;
+    ++pageStamps_[h.slot()].contentVersion;
     propagateCoverage(h.slot(), index);
 }
 
@@ -602,7 +607,7 @@ void World::markNonResident(NodeHandle h)
                "World: page residency summary underflow");
     --pageResidency_[h.slot()].residentNodes;
     propagateFullResidency(h.slot(), wasFullyResident);
-    ++rt->contentVersion;
+    ++pageStamps_[h.slot()].contentVersion;
     propagateCoverage(h.slot(), index);
 }
 
@@ -693,7 +698,8 @@ World::InstanceRef World::addInstanceInternal(uint32_t asset, const InstanceDesc
     recomputeInstanceBounds(id);
     tlasInsert(id);
     markTlasStructuralChange();
-    return InstanceRef{id, inst.generation, PageHandle{slot, slots_[slot].generation}};
+    return InstanceRef{id, inst.generation,
+                       PageHandle{slot, pageStamps_[slot].generation()}};
 }
 
 World::InstanceRef World::addInstance(AssetHandle asset, const InstanceDesc& desc)
@@ -855,14 +861,14 @@ const World::Overlay* World::findOverlay(const Instance& inst, uint32_t slot) co
     const Overlay& ov = overlays_[it->index];
     // The mount may have been detached (and its slot reused) since the
     // overlay was taken, in which case it describes a page that is gone.
-    if (!ov.inUse() || ov.generation != slots_[slot].generation) return nullptr;
+    if (!ov.inUse() || ov.generation != pageStamps_[slot].generation()) return nullptr;
     return &ov;
 }
 
-void World::initOverlay(Overlay& ov, const PageRt& rt)
+void World::initOverlay(Overlay& ov, uint32_t slot, const PageRt& rt)
 {
     const PageView& pg = pageView(rt);
-    ov.generation = rt.generation;
+    ov.generation = pageStamps_[slot].generation();
     ov.bbox.assign(pg.bbox, pg.bbox + pg.nodeCount());
     ov.wide.resize(pg.wideCount());
     for (uint32_t b = 0; b < pg.wideCount(); ++b) ov.wide[b] = pg.wide[b].bounds;
@@ -878,8 +884,8 @@ uint32_t World::ensureOverlay(Instance& inst, uint32_t slot)
     {
         const uint32_t idx = it->index;
         Overlay& ov = overlays_[idx];
-        if (!ov.inUse() || ov.generation != slots_[slot].generation)
-            initOverlay(ov, slots_[slot]);   // stale: retake from the new page
+        if (!ov.inUse() || ov.generation != pageStamps_[slot].generation())
+            initOverlay(ov, slot, slots_[slot]);   // stale: retake from new page
         return idx;
     }
 
@@ -896,7 +902,7 @@ uint32_t World::ensureOverlay(Instance& inst, uint32_t slot)
     }
     Overlay& ov = overlays_[idx];
     ov.slot = slot;
-    initOverlay(ov, slots_[slot]);
+    initOverlay(ov, slot, slots_[slot]);
     ++liveOverlays_;
     inst.overlays.insert(it, OverlayRef{slot, idx});
     return idx;
@@ -1845,19 +1851,22 @@ void World::tlasQueryImpl(const Camera& view, float minPix, float rootThreshold,
 void World::lruUnlink(uint32_t slot)
 {
     PageRt& rt = slots_[slot];
-    if (rt.lruPrev != kInvalidIndex) slots_[rt.lruPrev].lruNext = rt.lruNext;
-    else if (lruHead_ == slot) lruHead_ = rt.lruNext;
-    if (rt.lruNext != kInvalidIndex) slots_[rt.lruNext].lruPrev = rt.lruPrev;
-    else if (lruTail_ == slot) lruTail_ = rt.lruPrev;
-    rt.lruPrev = rt.lruNext = kInvalidIndex;
+    const uint32_t prev = rt.lruPrev();
+    const uint32_t next = rt.lruNext();
+    if (prev != kInvalidIndex) slots_[prev].setLruNext(next);
+    else if (lruHead_ == slot) lruHead_ = next;
+    if (next != kInvalidIndex) slots_[next].setLruPrev(prev);
+    else if (lruTail_ == slot) lruTail_ = prev;
+    rt.setLruPrev(kInvalidIndex);
+    rt.setLruNext(kInvalidIndex);
 }
 
 void World::lruPushFront(uint32_t slot)
 {
     PageRt& rt = slots_[slot];
-    rt.lruPrev = kInvalidIndex;
-    rt.lruNext = lruHead_;
-    if (lruHead_ != kInvalidIndex) slots_[lruHead_].lruPrev = slot;
+    rt.setLruPrev(kInvalidIndex);
+    rt.setLruNext(lruHead_);
+    if (lruHead_ != kInvalidIndex) slots_[lruHead_].setLruPrev(slot);
     lruHead_ = slot;
     if (lruTail_ == kInvalidIndex) lruTail_ = slot;
 }
@@ -1902,8 +1911,8 @@ void World::consumePageUsage(std::initializer_list<PageUsageContext*> usages)
             PageUsageContext::Rec& rec = usage->rec_[slot];
             rec.setPending(false);
             if (slot >= slots_.size()) continue;
-            const PageRt& rt = slots_[slot];
-            if (!rt.inUse() || rt.generation != rec.generation()) continue;
+            const PageStamp& stamp = pageStamps_[slot];
+            if (!stamp.inUse() || stamp.generation() != rec.generation()) continue;
             events.push_back({slot, rec.lastUsed});
         }
         usage->dirty_.clear();
@@ -1927,12 +1936,13 @@ void World::recordPageUsage(PageUsageContext& usage, uint32_t slot) const
     usage.world_ = this;
     const PageRt& rt = slots_[slot];
     if (rt.pinned()) return;
+    const uint32_t generation = pageStamps_[slot].generation();
     if (usage.rec_.size() <= slot) usage.rec_.resize(size_t(slot) + 1);
     PageUsageContext::Rec& rec = usage.rec_[slot];
-    if (rec.generation() != rt.generation)
+    if (rec.generation() != generation)
     {
         rec = PageUsageContext::Rec{};
-        rec.setGeneration(rt.generation);
+        rec.setGeneration(generation);
     }
     rec.lastUsed = frame_;
     if (!rec.pending())
@@ -1991,7 +2001,7 @@ size_t World::collect(size_t maxAttachedPages, uint32_t minAge,
     uint32_t slot = lruTail_;
     while (streamedPageCount() > maxAttachedPages && slot != kInvalidIndex)
     {
-        const uint32_t prev = slots_[slot].lruPrev;
+        const uint32_t prev = slots_[slot].lruPrev();
         const PageRt& rt = slots_[slot];
         const bool eligible = rt.inUse() && !rt.pinned() &&
                               rt.attachedChildPages() == 0 &&
@@ -2184,7 +2194,7 @@ void World::runPage(const WorkItem& item, const Instance& inst, const Camera& lo
 
     HLOD_STAT(w, pagesVisited, 1);
     const PageView& pg = pageView(rt);
-    const uint32_t gen = rt.generation;
+    const uint32_t gen = rt.generation();
     const InstanceId instance = InstanceId(&inst - instances_.data());
     // One bar, no history: damping is already folded into the view's camera
     // envelope, which widened the measured error rather than moving the
@@ -2362,7 +2372,7 @@ void World::runInstance(uint32_t instIdx, const Camera& view, const CutParams& p
                          w.touched.end()))
                     w.touched.push_back(inst.rootSlot);
                 w.cut.shared.push(makeCutEntry(
-                    NodeHandle{inst.rootSlot, 1, rootRt.generation}, error,
+                    NodeHandle{inst.rootSlot, 1, rootRt.generation()}, error,
                     w.bar, w.barInv, instIdx));
                 return;
             }
@@ -2408,7 +2418,6 @@ void World::runFlatInstance(uint32_t instIdx, const Camera& view,
     }
 
     HLOD_STAT(w, instancesVisited, 1);
-    const PageRt& rt = slots_[slot];
     if (w.trackTouches &&
         (!w.uniqueTouches ||
          std::find(w.touched.begin(), w.touched.end(), slot) == w.touched.end()))
@@ -2420,7 +2429,8 @@ void World::runFlatInstance(uint32_t instIdx, const Camera& view,
                                   distanceToBox(spatial->worldBox, view.queryMin(),
                                                 view.queryMax()))
                             : 0.0f;
-    w.cut.shared.push(makeCutEntry(NodeHandle{slot, 1, rt.generation}, error,
+    w.cut.shared.push(makeCutEntry(NodeHandle{slot, 1,
+                                             pageStamps_[slot].generation()}, error,
                                    w.bar, w.barInv, instIdx));
 }
 
@@ -2849,14 +2859,14 @@ void World::selectCutCached(const Camera& camera, const CutParams& params,
                    r.cutVersion == instanceCutVersions_[instIdx];
         if (hit && depCount != 0)
         {
-            const PageRt& rt = slots_[r.depSlot];
-            hit = rt.inUse() && rt.contentVersion == r.depVersion;
+            const PageStamp& stamp = pageStamps_[r.depSlot];
+            hit = stamp.inUse() && stamp.contentVersion == r.depVersion;
         }
         if (hit && depCount == 2)
         {
             const View::SecondDep& dep = ctx.secondDep_[instIdx];
-            const PageRt& rt = slots_[dep.slot];
-            hit = rt.inUse() && rt.contentVersion == dep.version;
+            const PageStamp& stamp = pageStamps_[dep.slot];
+            hit = stamp.inUse() && stamp.contentVersion == dep.version;
         }
 
         if (hit)
@@ -2949,13 +2959,13 @@ void World::selectCutCached(const Camera& camera, const CutParams& params,
             if (!w.touched.empty())
             {
                 r.depSlot = w.touched[0];
-                r.depVersion = slots_[w.touched[0]].contentVersion;
+                r.depVersion = pageStamps_[w.touched[0]].contentVersion;
             }
             if (w.touched.size() == 2)
             {
                 View::SecondDep& dep = ctx.secondDep_[instIdx];
                 dep.slot = w.touched[1];
-                dep.version = slots_[w.touched[1]].contentVersion;
+                dep.version = pageStamps_[w.touched[1]].contentVersion;
             }
         }
         else

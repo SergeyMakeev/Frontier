@@ -116,7 +116,8 @@ The runtime's multiplied structures have exact compile-time size contracts on
 | optional second page dependency | 8 B/instance | allocated only after a cacheable record actually touches two pages |
 | `PageUsageContext::Rec` | 8 B | 24-bit page generation and pending flag share one word |
 | `AssetRt` | 112 B | one owning-or-borrowing `Page`; no duplicate `PageView` |
-| `PageRt` | 112 B | refers to immutable bytes through its asset index; flags share bounded counters |
+| `PageRt` | 104 B | cold mount state; LRU links and the 24-bit handle generation share one word |
+| per mounted page validation stamp | 8 B | dense content version plus generation/live flag for cache-friendly validation |
 | per mounted page residency summary | 8 B | recursively identifies fully-resident mount trees without scanning nodes |
 | per mounted node | 3 B | one packed residency/coverage byte + 16-bit covered-child count |
 | `Instance` + `InstanceTlas` | 64 B + 48 B | selection-hot and spatial-maintenance streams stay separate |
@@ -875,7 +876,7 @@ regions became eligible during the run.
 Theory: a one-node asset has no cut decision to make. The TLAS already performs
 coarse instance culling, its root payload is pinned, and the sole authored node
 is necessarily in `shared`. Re-entering the normal page traversal therefore
-loaded a 64-byte `Instance`, a 112-byte mount header, and part of a 256-byte
+loaded a 64-byte `Instance`, the then-112-byte mount header, and part of a 256-byte
 wide block only to emit one known node.
 
 The kept path lazily records a 4-byte flat-root marker per instance. Uncached walks
@@ -969,6 +970,33 @@ Only about 0.5-1.2% of visible instances then used the shortcut in the moving
 camera workloads. The 20k cases were effectively flat versus the root-only
 binary, while the 80k moving-camera/5%-mover case rose to about 0.519 ms from
 roughly 0.47 ms. All frontier state and traversal branches were removed.
+
+### Y. Compact page validation stamps -- KEPT
+
+The 100k unique-page flat benchmark exposed a host-dependent cache cliff. A
+warm `View` validated each visible dependency by reading `contentVersion` from
+a 112-byte-stride `PageRt` array. The same logical validation now reads an
+8-byte `PageStamp` stream containing content version, handle generation, and a
+live flag. `PageRt` fell from 112 to 104 bytes, so adding the stamp does not
+increase total per-mount fixed state. Generation remains available in the
+already-loaded `PageRt` during a real hierarchy walk by sharing one 64-bit word
+with the two 20-bit LRU links.
+
+On an i9-12900K, seven alternating baseline/candidate rounds were pinned to
+logical CPUs 0-15 and run at high priority. The median paired high-resolution
+wall-time changes for unique flat pages were:
+
+| Visible instances | Uncached selection | Warm cached selection |
+|---:|---:|---:|
+| 25k | -6.7% (7/7 wins) | -14.7% (7/7 wins) |
+| 100k | -31.8% (7/7 wins) | -51.5% (7/7 wins) |
+
+The primary 100k cached case moved from a 1.623 ms baseline median to 0.803 ms
+for the new binary. Pure-hierarchy and pure-flat uncached mixed-forest controls
+changed +0.2% and +0.1%; six representative view-update controls ranged from
+-1.4% to +0.2%. The largest root-decision control movement was +1.4% with only
+2/7 candidate wins, consistent with run/layout noise rather than a systematic
+regression.
 
 ---
 

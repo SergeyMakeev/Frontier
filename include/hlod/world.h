@@ -902,8 +902,41 @@ private:
     };
     static_assert(sizeof(AssetRt) == 112, "asset runtime state must stay 112 bytes");
 
-    // A mount: one placement of an asset's bytes, with the mutable state that
-    // placement needs. There is exactly one mount per (asset, attachment
+    // The two words queried independently of the rest of a mount. Cached View
+    // hits validate a page dependency through contentVersion, while handles
+    // and overlays validate through generation. Keeping these stamps in a
+    // compact parallel stream avoids fetching a sparse 104-byte PageRt record
+    // for every visible instance in a world with many unique pages.
+    struct PageStamp
+    {
+        uint32_t contentVersion = 0;
+        // Page generations use 24 bits in NodeHandle. One spare high bit is
+        // the live-mount flag, so dependency validation remains two compact
+        // loads and never has to touch PageRt::asset.
+        static constexpr uint32_t kInUse = 1u << 31;
+        uint32_t generationAndInUse = 0;
+
+        uint32_t generation() const
+        {
+            return generationAndInUse & NodeHandle::kGenerationMask;
+        }
+        bool inUse() const { return (generationAndInUse & kInUse) != 0; }
+        void setGeneration(uint32_t generation)
+        {
+            generationAndInUse =
+                (generationAndInUse & kInUse) |
+                (generation & NodeHandle::kGenerationMask);
+        }
+        void setInUse(bool inUse)
+        {
+            if (inUse) generationAndInUse |= kInUse;
+            else generationAndInUse &= ~kInUse;
+        }
+    };
+    static_assert(sizeof(PageStamp) == 8, "page stamp must stay 8 bytes");
+
+    // A mount: one placement of an asset's bytes, with the cold mutable state
+    // that placement needs. There is exactly one mount per (asset, attachment
     // point) no matter how many instances walk it.
     struct PageRt
     {
@@ -926,15 +959,17 @@ private:
         // A page node has at most kMaxChildren (511), so 16 bits are ample and
         // halve this per-node propagation counter.
         std::vector<uint16_t> coveredChildren;
-        // Bumped by anything that can change what a walk of this page emits:
-        // a child attaching or detaching, a payload becoming resident or
-        // ceasing to be, a new error clamp. A View records this per
-        // page it walked, which is what lets one shared asset streaming in
-        // invalidate every instance of it without any per-instance work.
-        uint32_t   contentVersion = 0;
-        uint32_t   generation = 0;            // bumped per attach; invalidates handles
+        // LRU links need 20 bits each and the handle generation needs 24.
+        // Packing all three into one word retains generation beside the page
+        // data used by an actual walk without growing this cold record.
+        static constexpr uint32_t kLruBits = NodeHandle::kSlotBits;
+        static constexpr uint64_t kLruMask = NodeHandle::kSlotMask;
+        static constexpr uint32_t kLruNextShift = kLruBits;
+        static constexpr uint32_t kGenerationShift = 2 * kLruBits;
+        uint64_t lruLinksAndGeneration =
+            uint64_t(NodeHandle::kInvalidSlot) |
+            (uint64_t(NodeHandle::kInvalidSlot) << kLruNextShift);
         uint32_t   lastTouched = 0;           // world frame of last walk touch
-        uint32_t   lruPrev = kInvalidIndex, lruNext = kInvalidIndex;
         static constexpr uint32_t kPinned = 1u << 31;
         uint32_t   attachedChildrenAndPinned = 0;
         NodeRef    owner;                     // expansion node above; invalid for root pages
@@ -962,6 +997,48 @@ private:
             else nodeState[node] &= uint8_t(~kCovered);
         }
         bool inUse() const { return asset != kInvalidIndex; }
+        uint32_t generation() const
+        {
+            return uint32_t(lruLinksAndGeneration >> kGenerationShift) &
+                   NodeHandle::kGenerationMask;
+        }
+        void setGeneration(uint32_t generation)
+        {
+            const uint64_t low = lruLinksAndGeneration &
+                                 ((uint64_t(1) << kGenerationShift) - 1);
+            lruLinksAndGeneration =
+                low | (uint64_t(generation & NodeHandle::kGenerationMask) <<
+                       kGenerationShift);
+        }
+        uint32_t lruPrev() const
+        {
+            const uint32_t slot = uint32_t(lruLinksAndGeneration & kLruMask);
+            return slot == NodeHandle::kInvalidSlot ? kInvalidIndex : slot;
+        }
+        uint32_t lruNext() const
+        {
+            const uint32_t slot =
+                uint32_t((lruLinksAndGeneration >> kLruNextShift) & kLruMask);
+            return slot == NodeHandle::kInvalidSlot ? kInvalidIndex : slot;
+        }
+        void setLruPrev(uint32_t slot)
+        {
+            const uint64_t encoded =
+                slot == kInvalidIndex ? NodeHandle::kInvalidSlot
+                                      : (slot & NodeHandle::kSlotMask);
+            lruLinksAndGeneration =
+                (lruLinksAndGeneration & ~kLruMask) | encoded;
+        }
+        void setLruNext(uint32_t slot)
+        {
+            const uint64_t mask = kLruMask << kLruNextShift;
+            const uint64_t encoded =
+                uint64_t(slot == kInvalidIndex ? NodeHandle::kInvalidSlot
+                                               : (slot & NodeHandle::kSlotMask))
+                << kLruNextShift;
+            lruLinksAndGeneration =
+                (lruLinksAndGeneration & ~mask) | encoded;
+        }
         bool pinned() const
         {
             return (attachedChildrenAndPinned & kPinned) != 0;
@@ -978,7 +1055,7 @@ private:
         void addAttachedChild() { ++attachedChildrenAndPinned; }
         void removeAttachedChild() { --attachedChildrenAndPinned; }
     };
-    static_assert(sizeof(PageRt) == 112, "mounted-page state must stay 112 bytes");
+    static_assert(sizeof(PageRt) == 104, "mounted-page state must stay 104 bytes");
 
     // Compact mount-wide summary for the shared-only traversal. A mount tree
     // is fully resident when every payload-bearing node in this page is
@@ -1265,7 +1342,7 @@ private:
     // reference to another, and refit holds two at a time as it crosses a page
     // boundary.
     uint32_t       ensureOverlay(Instance& inst, uint32_t slot);
-    void           initOverlay(Overlay& ov, const PageRt& rt);
+    void           initOverlay(Overlay& ov, uint32_t slot, const PageRt& rt);
     void           freeOverlays(Instance& inst);
     // Effective bounds for a walk of `slot` by `inst`.
     const AABB*    boundsFor(const Instance& inst, uint32_t slot, const PageRt& rt) const;
@@ -1344,6 +1421,7 @@ private:
     size_t                liveAssets_ = 0;
 
     std::vector<PageRt>   slots_;
+    std::vector<PageStamp> pageStamps_;
     std::vector<PageResidency> pageResidency_;
     std::vector<uint32_t> freeSlots_;
     size_t                attachedPages_ = 0;

@@ -75,7 +75,7 @@ struct World::TestAccess
             const PageView& page = w.pageView(rt);
             for (uint32_t i = 1; i < page.nodeCount(); ++i)
                 if (page.payload[i] == payload)
-                    return NodeHandle{s, i, rt.generation};
+                    return NodeHandle{s, i, w.pageStamps_[s].generation()};
         }
         return NodeHandle{};
     }
@@ -102,6 +102,7 @@ struct World::TestAccess
     static size_t tlasNodeCount(World& w) { return w.tlasNodes_.size(); }
     static size_t assetRtBytes() { return sizeof(AssetRt); }
     static size_t pageRtBytes() { return sizeof(PageRt); }
+    static size_t pageStampBytes() { return sizeof(PageStamp); }
     static size_t pageResidencyBytes() { return sizeof(PageResidency); }
     static size_t overlayBytes() { return sizeof(Overlay); }
     static size_t instanceBytes() { return sizeof(Instance); }
@@ -355,7 +356,7 @@ private:
         const bool exp = pg.isExpansion(i);
         const bool wants = ideal && (cc > 0 || exp) && err > p.threshold;
 
-        const NodeHandle here{slot, i, rt.generation};
+        const NodeHandle here{slot, i, w.pageStamps_[slot].generation()};
         if (!ideal)
         {
             if (rt.isResident(i))

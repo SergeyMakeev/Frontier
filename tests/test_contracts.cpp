@@ -604,6 +604,7 @@ TEST(Contracts, MemoryBudgets)
     // visible in benchmark output as well as enforcing broad ceilings here.
     RecordProperty("assetrt_bytes", int(TA::assetRtBytes()));
     RecordProperty("pagert_bytes", int(TA::pageRtBytes()));
+    RecordProperty("page_stamp_bytes", int(TA::pageStampBytes()));
     RecordProperty("page_residency_bytes", int(TA::pageResidencyBytes()));
     RecordProperty("overlay_bytes", int(TA::overlayBytes()));
     RecordProperty("instance_bytes", int(TA::instanceBytes()));
@@ -615,7 +616,8 @@ TEST(Contracts, MemoryBudgets)
     RecordProperty("tlas_item_bytes", int(TA::tlasItemBytes()));
     RecordProperty("morton_item_bytes", int(TA::mortonItemBytes()));
     EXPECT_EQ(TA::assetRtBytes(), 112u);
-    EXPECT_EQ(TA::pageRtBytes(), 112u);
+    EXPECT_EQ(TA::pageRtBytes(), 104u);
+    EXPECT_EQ(TA::pageStampBytes(), 8u);
     EXPECT_EQ(TA::pageResidencyBytes(), 8u);
     EXPECT_EQ(TA::overlayBytes(), 56u);
     EXPECT_EQ(TA::instanceBytes(), 64u);
