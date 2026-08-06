@@ -308,6 +308,51 @@ TEST(Streaming, ExpansionLifeCycle)
     }
 }
 
+TEST(Streaming, FullyResidentSummaryTracksAttachedMountTree)
+{
+    HLodBuilder rootBuilder;
+    const auto root = rootBuilder.createRoot(1, 64.0f);
+    const auto expansion = rootBuilder.createNode(
+        root, 2, 32.0f,
+        AABB::fromCenterExtent(float4::point(0, 0, 0), float4::vec(2, 2, 2)));
+    rootBuilder.markExpansion(expansion);
+    Page rootPage = rootBuilder.build();
+    const auto rootIds = pageIds(rootPage);
+
+    World world;
+    world.addInstance(std::move(rootPage), float4::point(0, 0, 0));
+    markAllResident(world, rootIds);
+    EXPECT_TRUE(TA::fullyResidentTree(world, 1));
+
+    HLodBuilder childBuilder;
+    childBuilder.createRoot(
+        10, 0.0f,
+        AABB::fromCenterExtent(float4::point(0, 0, 0), float4::vec(1, 1, 1)));
+    Page childPage = childBuilder.build();
+    const uint32_t childNodes = childPage.nodeCount();
+    const PageHandle child = attachPage(world, 2, std::move(childPage));
+    ASSERT_TRUE(child.valid());
+    EXPECT_FALSE(TA::fullyResidentTree(world, 1));
+
+    markAllResident(world, child, childNodes);
+    EXPECT_TRUE(TA::fullyResidentTree(world, 1));
+
+    const Camera view =
+        makeLookAtCamera(float4::point(0, 0, -8), float4::point(0, 0, 0));
+    const Outputs output = frame(world, view, {4.0f, 0.0f});
+    EXPECT_TRUE(output.cut.currentOnly.empty());
+    EXPECT_TRUE(output.cut.idealOnly.empty());
+    EXPECT_EQ(cutIds(output), std::set<UserId>{10});
+
+    world.markNonResident(nodeAt(child, 1));
+    EXPECT_FALSE(TA::fullyResidentTree(world, 1));
+    world.markResident(nodeAt(child, 1));
+    EXPECT_TRUE(TA::fullyResidentTree(world, 1));
+
+    detachPage(world, 2);
+    EXPECT_TRUE(TA::fullyResidentTree(world, 1));
+}
+
 // ---------------------------------------------------------------------------
 // Attach-time clamp: invariant (D) across the page boundary is enforced by a
 // per-mount scalar (errClamp), NOT by rewriting the child page's error array

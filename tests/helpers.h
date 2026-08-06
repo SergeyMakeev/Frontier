@@ -89,6 +89,7 @@ struct World::TestAccess
     static size_t tlasNodeCount(World& w) { return w.tlasNodes_.size(); }
     static size_t assetRtBytes() { return sizeof(AssetRt); }
     static size_t pageRtBytes() { return sizeof(PageRt); }
+    static size_t pageResidencyBytes() { return sizeof(PageResidency); }
     static size_t overlayBytes() { return sizeof(Overlay); }
     static size_t instanceBytes() { return sizeof(Instance); }
     static size_t instanceTlasBytes() { return sizeof(InstanceTlas); }
@@ -98,6 +99,10 @@ struct World::TestAccess
     static size_t pendingMoveBytes() { return sizeof(PendingMove); }
     static size_t tlasItemBytes() { return sizeof(TlasItem); }
     static size_t mortonItemBytes() { return sizeof(MortonItem); }
+    static bool fullyResidentTree(World& w, UserPayload anyNodeInPage)
+    {
+        return w.pageTreeFullyResident(requireByScan(w, anyNodeInPage).slot());
+    }
 
     // Invariant (D) across a page boundary is a per-mount scalar now, not a
     // rewrite of the child page's error array (page bytes are immutable).

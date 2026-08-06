@@ -972,6 +972,18 @@ private:
     };
     static_assert(sizeof(PageRt) == 112, "mounted-page state must stay 112 bytes");
 
+    // Compact mount-wide summary for the shared-only traversal. A mount tree
+    // is fully resident when every payload-bearing node in this page is
+    // resident and every attached child mount is recursively fully resident.
+    // Keeping this parallel avoids growing the already dense PageRt header.
+    struct PageResidency
+    {
+        uint32_t residentNodes = 0;
+        uint32_t incompleteChildren = 0;
+    };
+    static_assert(sizeof(PageResidency) == 8,
+                  "page residency summary must stay 8 bytes");
+
     // Copy-on-write bounds for one (instance, mount) pair: the only part of a
     // page a deformed instance stops sharing. Allocated on that instance's
     // first setNodeBounds touching the mount, and on any ancestor mount that
@@ -1260,10 +1272,14 @@ private:
                                    const Camera& local,
                                    std::vector<uint32_t>* touched = nullptr,
                                    bool uniqueTouches = true) const;
+    bool pageTreeFullyResident(uint32_t slot) const;
+    void propagateFullResidency(uint32_t slot, bool wasFullyResident);
     void runInstance(uint32_t instIdx, const Camera& view, const CutParams& params,
                      uint8_t mask, Worker& w) const;
+    template<bool FullyResident>
     void runPage(const WorkItem& item, const Instance& inst, const Camera& local,
                  const CutParams& params, Worker& w) const;
+    template<bool FullyResident>
     void wideVisit(const WorkItem& item, const PageView& pg, float errClamp,
                    uint32_t gen, InstanceId instance, uint32_t node, uint8_t mask,
                    uint8_t currentKids, uint8_t idealKids,
@@ -1284,6 +1300,7 @@ private:
     size_t                liveAssets_ = 0;
 
     std::vector<PageRt>   slots_;
+    std::vector<PageResidency> pageResidency_;
     std::vector<uint32_t> freeSlots_;
     size_t                attachedPages_ = 0;
     size_t                pinnedPages_ = 0;

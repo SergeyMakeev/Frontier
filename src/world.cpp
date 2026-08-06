@@ -279,6 +279,7 @@ uint32_t World::allocSlot()
     HLOD_CHECK(slots_.size() < NodeHandle::kInvalidSlot,
                "World: exhausted the 20-bit page-mount slot space");
     slots_.emplace_back();
+    pageResidency_.emplace_back();
     return uint32_t(slots_.size() - 1);
 }
 
@@ -287,6 +288,7 @@ uint32_t World::registerPage(uint32_t asset, NodeRef owner, bool pinned)
     const uint32_t slot = allocSlot();
     AssetRt& as = assets_[asset];
     PageRt& rt = slots_[slot];
+    pageResidency_[slot] = PageResidency{};
 
     HLOD_CHECK(as.page.nodeCount() <= (1u << NodeHandle::kIndexBits),
                "World: page exceeds the 20-bit page-local node space");
@@ -325,6 +327,7 @@ void World::pinRootPayloads(uint32_t slot)
     for (uint32_t k = 0; k < page.childCount(0); ++k)
     {
         rt.setResident(c, true);
+        ++pageResidency_[slot].residentNodes;
         propagateCoverage(slot, c);
         c += page.subtreeSize[c];
     }
@@ -375,10 +378,13 @@ PageHandle World::attachPage(NodeHandle expansionNode, AssetHandle assetHandle)
     slots_[slot].errClamp = childClamp;
 
     PageRt& ort = slots_[owner.slot];
+    const bool ownerWasFullyResident = pageTreeFullyResident(owner.slot);
     if (ort.expSlot.empty())
         ort.expSlot.assign(pageView(ort).nodeCount(), kInvalidIndex);
     ort.expSlot[owner.index] = slot;
     ort.addAttachedChild();
+    ++pageResidency_[owner.slot].incompleteChildren;
+    propagateFullResidency(owner.slot, ownerWasFullyResident);
     ++ort.contentVersion;   // this page now refines further than it did
 
     return PageHandle{slot, slots_[slot].generation};
@@ -428,8 +434,16 @@ void World::detachSlot(uint32_t slot, std::vector<UserPayload>* freedPayloads)
     if (rt.owner.valid())
     {
         PageRt& ownerRt = slots_[rt.owner.slot];
+        const bool ownerWasFullyResident = pageTreeFullyResident(rt.owner.slot);
+        if (!pageTreeFullyResident(slot))
+        {
+            HLOD_CHECK(pageResidency_[rt.owner.slot].incompleteChildren != 0,
+                       "World: page residency summary underflow");
+            --pageResidency_[rt.owner.slot].incompleteChildren;
+        }
         ownerRt.expSlot[rt.owner.index] = kInvalidIndex;
         ownerRt.removeAttachedChild();
+        propagateFullResidency(rt.owner.slot, ownerWasFullyResident);
         ++ownerRt.contentVersion;   // it collapses back to a leaf here
         propagateCoverage(rt.owner.slot, rt.owner.index);
     }
@@ -444,6 +458,7 @@ void World::detachSlot(uint32_t slot, std::vector<UserPayload>* freedPayloads)
     // compact handle or a View dependency record.
     rt.generation = generation;
     rt.contentVersion = contentVersion;
+    pageResidency_[slot] = PageResidency{};
     freeSlots_.push_back(slot);
     --attachedPages_;
     // Any per-instance bounds overlay on this mount is now describing a page
@@ -477,6 +492,37 @@ void World::detachMountTree(uint32_t rootSlot, std::vector<UserPayload>* freedPa
 // ============================================================================
 // residency
 // ============================================================================
+
+bool World::pageTreeFullyResident(uint32_t slot) const
+{
+    const PageResidency& summary = pageResidency_[slot];
+    return summary.incompleteChildren == 0 &&
+           summary.residentNodes + 1 == pageView(slots_[slot]).nodeCount();
+}
+
+void World::propagateFullResidency(uint32_t slot, bool wasFullyResident)
+{
+    bool fullyResident = pageTreeFullyResident(slot);
+    while (fullyResident != wasFullyResident)
+    {
+        const NodeRef owner = slots_[slot].owner;
+        if (!owner.valid()) return;
+
+        slot = owner.slot;
+        PageResidency& summary = pageResidency_[slot];
+        const bool ownerWasFullyResident = pageTreeFullyResident(slot);
+        if (fullyResident)
+        {
+            HLOD_CHECK(summary.incompleteChildren != 0,
+                       "World: page residency summary underflow");
+            --summary.incompleteChildren;
+        }
+        else
+            ++summary.incompleteChildren;
+        wasFullyResident = ownerWasFullyResident;
+        fullyResident = pageTreeFullyResident(slot);
+    }
+}
 
 bool World::descendantsCovered(uint32_t slot, uint32_t node) const
 {
@@ -532,7 +578,10 @@ void World::markResident(NodeHandle h)
     if (!rt) return;   // page collected while the payload was loading
     const uint32_t index = h.index();
     if (rt->isResident(index)) return;
+    const bool wasFullyResident = pageTreeFullyResident(h.slot());
     rt->setResident(index, true);
+    ++pageResidency_[h.slot()].residentNodes;
+    propagateFullResidency(h.slot(), wasFullyResident);
     ++rt->contentVersion;
     propagateCoverage(h.slot(), index);
 }
@@ -545,7 +594,12 @@ void World::markNonResident(NodeHandle h)
     HLOD_CHECK(!(rt->pinned() && pageView(*rt).parent[index] == 0),
                "World::markNonResident: pinned root");
     if (!rt->isResident(index)) return;
+    const bool wasFullyResident = pageTreeFullyResident(h.slot());
     rt->setResident(index, false);
+    HLOD_CHECK(pageResidency_[h.slot()].residentNodes != 0,
+               "World: page residency summary underflow");
+    --pageResidency_[h.slot()].residentNodes;
+    propagateFullResidency(h.slot(), wasFullyResident);
     ++rt->contentVersion;
     propagateCoverage(h.slot(), index);
 }
@@ -1872,6 +1926,7 @@ size_t World::collect(std::initializer_list<PageUsageContext*> usage,
 // own boxes or this instance's overlay. Everything else is read from the
 // shared page. There is no per-block branch for the overlay case: the two
 // layouts differ only in stride.
+template<bool FullyResident>
 void World::wideVisit(const WorkItem& item, const PageView& pg, float errClamp,
                       uint32_t gen, InstanceId instance, uint32_t node, uint8_t mask,
                       uint8_t currentKids, uint8_t idealKids,
@@ -1917,9 +1972,13 @@ void World::wideVisit(const WorkItem& item, const PageView& pg, float errClamp,
             const uint32_t l = uint32_t(std::countr_zero(leaves));
             leaves &= leaves - 1;
             const uint32_t c = blk.child[l];
-            w.emit(makeCutEntry(NodeHandle{item.slot(), c, gen}, errs.v[l], w.bar,
-                                w.barInv, instance),
-                   currentKids != 0, idealKids != 0);
+            const CutEntry entry =
+                makeCutEntry(NodeHandle{item.slot(), c, gen}, errs.v[l], w.bar,
+                             w.barInv, instance);
+            if constexpr (FullyResident)
+                w.cut.shared.push(entry);
+            else
+                w.emit(entry, currentKids != 0, idealKids != 0);
         }
 
         uint32_t inner = survivors & ~leafLanes;
@@ -1929,8 +1988,11 @@ void World::wideVisit(const WorkItem& item, const PageView& pg, float errClamp,
             inner &= inner - 1;
             const uint32_t c = blk.child[l];
             const uint8_t planes = outMasks[l];
-            w.nodeStack.push_back(
-                {c, errs.v[l], planes, currentKids, idealKids});
+            if constexpr (FullyResident)
+                w.nodeStack.push_back({c, errs.v[l], planes, 1, 1});
+            else
+                w.nodeStack.push_back(
+                    {c, errs.v[l], planes, currentKids, idealKids});
 
             // This lane is the only kind that gets DECIDED: runPage will ask
             // whether its error clears the bar, and plain leaves (handled
@@ -1938,7 +2000,7 @@ void World::wideVisit(const WorkItem& item, const PageView& pg, float errClamp,
             // distance reaches eff * k / bar, so the gap between where this
             // node is and where that happens is how far the camera may travel
             // before this instance's cut could differ. See View.
-            if (w.trackMargin && idealKids)
+            if (w.trackMargin && (FullyResident || idealKids))
             {
                 w.maxError = std::max(w.maxError, eff.v[l]);
                 const float flipAt = eff.v[l] * local.k / w.bar;
@@ -2001,6 +2063,7 @@ bool World::visibleDescendantsCovered(uint32_t slot, uint32_t node, uint8_t mask
     return true;
 }
 
+template<bool FullyResident>
 void World::runPage(const WorkItem& item, const Instance& inst, const Camera& local,
                     const CutParams& params, Worker& w) const
 {
@@ -2020,8 +2083,8 @@ void World::runPage(const WorkItem& item, const Instance& inst, const Camera& lo
     const float bar = params.threshold;
 
     w.nodeStack.clear();
-    wideVisit(item, pg, rt.errClamp, gen, instance, 0, item.mask(), item.current(),
-              item.ideal(), local, w);
+    wideVisit<FullyResident>(item, pg, rt.errClamp, gen, instance, 0, item.mask(),
+                             item.current(), item.ideal(), local, w);
 
     while (!w.nodeStack.empty())
     {
@@ -2030,86 +2093,116 @@ void World::runPage(const WorkItem& item, const Instance& inst, const Camera& lo
         const uint32_t i = e.node();
         HLOD_STAT(w, nodesVisited, 1);
 
-        const bool current = e.current();
-        const bool ideal = e.ideal();
         const NodeHandle here{item.slot(), i, gen};
 
-        uint8_t nextCurrent = 0;
-        uint8_t nextIdeal = 0;
-
-        // Current-only traversal happens when the ideal cut stopped at a
-        // non-resident proxy whose descendants nevertheless form a complete
-        // resident cover. Stop at the nearest resident descendant; otherwise
-        // continue through the precomputed cover.
-        if (!ideal)
+        if constexpr (FullyResident)
         {
-            if (rt.isResident(i))
+            if (!(e.err > bar))
             {
-                w.cut.currentOnly.push(
+                w.cut.shared.push(
                     makeCutEntry(here, e.err, bar, w.barInv, instance));
                 continue;
             }
-            nextCurrent = 1;
-        }
-        else if (!(e.err > bar))
-        {
-            const bool shared = current && rt.isResident(i);
-            const CutEntry entry =
-                makeCutEntry(here, e.err, bar, w.barInv, instance);
-            w.emit(entry, shared, true);
-            if (!current || shared) continue;
-            // The ideal proxy is missing, but a recursively complete resident
-            // descendant cut exists because the current walk reached it.
-            nextCurrent = 1;
-        }
 
-        const uint32_t m = pg.meta[i];
-        const bool exp = metaIsExpansion(m);
-
-        const uint32_t childSlot =
-            (exp && !rt.expSlot.empty()) ? rt.expSlot[i] : kInvalidIndex;
-
-        if (ideal && e.err > bar && exp && childSlot == kInvalidIndex)
-        {
-            HLOD_CHECK(!current || rt.isResident(i),
-                       "View::selectCut: non-resident current expansion proxy");
-            const CutEntry entry =
-                makeCutEntry(here, e.err, bar, w.barInv, instance);
-            w.emit(entry, current, true);
-            continue;
-        }
-
-        if (ideal && e.err > bar)
-        {
-            const bool canDescend =
-                !current ||
-                visibleDescendantsCovered(item.slot(), i, e.planes(), inst, local,
-                                           w.trackTouches ? &w.touched : nullptr,
-                                           w.uniqueTouches);
-            if (current && !canDescend)
+            const bool exp = metaIsExpansion(pg.meta[i]);
+            const uint32_t childSlot =
+                (exp && !rt.expSlot.empty()) ? rt.expSlot[i] : kInvalidIndex;
+            if (exp)
             {
-                HLOD_CHECK(rt.isResident(i),
-                           "View::selectCut: uncovered current subtree");
-                w.cut.currentOnly.push(
-                    makeCutEntry(here, e.err, bar, w.barInv, instance));
+                if (childSlot == kInvalidIndex)
+                    w.cut.shared.push(
+                        makeCutEntry(here, e.err, bar, w.barInv, instance));
+                else
+                    w.work.push_back(
+                        {childSlot,
+                         wideBoundsFor(inst, childSlot, slots_[childSlot]),
+                         1, 1, e.planes()});
             }
-            nextCurrent = uint8_t(current && canDescend);
-            nextIdeal = 1;
-        }
-
-        HLOD_CHECK(nextCurrent || nextIdeal,
-                   "View::selectCut: node has no current or ideal continuation");
-        if (exp)
-        {
-            HLOD_CHECK(childSlot != kInvalidIndex,
-                       "View::selectCut: uncovered expansion subtree");
-            w.work.push_back({childSlot,
-                              wideBoundsFor(inst, childSlot, slots_[childSlot]),
-                              nextCurrent, nextIdeal, e.planes()});
+            else
+                wideVisit<true>(item, pg, rt.errClamp, gen, instance, i,
+                                e.planes(), 1, 1, local, w);
         }
         else
-            wideVisit(item, pg, rt.errClamp, gen, instance, i, e.planes(), nextCurrent,
-                      nextIdeal, local, w);
+        {
+            const bool current = e.current();
+            const bool ideal = e.ideal();
+            uint8_t nextCurrent = 0;
+            uint8_t nextIdeal = 0;
+
+            // Current-only traversal happens when the ideal cut stopped at a
+            // non-resident proxy whose descendants nevertheless form a complete
+            // resident cover. Stop at the nearest resident descendant; otherwise
+            // continue through the precomputed cover.
+            if (!ideal)
+            {
+                if (rt.isResident(i))
+                {
+                    w.cut.currentOnly.push(
+                        makeCutEntry(here, e.err, bar, w.barInv, instance));
+                    continue;
+                }
+                nextCurrent = 1;
+            }
+            else if (!(e.err > bar))
+            {
+                const bool shared = current && rt.isResident(i);
+                const CutEntry entry =
+                    makeCutEntry(here, e.err, bar, w.barInv, instance);
+                w.emit(entry, shared, true);
+                if (!current || shared) continue;
+                // The ideal proxy is missing, but a recursively complete resident
+                // descendant cut exists because the current walk reached it.
+                nextCurrent = 1;
+            }
+
+            const uint32_t m = pg.meta[i];
+            const bool exp = metaIsExpansion(m);
+
+            const uint32_t childSlot =
+                (exp && !rt.expSlot.empty()) ? rt.expSlot[i] : kInvalidIndex;
+
+            if (ideal && e.err > bar && exp && childSlot == kInvalidIndex)
+            {
+                HLOD_CHECK(!current || rt.isResident(i),
+                           "View::selectCut: non-resident current expansion proxy");
+                const CutEntry entry =
+                    makeCutEntry(here, e.err, bar, w.barInv, instance);
+                w.emit(entry, current, true);
+                continue;
+            }
+
+            if (ideal && e.err > bar)
+            {
+                const bool canDescend =
+                    !current ||
+                    visibleDescendantsCovered(item.slot(), i, e.planes(), inst, local,
+                                               w.trackTouches ? &w.touched : nullptr,
+                                               w.uniqueTouches);
+                if (current && !canDescend)
+                {
+                    HLOD_CHECK(rt.isResident(i),
+                               "View::selectCut: uncovered current subtree");
+                    w.cut.currentOnly.push(
+                        makeCutEntry(here, e.err, bar, w.barInv, instance));
+                }
+                nextCurrent = uint8_t(current && canDescend);
+                nextIdeal = 1;
+            }
+
+            HLOD_CHECK(nextCurrent || nextIdeal,
+                       "View::selectCut: node has no current or ideal continuation");
+            if (exp)
+            {
+                HLOD_CHECK(childSlot != kInvalidIndex,
+                           "View::selectCut: uncovered expansion subtree");
+                w.work.push_back({childSlot,
+                                  wideBoundsFor(inst, childSlot, slots_[childSlot]),
+                                  nextCurrent, nextIdeal, e.planes()});
+            }
+            else
+                wideVisit<false>(item, pg, rt.errClamp, gen, instance, i,
+                                 e.planes(), nextCurrent, nextIdeal, local, w);
+        }
     }
 }
 
@@ -2122,11 +2215,15 @@ void World::runInstance(uint32_t instIdx, const Camera& view, const CutParams& p
     w.work.push_back({inst.rootSlot,
                       wideBoundsFor(inst, inst.rootSlot, slots_[inst.rootSlot]),
                       1, 1, mask});
+    const bool fullyResident = pageTreeFullyResident(inst.rootSlot);
     while (!w.work.empty())
     {
         const WorkItem item = w.work.back();
         w.work.pop_back();
-        runPage(item, inst, local, params, w);
+        if (fullyResident)
+            runPage<true>(item, inst, local, params, w);
+        else
+            runPage<false>(item, inst, local, params, w);
     }
 }
 
