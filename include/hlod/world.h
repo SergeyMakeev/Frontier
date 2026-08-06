@@ -807,6 +807,12 @@ public:
     // Propagation up the ancestor chain promotes overlays as it crosses page
     // boundaries, so only the pages on the path from the moved node to the
     // instance root are ever privatised.
+    //
+    // Performance: submission order is preserved. For large batches, group
+    // calls by instance and page when practical so consecutive refits reuse
+    // nearby overlay data. Ordering is irrelevant to correctness, and World
+    // intentionally does not sort the queue because sorting can cost more
+    // than the saved cache misses.
     void setNodeBounds(InstanceRef inst, NodeHandle h, const AABB& localBounds);
 
     // Force pending bounds refits now (conservative grow-only propagation up

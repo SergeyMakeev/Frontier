@@ -262,7 +262,13 @@ mutations using it become safe no-ops.
   the current cut stays free of holes and parent/child overlap.
 - `setNodeBounds(instance, node, bounds)` creates bounds-only copy-on-write
   overlays for the affected instance. Refits are queued and published by
-  `applyUpdates`.
+  `applyUpdates`. Submission order does not affect correctness, but it can
+  materially affect large-batch throughput: group updates by instance and
+  page when practical so refitting walks overlay memory locally. The library
+  preserves caller order and deliberately does not sort the queue, because
+  sorting can cost more than the refit. In the 80,000-update locality benchmark,
+  grouped submission reduced submit-plus-refit time from 11.12 ms to 4.02 ms
+  on the test i9.
 - Every camera or shadow cascade owns a `View`. It contains damping, reusable
   cut records, traversal scratch, and selection statistics. Reuse is enabled
   by default and can be disabled with `setReuseEnabled(false)` for highly
