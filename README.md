@@ -351,16 +351,16 @@ Set `HLOD_PERF_BUILD_DIR` to use a build directory other than `build-perf`.
 
 The optimized NEON squared-distance/reciprocal-square-root path is enabled by
 default. To A/B it against the previous full-square-root/divide path on Apple
-Silicon, use separate build directories and identical benchmark arguments:
+Silicon, run the two self-contained wrappers from the repository root:
 
 ```sh
-HLOD_PERF_BUILD_DIR=build-perf-neon-base HLOD_PERF_NEON_RSQRT=OFF \
-  ./run_perf_bench.sh --benchmark_filter='BM_(Adversarial_WideNode|AssetSharing_CutCost|MixedForest100k|View_Breakdown)' \
-    --benchmark_repetitions=7 --benchmark_out=neon-base.json --benchmark_out_format=json
-HLOD_PERF_BUILD_DIR=build-perf-neon-rsqrt HLOD_PERF_NEON_RSQRT=ON \
-  ./run_perf_bench.sh --benchmark_filter='BM_(Adversarial_WideNode|AssetSharing_CutCost|MixedForest100k|View_Breakdown)' \
-    --benchmark_repetitions=7 --benchmark_out=neon-rsqrt.json --benchmark_out_format=json
+bash ./run_perf_neon_off.sh
+bash ./run_perf_neon_on.sh
 ```
+
+They use separate build directories and write `neon-off.json` and
+`neon-on.json` in the repository root. Additional Google Benchmark arguments
+may be appended to either command.
 
 Normal configuration options:
 
