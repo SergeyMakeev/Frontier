@@ -336,6 +336,19 @@ run_perf_bench.bat
 run_perf_bench.bat --benchmark_filter=BM_RootDecisionForest100k --benchmark_repetitions=7
 ```
 
+On macOS, `run_perf_bench.sh` provides the same workflow and benchmark defaults.
+On Apple Silicon it explicitly targets native `arm64` (even when launched from
+a shell running under Rosetta), selecting the library's NEON path. Intel Macs
+use AVX2 when available, with SSE2 as the fallback. Pass Google Benchmark
+arguments in the same way:
+
+```sh
+./run_perf_bench.sh
+./run_perf_bench.sh --benchmark_filter=BM_DeformationSubmissionOrder --benchmark_repetitions=7
+```
+
+Set `HLOD_PERF_BUILD_DIR` to use a build directory other than `build-perf`.
+
 Normal configuration options:
 
 | Option | Default | Meaning |
