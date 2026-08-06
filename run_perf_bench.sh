@@ -3,7 +3,6 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="${HLOD_PERF_BUILD_DIR:-${ROOT_DIR}/build-perf}"
-NEON_RSQRT="${HLOD_PERF_NEON_RSQRT:-ON}"
 
 if ! command -v cmake >/dev/null 2>&1; then
     echo "ERROR: CMake was not found in PATH." >&2
@@ -51,7 +50,6 @@ configure_args=(
     -DHLOD_BUILD_BENCH=ON
     -DHLOD_AVX2="${avx2}"
     -DHLOD_FORCE_SCALAR=OFF
-    -DHLOD_NEON_RSQRT="${NEON_RSQRT}"
 )
 if [[ -n "${generator}" ]]; then
     configure_args+=(-G "${generator}")
@@ -60,8 +58,6 @@ if [[ -n "${target_architecture}" ]]; then
     configure_args+=("-DCMAKE_OSX_ARCHITECTURES=${target_architecture}")
 fi
 cmake "${configure_args[@]}"
-
-echo "NEON squared-distance/rsqrt path: ${NEON_RSQRT}"
 
 echo "Building hlod_bench..."
 cmake --build "${BUILD_DIR}" --config Release --target hlod_bench --parallel

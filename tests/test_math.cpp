@@ -1,6 +1,5 @@
 #include <gtest/gtest.h>
 
-#include <algorithm>
 #include <random>
 
 #include "hlod/math.h"
@@ -187,67 +186,6 @@ TEST(ScreenError, ZeroDistanceSaturatesFinitePositive)
     const float e = screenError(4.0f, 1000.0f, 0.0f);
     EXPECT_GT(e, 1.0e30f);
     EXPECT_FALSE(std::isnan(e));
-}
-
-TEST(ScreenError, SquaredWideMatchesScalarFuzz)
-{
-    std::mt19937 rng(98761);
-    std::uniform_real_distribution<float> errDist(0.01f, 1.0e4f);
-    std::uniform_real_distribution<float> distDist(1.0e-4f, 1.0e5f);
-
-    for (int iter = 0; iter < 500; ++iter)
-    {
-        const float k = 10.0f + float(iter);
-        float8 ge, d2;
-        for (uint32_t l = 0; l < kWide; ++l)
-        {
-            ge.v[l] = errDist(rng);
-            const float d = distDist(rng);
-            d2.v[l] = d * d;
-        }
-        if ((iter % 7) == 0) d2.v[3] = 0.0f;
-
-        const float8 wide = screenErrorFromSq8(ge, k, d2);
-        for (uint32_t l = 0; l < kWide; ++l)
-        {
-            const float expected = screenError(ge.v[l], k, std::sqrt(d2.v[l]));
-            const float tolerance = std::max(1.0e-5f, std::abs(expected) * 5.0e-5f);
-            EXPECT_NEAR(wide.v[l], expected, tolerance)
-                << "iter " << iter << " lane " << l;
-            EXPECT_TRUE(std::isfinite(wide.v[l]))
-                << "iter " << iter << " lane " << l;
-        }
-    }
-}
-
-TEST(Aabb, SquaredWideDistanceMatchesScalarFuzz)
-{
-    std::mt19937 rng(45123);
-    std::uniform_real_distribution<float> pos(-1000.0f, 1000.0f);
-    std::uniform_real_distribution<float> ext(0.0f, 30.0f);
-
-    for (int iter = 0; iter < 500; ++iter)
-    {
-        WideBounds wb = WideBounds::allEmpty();
-        AABB boxes[kWide];
-        for (uint32_t l = 0; l < kWide; ++l)
-        {
-            boxes[l] = AABB::fromCenterExtent(
-                float4::vec(pos(rng), pos(rng), pos(rng)),
-                float4::vec(ext(rng), ext(rng), ext(rng)));
-            wb.setLane(l, boxes[l]);
-        }
-        const float4 q = float4::point(pos(rng), pos(rng), pos(rng));
-        const float8 wide = distanceToBoxesSq(wb, q, q);
-        for (uint32_t l = 0; l < kWide; ++l)
-        {
-            const float d = distanceToBox(boxes[l], q);
-            const float expected = d * d;
-            const float tolerance = std::max(1.0e-4f, expected * 2.0e-6f);
-            EXPECT_NEAR(wide.v[l], expected, tolerance)
-                << "iter " << iter << " lane " << l;
-        }
-    }
 }
 
 TEST(Camera, LocalTransformIsScaleInvariant)
