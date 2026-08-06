@@ -8,6 +8,7 @@ option(HLOD_BUILD_TESTS "Build unit tests" ON)
 option(HLOD_BUILD_BENCH "Build performance tests" ON)
 option(HLOD_AVX2 "Enable AVX2 code generation (x86-64 only)" ON)
 option(HLOD_FORCE_SCALAR "Disable SIMD intrinsics; use the portable scalar paths" OFF)
+option(HLOD_NEON_RSQRT "Use squared distance and reciprocal sqrt on NEON" ON)
 
 if(HLOD_BUILD_TESTS OR HLOD_BUILD_BENCH)
     find_package(Threads REQUIRED)
@@ -44,6 +45,12 @@ endif()
 
 if(HLOD_FORCE_SCALAR)
     target_compile_definitions(hlod PUBLIC HLOD_FORCE_SCALAR=1)
+endif()
+
+if(HLOD_NEON_RSQRT)
+    target_compile_definitions(hlod PUBLIC HLOD_NEON_RSQRT=1)
+else()
+    target_compile_definitions(hlod PUBLIC HLOD_NEON_RSQRT=0)
 endif()
 
 # ---- external deps via FetchContent ------------------------------------------

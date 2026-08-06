@@ -14,6 +14,12 @@
 
 #include "config.h"
 
+// Header-only users get the optimized ARM path by default. CMake defines this
+// explicitly to 0 or 1 so performance runs can retain the old path for A/B.
+#ifndef HLOD_NEON_RSQRT
+  #define HLOD_NEON_RSQRT 1
+#endif
+
 // ---------------------------------------------------------------------------
 // Bring your own vector types.
 //
@@ -925,10 +931,10 @@ inline float8 screenError8(const float8& geomError, float k, const float8& dist)
 // back on the same dependency chain. Folding them into one reciprocal square
 // root removes both: err = e * k * rsqrt(d2).
 //
-// The hardware rsqrt is 12-bit; one Newton-Raphson step takes it to within an
-// ulp or two of the exact reciprocal square root, which is the precision the
-// screen-error comparison actually needs. The min() reproduces the
-// max(dist, 1e-30) floor of the exact path exactly, including d2 == 0.
+// AVX2's hardware rsqrt seed is refined once; NEON's lower-precision estimate
+// is refined twice. Both land close to the exact reciprocal square root, which
+// is the precision the screen-error comparison actually needs. The min()
+// reproduces the max(dist, 1e-30) floor of the exact path, including d2 == 0.
 // ---------------------------------------------------------------------------
 
 #if HLOD_SIMD_AVX2
@@ -970,6 +976,56 @@ inline float8 screenErrorFromSq8(const float8& geomError, float k, const float8&
     float8 r;
     _mm256_store_ps(r.v, _mm256_mul_ps(
         _mm256_mul_ps(_mm256_load_ps(geomError.v), _mm256_set1_ps(k)), inv));
+    return r;
+}
+#elif HLOD_SIMD_NEON && HLOD_NEON_RSQRT
+inline float8 distanceToBoxesSq(const WideBounds& b, float4 qmn, float4 qmx)
+{
+    const float32x4_t lox = vdupq_n_f32(qmn.x), loy = vdupq_n_f32(qmn.y),
+                      loz = vdupq_n_f32(qmn.z);
+    const float32x4_t hix = vdupq_n_f32(qmx.x), hiy = vdupq_n_f32(qmx.y),
+                      hiz = vdupq_n_f32(qmx.z);
+    const float32x4_t zero = vdupq_n_f32(0.0f);
+    float8 r;
+    for (uint32_t h = 0; h < 2; ++h)
+    {
+        const float32x4_t cx = vmaxq_f32(
+            vmaxq_f32(vsubq_f32(vld1q_f32(b.mnx.v + 4 * h), hix),
+                      vsubq_f32(lox, vld1q_f32(b.mxx.v + 4 * h))), zero);
+        const float32x4_t cy = vmaxq_f32(
+            vmaxq_f32(vsubq_f32(vld1q_f32(b.mny.v + 4 * h), hiy),
+                      vsubq_f32(loy, vld1q_f32(b.mxy.v + 4 * h))), zero);
+        const float32x4_t cz = vmaxq_f32(
+            vmaxq_f32(vsubq_f32(vld1q_f32(b.mnz.v + 4 * h), hiz),
+                      vsubq_f32(loz, vld1q_f32(b.mxz.v + 4 * h))), zero);
+        const float32x4_t d2v =
+            vfmaq_f32(vfmaq_f32(vmulq_f32(cz, cz), cy, cy), cx, cx);
+        vst1q_f32(r.v + 4 * h, d2v);
+    }
+    return r;
+}
+
+inline float8 screenErrorFromSq8(const float8& geomError, float k, const float8& d2)
+{
+    const float32x4_t kk = vdupq_n_f32(k);
+    const float32x4_t cap = vdupq_n_f32(1.0e30f);
+    float8 r;
+    for (uint32_t h = 0; h < 2; ++h)
+    {
+        const float32x4_t x = vld1q_f32(d2.v + 4 * h);
+        const float32x4_t y0 = vrsqrteq_f32(x);
+        const float32x4_t y1 = vmulq_f32(
+            y0, vrsqrtsq_f32(vmulq_f32(x, y0), y0));
+        const float32x4_t y2 = vmulq_f32(
+            y1, vrsqrtsq_f32(vmulq_f32(x, y1), y1));
+        // Refinement produces NaN for both 0*inf and inf*0. In those cases
+        // the seed already has the desired +inf/0 reciprocal, matching AVX2.
+        const float32x4_t estimate = vbslq_f32(vceqq_f32(y2, y2), y2, y0);
+        const float32x4_t inv = vminq_f32(cap, estimate);
+        const float32x4_t e =
+            vmulq_f32(vmulq_f32(vld1q_f32(geomError.v + 4 * h), kk), inv);
+        vst1q_f32(r.v + 4 * h, e);
+    }
     return r;
 }
 #else

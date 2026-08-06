@@ -349,6 +349,19 @@ arguments in the same way:
 
 Set `HLOD_PERF_BUILD_DIR` to use a build directory other than `build-perf`.
 
+The optimized NEON squared-distance/reciprocal-square-root path is enabled by
+default. To A/B it against the previous full-square-root/divide path on Apple
+Silicon, use separate build directories and identical benchmark arguments:
+
+```sh
+HLOD_PERF_BUILD_DIR=build-perf-neon-base HLOD_PERF_NEON_RSQRT=OFF \
+  ./run_perf_bench.sh --benchmark_filter='BM_(Adversarial_WideNode|AssetSharing_CutCost|MixedForest100k|View_Breakdown)' \
+    --benchmark_repetitions=7 --benchmark_out=neon-base.json --benchmark_out_format=json
+HLOD_PERF_BUILD_DIR=build-perf-neon-rsqrt HLOD_PERF_NEON_RSQRT=ON \
+  ./run_perf_bench.sh --benchmark_filter='BM_(Adversarial_WideNode|AssetSharing_CutCost|MixedForest100k|View_Breakdown)' \
+    --benchmark_repetitions=7 --benchmark_out=neon-rsqrt.json --benchmark_out_format=json
+```
+
 Normal configuration options:
 
 | Option | Default | Meaning |
@@ -357,6 +370,7 @@ Normal configuration options:
 | `HLOD_BUILD_BENCH` | `ON` | Build the Google Benchmark suite |
 | `HLOD_AVX2` | `ON` | Use AVX2/FMA on x86-64 when available |
 | `HLOD_FORCE_SCALAR` | `OFF` | Disable intrinsic implementations |
+| `HLOD_NEON_RSQRT` | `ON` | Use squared distance and reciprocal square root in the NEON traversal |
 
 ## SIMD and CI
 
