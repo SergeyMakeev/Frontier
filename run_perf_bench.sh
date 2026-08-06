@@ -12,22 +12,22 @@ fi
 
 # Prefer Ninja for a compact single-config build when it is available. An
 # existing build directory keeps the generator recorded in its CMake cache.
-generator_args=()
+generator=""
 if [[ ! -f "${BUILD_DIR}/CMakeCache.txt" ]] && command -v ninja >/dev/null 2>&1; then
-    generator_args=(-G Ninja)
+    generator="Ninja"
 fi
 
 # Prefer a native Apple Silicon build even when this script is launched from a
 # terminal running under Rosetta. Intel Macs use AVX2 when the host advertises
 # it, and otherwise retain the x86 SSE2 baseline.
 avx2=OFF
-architecture_args=()
+target_architecture=""
 host_system="$(uname -s)"
 host_machine="$(uname -m)"
 if [[ "${host_system}" == "Darwin" ]]; then
     apple_silicon="$(sysctl -n hw.optional.arm64 2>/dev/null || true)"
     if [[ "${host_machine}" == "arm64" || "${apple_silicon}" == "1" ]]; then
-        architecture_args=(-DCMAKE_OSX_ARCHITECTURES=arm64)
+        target_architecture="arm64"
         echo "Targeting native Apple Silicon arm64/NEON."
     elif [[ "${host_machine}" == "x86_64" ]]; then
         intel_features="$(sysctl -n machdep.cpu.leaf7_features 2>/dev/null || true)"
@@ -42,13 +42,22 @@ elif [[ "${host_machine}" == "x86_64" ]]; then
 fi
 
 echo "Configuring Release performance build..."
-cmake -S "${ROOT_DIR}" -B "${BUILD_DIR}" "${generator_args[@]}" \
-    "${architecture_args[@]}" \
-    -DCMAKE_BUILD_TYPE=Release \
-    -DHLOD_BUILD_TESTS=OFF \
-    -DHLOD_BUILD_BENCH=ON \
-    -DHLOD_AVX2="${avx2}" \
+configure_args=(
+    -S "${ROOT_DIR}"
+    -B "${BUILD_DIR}"
+    -DCMAKE_BUILD_TYPE=Release
+    -DHLOD_BUILD_TESTS=OFF
+    -DHLOD_BUILD_BENCH=ON
+    -DHLOD_AVX2="${avx2}"
     -DHLOD_FORCE_SCALAR=OFF
+)
+if [[ -n "${generator}" ]]; then
+    configure_args+=(-G "${generator}")
+fi
+if [[ -n "${target_architecture}" ]]; then
+    configure_args+=("-DCMAKE_OSX_ARCHITECTURES=${target_architecture}")
+fi
+cmake "${configure_args[@]}"
 
 echo "Building hlod_bench..."
 cmake --build "${BUILD_DIR}" --config Release --target hlod_bench --parallel
