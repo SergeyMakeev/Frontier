@@ -305,11 +305,21 @@ ctest --test-dir build -C Release --output-on-failure
 Run `build/bench/hlod_bench` on single-config systems or
 `build\bench\Release\hlod_bench.exe` on a Visual Studio build.
 
+On Windows, `run_perf_bench.bat` configures a dedicated `build-perf` directory,
+builds only `hlod_bench` in Release with AVX2 enabled, and runs the documented
+performance suite five times. Google Benchmark arguments replace that default,
+for example:
+
+```bat
+run_perf_bench.bat
+run_perf_bench.bat --benchmark_filter=BM_RootDecisionForest100k --benchmark_repetitions=7
+```
+
 Normal configuration options:
 
 | Option | Default | Meaning |
 |---|---:|---|
-| `HLOD_BUILD_TESTS` | `ON` | Build the 97-test correctness suite |
+| `HLOD_BUILD_TESTS` | `ON` | Build the 100-test correctness suite |
 | `HLOD_BUILD_BENCH` | `ON` | Build the Google Benchmark suite |
 | `HLOD_AVX2` | `ON` | Use AVX2/FMA on x86-64 when available |
 | `HLOD_FORCE_SCALAR` | `OFF` | Disable intrinsic implementations |
