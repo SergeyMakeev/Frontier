@@ -392,7 +392,9 @@ comparison:
 On Apple silicon, `profile_macos_cpu.sh` records the cached hierarchical
 workload using real hardware CPU counters and optimized source line tables. It
 automatically selects Xcode 26's **CPU Bottlenecks** template or the older
-**CPU Counters** template, including when a suitable full Xcode is installed
+**CPU Counters** template. If a current Xcode publishes the counter instrument
+but not its GUI template to `xctrace`, the script composes the recording from
+that instrument directly. It also discovers a suitable full Xcode installed
 beside the currently selected command-line tools. It writes an Instruments
 `.trace`, an exported table of contents, capture metadata, and an attachable
 `.trace.zip` under `profile_results/`:

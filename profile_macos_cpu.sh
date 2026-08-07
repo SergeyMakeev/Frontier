@@ -39,10 +39,12 @@ if [[ -n "${HLOD_DEVELOPER_DIR:-}" ]]; then
 elif [[ -n "${DEVELOPER_DIR:-}" ]]; then
     add_developer_dir "${DEVELOPER_DIR}"
 else
-    add_developer_dir "$(xcode-select -p 2>/dev/null || true)"
+    # Full Xcode contains Instruments/xctrace; Command Line Tools usually does
+    # not. Prefer installed Xcode apps before the active developer directory.
     for xcode_app in /Applications/Xcode*.app; do
         add_developer_dir "${xcode_app}/Contents/Developer"
     done
+    add_developer_dir "$(xcode-select -p 2>/dev/null || true)"
 fi
 
 if [[ ${#developer_dirs[@]} -eq 0 ]]; then
@@ -60,10 +62,13 @@ fi
 
 selected_developer_dir=""
 selected_template=""
+selected_instrument=""
 if [[ -n "${HLOD_XCTRACE_TEMPLATE:-}" && -f "${HLOD_XCTRACE_TEMPLATE}" ]]; then
     selected_developer_dir="${developer_dirs[0]}"
     selected_template="${HLOD_XCTRACE_TEMPLATE}"
 else
+    # Prefer a configured template because it carries Apple's recommended
+    # counter mode and derived metrics.
     for developer_dir in "${developer_dirs[@]}"; do
         templates="$(DEVELOPER_DIR="${developer_dir}" xcrun xctrace list templates 2>/dev/null || true)"
         for template_candidate in "${template_candidates[@]}"; do
@@ -74,22 +79,55 @@ else
             fi
         done
     done
+
+    # Recent xctrace versions can compose a recording from an Instrument even
+    # when the corresponding GUI template is not published to the CLI.
+    if [[ -z "${selected_template}" && -z "${HLOD_XCTRACE_TEMPLATE:-}" ]]; then
+        for developer_dir in "${developer_dirs[@]}"; do
+            record_help="$(DEVELOPER_DIR="${developer_dir}" xcrun xctrace help record 2>/dev/null || true)"
+            grep -Fq -- '--instrument' <<<"${record_help}" || continue
+            instruments="$(DEVELOPER_DIR="${developer_dir}" xcrun xctrace list instruments 2>/dev/null || true)"
+            for instrument_candidate in 'CPU Counters' 'Counters'; do
+                if grep -Fq "${instrument_candidate}" <<<"${instruments}"; then
+                    selected_developer_dir="${developer_dir}"
+                    selected_instrument="${instrument_candidate}"
+                    break 2
+                fi
+            done
+        done
+    fi
 fi
 
-if [[ -z "${selected_template}" ]]; then
-    echo "ERROR: No hardware CPU-counter template is exposed to xctrace." >&2
-    echo "Searched for: ${template_candidates[*]}" >&2
-    echo "Developer directories checked:" >&2
-    printf '  %s\n' "${developer_dirs[@]}" >&2
-    echo "Available templates from the selected installation:" >&2
-    DEVELOPER_DIR="${developer_dirs[0]}" xcrun xctrace list templates >&2 || true
-    echo "Install/select full Xcode 26+ or set HLOD_DEVELOPER_DIR/HLOD_XCTRACE_TEMPLATE." >&2
+if [[ -z "${selected_template}" && -z "${selected_instrument}" ]]; then
+    echo "ERROR: No xctrace hardware CPU-counter configuration was found." >&2
+    echo "Searched for templates: ${template_candidates[*]}" >&2
+    echo "Diagnostics by developer directory:" >&2
+    for developer_dir in "${developer_dirs[@]}"; do
+        echo "--- ${developer_dir}" >&2
+        if xctrace_path="$(DEVELOPER_DIR="${developer_dir}" xcrun --find xctrace 2>&1)"; then
+            echo "xctrace: ${xctrace_path}" >&2
+            echo "Templates:" >&2
+            DEVELOPER_DIR="${developer_dir}" xcrun xctrace list templates >&2 || true
+            echo "CPU-related instruments:" >&2
+            DEVELOPER_DIR="${developer_dir}" xcrun xctrace list instruments 2>&1 \
+                | grep -Ei 'CPU|Counter' >&2 || true
+        else
+            echo "${xctrace_path}" >&2
+        fi
+    done
+    echo "If full Xcode was just installed, open it once to finish setup, or run:" >&2
+    echo "  sudo env DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcodebuild -runFirstLaunch" >&2
+    echo "Then rerun this script. HLOD_DEVELOPER_DIR and HLOD_XCTRACE_TEMPLATE can override discovery." >&2
     exit 1
 fi
 
 export DEVELOPER_DIR="${selected_developer_dir}"
 echo "Using developer directory: ${DEVELOPER_DIR}"
-echo "Using Instruments template: ${selected_template}"
+if [[ -n "${selected_template}" ]]; then
+    echo "Using Instruments template: ${selected_template}"
+else
+    echo "Using Instruments directly: ${selected_instrument}"
+fi
 xcodebuild -version
 
 echo "Building optimized arm64 benchmark with source line tables..."
@@ -130,7 +168,8 @@ archive="${trace}.zip"
 
 {
     echo "developer_dir=${DEVELOPER_DIR}"
-    echo "template=${selected_template}"
+    echo "template=${selected_template:-none}"
+    echo "instrument=${selected_instrument:-none}"
     echo "benchmark=${bench_exe}"
     echo "benchmark_filter=${BENCHMARK_FILTER}"
     echo "benchmark_min_time=${BENCHMARK_MIN_TIME}"
@@ -141,16 +180,22 @@ archive="${trace}.zip"
 } >"${info}"
 
 echo "Recording hardware CPU counters for the cached hierarchical workload..."
-xcrun xctrace record \
-    --template "${selected_template}" \
-    --output "${trace}" \
-    --time-limit "${TRACE_TIME_LIMIT}" \
-    --no-prompt \
-    --target-stdout - \
-    --launch -- "${bench_exe}" \
-    "--benchmark_filter=${BENCHMARK_FILTER}" \
-    "--benchmark_min_time=${BENCHMARK_MIN_TIME}" \
-    --benchmark_repetitions=1
+record_cpu_counters() {
+    xcrun xctrace record "$@" \
+        --output "${trace}" \
+        --time-limit "${TRACE_TIME_LIMIT}" \
+        --no-prompt \
+        --target-stdout - \
+        --launch -- "${bench_exe}" \
+        "--benchmark_filter=${BENCHMARK_FILTER}" \
+        "--benchmark_min_time=${BENCHMARK_MIN_TIME}" \
+        --benchmark_repetitions=1
+}
+if [[ -n "${selected_template}" ]]; then
+    record_cpu_counters --template "${selected_template}"
+else
+    record_cpu_counters --instrument "${selected_instrument}"
+fi
 
 echo "Exporting the trace table of contents..."
 xcrun xctrace export "${trace}" --toc --output "${toc}"
