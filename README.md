@@ -362,6 +362,24 @@ arguments in the same way:
 
 Set `HLOD_PERF_BUILD_DIR` to use a build directory other than `build-perf`.
 
+For cross-machine diagnosis, `run_machine_bench.sh` builds a separate
+`hlod_machine_bench` executable and writes `machine_perf.json`. These probes do
+not call HLodTree: they isolate scalar dependency and throughput, 128-bit SIMD
+arithmetic and compare-to-mask cost, square root/divide, sequential cache and
+memory bandwidth, constant-stride hardware prefetch, dependent-load latency,
+random-load parallelism, branch prediction, and sparse-mask iteration. Run it
+once on each machine under the same power conditions:
+
+```sh
+./run_machine_bench.sh
+```
+
+The executable is separate so diagnostic additions cannot change the code
+layout of `hlod_bench`. Set `HLOD_MACHINE_BUILD_DIR` to override its dedicated
+`build-machine-perf` directory. SIMD probes deliberately use one 128-bit vector
+on both platforms (SSE2 on x86-64 and NEON on arm64), independent of the
+library's AVX2 option.
+
 Normal configuration options:
 
 | Option | Default | Meaning |
