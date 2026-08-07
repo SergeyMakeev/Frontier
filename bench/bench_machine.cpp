@@ -446,42 +446,35 @@ static void BM_KernelWideAabb(benchmark::State& state)
 BENCHMARK(BM_KernelWideAabb)
     ->Args({1})->Args({3})->Args({6})->ArgName("active_planes");
 
-#if HLOD_MACHINE_NEON
-inline hlod::float8 distanceToBoxesSqDirectCandidate(
-    const hlod::WideBounds& b, hlod::float4 qmn, hlod::float4 qmx)
+inline hlod::float8 screenErrorFromSqExact(const hlod::float8& geomError,
+                                           float k, const hlod::float8& d2)
 {
-    const float32x4_t lox = vdupq_n_f32(qmn.x), loy = vdupq_n_f32(qmn.y),
-                      loz = vdupq_n_f32(qmn.z);
-    const float32x4_t hix = vdupq_n_f32(qmx.x), hiy = vdupq_n_f32(qmx.y),
-                      hiz = vdupq_n_f32(qmx.z);
-    const float32x4_t zero = vdupq_n_f32(0.0f);
-    hlod::float8 r;
-    for (uint32_t h = 0; h < 2; ++h)
-    {
-        const float32x4_t cx = vmaxq_f32(
-            vmaxq_f32(vsubq_f32(vld1q_f32(b.mnx.v + 4 * h), hix),
-                      vsubq_f32(lox, vld1q_f32(b.mxx.v + 4 * h))), zero);
-        const float32x4_t cy = vmaxq_f32(
-            vmaxq_f32(vsubq_f32(vld1q_f32(b.mny.v + 4 * h), hiy),
-                      vsubq_f32(loy, vld1q_f32(b.mxy.v + 4 * h))), zero);
-        const float32x4_t cz = vmaxq_f32(
-            vmaxq_f32(vsubq_f32(vld1q_f32(b.mnz.v + 4 * h), hiz),
-                      vsubq_f32(loz, vld1q_f32(b.mxz.v + 4 * h))), zero);
-        const float32x4_t d2 =
-            vfmaq_f32(vfmaq_f32(vmulq_f32(cz, cz), cy, cy), cx, cx);
-        vst1q_f32(r.v + 4 * h, d2);
-    }
-    return r;
+    hlod::float8 distance;
+    for (uint32_t lane = 0; lane < hlod::kWide; ++lane)
+        distance.v[lane] = std::sqrt(d2.v[lane]);
+    return hlod::screenError8(geomError, k, distance);
 }
-#else
-inline hlod::float8 distanceToBoxesSqDirectCandidate(
-    const hlod::WideBounds& b, hlod::float4 qmn, hlod::float4 qmx)
-{
-    return hlod::distanceToBoxesSq(b, qmn, qmx);
-}
-#endif
 
-template <bool DirectSquaredDistance>
+inline hlod::float8 distanceToBoxesSqLegacy(
+    const hlod::WideBounds& b, hlod::float4 qmn, hlod::float4 qmx)
+{
+    const hlod::float8 distance = hlod::distanceToBoxes(b, qmn, qmx);
+    hlod::float8 d2;
+    for (uint32_t lane = 0; lane < hlod::kWide; ++lane)
+        d2.v[lane] = distance.v[lane] * distance.v[lane];
+    return d2;
+}
+
+enum class DistanceErrorMode
+{
+    Production,
+    DirectSqExact,
+    LegacyExact,
+    NeonRsqrt1,
+    NeonRsqrt2
+};
+
+template <DistanceErrorMode Mode>
 static void runKernelDistanceError(benchmark::State& state)
 {
     constexpr int kCalls = 4096;
@@ -495,33 +488,96 @@ static void runKernelDistanceError(benchmark::State& state)
         for (int i = 0; i < kCalls; ++i)
         {
             const size_t index = size_t(i) & (WideAabbFixture::kCases - 1);
-            const hlod::float8 d2 = DirectSquaredDistance
-                                        ? distanceToBoxesSqDirectCandidate(
-                                              fixture.bounds[index], queryMin,
+            const hlod::float8 d2 =
+                Mode == DistanceErrorMode::LegacyExact
+                    ? distanceToBoxesSqLegacy(fixture.bounds[index], queryMin,
                                               queryMax)
-                                        : hlod::distanceToBoxesSq(
-                                              fixture.bounds[index], queryMin,
+                    : hlod::distanceToBoxesSq(fixture.bounds[index], queryMin,
                                               queryMax);
-            output[index] = hlod::screenErrorFromSq8(
-                fixture.geometricError[index], 935.0f, d2);
+            if constexpr (Mode == DistanceErrorMode::Production)
+                output[index] = hlod::screenErrorFromSq8(
+                    fixture.geometricError[index], 935.0f, d2);
+            else if constexpr (Mode == DistanceErrorMode::DirectSqExact ||
+                               Mode == DistanceErrorMode::LegacyExact)
+                output[index] = screenErrorFromSqExact(
+                    fixture.geometricError[index], 935.0f, d2);
+#if HLOD_MACHINE_NEON
+            else if constexpr (Mode == DistanceErrorMode::NeonRsqrt1)
+                output[index] = hlod::detail::screenErrorFromSq8Neon<1>(
+                    fixture.geometricError[index], 935.0f, d2);
+            else
+                output[index] = hlod::detail::screenErrorFromSq8Neon<2>(
+                    fixture.geometricError[index], 935.0f, d2);
+#endif
         }
         benchmark::ClobberMemory();
     }
     benchmark::DoNotOptimize(output.data());
     state.SetItemsProcessed(state.iterations() * kCalls * hlod::kWide);
+#if HLOD_MACHINE_NEON
+    if constexpr (Mode == DistanceErrorMode::NeonRsqrt1 ||
+                  Mode == DistanceErrorMode::NeonRsqrt2)
+    {
+        double maxRelativeError = 0.0;
+        for (size_t index = 0; index < WideAabbFixture::kCases; ++index)
+        {
+            const hlod::float8 d2 = hlod::distanceToBoxesSq(
+                fixture.bounds[index], queryMin, queryMax);
+            const hlod::float8 exact = screenErrorFromSqExact(
+                fixture.geometricError[index], 935.0f, d2);
+            const hlod::float8 approximate =
+                Mode == DistanceErrorMode::NeonRsqrt1
+                    ? hlod::detail::screenErrorFromSq8Neon<1>(
+                          fixture.geometricError[index], 935.0f, d2)
+                    : hlod::detail::screenErrorFromSq8Neon<2>(
+                          fixture.geometricError[index], 935.0f, d2);
+            for (uint32_t lane = 0; lane < hlod::kWide; ++lane)
+            {
+                if (!(exact.v[lane] > 0.0f) ||
+                    !std::isfinite(exact.v[lane]))
+                    continue;
+                maxRelativeError = std::max(
+                    maxRelativeError,
+                    double(std::fabs(approximate.v[lane] - exact.v[lane]) /
+                           exact.v[lane]));
+            }
+        }
+        state.counters["max_relative_error"] = maxRelativeError;
+    }
+#endif
 }
 
 static void BM_KernelDistanceErrorCurrent(benchmark::State& state)
 {
-    runKernelDistanceError<false>(state);
+    runKernelDistanceError<DistanceErrorMode::Production>(state);
 }
 BENCHMARK(BM_KernelDistanceErrorCurrent);
 
 static void BM_KernelDistanceErrorDirectSq(benchmark::State& state)
 {
-    runKernelDistanceError<true>(state);
+    runKernelDistanceError<DistanceErrorMode::DirectSqExact>(state);
 }
 BENCHMARK(BM_KernelDistanceErrorDirectSq);
+
+#if HLOD_MACHINE_NEON
+static void BM_KernelDistanceErrorLegacy(benchmark::State& state)
+{
+    runKernelDistanceError<DistanceErrorMode::LegacyExact>(state);
+}
+BENCHMARK(BM_KernelDistanceErrorLegacy);
+
+static void BM_KernelDistanceErrorNeonRsqrt1(benchmark::State& state)
+{
+    runKernelDistanceError<DistanceErrorMode::NeonRsqrt1>(state);
+}
+BENCHMARK(BM_KernelDistanceErrorNeonRsqrt1);
+
+static void BM_KernelDistanceErrorNeonRsqrt2(benchmark::State& state)
+{
+    runKernelDistanceError<DistanceErrorMode::NeonRsqrt2>(state);
+}
+BENCHMARK(BM_KernelDistanceErrorNeonRsqrt2);
+#endif
 
 struct alignas(32) CacheHitRecord
 {

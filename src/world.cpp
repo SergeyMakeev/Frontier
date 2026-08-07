@@ -2986,7 +2986,8 @@ void View::compact()
     // therefore move one run over the still-unread source of another run.
     // Compaction is deliberately rare, so use a same-sized scratch slab and
     // keep the existing allocation headroom while making the copy order moot.
-    std::vector<CutEntry> packed(store_.size());
+    AppendBuffer<CutEntry> packed;
+    packed.resize_uninitialized(store_.size());
     uint32_t w = 0;
     for (size_t i = 0; i < rec_.size(); ++i)
     {
@@ -3051,7 +3052,8 @@ void World::selectCutCached(const Camera& camera, const CutParams& params,
     {
         ctx.rec_.resize(instances_.size());
         ctx.recCold_.resize(instances_.size());
-        if (!ctx.secondDep_.empty()) ctx.secondDep_.resize(instances_.size());
+        if (!ctx.secondDep_.empty())
+            ctx.secondDep_.resize_uninitialized(instances_.size());
     }
 
     // How far the query envelope moved since the last call, added to this
@@ -3180,14 +3182,14 @@ void World::selectCutCached(const Camera& camera, const CutParams& params,
         {
             ctx.garbage_ += cold.capacity;
             if (size_t(ctx.used_) + n > ctx.store_.size())
-                ctx.store_.resize(
+                ctx.store_.resize_uninitialized(
                     std::max<size_t>(size_t(ctx.used_) + n, ctx.store_.size() * 2 + 256));
             r.begin = ctx.used_;
             cold.capacity = n;
             ctx.used_ += n;
         }
         if (eligible && w.touched.size() == 2 && ctx.secondDep_.empty())
-            ctx.secondDep_.resize(instances_.size());
+            ctx.secondDep_.resize_uninitialized(instances_.size());
         r.counts = eligible
                        ? packCutCounts(nShared, nCurrent, nIdeal,
                                        uint32_t(w.touched.size()))

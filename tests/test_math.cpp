@@ -48,6 +48,51 @@ TEST(Aabb, DistanceToBox)
                     std::sqrt(9.0f + 16.0f));                             // edge
 }
 
+TEST(Aabb, SquaredWideMatchesScalarEnvelopes)
+{
+    std::mt19937 rng(0xd157u);
+    std::uniform_real_distribution<float> centerDist(-1000.0f, 1000.0f);
+    std::uniform_real_distribution<float> extentDist(0.0f, 100.0f);
+
+    for (int iteration = 0; iteration < 1000; ++iteration)
+    {
+        WideBounds bounds = WideBounds::allEmpty();
+        AABB boxes[kWide];
+        for (uint32_t lane = 0; lane < kWide; ++lane)
+        {
+            const float4 center = float4::vec(
+                centerDist(rng), centerDist(rng), centerDist(rng));
+            const float4 extent = float4::vec(
+                extentDist(rng), extentDist(rng), extentDist(rng));
+            boxes[lane] = AABB::fromCenterExtent(center, extent);
+            bounds.setLane(lane, boxes[lane]);
+        }
+
+        const float4 queryCenter = float4::vec(
+            centerDist(rng), centerDist(rng), centerDist(rng));
+        const float4 queryExtent = float4::vec(
+            extentDist(rng), extentDist(rng), extentDist(rng));
+        const float4 queryMin = queryCenter - queryExtent;
+        const float4 queryMax = queryCenter + queryExtent;
+        const float8 actual = distanceToBoxesSq(bounds, queryMin, queryMax);
+
+        for (uint32_t lane = 0; lane < kWide; ++lane)
+        {
+            const AABB& box = boxes[lane];
+            float cx = std::max(std::max(box.mn.x - queryMax.x,
+                                         queryMin.x - box.mx.x), 0.0f);
+            float cy = std::max(std::max(box.mn.y - queryMax.y,
+                                         queryMin.y - box.mx.y), 0.0f);
+            float cz = std::max(std::max(box.mn.z - queryMax.z,
+                                         queryMin.z - box.mx.z), 0.0f);
+            const float expected =
+                fmadd(cx, cx, fmadd(cy, cy, cz * cz));
+            EXPECT_FLOAT_EQ(actual.v[lane], expected)
+                << "iteration " << iteration << " lane " << lane;
+        }
+    }
+}
+
 TEST(Frustum, TriStateScalar)
 {
     const Camera v = makeLookAtCamera(float4::point(0, 0, -10), float4::point(0, 0, 0));
@@ -177,6 +222,64 @@ TEST(ScreenError, Wide8MatchesScalarFuzz)
             EXPECT_FLOAT_EQ(wide.v[l], screenError(ge.v[l], k, d.v[l]))
                 << "iter " << iter << " lane " << l;
     }
+}
+
+TEST(ScreenError, SquaredWideMatchesScalarWithinTolerance)
+{
+    std::mt19937 rng(0x51a7u);
+    std::uniform_real_distribution<float> errorDist(0.01f, 1000.0f);
+    std::uniform_real_distribution<float> exponentDist(-20.0f, 20.0f);
+
+    float maxRelativeError = 0.0f;
+#if HLOD_SIMD_NEON
+    float maxOneRefinementError = 0.0f;
+    float maxTwoRefinementError = 0.0f;
+#endif
+    for (int iteration = 0; iteration < 2000; ++iteration)
+    {
+        const float k = 0.25f + float(iteration % 100);
+        float8 geometricError, d2;
+        for (uint32_t lane = 0; lane < kWide; ++lane)
+        {
+            geometricError.v[lane] = errorDist(rng);
+            const float distance = std::exp2(exponentDist(rng));
+            d2.v[lane] = distance * distance;
+        }
+
+        const float8 actual = screenErrorFromSq8(geometricError, k, d2);
+#if HLOD_SIMD_NEON
+        const float8 one =
+            detail::screenErrorFromSq8Neon<1>(geometricError, k, d2);
+        const float8 two =
+            detail::screenErrorFromSq8Neon<2>(geometricError, k, d2);
+#endif
+        for (uint32_t lane = 0; lane < kWide; ++lane)
+        {
+            const float expected = geometricError.v[lane] * k /
+                                   std::sqrt(d2.v[lane]);
+            const float relative =
+                std::fabs(actual.v[lane] - expected) / expected;
+            maxRelativeError = std::max(maxRelativeError, relative);
+#if HLOD_SIMD_NEON
+            maxOneRefinementError = std::max(
+                maxOneRefinementError,
+                std::fabs(one.v[lane] - expected) / expected);
+            maxTwoRefinementError = std::max(
+                maxTwoRefinementError,
+                std::fabs(two.v[lane] - expected) / expected);
+#endif
+        }
+    }
+
+    EXPECT_LT(maxRelativeError, 2.0e-5f);
+#if HLOD_SIMD_NEON
+    RecordProperty("one_refinement_max_relative_error",
+                   maxOneRefinementError);
+    RecordProperty("two_refinement_max_relative_error",
+                   maxTwoRefinementError);
+    EXPECT_LT(maxTwoRefinementError, maxOneRefinementError);
+    EXPECT_LT(maxTwoRefinementError, 2.0e-5f);
+#endif
 }
 
 TEST(ScreenError, ZeroDistanceSaturatesFinitePositive)

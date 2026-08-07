@@ -71,9 +71,27 @@ public:
             reallocate(uint32_t(requested));
     }
 
+    // Changes the logical size without initializing new POD elements. The
+    // caller must overwrite every newly exposed element before reading it.
+    void resize_uninitialized(size_t requested)
+    {
+        if (requested > maxCapacity())
+            throw std::length_error("AppendBuffer capacity exceeded");
+        if (requested > capacity_)
+            reallocate(uint32_t(requested));
+        size_ = uint32_t(requested);
+    }
+
+    void swap(AppendBuffer& other) noexcept
+    {
+        std::swap(data_, other.data_);
+        std::swap(size_, other.size_);
+        std::swap(capacity_, other.capacity_);
+    }
+
     void push_back(T value)
     {
-        ensureCapacity(checkedSize(1));
+        if (size_ == capacity_) growForOne();
         std::construct_at(data_ + size_, value);
         ++size_;
     }
@@ -81,7 +99,7 @@ public:
     template <class... Args>
     T& emplace_back(Args&&... args)
     {
-        ensureCapacity(checkedSize(1));
+        if (size_ == capacity_) growForOne();
         T* out = std::construct_at(data_ + size_,
                                    std::forward<Args>(args)...);
         ++size_;
@@ -154,6 +172,16 @@ private:
         if (required <= capacity_) return;
         uint64_t grown = capacity_ ? uint64_t(capacity_) * 3 / 2 : 8;
         if (grown < required) grown = required;
+        if (grown > maxCapacity()) grown = maxCapacity();
+        reallocate(uint32_t(grown));
+    }
+
+    void growForOne()
+    {
+        if (size_ == maxCapacity())
+            throw std::length_error("AppendBuffer capacity exceeded");
+        uint64_t grown = capacity_ ? uint64_t(capacity_) * 3 / 2 : 8;
+        if (grown <= size_) grown = uint64_t(size_) + 1;
         if (grown > maxCapacity()) grown = maxCapacity();
         reallocate(uint32_t(grown));
     }

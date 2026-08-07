@@ -576,8 +576,8 @@ private:
     std::vector<RecCold>  recCold_;  // miss/compaction state, by InstanceId
     // Allocated only after a cacheable walk actually touches two pages. The
     // common one-page world therefore pays no dense second-dependency array.
-    std::vector<SecondDep> secondDep_;
-    std::vector<CutEntry> store_;    // slab of recorded runs
+    AppendBuffer<SecondDep> secondDep_;
+    AppendBuffer<CutEntry> store_;   // slab of recorded runs
     uint32_t              used_ = 0;
     uint32_t              garbage_ = 0;
     uint32_t              instanceLayoutVersion_ = 0;

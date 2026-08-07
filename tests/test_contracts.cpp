@@ -617,6 +617,23 @@ TEST(Contracts, AppendBufferRetainsAndOwnsContiguousStorage)
     EXPECT_TRUE(buffer.empty());
     ASSERT_EQ(moved.size(), 2u);
     EXPECT_EQ(moved.front(), 20u);
+
+    AppendBuffer<uint32_t> scratch;
+    scratch.resize_uninitialized(3);
+    scratch[0] = 30;
+    scratch[1] = 31;
+    scratch[2] = 32;
+    const size_t scratchCapacity = scratch.capacity();
+    scratch.resize_uninitialized(1);
+    EXPECT_EQ(scratch.size(), 1u);
+    EXPECT_EQ(scratch.capacity(), scratchCapacity);
+
+    moved.swap(scratch);
+    ASSERT_EQ(moved.size(), 1u);
+    EXPECT_EQ(moved.front(), 30u);
+    ASSERT_EQ(scratch.size(), 2u);
+    EXPECT_EQ(scratch.front(), 20u);
+    EXPECT_EQ(scratch.back(), 11u);
 }
 
 TEST(Contracts, MemoryBudgets)
