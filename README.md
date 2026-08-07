@@ -389,14 +389,23 @@ comparison:
 ./run_arch_bench.sh
 ```
 
-On a Mac whose Xcode installation exposes the Instruments **CPU Counters**
-template, `profile_macos_cpu.sh` records the cached hierarchical workload with
-optimized source line tables. It writes an Instruments `.trace` plus an
-attachable `.trace.zip`:
+On Apple silicon, `profile_macos_cpu.sh` records the cached hierarchical
+workload using real hardware CPU counters and optimized source line tables. It
+automatically selects Xcode 26's **CPU Bottlenecks** template or the older
+**CPU Counters** template, including when a suitable full Xcode is installed
+beside the currently selected command-line tools. It writes an Instruments
+`.trace`, an exported table of contents, capture metadata, and an attachable
+`.trace.zip` under `profile_results/`:
 
 ```sh
 ./profile_macos_cpu.sh
 ```
+
+Set `HLOD_DEVELOPER_DIR` to force a particular Xcode installation,
+`HLOD_XCTRACE_TEMPLATE` to use a custom counter template, or
+`HLOD_PROFILE_FILTER` to profile a different benchmark. Hardware-counter
+recording may require enabling the terminal under **Privacy & Security >
+Developer Tools**.
 
 Normal configuration options:
 

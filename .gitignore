@@ -1,4 +1,5 @@
 build*/
+profile_results/
 *.json
 *.trace
 *.trace.zip
