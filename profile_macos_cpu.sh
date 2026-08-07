@@ -130,6 +130,58 @@ else
 fi
 xcodebuild -version
 
+export_trace_summary() {
+    local source_trace="$1"
+    local source_base="${source_trace%.trace}"
+    local source_dir
+    local source_name
+    local toc_file="${source_base}_toc.xml"
+    local info_file="${source_base}_info.txt"
+    local summary_archive="${source_base}_summary.zip"
+
+    if [[ ! -e "${source_trace}" ]]; then
+        echo "ERROR: Trace was not found: ${source_trace}" >&2
+        return 1
+    fi
+
+    echo "Exporting the trace table of contents..."
+    xcrun xctrace export --input "${source_trace}" --toc --output "${toc_file}"
+
+    source_dir="$(cd "$(dirname "${source_trace}")" && pwd)"
+    source_name="$(basename "${source_base}")"
+    (
+        cd "${source_dir}"
+        if [[ -f "$(basename "${info_file}")" ]]; then
+            /usr/bin/zip -q "${source_name}_summary.zip" \
+                "${source_name}_toc.xml" "${source_name}_info.txt"
+        else
+            /usr/bin/zip -q "${source_name}_summary.zip" \
+                "${source_name}_toc.xml"
+        fi
+    )
+
+    echo "Wrote ${toc_file}"
+    echo "Attach ${summary_archive} to the Codex task for analysis."
+}
+
+if [[ "${1:-}" == "--process" ]]; then
+    trace_to_process="${2:-}"
+    if [[ -z "${trace_to_process}" ]]; then
+        for trace_candidate in "${OUTPUT_DIR}"/*.trace; do
+            [[ -e "${trace_candidate}" ]] || continue
+            if [[ -z "${trace_to_process}" || "${trace_candidate}" -nt "${trace_to_process}" ]]; then
+                trace_to_process="${trace_candidate}"
+            fi
+        done
+    fi
+    if [[ -z "${trace_to_process}" ]]; then
+        echo "ERROR: No trace was provided and none exists under ${OUTPUT_DIR}." >&2
+        exit 1
+    fi
+    export_trace_summary "${trace_to_process}"
+    exit 0
+fi
+
 echo "Building optimized arm64 benchmark with source line tables..."
 configure_benchmark() {
     cmake -S "${ROOT_DIR}" -B "${BUILD_DIR}" "$@" \
@@ -162,9 +214,7 @@ fi
 stamp="$(date +%Y%m%d-%H%M%S)"
 mkdir -p "${OUTPUT_DIR}"
 trace="${OUTPUT_DIR}/hlod_cpu_counters_${stamp}.trace"
-toc="${OUTPUT_DIR}/hlod_cpu_counters_${stamp}_toc.xml"
 info="${OUTPUT_DIR}/hlod_cpu_counters_${stamp}_info.txt"
-archive="${trace}.zip"
 
 {
     echo "developer_dir=${DEVELOPER_DIR}"
@@ -192,24 +242,22 @@ record_cpu_counters() {
         --benchmark_repetitions=1
 }
 if [[ -n "${selected_template}" ]]; then
-    record_cpu_counters --template "${selected_template}"
+    record_status=0
+    record_cpu_counters --template "${selected_template}" || record_status=$?
 else
-    record_cpu_counters --instrument "${selected_instrument}"
+    record_status=0
+    record_cpu_counters --instrument "${selected_instrument}" || record_status=$?
 fi
 
-echo "Exporting the trace table of contents..."
-xcrun xctrace export "${trace}" --toc --output "${toc}"
-
-(
-    cd "${OUTPUT_DIR}"
-    /usr/bin/zip -qry \
-        "$(basename "${archive}")" \
-        "$(basename "${trace}")" \
-        "$(basename "${toc}")" \
-        "$(basename "${info}")"
-)
+if [[ ! -e "${trace}" ]]; then
+    echo "ERROR: xctrace exited with status ${record_status} and did not produce ${trace}." >&2
+    [[ ${record_status} -ne 0 ]] && exit "${record_status}"
+    exit 1
+fi
+if [[ ${record_status} -ne 0 ]]; then
+    echo "WARNING: xctrace exited with status ${record_status}, but produced a trace; continuing with export." >&2
+fi
 
 echo "Wrote ${trace}"
-echo "Wrote ${toc}"
-echo "Attach ${archive} to the Codex task for analysis."
+export_trace_summary "${trace}"
 echo "Open it with: open '${trace}'"

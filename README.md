@@ -396,12 +396,22 @@ automatically selects Xcode 26's **CPU Bottlenecks** template or the older
 but not its GUI template to `xctrace`, the script composes the recording from
 that instrument directly. It also discovers a suitable full Xcode installed
 beside the currently selected command-line tools. It writes an Instruments
-`.trace`, an exported table of contents, capture metadata, and an attachable
-`.trace.zip` under `profile_results/`:
+`.trace`, an exported table of contents, capture metadata, and a small
+attachable `_summary.zip` under `profile_results/`. The raw trace remains local
+because hardware-counter captures can be hundreds of megabytes:
 
 ```sh
 ./profile_macos_cpu.sh
 ```
+
+If recording produced a trace but post-processing failed, process the newest
+existing trace without recording again:
+
+```sh
+./profile_macos_cpu.sh --process
+```
+
+Pass a trace path after `--process` to select a file other than the newest one.
 
 Set `HLOD_DEVELOPER_DIR` to force a particular Xcode installation,
 `HLOD_XCTRACE_TEMPLATE` to use a custom counter template, or
