@@ -10,12 +10,13 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
-#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <numeric>
 #include <string>
 #include <vector>
+
+#include "hlod/math.h"
 
 #if defined(__aarch64__) || defined(_M_ARM64) || defined(_M_ARM64EC)
 #include <arm_neon.h>
@@ -56,19 +57,6 @@ inline uint32_t compareMask(Vec4 a, Vec4 b)
     const uint32x4_t weights = {1u, 2u, 4u, 8u};
     return vaddvq_u32(vmulq_u32(bits, weights));
 }
-inline uint32_t compareMaskCurrent(Vec4 a, Vec4 b)
-{
-    alignas(16) static constexpr uint32_t kBits[4] = {1u, 2u, 4u, 8u};
-    return vaddvq_u32(vandq_u32(vcltq_f32(a, b), vld1q_u32(kBits)));
-}
-inline uint32_t compareMaskU64(Vec4 a, Vec4 b)
-{
-    const uint64x2_t q = vreinterpretq_u64_u32(vcltq_f32(a, b));
-    const uint64_t lo = vgetq_lane_u64(q, 0);
-    const uint64_t hi = vgetq_lane_u64(q, 1);
-    return uint32_t(((lo >> 31) & 1u) | ((lo >> 62) & 2u) |
-                    ((hi >> 29) & 4u) | ((hi >> 60) & 8u));
-}
 #elif HLOD_MACHINE_SSE2
 using Vec4 = __m128;
 constexpr const char* kVectorBackend = "SSE2 128-bit";
@@ -82,18 +70,6 @@ inline void vstore(float* p, Vec4 v) { _mm_storeu_ps(p, v); }
 inline uint32_t compareMask(Vec4 a, Vec4 b)
 {
     return uint32_t(_mm_movemask_ps(_mm_cmplt_ps(a, b)));
-}
-inline uint32_t compareMaskCurrent(Vec4 a, Vec4 b)
-{
-    return uint32_t(_mm_movemask_ps(_mm_cmplt_ps(a, b)));
-}
-inline uint32_t compareMaskU64(Vec4 a, Vec4 b)
-{
-    const __m128i q = _mm_castps_si128(_mm_cmplt_ps(a, b));
-    const uint64_t lo = uint64_t(_mm_cvtsi128_si64(q));
-    const uint64_t hi = uint64_t(_mm_cvtsi128_si64(_mm_srli_si128(q, 8)));
-    return uint32_t(((lo >> 31) & 1u) | ((lo >> 62) & 2u) |
-                    ((hi >> 29) & 4u) | ((hi >> 60) & 8u));
 }
 #else
 struct Vec4 { float v[4]; };
@@ -130,14 +106,6 @@ inline uint32_t compareMask(Vec4 a, Vec4 b)
     for (uint32_t i = 0; i < 4; ++i) mask |= uint32_t(a.v[i] < b.v[i]) << i;
     return mask;
 }
-inline uint32_t compareMaskCurrent(Vec4 a, Vec4 b)
-{
-    return compareMask(a, b);
-}
-inline uint32_t compareMaskU64(Vec4 a, Vec4 b)
-{
-    return compareMask(a, b);
-}
 #endif
 
 #if defined(__clang__)
@@ -159,26 +127,6 @@ inline void consume(Vec4 v)
     benchmark::DoNotOptimize(lanes[1]);
     benchmark::DoNotOptimize(lanes[2]);
     benchmark::DoNotOptimize(lanes[3]);
-}
-
-bool validateCompareMasks()
-{
-    for (uint32_t expected = 0; expected < 16; ++expected)
-    {
-        alignas(16) float a[4], b[4];
-        for (uint32_t lane = 0; lane < 4; ++lane)
-        {
-            const bool set = ((expected >> lane) & 1u) != 0;
-            a[lane] = set ? -1.0f : 1.0f;
-            b[lane] = set ? 1.0f : -1.0f;
-        }
-        const Vec4 va = vload(a), vb = vload(b);
-        if (compareMask(va, vb) != expected ||
-            compareMaskCurrent(va, vb) != expected ||
-            compareMaskU64(va, vb) != expected)
-            return false;
-    }
-    return true;
 }
 
 // ---- scalar and vector execution ------------------------------------------
@@ -405,87 +353,182 @@ static void BM_VectorCompareMask128(benchmark::State& state)
 }
 BENCHMARK(BM_VectorCompareMask128);
 
-template <uint32_t (*Mask)(Vec4, Vec4)>
-static void runVectorCompareMaskIndependent128(benchmark::State& state)
+// ---- exact wide-frustum mask A/B -----------------------------------------
+
+using WideAabbFn = uint32_t (*)(const hlod::WideBounds&, const hlod::Frustum&,
+                                uint8_t, uint8_t*);
+
+inline uint32_t wideAabbVectorResident(const hlod::WideBounds& b,
+                                       const hlod::Frustum& fr,
+                                       uint8_t inMask, uint8_t* outMasks)
 {
-    constexpr size_t kLanes = 4096;
-    std::vector<float> a(kLanes), b(kLanes);
-    uint32_t rng = 0x9e3779b9u;
-    for (size_t i = 0; i < kLanes; ++i)
-    {
-        rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
-        a[i] = float(int32_t(rng)) * (1.0f / 2147483648.0f);
-        rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
-        b[i] = float(int32_t(rng)) * (1.0f / 2147483648.0f);
-    }
-    uint32_t result = 0;
-    for (auto _ : state)
-    {
-        benchmark::ClobberMemory();
-        for (size_t i = 0; i < kLanes; i += 4)
-            result ^= Mask(vload(a.data() + i), vload(b.data() + i));
-        benchmark::DoNotOptimize(result);
-    }
-    state.SetItemsProcessed(state.iterations() * int64_t(kLanes));
+    return hlod::testWideAabb(b, fr, inMask, outMasks);
 }
 
-static void BM_VectorCompareMaskCurrent128(benchmark::State& state)
+#if HLOD_MACHINE_NEON
+// Exact NEON implementation before the vector-resident experiment. Keeping
+// it here, outside the library, gives both versions identical inputs, process
+// scheduling, and randomized benchmark ordering without retaining two
+// production paths.
+inline uint32_t wideAabbScalarized(const hlod::WideBounds& b,
+                                   const hlod::Frustum& fr,
+                                   uint8_t inMask, uint8_t* outMasks)
 {
-    runVectorCompareMaskIndependent128<compareMaskCurrent>(state);
-}
-BENCHMARK(BM_VectorCompareMaskCurrent128);
+    for (uint32_t l = 0; l < hlod::kWide; ++l) outMasks[l] = inMask;
+    if (!inMask) return (1u << hlod::kWide) - 1;
 
-static void BM_VectorCompareMaskU64_128(benchmark::State& state)
-{
-    runVectorCompareMaskIndependent128<compareMaskU64>(state);
-}
-BENCHMARK(BM_VectorCompareMaskU64_128);
+    const float32x4_t mnx[2] = {vld1q_f32(b.mnx.v), vld1q_f32(b.mnx.v + 4)};
+    const float32x4_t mny[2] = {vld1q_f32(b.mny.v), vld1q_f32(b.mny.v + 4)};
+    const float32x4_t mnz[2] = {vld1q_f32(b.mnz.v), vld1q_f32(b.mnz.v + 4)};
+    const float32x4_t mxx[2] = {vld1q_f32(b.mxx.v), vld1q_f32(b.mxx.v + 4)};
+    const float32x4_t mxy[2] = {vld1q_f32(b.mxy.v), vld1q_f32(b.mxy.v + 4)};
+    const float32x4_t mxz[2] = {vld1q_f32(b.mxz.v), vld1q_f32(b.mxz.v + 4)};
+    const float32x4_t zero = vdupq_n_f32(0.0f);
 
-template <uint32_t (*Mask)(Vec4, Vec4)>
-static void runVectorCompareMaskDependent128(benchmark::State& state)
-{
-    constexpr uint32_t kMasks = 16;
-    constexpr int kUpdates = 4096;
-    alignas(16) std::array<float, kMasks * 4> a{};
-    alignas(16) std::array<float, kMasks * 4> b{};
-    for (uint32_t index = 0; index < kMasks; ++index)
+    uint32_t alive = (1u << hlod::kWide) - 1;
+    for (uint32_t p = 0; p < 6; ++p)
     {
-        const uint32_t next = (index * 5u + 1u) & (kMasks - 1u);
-        for (uint32_t lane = 0; lane < 4; ++lane)
+        if (!((inMask >> p) & 1)) continue;
+        const hlod::float4 pl = fr.plane[p];
+        const float32x4_t nx = vdupq_n_f32(pl.x), ny = vdupq_n_f32(pl.y);
+        const float32x4_t nz = vdupq_n_f32(pl.z), d = vdupq_n_f32(pl.w);
+        const uint32x4_t sx = vcltq_f32(nx, zero);
+        const uint32x4_t sy = vcltq_f32(ny, zero);
+        const uint32x4_t sz = vcltq_f32(nz, zero);
+
+        for (uint32_t h = 0; h < 2; ++h)
         {
-            const bool set = ((next >> lane) & 1u) != 0;
-            a[index * 4 + lane] = set ? -1.0f : 1.0f;
-            b[index * 4 + lane] = set ? 1.0f : -1.0f;
+            const float32x4_t px = vbslq_f32(sx, mnx[h], mxx[h]);
+            const float32x4_t py = vbslq_f32(sy, mny[h], mxy[h]);
+            const float32x4_t pz = vbslq_f32(sz, mnz[h], mxz[h]);
+            const float32x4_t dp =
+                vfmaq_f32(vfmaq_f32(vfmaq_f32(d, nz, pz), ny, py), nx, px);
+            alive &= ~(hlod::detail::movemask4(vcltq_f32(dp, zero)) <<
+                       (4 * h));
+
+            const float32x4_t qx = vbslq_f32(sx, mxx[h], mnx[h]);
+            const float32x4_t qy = vbslq_f32(sy, mxy[h], mny[h]);
+            const float32x4_t qz = vbslq_f32(sz, mxz[h], mnz[h]);
+            const float32x4_t dn =
+                vfmaq_f32(vfmaq_f32(vfmaq_f32(d, nz, qz), ny, qy), nx, qx);
+            uint32_t inside =
+                hlod::detail::movemask4(vcgeq_f32(dn, zero)) << (4 * h);
+            while (inside)
+            {
+                const uint32_t l = uint32_t(std::countr_zero(inside));
+                inside &= inside - 1;
+                outMasks[l] = uint8_t(outMasks[l] & ~(1u << p));
+            }
+        }
+    }
+    return alive & ((1u << hlod::kWide) - 1);
+}
+#else
+inline uint32_t wideAabbScalarized(const hlod::WideBounds& b,
+                                   const hlod::Frustum& fr,
+                                   uint8_t inMask, uint8_t* outMasks)
+{
+    return hlod::testWideAabb(b, fr, inMask, outMasks);
+}
+#endif
+
+struct WideAabbFixture
+{
+    static constexpr size_t kCases = 128;
+    std::array<hlod::WideBounds, kCases> bounds{};
+    hlod::Frustum frustum{};
+};
+
+WideAabbFixture makeWideAabbFixture()
+{
+    WideAabbFixture f;
+    f.frustum.plane[0] = { 0.98058f,  0.00000f,  0.19612f, 25.0f};
+    f.frustum.plane[1] = {-0.98058f,  0.00000f,  0.19612f, 25.0f};
+    f.frustum.plane[2] = { 0.00000f,  0.97014f,  0.24254f, 20.0f};
+    f.frustum.plane[3] = { 0.00000f, -0.97014f,  0.24254f, 20.0f};
+    f.frustum.plane[4] = { 0.00000f,  0.00000f,  1.00000f,  5.0f};
+    f.frustum.plane[5] = { 0.00000f,  0.00000f, -1.00000f, 80.0f};
+
+    uint32_t rng = 0x6d2b79f5u;
+    const auto random = [&rng](float lo, float hi)
+    {
+        rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
+        const float unit = float(rng >> 8) * (1.0f / 16777216.0f);
+        return lo + (hi - lo) * unit;
+    };
+    for (hlod::WideBounds& wide : f.bounds)
+        for (uint32_t lane = 0; lane < hlod::kWide; ++lane)
+        {
+            const float cx = random(-60.0f, 60.0f);
+            const float cy = random(-50.0f, 50.0f);
+            const float cz = random(-20.0f, 100.0f);
+            const float ex = random(0.05f, 8.0f);
+            const float ey = random(0.05f, 8.0f);
+            const float ez = random(0.05f, 8.0f);
+            wide.setLane(lane, hlod::AABB::fromMinMax(
+                {cx - ex, cy - ey, cz - ez, 0.0f},
+                {cx + ex, cy + ey, cz + ez, 0.0f}));
+        }
+    return f;
+}
+
+template <WideAabbFn Test>
+static void runWideAabbMaskBenchmark(benchmark::State& state)
+{
+    constexpr int kCalls = 4096;
+    const WideAabbFixture fixture = makeWideAabbFixture();
+    const uint32_t activePlanes = uint32_t(state.range(0));
+    const uint8_t inMask = uint8_t((1u << activePlanes) - 1u);
+
+    // Correctness is checked outside the timed region on exactly the inputs
+    // the benchmark will use.
+    for (const hlod::WideBounds& bounds : fixture.bounds)
+    {
+        uint8_t oldMasks[hlod::kWide], newMasks[hlod::kWide];
+        const uint32_t oldAlive =
+            wideAabbScalarized(bounds, fixture.frustum, inMask, oldMasks);
+        const uint32_t newAlive =
+            wideAabbVectorResident(bounds, fixture.frustum, inMask, newMasks);
+        if (oldAlive != newAlive ||
+            !std::equal(std::begin(oldMasks), std::end(oldMasks),
+                        std::begin(newMasks)))
+        {
+            state.SkipWithError("wide-AABB A/B implementations disagree");
+            return;
         }
     }
 
-    benchmark::DoNotOptimize(a.data());
-    benchmark::DoNotOptimize(b.data());
-    uint32_t index = 0;
+    uint64_t checksum[4] = {};
     for (auto _ : state)
     {
-        benchmark::ClobberMemory();
-        for (int i = 0; i < kUpdates; ++i)
+        for (int i = 0; i < kCalls; ++i)
         {
-            const size_t offset = size_t(index) * 4;
-            index = Mask(vload(a.data() + offset), vload(b.data() + offset));
+            uint8_t masks[hlod::kWide];
+            const uint32_t alive = Test(
+                fixture.bounds[size_t(i) & (WideAabbFixture::kCases - 1)],
+                fixture.frustum, inMask, masks);
+            uint64_t packed;
+            std::memcpy(&packed, masks, sizeof(packed));
+            checksum[i & 3] += packed ^ alive;
         }
-        benchmark::DoNotOptimize(index);
+        benchmark::DoNotOptimize(checksum);
     }
-    state.SetItemsProcessed(state.iterations() * kUpdates);
+    state.SetItemsProcessed(state.iterations() * kCalls * hlod::kWide);
 }
 
-static void BM_VectorCompareMaskCurrentDependent128(benchmark::State& state)
+static void BM_WideAabbMaskScalarized(benchmark::State& state)
 {
-    runVectorCompareMaskDependent128<compareMaskCurrent>(state);
+    runWideAabbMaskBenchmark<wideAabbScalarized>(state);
 }
-BENCHMARK(BM_VectorCompareMaskCurrentDependent128);
+BENCHMARK(BM_WideAabbMaskScalarized)
+    ->Args({1})->Args({3})->Args({6})->ArgName("active_planes");
 
-static void BM_VectorCompareMaskU64Dependent128(benchmark::State& state)
+static void BM_WideAabbMaskVectorResident(benchmark::State& state)
 {
-    runVectorCompareMaskDependent128<compareMaskU64>(state);
+    runWideAabbMaskBenchmark<wideAabbVectorResident>(state);
 }
-BENCHMARK(BM_VectorCompareMaskU64Dependent128);
+BENCHMARK(BM_WideAabbMaskVectorResident)
+    ->Args({1})->Args({3})->Args({6})->ArgName("active_planes");
 
 // ---- memory hierarchy ------------------------------------------------------
 
@@ -742,11 +785,6 @@ BENCHMARK(BM_BitMaskIteration)
 
 int main(int argc, char** argv)
 {
-    if (!validateCompareMasks())
-    {
-        std::fputs("ERROR: compare-mask implementation failed self-test.\n", stderr);
-        return 2;
-    }
     benchmark::MaybeReenterWithoutASLR(argc, argv);
     benchmark::Initialize(&argc, argv);
     benchmark::AddCustomContext("machine_vector_backend", kVectorBackend);
