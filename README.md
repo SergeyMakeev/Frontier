@@ -225,13 +225,19 @@ than platform promises; selection remains output-sensitive. See
 
 ## What selection returns
 
-One traversal fills three disjoint `CutResults` vectors:
+One traversal fills three disjoint, contiguous `CutResults` buffers:
 
 - `shared`: selected in both the current render cut and fully-resident ideal
   cut;
 - `currentOnly`: a resident fallback selected only because some more detailed
   ideal entries are not resident; and
 - `idealOnly`: selected only by the fully-resident ideal cut.
+
+Each field is an `AppendBuffer<CutEntry>`: contiguous, iterable storage with
+`data()`, `size()`, `capacity()`, `clear()`, and retained capacity between
+queries. It deliberately has no middle insertion or erasure. Construct a
+`std::vector` from its iterators only when an owning STL copy is actually
+needed.
 
 Render `shared + currentOnly`; inspect the fully-resident frontier as
 `shared + idealOnly`. A high-error leaf on the ideal side is the point where

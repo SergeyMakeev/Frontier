@@ -31,7 +31,7 @@ Keys keysOf(const CutResults& cut)
 {
     Keys k;
     k.reserve(cut.size());
-    const auto append = [&](const std::vector<CutEntry>& entries, uint32_t bucket)
+    const auto append = [&](const auto& entries, uint32_t bucket)
     {
         for (const CutEntry& e : entries)
             k.push_back({bucket, e.instance(), e.nodeHandle.lo, e.nodeHandle.hi});

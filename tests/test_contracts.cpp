@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <iterator>
 #include <random>
 #include <set>
 #include <tuple>
@@ -44,7 +45,7 @@ std::vector<ResultKey> resultKeys(World& world, const CutResults& cut)
 {
     std::vector<ResultKey> keys;
     keys.reserve(cut.size());
-    const auto append = [&](const std::vector<CutEntry>& entries, uint32_t bucket)
+    const auto append = [&](const auto& entries, uint32_t bucket)
     {
         for (const CutEntry& e : entries)
             keys.emplace_back(bucket, payloadOf(world, e), e.errorCode(),
@@ -580,6 +581,42 @@ TEST(Contracts, CompactCutRepresentation)
     EXPECT_EQ(sink.shared.dropped(), 1u);
     EXPECT_EQ(sink.currentOnly.count(), 1u);
     EXPECT_EQ(sink.idealOnly.count(), 1u);
+}
+
+TEST(Contracts, AppendBufferRetainsAndOwnsContiguousStorage)
+{
+    const uint32_t first[] = {1, 2, 3, 4};
+    const uint32_t second[] = {5, 6, 7, 8, 9};
+
+    AppendBuffer<uint32_t> buffer;
+    buffer.append(first, std::size(first));
+    buffer.append(second, std::size(second));
+    ASSERT_EQ(buffer.size(), 9u);
+    EXPECT_GE(buffer.capacity(), buffer.size());
+    for (uint32_t i = 0; i < buffer.size(); ++i)
+        EXPECT_EQ(buffer[i], i + 1);
+
+    const size_t retained = buffer.capacity();
+    buffer.clear();
+    EXPECT_TRUE(buffer.empty());
+    EXPECT_EQ(buffer.capacity(), retained);
+    buffer.push_back(10);
+    EXPECT_EQ(buffer.emplace_back(11), 11u);
+
+    AppendBuffer<uint32_t> copy = buffer;
+    buffer[0] = 20;
+    EXPECT_EQ(copy.front(), 10u);
+    EXPECT_EQ(copy.back(), 11u);
+
+    AppendBuffer<uint32_t> assigned;
+    assigned = copy;
+    EXPECT_EQ(assigned.size(), 2u);
+    EXPECT_EQ(assigned[1], 11u);
+
+    AppendBuffer<uint32_t> moved = std::move(buffer);
+    EXPECT_TRUE(buffer.empty());
+    ASSERT_EQ(moved.size(), 2u);
+    EXPECT_EQ(moved.front(), 20u);
 }
 
 TEST(Contracts, MemoryBudgets)

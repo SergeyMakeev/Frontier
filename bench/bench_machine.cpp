@@ -14,9 +14,11 @@
 #include <limits>
 #include <numeric>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #include "hlod/math.h"
+#include "hlod/world.h"
 
 #if defined(__aarch64__) || defined(_M_ARM64) || defined(_M_ARM64EC)
 #include <arm_neon.h>
@@ -635,6 +637,114 @@ static void BM_KernelCacheHitFixedProjection(benchmark::State& state)
     runCacheHitValidation<2>(state);
 }
 BENCHMARK(BM_KernelCacheHitFixedProjection);
+
+// The cached hierarchical workload emits four CutEntries for each of 25k
+// visible instances. Compare many-small-range append strategies in isolation;
+// one bulk insert provides the lower-bound cost of copying the same output.
+enum class OutputAppendMode
+{
+    RangeInsert,
+    PushLoop,
+    AppendBuffer,
+    BulkInsert
+};
+
+template <OutputAppendMode Mode>
+static void runOutputAppend(benchmark::State& state)
+{
+    constexpr uint32_t kRanges = 25'000;
+    const uint32_t entriesPerRange = uint32_t(state.range(0));
+    const size_t entryCount = size_t(kRanges) * entriesPerRange;
+    std::vector<hlod::CutEntry> input(entryCount);
+    for (size_t i = 0; i < entryCount; ++i)
+    {
+        input[i] = hlod::CutEntry(
+            hlod::NodeHandle{uint32_t(i) & 0xffffu, uint32_t(i) & 0xffu, 1u},
+            uint8_t(i), uint32_t(i) & hlod::kInstanceIdMask);
+    }
+
+    using Output = std::conditional_t<Mode == OutputAppendMode::AppendBuffer,
+                                      hlod::AppendBuffer<hlod::CutEntry>,
+                                      std::vector<hlod::CutEntry>>;
+    Output output;
+    output.reserve(entryCount);
+    for (auto _ : state)
+    {
+        output.clear();
+        if constexpr (Mode == OutputAppendMode::BulkInsert)
+        {
+            output.insert(output.end(), input.data(), input.data() + input.size());
+        }
+        else
+        {
+            for (uint32_t range = 0; range < kRanges; ++range)
+            {
+                const hlod::CutEntry* p =
+                    input.data() + size_t(range) * entriesPerRange;
+                if constexpr (Mode == OutputAppendMode::RangeInsert)
+                {
+                    output.insert(output.end(), p, p + entriesPerRange);
+                }
+                else if constexpr (Mode == OutputAppendMode::PushLoop)
+                {
+                    for (uint32_t i = 0; i < entriesPerRange; ++i)
+                        output.push_back(p[i]);
+                }
+                else
+                {
+                    output.append(p, entriesPerRange);
+                }
+            }
+        }
+        benchmark::DoNotOptimize(output.data());
+        benchmark::ClobberMemory();
+    }
+    state.SetItemsProcessed(state.iterations() * int64_t(entryCount));
+    state.SetBytesProcessed(
+        state.iterations() * int64_t(entryCount * sizeof(hlod::CutEntry)));
+}
+
+static void BM_OutputAppendRangeInsert(benchmark::State& state)
+{
+    runOutputAppend<OutputAppendMode::RangeInsert>(state);
+}
+BENCHMARK(BM_OutputAppendRangeInsert)
+    ->Arg(1)
+    ->Arg(4)
+    ->Arg(8)
+    ->Arg(16)
+    ->Arg(64)
+    ->ArgName("entries_per_range");
+
+static void BM_OutputAppendPushLoop(benchmark::State& state)
+{
+    runOutputAppend<OutputAppendMode::PushLoop>(state);
+}
+BENCHMARK(BM_OutputAppendPushLoop)
+    ->Arg(1)
+    ->Arg(4)
+    ->Arg(8)
+    ->Arg(16)
+    ->Arg(64)
+    ->ArgName("entries_per_range");
+
+static void BM_OutputAppendBuffer(benchmark::State& state)
+{
+    runOutputAppend<OutputAppendMode::AppendBuffer>(state);
+}
+BENCHMARK(BM_OutputAppendBuffer)
+    ->Arg(1)
+    ->Arg(4)
+    ->Arg(8)
+    ->Arg(16)
+    ->Arg(64)
+    ->ArgName("entries_per_range");
+
+static void BM_OutputAppendBulkInsert(benchmark::State& state)
+{
+    runOutputAppend<OutputAppendMode::BulkInsert>(state);
+}
+BENCHMARK(BM_OutputAppendBulkInsert)->Arg(4)->ArgName("entries_per_range");
 
 // ---- memory hierarchy ------------------------------------------------------
 

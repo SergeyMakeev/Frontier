@@ -127,7 +127,7 @@ using ResultKey = std::tuple<uint32_t, UserPayload, uint8_t>;
 std::vector<ResultKey> resultKeys(World& world, const CutResults& cut)
 {
     std::vector<ResultKey> keys;
-    const auto append = [&](const std::vector<CutEntry>& entries, uint32_t bucket)
+    const auto append = [&](const auto& entries, uint32_t bucket)
     {
         for (const CutEntry& e : entries)
             keys.emplace_back(bucket, payloadOf(world, e), e.errorCode());

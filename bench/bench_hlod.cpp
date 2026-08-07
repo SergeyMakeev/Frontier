@@ -93,7 +93,7 @@ size_t attachTopByPriority(World& w, TreeGen& gen,
 {
     static std::vector<const CutEntry*> candidates;
     candidates.clear();
-    const auto gather = [&](const std::vector<CutEntry>& entries)
+    const auto gather = [&](const auto& entries)
     {
         for (const CutEntry& entry : entries)
         {
@@ -128,7 +128,7 @@ size_t attachTopByPriority(World& w, TreeGen& gen,
 // priorities/budgets, and complete these calls asynchronously.
 size_t makeIdealResident(World& w, const CutResults& cut)
 {
-    const auto mark = [&](const std::vector<CutEntry>& entries)
+    const auto mark = [&](const auto& entries)
     {
         for (const CutEntry& e : entries)
             if (!w.isResident(e.nodeHandle)) w.markResident(e.nodeHandle);
@@ -1321,7 +1321,7 @@ void predictiveAttachFrame(World& w, TreeGen& gen, const CutResults& cut,
     static std::priority_queue<Cand> heap;   // max-heap by (estimated) error
     while (!heap.empty()) heap.pop();
 
-    const auto gather = [&](const std::vector<CutEntry>& entries)
+    const auto gather = [&](const auto& entries)
     {
         for (const CutEntry& e : entries)
         {
@@ -1414,7 +1414,7 @@ static void BM_StreamingConvergence(benchmark::State& state)
         // 1e33+ (distance 0), and one such frame would swamp the average —
         // 1e6 px already means "the box you are standing in is unexpanded".
         float worst = 0.0f;
-        const auto measureResidual = [&](const std::vector<CutEntry>& entries)
+        const auto measureResidual = [&](const auto& entries)
         {
             for (const CutEntry& e : entries)
             {

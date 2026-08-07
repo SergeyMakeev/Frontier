@@ -447,14 +447,14 @@ using UserId = UserPayload;
 
 inline std::vector<CutEntry> currentCut(const CutResults& cut)
 {
-    std::vector<CutEntry> out = cut.shared;
+    std::vector<CutEntry> out(cut.shared.begin(), cut.shared.end());
     out.insert(out.end(), cut.currentOnly.begin(), cut.currentOnly.end());
     return out;
 }
 
 inline std::vector<CutEntry> idealCut(const CutResults& cut)
 {
-    std::vector<CutEntry> out = cut.shared;
+    std::vector<CutEntry> out(cut.shared.begin(), cut.shared.end());
     out.insert(out.end(), cut.idealOnly.begin(), cut.idealOnly.end());
     return out;
 }

@@ -51,6 +51,7 @@
 #include <memory>
 #include <vector>
 
+#include "append_buffer.h"
 #include "config.h"
 #include "math.h"
 #include "page.h"
@@ -180,9 +181,9 @@ static_assert(sizeof(CutEntry) == 12, "CutEntry must stay 12 bytes");
 // policy to decide whether its external content graph can expand it.
 struct CutResults
 {
-    std::vector<CutEntry> shared;
-    std::vector<CutEntry> currentOnly;
-    std::vector<CutEntry> idealOnly;
+    AppendBuffer<CutEntry> shared;
+    AppendBuffer<CutEntry> currentOnly;
+    AppendBuffer<CutEntry> idealOnly;
 
     void clear()
     {
@@ -220,7 +221,7 @@ struct InstanceDesc
 // Output sinks
 //
 // selectCut writes through a Sink so the same out-of-line traversal can fill
-// either a std::vector (grows, never drops) or caller memory (fixed, reports
+// either an AppendBuffer (grows, never drops) or caller memory (fixed, reports
 // what did not fit). Engines that write straight into a draw list or a mapped
 // instance buffer want the second one.
 // ---------------------------------------------------------------------------
@@ -232,7 +233,7 @@ public:
     Sink() = default;
 
     // Growable: appends to `v`, which is cleared first. Never drops.
-    explicit Sink(std::vector<T>& v) : vec_(&v) { v.clear(); }
+    explicit Sink(AppendBuffer<T>& v) : vec_(&v) { v.clear(); }
 
     // Fixed: writes into caller memory, counting (not writing) the overflow.
     Sink(T* data, uint32_t capacity) : data_(data), capacity_(capacity) {}
@@ -257,15 +258,7 @@ public:
         if (n == 0) return;
         if (vec_)
         {
-            // Contextual cuts are usually one entry per distant instance.
-            // Avoid std::vector's range-insert machinery for that dominant
-            // case; capacity is already retained across selectCut calls.
-            if (n == 1)
-            {
-                vec_->push_back(*p);
-                return;
-            }
-            vec_->insert(vec_->end(), p, p + n);
+            vec_->append(p, n);
             return;
         }
         const uint32_t fits = count_ < capacity_ ? capacity_ - count_ : 0;
@@ -280,7 +273,7 @@ public:
     bool     overflowed() const { return dropped_ != 0; }
 
 private:
-    std::vector<T>* vec_ = nullptr;
+    AppendBuffer<T>* vec_ = nullptr;
     T*              data_ = nullptr;
     uint32_t        capacity_ = 0;
     uint32_t        count_ = 0;
