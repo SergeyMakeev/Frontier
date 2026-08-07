@@ -26,9 +26,11 @@ add_developer_dir() {
     local candidate="$1"
     [[ -d "${candidate}" ]] || return
     local existing
-    for existing in "${developer_dirs[@]}"; do
-        [[ "${existing}" == "${candidate}" ]] && return
-    done
+    if [[ ${#developer_dirs[@]} -gt 0 ]]; then
+        for existing in "${developer_dirs[@]}"; do
+            [[ "${existing}" == "${candidate}" ]] && return
+        done
+    fi
     developer_dirs+=("${candidate}")
 }
 
@@ -90,20 +92,22 @@ echo "Using developer directory: ${DEVELOPER_DIR}"
 echo "Using Instruments template: ${selected_template}"
 xcodebuild -version
 
-generator=()
-if [[ ! -f "${BUILD_DIR}/CMakeCache.txt" ]] && command -v ninja >/dev/null 2>&1; then
-    generator=(-G Ninja)
-fi
-
 echo "Building optimized arm64 benchmark with source line tables..."
-cmake -S "${ROOT_DIR}" -B "${BUILD_DIR}" "${generator[@]}" \
-    -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_OSX_ARCHITECTURES=arm64 \
-    -DHLOD_BUILD_TESTS=OFF \
-    -DHLOD_BUILD_BENCH=ON \
-    -DHLOD_AVX2=OFF \
-    -DHLOD_FORCE_SCALAR=OFF \
-    -DHLOD_PROFILE_SYMBOLS=ON
+configure_benchmark() {
+    cmake -S "${ROOT_DIR}" -B "${BUILD_DIR}" "$@" \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_OSX_ARCHITECTURES=arm64 \
+        -DHLOD_BUILD_TESTS=OFF \
+        -DHLOD_BUILD_BENCH=ON \
+        -DHLOD_AVX2=OFF \
+        -DHLOD_FORCE_SCALAR=OFF \
+        -DHLOD_PROFILE_SYMBOLS=ON
+}
+if [[ ! -f "${BUILD_DIR}/CMakeCache.txt" ]] && command -v ninja >/dev/null 2>&1; then
+    configure_benchmark -G Ninja
+else
+    configure_benchmark
+fi
 cmake --build "${BUILD_DIR}" --config Release --target hlod_bench --parallel
 
 cache_file="${BUILD_DIR}/CMakeCache.txt"
