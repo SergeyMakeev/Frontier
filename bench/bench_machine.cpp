@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <numeric>
@@ -55,6 +56,19 @@ inline uint32_t compareMask(Vec4 a, Vec4 b)
     const uint32x4_t weights = {1u, 2u, 4u, 8u};
     return vaddvq_u32(vmulq_u32(bits, weights));
 }
+inline uint32_t compareMaskCurrent(Vec4 a, Vec4 b)
+{
+    alignas(16) static constexpr uint32_t kBits[4] = {1u, 2u, 4u, 8u};
+    return vaddvq_u32(vandq_u32(vcltq_f32(a, b), vld1q_u32(kBits)));
+}
+inline uint32_t compareMaskU64(Vec4 a, Vec4 b)
+{
+    const uint64x2_t q = vreinterpretq_u64_u32(vcltq_f32(a, b));
+    const uint64_t lo = vgetq_lane_u64(q, 0);
+    const uint64_t hi = vgetq_lane_u64(q, 1);
+    return uint32_t(((lo >> 31) & 1u) | ((lo >> 62) & 2u) |
+                    ((hi >> 29) & 4u) | ((hi >> 60) & 8u));
+}
 #elif HLOD_MACHINE_SSE2
 using Vec4 = __m128;
 constexpr const char* kVectorBackend = "SSE2 128-bit";
@@ -68,6 +82,18 @@ inline void vstore(float* p, Vec4 v) { _mm_storeu_ps(p, v); }
 inline uint32_t compareMask(Vec4 a, Vec4 b)
 {
     return uint32_t(_mm_movemask_ps(_mm_cmplt_ps(a, b)));
+}
+inline uint32_t compareMaskCurrent(Vec4 a, Vec4 b)
+{
+    return uint32_t(_mm_movemask_ps(_mm_cmplt_ps(a, b)));
+}
+inline uint32_t compareMaskU64(Vec4 a, Vec4 b)
+{
+    const __m128i q = _mm_castps_si128(_mm_cmplt_ps(a, b));
+    const uint64_t lo = uint64_t(_mm_cvtsi128_si64(q));
+    const uint64_t hi = uint64_t(_mm_cvtsi128_si64(_mm_srli_si128(q, 8)));
+    return uint32_t(((lo >> 31) & 1u) | ((lo >> 62) & 2u) |
+                    ((hi >> 29) & 4u) | ((hi >> 60) & 8u));
 }
 #else
 struct Vec4 { float v[4]; };
@@ -104,6 +130,14 @@ inline uint32_t compareMask(Vec4 a, Vec4 b)
     for (uint32_t i = 0; i < 4; ++i) mask |= uint32_t(a.v[i] < b.v[i]) << i;
     return mask;
 }
+inline uint32_t compareMaskCurrent(Vec4 a, Vec4 b)
+{
+    return compareMask(a, b);
+}
+inline uint32_t compareMaskU64(Vec4 a, Vec4 b)
+{
+    return compareMask(a, b);
+}
 #endif
 
 #if defined(__clang__)
@@ -125,6 +159,26 @@ inline void consume(Vec4 v)
     benchmark::DoNotOptimize(lanes[1]);
     benchmark::DoNotOptimize(lanes[2]);
     benchmark::DoNotOptimize(lanes[3]);
+}
+
+bool validateCompareMasks()
+{
+    for (uint32_t expected = 0; expected < 16; ++expected)
+    {
+        alignas(16) float a[4], b[4];
+        for (uint32_t lane = 0; lane < 4; ++lane)
+        {
+            const bool set = ((expected >> lane) & 1u) != 0;
+            a[lane] = set ? -1.0f : 1.0f;
+            b[lane] = set ? 1.0f : -1.0f;
+        }
+        const Vec4 va = vload(a), vb = vload(b);
+        if (compareMask(va, vb) != expected ||
+            compareMaskCurrent(va, vb) != expected ||
+            compareMaskU64(va, vb) != expected)
+            return false;
+    }
+    return true;
 }
 
 // ---- scalar and vector execution ------------------------------------------
@@ -350,6 +404,88 @@ static void BM_VectorCompareMask128(benchmark::State& state)
     state.SetItemsProcessed(state.iterations() * int64_t(kLanes));
 }
 BENCHMARK(BM_VectorCompareMask128);
+
+template <uint32_t (*Mask)(Vec4, Vec4)>
+static void runVectorCompareMaskIndependent128(benchmark::State& state)
+{
+    constexpr size_t kLanes = 4096;
+    std::vector<float> a(kLanes), b(kLanes);
+    uint32_t rng = 0x9e3779b9u;
+    for (size_t i = 0; i < kLanes; ++i)
+    {
+        rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
+        a[i] = float(int32_t(rng)) * (1.0f / 2147483648.0f);
+        rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
+        b[i] = float(int32_t(rng)) * (1.0f / 2147483648.0f);
+    }
+    uint32_t result = 0;
+    for (auto _ : state)
+    {
+        benchmark::ClobberMemory();
+        for (size_t i = 0; i < kLanes; i += 4)
+            result ^= Mask(vload(a.data() + i), vload(b.data() + i));
+        benchmark::DoNotOptimize(result);
+    }
+    state.SetItemsProcessed(state.iterations() * int64_t(kLanes));
+}
+
+static void BM_VectorCompareMaskCurrent128(benchmark::State& state)
+{
+    runVectorCompareMaskIndependent128<compareMaskCurrent>(state);
+}
+BENCHMARK(BM_VectorCompareMaskCurrent128);
+
+static void BM_VectorCompareMaskU64_128(benchmark::State& state)
+{
+    runVectorCompareMaskIndependent128<compareMaskU64>(state);
+}
+BENCHMARK(BM_VectorCompareMaskU64_128);
+
+template <uint32_t (*Mask)(Vec4, Vec4)>
+static void runVectorCompareMaskDependent128(benchmark::State& state)
+{
+    constexpr uint32_t kMasks = 16;
+    constexpr int kUpdates = 4096;
+    alignas(16) std::array<float, kMasks * 4> a{};
+    alignas(16) std::array<float, kMasks * 4> b{};
+    for (uint32_t index = 0; index < kMasks; ++index)
+    {
+        const uint32_t next = (index * 5u + 1u) & (kMasks - 1u);
+        for (uint32_t lane = 0; lane < 4; ++lane)
+        {
+            const bool set = ((next >> lane) & 1u) != 0;
+            a[index * 4 + lane] = set ? -1.0f : 1.0f;
+            b[index * 4 + lane] = set ? 1.0f : -1.0f;
+        }
+    }
+
+    benchmark::DoNotOptimize(a.data());
+    benchmark::DoNotOptimize(b.data());
+    uint32_t index = 0;
+    for (auto _ : state)
+    {
+        benchmark::ClobberMemory();
+        for (int i = 0; i < kUpdates; ++i)
+        {
+            const size_t offset = size_t(index) * 4;
+            index = Mask(vload(a.data() + offset), vload(b.data() + offset));
+        }
+        benchmark::DoNotOptimize(index);
+    }
+    state.SetItemsProcessed(state.iterations() * kUpdates);
+}
+
+static void BM_VectorCompareMaskCurrentDependent128(benchmark::State& state)
+{
+    runVectorCompareMaskDependent128<compareMaskCurrent>(state);
+}
+BENCHMARK(BM_VectorCompareMaskCurrentDependent128);
+
+static void BM_VectorCompareMaskU64Dependent128(benchmark::State& state)
+{
+    runVectorCompareMaskDependent128<compareMaskU64>(state);
+}
+BENCHMARK(BM_VectorCompareMaskU64Dependent128);
 
 // ---- memory hierarchy ------------------------------------------------------
 
@@ -606,6 +742,11 @@ BENCHMARK(BM_BitMaskIteration)
 
 int main(int argc, char** argv)
 {
+    if (!validateCompareMasks())
+    {
+        std::fputs("ERROR: compare-mask implementation failed self-test.\n", stderr);
+        return 2;
+    }
     benchmark::MaybeReenterWithoutASLR(argc, argv);
     benchmark::Initialize(&argc, argv);
     benchmark::AddCustomContext("machine_vector_backend", kVectorBackend);

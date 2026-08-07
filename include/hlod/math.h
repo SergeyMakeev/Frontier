@@ -449,13 +449,19 @@ inline uint32_t testWideAabb(const WideBounds& b, const Frustum& fr,
     const float32x4_t mxz[2] = {vld1q_f32(b.mxz.v), vld1q_f32(b.mxz.v + 4)};
     const float32x4_t zero = vdupq_n_f32(0.0f);
 
-    uint32_t alive = (1u << kWide) - 1;
+    // Keep both survivor state and the narrowed per-lane plane masks in NEON
+    // registers for the whole test. Scalarizing every comparison costs a
+    // horizontal reduction plus a vector-to-GPR transfer on AArch64; doing it
+    // twice per half, per plane, dominated this otherwise compact kernel.
+    uint32x4_t alive[2] = {vdupq_n_u32(~0u), vdupq_n_u32(~0u)};
+    uint32x4_t remaining[2] = {vdupq_n_u32(inMask), vdupq_n_u32(inMask)};
     for (uint32_t p = 0; p < 6; ++p)
     {
         if (!((inMask >> p) & 1)) continue;
         const float4 pl = fr.plane[p];
         const float32x4_t nx = vdupq_n_f32(pl.x), ny = vdupq_n_f32(pl.y);
         const float32x4_t nz = vdupq_n_f32(pl.z), d = vdupq_n_f32(pl.w);
+        const uint32x4_t planeBit = vdupq_n_u32(1u << p);
         // Sign masks select the p-/n-vertex per axis (constant per plane).
         const uint32x4_t sx = vcltq_f32(nx, zero);
         const uint32x4_t sy = vcltq_f32(ny, zero);
@@ -469,23 +475,24 @@ inline uint32_t testWideAabb(const WideBounds& b, const Frustum& fr,
             // vfmaq_f32(c, a, b) = c + a*b, fused: matches std::fma.
             const float32x4_t dp =
                 vfmaq_f32(vfmaq_f32(vfmaq_f32(d, nz, pz), ny, py), nx, px);
-            alive &= ~(detail::movemask4(vcltq_f32(dp, zero)) << (4 * h));
+            alive[h] = vandq_u32(alive[h], vcgeq_f32(dp, zero));
 
             const float32x4_t qx = vbslq_f32(sx, mxx[h], mnx[h]);
             const float32x4_t qy = vbslq_f32(sy, mxy[h], mny[h]);
             const float32x4_t qz = vbslq_f32(sz, mxz[h], mnz[h]);
             const float32x4_t dn =
                 vfmaq_f32(vfmaq_f32(vfmaq_f32(d, nz, qz), ny, qy), nx, qx);
-            uint32_t inside = detail::movemask4(vcgeq_f32(dn, zero)) << (4 * h);
-            while (inside)
-            {
-                const uint32_t l = uint32_t(std::countr_zero(inside));
-                inside &= inside - 1;
-                outMasks[l] = uint8_t(outMasks[l] & ~(1u << p));
-            }
+            const uint32x4_t inside = vcgeq_f32(dn, zero);
+            remaining[h] = vbicq_u32(
+                remaining[h], vandq_u32(inside, planeBit));
         }
     }
-    return alive & ((1u << kWide) - 1);
+
+    const uint16x8_t remaining16 = vcombine_u16(
+        vmovn_u32(remaining[0]), vmovn_u32(remaining[1]));
+    vst1_u8(outMasks, vmovn_u16(remaining16));
+    return detail::movemask4(alive[0]) |
+           (detail::movemask4(alive[1]) << 4);
 }
 #elif HLOD_SIMD_SSE2
 inline uint32_t testWideAabb(const WideBounds& b, const Frustum& fr,
