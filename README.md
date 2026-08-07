@@ -363,12 +363,13 @@ arguments in the same way:
 Set `HLOD_PERF_BUILD_DIR` to use a build directory other than `build-perf`.
 
 For cross-machine diagnosis, `run_machine_bench.sh` builds a separate
-`hlod_machine_bench` executable and writes `machine_perf.json`. These probes do
-not call HLodTree: they isolate scalar dependency and throughput, 128-bit SIMD
-arithmetic and compare-to-mask cost, square root/divide, sequential cache and
-memory bandwidth, constant-stride hardware prefetch, dependent-load latency,
-random-load parallelism, branch prediction, and sparse-mask iteration. Run it
-once on each machine under the same power conditions:
+`hlod_machine_bench` executable and writes `machine_perf.json`. Its synthetic
+probes isolate scalar dependency and throughput, 128-bit SIMD arithmetic and
+compare-to-mask cost, square root/divide, sequential cache and memory
+bandwidth, constant-stride hardware prefetch, dependent-load latency,
+random-load parallelism, branch prediction, and sparse-mask iteration. It also
+contains a small `BM_Kernel*` group using the active production SIMD backend.
+Run it once on each machine under the same power conditions:
 
 ```sh
 ./run_machine_bench.sh
@@ -377,17 +378,35 @@ once on each machine under the same power conditions:
 The executable is separate so diagnostic additions cannot change the code
 layout of `hlod_bench`. Set `HLOD_MACHINE_BUILD_DIR` to override its dedicated
 `build-machine-perf` directory. SIMD probes deliberately use one 128-bit vector
-on both platforms (SSE2 on x86-64 and NEON on arm64), independent of the
-library's AVX2 option.
+on both platforms (SSE2 on x86-64 and NEON on arm64); `BM_Kernel*` instead uses
+the library backend reported as `hlod_kernel_backend` in the JSON context.
+
+`run_arch_bench.sh` runs only those production-kernel probes and focused
+candidate experiments, writing `arch_kernel_perf.json` for an i9/M-series
+comparison:
+
+```sh
+./run_arch_bench.sh
+```
+
+On a Mac whose Xcode installation exposes the Instruments **CPU Counters**
+template, `profile_macos_cpu.sh` records the cached hierarchical workload with
+optimized source line tables. It writes an Instruments `.trace` plus an
+attachable `.trace.zip`:
+
+```sh
+./profile_macos_cpu.sh
+```
 
 Normal configuration options:
 
 | Option | Default | Meaning |
 |---|---:|---|
-| `HLOD_BUILD_TESTS` | `ON` | Build the 100-test correctness suite |
+| `HLOD_BUILD_TESTS` | `ON` | Build the correctness suite |
 | `HLOD_BUILD_BENCH` | `ON` | Build the Google Benchmark suite |
 | `HLOD_AVX2` | `ON` | Use AVX2/FMA on x86-64 when available |
 | `HLOD_FORCE_SCALAR` | `OFF` | Disable intrinsic implementations |
+| `HLOD_PROFILE_SYMBOLS` | `OFF` | Add optimized Clang source line tables for profiling |
 
 ## SIMD and CI
 

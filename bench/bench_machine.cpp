@@ -1,6 +1,6 @@
-// Architecture-neutral machine characterization for interpreting HLodTree
-// results. This is a separate executable so adding probes cannot perturb the
-// code layout of the end-to-end library benchmarks.
+// Machine characterization for interpreting HLodTree results, plus a small
+// group of production-kernel probes. This is a separate executable so adding
+// diagnostics cannot perturb the end-to-end benchmark's code layout.
 
 #include <benchmark/benchmark.h>
 
@@ -40,6 +40,16 @@ namespace {
 
 constexpr int64_t kKiB = 1024;
 constexpr int64_t kMiB = 1024 * kKiB;
+
+#if HLOD_SIMD_AVX2
+constexpr const char* kKernelBackend = "AVX2 256-bit";
+#elif HLOD_SIMD_NEON
+constexpr const char* kKernelBackend = "NEON 128-bit x2";
+#elif HLOD_SIMD_SSE2
+constexpr const char* kKernelBackend = "SSE2 128-bit x2";
+#else
+constexpr const char* kKernelBackend = "portable scalar x8";
+#endif
 
 #if HLOD_MACHINE_NEON
 using Vec4 = float32x4_t;
@@ -353,89 +363,20 @@ static void BM_VectorCompareMask128(benchmark::State& state)
 }
 BENCHMARK(BM_VectorCompareMask128);
 
-// ---- exact wide-frustum mask A/B -----------------------------------------
+// ---- production traversal kernels ----------------------------------------
 
-using WideAabbFn = uint32_t (*)(const hlod::WideBounds&, const hlod::Frustum&,
-                                uint8_t, uint8_t*);
-
-inline uint32_t wideAabbVectorResident(const hlod::WideBounds& b,
-                                       const hlod::Frustum& fr,
-                                       uint8_t inMask, uint8_t* outMasks)
-{
-    return hlod::testWideAabb(b, fr, inMask, outMasks);
-}
-
-#if HLOD_MACHINE_NEON
-// Exact NEON implementation before the vector-resident experiment. Keeping
-// it here, outside the library, gives both versions identical inputs, process
-// scheduling, and randomized benchmark ordering without retaining two
-// production paths.
-inline uint32_t wideAabbScalarized(const hlod::WideBounds& b,
-                                   const hlod::Frustum& fr,
-                                   uint8_t inMask, uint8_t* outMasks)
-{
-    for (uint32_t l = 0; l < hlod::kWide; ++l) outMasks[l] = inMask;
-    if (!inMask) return (1u << hlod::kWide) - 1;
-
-    const float32x4_t mnx[2] = {vld1q_f32(b.mnx.v), vld1q_f32(b.mnx.v + 4)};
-    const float32x4_t mny[2] = {vld1q_f32(b.mny.v), vld1q_f32(b.mny.v + 4)};
-    const float32x4_t mnz[2] = {vld1q_f32(b.mnz.v), vld1q_f32(b.mnz.v + 4)};
-    const float32x4_t mxx[2] = {vld1q_f32(b.mxx.v), vld1q_f32(b.mxx.v + 4)};
-    const float32x4_t mxy[2] = {vld1q_f32(b.mxy.v), vld1q_f32(b.mxy.v + 4)};
-    const float32x4_t mxz[2] = {vld1q_f32(b.mxz.v), vld1q_f32(b.mxz.v + 4)};
-    const float32x4_t zero = vdupq_n_f32(0.0f);
-
-    uint32_t alive = (1u << hlod::kWide) - 1;
-    for (uint32_t p = 0; p < 6; ++p)
-    {
-        if (!((inMask >> p) & 1)) continue;
-        const hlod::float4 pl = fr.plane[p];
-        const float32x4_t nx = vdupq_n_f32(pl.x), ny = vdupq_n_f32(pl.y);
-        const float32x4_t nz = vdupq_n_f32(pl.z), d = vdupq_n_f32(pl.w);
-        const uint32x4_t sx = vcltq_f32(nx, zero);
-        const uint32x4_t sy = vcltq_f32(ny, zero);
-        const uint32x4_t sz = vcltq_f32(nz, zero);
-
-        for (uint32_t h = 0; h < 2; ++h)
-        {
-            const float32x4_t px = vbslq_f32(sx, mnx[h], mxx[h]);
-            const float32x4_t py = vbslq_f32(sy, mny[h], mxy[h]);
-            const float32x4_t pz = vbslq_f32(sz, mnz[h], mxz[h]);
-            const float32x4_t dp =
-                vfmaq_f32(vfmaq_f32(vfmaq_f32(d, nz, pz), ny, py), nx, px);
-            alive &= ~(hlod::detail::movemask4(vcltq_f32(dp, zero)) <<
-                       (4 * h));
-
-            const float32x4_t qx = vbslq_f32(sx, mxx[h], mnx[h]);
-            const float32x4_t qy = vbslq_f32(sy, mxy[h], mny[h]);
-            const float32x4_t qz = vbslq_f32(sz, mxz[h], mnz[h]);
-            const float32x4_t dn =
-                vfmaq_f32(vfmaq_f32(vfmaq_f32(d, nz, qz), ny, qy), nx, qx);
-            uint32_t inside =
-                hlod::detail::movemask4(vcgeq_f32(dn, zero)) << (4 * h);
-            while (inside)
-            {
-                const uint32_t l = uint32_t(std::countr_zero(inside));
-                inside &= inside - 1;
-                outMasks[l] = uint8_t(outMasks[l] & ~(1u << p));
-            }
-        }
-    }
-    return alive & ((1u << hlod::kWide) - 1);
-}
-#else
-inline uint32_t wideAabbScalarized(const hlod::WideBounds& b,
+inline uint32_t wideAabbProduction(const hlod::WideBounds& b,
                                    const hlod::Frustum& fr,
                                    uint8_t inMask, uint8_t* outMasks)
 {
     return hlod::testWideAabb(b, fr, inMask, outMasks);
 }
-#endif
 
 struct WideAabbFixture
 {
     static constexpr size_t kCases = 128;
     std::array<hlod::WideBounds, kCases> bounds{};
+    std::array<hlod::float8, kCases> geometricError{};
     hlod::Frustum frustum{};
 };
 
@@ -456,7 +397,9 @@ WideAabbFixture makeWideAabbFixture()
         const float unit = float(rng >> 8) * (1.0f / 16777216.0f);
         return lo + (hi - lo) * unit;
     };
-    for (hlod::WideBounds& wide : f.bounds)
+    for (size_t i = 0; i < f.bounds.size(); ++i)
+    {
+        hlod::WideBounds& wide = f.bounds[i];
         for (uint32_t lane = 0; lane < hlod::kWide; ++lane)
         {
             const float cx = random(-60.0f, 60.0f);
@@ -468,35 +411,18 @@ WideAabbFixture makeWideAabbFixture()
             wide.setLane(lane, hlod::AABB::fromMinMax(
                 {cx - ex, cy - ey, cz - ez, 0.0f},
                 {cx + ex, cy + ey, cz + ez, 0.0f}));
+            f.geometricError[i].v[lane] = random(0.1f, 50.0f);
         }
+    }
     return f;
 }
 
-template <WideAabbFn Test>
-static void runWideAabbMaskBenchmark(benchmark::State& state)
+static void BM_KernelWideAabb(benchmark::State& state)
 {
     constexpr int kCalls = 4096;
     const WideAabbFixture fixture = makeWideAabbFixture();
     const uint32_t activePlanes = uint32_t(state.range(0));
     const uint8_t inMask = uint8_t((1u << activePlanes) - 1u);
-
-    // Correctness is checked outside the timed region on exactly the inputs
-    // the benchmark will use.
-    for (const hlod::WideBounds& bounds : fixture.bounds)
-    {
-        uint8_t oldMasks[hlod::kWide], newMasks[hlod::kWide];
-        const uint32_t oldAlive =
-            wideAabbScalarized(bounds, fixture.frustum, inMask, oldMasks);
-        const uint32_t newAlive =
-            wideAabbVectorResident(bounds, fixture.frustum, inMask, newMasks);
-        if (oldAlive != newAlive ||
-            !std::equal(std::begin(oldMasks), std::end(oldMasks),
-                        std::begin(newMasks)))
-        {
-            state.SkipWithError("wide-AABB A/B implementations disagree");
-            return;
-        }
-    }
 
     uint64_t checksum[4] = {};
     for (auto _ : state)
@@ -504,7 +430,7 @@ static void runWideAabbMaskBenchmark(benchmark::State& state)
         for (int i = 0; i < kCalls; ++i)
         {
             uint8_t masks[hlod::kWide];
-            const uint32_t alive = Test(
+            const uint32_t alive = wideAabbProduction(
                 fixture.bounds[size_t(i) & (WideAabbFixture::kCases - 1)],
                 fixture.frustum, inMask, masks);
             uint64_t packed;
@@ -515,20 +441,200 @@ static void runWideAabbMaskBenchmark(benchmark::State& state)
     }
     state.SetItemsProcessed(state.iterations() * kCalls * hlod::kWide);
 }
-
-static void BM_WideAabbMaskScalarized(benchmark::State& state)
-{
-    runWideAabbMaskBenchmark<wideAabbScalarized>(state);
-}
-BENCHMARK(BM_WideAabbMaskScalarized)
+BENCHMARK(BM_KernelWideAabb)
     ->Args({1})->Args({3})->Args({6})->ArgName("active_planes");
 
-static void BM_WideAabbMaskVectorResident(benchmark::State& state)
+#if HLOD_MACHINE_NEON
+inline hlod::float8 distanceToBoxesSqDirectCandidate(
+    const hlod::WideBounds& b, hlod::float4 qmn, hlod::float4 qmx)
 {
-    runWideAabbMaskBenchmark<wideAabbVectorResident>(state);
+    const float32x4_t lox = vdupq_n_f32(qmn.x), loy = vdupq_n_f32(qmn.y),
+                      loz = vdupq_n_f32(qmn.z);
+    const float32x4_t hix = vdupq_n_f32(qmx.x), hiy = vdupq_n_f32(qmx.y),
+                      hiz = vdupq_n_f32(qmx.z);
+    const float32x4_t zero = vdupq_n_f32(0.0f);
+    hlod::float8 r;
+    for (uint32_t h = 0; h < 2; ++h)
+    {
+        const float32x4_t cx = vmaxq_f32(
+            vmaxq_f32(vsubq_f32(vld1q_f32(b.mnx.v + 4 * h), hix),
+                      vsubq_f32(lox, vld1q_f32(b.mxx.v + 4 * h))), zero);
+        const float32x4_t cy = vmaxq_f32(
+            vmaxq_f32(vsubq_f32(vld1q_f32(b.mny.v + 4 * h), hiy),
+                      vsubq_f32(loy, vld1q_f32(b.mxy.v + 4 * h))), zero);
+        const float32x4_t cz = vmaxq_f32(
+            vmaxq_f32(vsubq_f32(vld1q_f32(b.mnz.v + 4 * h), hiz),
+                      vsubq_f32(loz, vld1q_f32(b.mxz.v + 4 * h))), zero);
+        const float32x4_t d2 =
+            vfmaq_f32(vfmaq_f32(vmulq_f32(cz, cz), cy, cy), cx, cx);
+        vst1q_f32(r.v + 4 * h, d2);
+    }
+    return r;
 }
-BENCHMARK(BM_WideAabbMaskVectorResident)
-    ->Args({1})->Args({3})->Args({6})->ArgName("active_planes");
+#else
+inline hlod::float8 distanceToBoxesSqDirectCandidate(
+    const hlod::WideBounds& b, hlod::float4 qmn, hlod::float4 qmx)
+{
+    return hlod::distanceToBoxesSq(b, qmn, qmx);
+}
+#endif
+
+template <bool DirectSquaredDistance>
+static void runKernelDistanceError(benchmark::State& state)
+{
+    constexpr int kCalls = 4096;
+    const WideAabbFixture fixture = makeWideAabbFixture();
+    const hlod::float4 queryMin = hlod::float4::point(-1.0f, -1.0f, -1.0f);
+    const hlod::float4 queryMax = hlod::float4::point(1.0f, 1.0f, 1.0f);
+    std::array<hlod::float8, WideAabbFixture::kCases> output{};
+
+    for (auto _ : state)
+    {
+        for (int i = 0; i < kCalls; ++i)
+        {
+            const size_t index = size_t(i) & (WideAabbFixture::kCases - 1);
+            const hlod::float8 d2 = DirectSquaredDistance
+                                        ? distanceToBoxesSqDirectCandidate(
+                                              fixture.bounds[index], queryMin,
+                                              queryMax)
+                                        : hlod::distanceToBoxesSq(
+                                              fixture.bounds[index], queryMin,
+                                              queryMax);
+            output[index] = hlod::screenErrorFromSq8(
+                fixture.geometricError[index], 935.0f, d2);
+        }
+        benchmark::ClobberMemory();
+    }
+    benchmark::DoNotOptimize(output.data());
+    state.SetItemsProcessed(state.iterations() * kCalls * hlod::kWide);
+}
+
+static void BM_KernelDistanceErrorCurrent(benchmark::State& state)
+{
+    runKernelDistanceError<false>(state);
+}
+BENCHMARK(BM_KernelDistanceErrorCurrent);
+
+static void BM_KernelDistanceErrorDirectSq(benchmark::State& state)
+{
+    runKernelDistanceError<true>(state);
+}
+BENCHMARK(BM_KernelDistanceErrorDirectSq);
+
+struct alignas(32) CacheHitRecord
+{
+    float validUntil;
+    float kSlope;
+    uint32_t epoch;
+    uint32_t cutVersion;
+    uint32_t begin;
+    uint32_t counts;
+    uint32_t depSlot;
+    uint32_t depVersion;
+};
+static_assert(sizeof(CacheHitRecord) == 32);
+
+struct CacheHitStamp
+{
+    uint32_t contentVersion;
+    uint32_t inUse;
+};
+
+// 0 = exact production short-circuit expression
+// 1 = eager independent predicates
+// 2 = fixed-projection specialization (kTravel == 0)
+template <uint32_t Mode>
+static void runCacheHitValidation(benchmark::State& state)
+{
+    constexpr uint32_t kRecords = 25'000;
+    constexpr uint32_t kStampCount = 64;
+    std::vector<uint32_t> visible(kRecords);
+    std::vector<CacheHitRecord> records(kRecords);
+    std::vector<uint32_t> cutVersions(kRecords, 11u);
+    std::array<CacheHitStamp, kStampCount> stamps{};
+
+    for (CacheHitStamp& stamp : stamps) stamp = {7u, 1u};
+    for (uint32_t i = 0; i < kRecords; ++i)
+    {
+        // Five percent of records conservatively miss because their instance
+        // is not wholly inside the frustum; the rest take the common one-page
+        // cache-hit path used by the cached forest benchmarks.
+        const uint32_t mask = (i % 20u) == 0 ? 1u : 0u;
+        visible[i] = i | (mask << 24);
+        records[i] = {100.0f, 0.125f, 5u, 11u, i * 4u,
+                      (1u << 30) | 4u, i & (kStampCount - 1u), 7u};
+    }
+
+    uint64_t checksum = 0;
+    uint32_t misses = 0;
+    for (auto _ : state)
+    {
+        benchmark::ClobberMemory();
+        for (const uint32_t packed : visible)
+        {
+            const uint32_t instance = packed & 0x00ffffffu;
+            const uint32_t mask = packed >> 24;
+            const CacheHitRecord& r = records[instance];
+            const uint32_t depCount = r.counts >> 30;
+
+            bool hit;
+            if constexpr (Mode == 1)
+            {
+                // Same predicates as the production path, but no
+                // short-circuit chain: expose independent comparisons to the
+                // out-of-order core and combine their boolean results once.
+                hit = mask == 0;
+                hit &= 1.0f + r.kSlope * 0.5f < r.validUntil;
+                hit &= r.epoch == 5u;
+                hit &= r.cutVersion == cutVersions[instance];
+            }
+            else if constexpr (Mode == 2)
+            {
+                hit = mask == 0 &&
+                      1.0f < r.validUntil &&
+                      r.epoch == 5u &&
+                      r.cutVersion == cutVersions[instance];
+            }
+            else
+            {
+                hit = mask == 0 &&
+                      1.0f + r.kSlope * 0.5f < r.validUntil &&
+                      r.epoch == 5u &&
+                      r.cutVersion == cutVersions[instance];
+            }
+            if (hit && depCount != 0)
+            {
+                const CacheHitStamp& stamp = stamps[r.depSlot];
+                hit = stamp.inUse && stamp.contentVersion == r.depVersion;
+            }
+            if (hit)
+                checksum += uint64_t(r.begin) + (r.counts & 0x3fffffffu);
+            else
+                ++misses;
+        }
+        benchmark::DoNotOptimize(checksum);
+        benchmark::DoNotOptimize(misses);
+    }
+    state.SetItemsProcessed(state.iterations() * kRecords);
+}
+
+static void BM_KernelCacheHitShortCircuit(benchmark::State& state)
+{
+    runCacheHitValidation<0>(state);
+}
+BENCHMARK(BM_KernelCacheHitShortCircuit);
+
+static void BM_KernelCacheHitEager(benchmark::State& state)
+{
+    runCacheHitValidation<1>(state);
+}
+BENCHMARK(BM_KernelCacheHitEager);
+
+static void BM_KernelCacheHitFixedProjection(benchmark::State& state)
+{
+    runCacheHitValidation<2>(state);
+}
+BENCHMARK(BM_KernelCacheHitFixedProjection);
 
 // ---- memory hierarchy ------------------------------------------------------
 
@@ -788,6 +894,7 @@ int main(int argc, char** argv)
     benchmark::MaybeReenterWithoutASLR(argc, argv);
     benchmark::Initialize(&argc, argv);
     benchmark::AddCustomContext("machine_vector_backend", kVectorBackend);
+    benchmark::AddCustomContext("hlod_kernel_backend", kKernelBackend);
     benchmark::AddCustomContext("machine_compiler", kCompiler);
     if (benchmark::ReportUnrecognizedArguments(argc, argv)) return 1;
     benchmark::RunSpecifiedBenchmarks();

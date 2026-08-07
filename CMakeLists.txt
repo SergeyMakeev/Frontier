@@ -8,6 +8,7 @@ option(HLOD_BUILD_TESTS "Build unit tests" ON)
 option(HLOD_BUILD_BENCH "Build performance tests" ON)
 option(HLOD_AVX2 "Enable AVX2 code generation (x86-64 only)" ON)
 option(HLOD_FORCE_SCALAR "Disable SIMD intrinsics; use the portable scalar paths" OFF)
+option(HLOD_PROFILE_SYMBOLS "Keep optimized source line tables for CPU profiling" OFF)
 
 if(HLOD_BUILD_TESTS OR HLOD_BUILD_BENCH)
     find_package(Threads REQUIRED)
@@ -44,6 +45,10 @@ endif()
 
 if(HLOD_FORCE_SCALAR)
     target_compile_definitions(hlod PUBLIC HLOD_FORCE_SCALAR=1)
+endif()
+
+if(HLOD_PROFILE_SYMBOLS AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    target_compile_options(hlod PRIVATE -gline-tables-only)
 endif()
 
 # ---- external deps via FetchContent ------------------------------------------

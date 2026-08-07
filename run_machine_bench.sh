@@ -16,12 +16,22 @@ if [[ ! -f "${BUILD_DIR}/CMakeCache.txt" ]] && command -v ninja >/dev/null 2>&1;
 fi
 
 target_architecture=""
-if [[ "$(uname -s)" == "Darwin" ]]; then
+avx2=OFF
+host_system="$(uname -s)"
+host_machine="$(uname -m)"
+if [[ "${host_system}" == "Darwin" ]]; then
     apple_silicon="$(sysctl -n hw.optional.arm64 2>/dev/null || true)"
-    if [[ "$(uname -m)" == "arm64" || "${apple_silicon}" == "1" ]]; then
+    if [[ "${host_machine}" == "arm64" || "${apple_silicon}" == "1" ]]; then
         target_architecture="arm64"
         echo "Targeting native Apple Silicon arm64/NEON."
+    elif [[ "${host_machine}" == "x86_64" ]]; then
+        intel_features="$(sysctl -n machdep.cpu.leaf7_features 2>/dev/null || true)"
+        if [[ " ${intel_features} " == *" AVX2 "* ]]; then
+            avx2=ON
+        fi
     fi
+elif [[ "${host_machine}" == "x86_64" ]]; then
+    avx2=ON
 fi
 
 configure_args=(
@@ -30,7 +40,7 @@ configure_args=(
     -DCMAKE_BUILD_TYPE=Release
     -DHLOD_BUILD_TESTS=OFF
     -DHLOD_BUILD_BENCH=ON
-    -DHLOD_AVX2=OFF
+    -DHLOD_AVX2="${avx2}"
 )
 if [[ -n "${generator}" ]]; then
     configure_args+=(-G "${generator}")

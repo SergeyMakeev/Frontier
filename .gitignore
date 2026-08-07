@@ -1,4 +1,6 @@
 build*/
 *.json
+*.trace
+*.trace.zip
 *.user
 .vs/
