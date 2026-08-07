@@ -397,8 +397,11 @@ but not its GUI template to `xctrace`, the script composes the recording from
 that instrument directly. It also discovers a suitable full Xcode installed
 beside the currently selected command-line tools. It writes an Instruments
 `.trace`, an exported table of contents, capture metadata, and a small
-attachable `_summary.zip` under `profile_results/`. The raw trace remains local
-because hardware-counter captures can be hundreds of megabytes:
+attachable `_summary.zip` under `profile_results/`. The summary contains the
+process/thread bottleneck metrics, counter samples, core placement, and
+time-profile hotspots, excluding the first five seconds of process setup. The
+raw trace remains local because hardware-counter captures can be hundreds of
+megabytes:
 
 ```sh
 ./profile_macos_cpu.sh
@@ -412,6 +415,7 @@ existing trace without recording again:
 ```
 
 Pass a trace path after `--process` to select a file other than the newest one.
+Set `HLOD_PROFILE_EXPORT_START` to change the default `5s` export start.
 
 Set `HLOD_DEVELOPER_DIR` to force a particular Xcode installation,
 `HLOD_XCTRACE_TEMPLATE` to use a custom counter template, or

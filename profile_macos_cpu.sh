@@ -7,6 +7,7 @@ OUTPUT_DIR="${HLOD_PROFILE_OUTPUT_DIR:-${ROOT_DIR}/profile_results}"
 BENCHMARK_FILTER="${HLOD_PROFILE_FILTER:-BM_MixedForest100k/flat_pct:0/cached:1$}"
 BENCHMARK_MIN_TIME="${HLOD_PROFILE_MIN_TIME:-18s}"
 TRACE_TIME_LIMIT="${HLOD_PROFILE_TIME_LIMIT:-25s}"
+EXPORT_TIME_START="${HLOD_PROFILE_EXPORT_START:-5s}"
 
 if [[ "$(uname -s)" != "Darwin" ]]; then
     echo "ERROR: CPU Counters profiling is available only on macOS." >&2
@@ -147,16 +148,37 @@ export_trace_summary() {
     echo "Exporting the trace table of contents..."
     xcrun xctrace export --input "${source_trace}" --toc --output "${toc_file}"
 
+    # Keep the summary focused on the target process: the guided bottleneck
+    # breakdown, thread/core placement, PMU samples, and symbolized hotspots.
+    local measurements_file="${source_base}_measurements.xml"
+    local measurements_query
+    measurements_query='/trace-toc/run[@number="1"]/data/table['
+    measurements_query+='@schema="CounterMetricAggregatedForProcess" or '
+    measurements_query+='@schema="CounterMetricByThread" or '
+    measurements_query+='@schema="CountingModeSamples" or '
+    measurements_query+='@schema="MetricTableForThread" or '
+    measurements_query+='@schema="RemarksByThread" or '
+    measurements_query+='@schema="CoreTypeByThread" or '
+    measurements_query+='@schema="time-profile"]'
+    echo "Exporting focused CPU-counter measurements..."
+    if ! xcrun xctrace export --input "${source_trace}" \
+        --time-start "${EXPORT_TIME_START}" \
+        --xpath "${measurements_query}" --output "${measurements_file}"; then
+        echo "WARNING: xctrace could not export focused measurements; the TOC will still be archived." >&2
+        /bin/rm -f "${measurements_file}"
+    fi
+
     source_dir="$(cd "$(dirname "${source_trace}")" && pwd)"
     source_name="$(basename "${source_base}")"
     (
         cd "${source_dir}"
+        /bin/rm -f "${source_name}_summary.zip"
         if [[ -f "$(basename "${info_file}")" ]]; then
             /usr/bin/zip -q "${source_name}_summary.zip" \
-                "${source_name}_toc.xml" "${source_name}_info.txt"
+                "${source_name}"_*.xml "${source_name}_info.txt"
         else
             /usr/bin/zip -q "${source_name}_summary.zip" \
-                "${source_name}_toc.xml"
+                "${source_name}"_*.xml
         fi
     )
 
@@ -224,6 +246,7 @@ info="${OUTPUT_DIR}/hlod_cpu_counters_${stamp}_info.txt"
     echo "benchmark_filter=${BENCHMARK_FILTER}"
     echo "benchmark_min_time=${BENCHMARK_MIN_TIME}"
     echo "trace_time_limit=${TRACE_TIME_LIMIT}"
+    echo "export_time_start=${EXPORT_TIME_START}"
     xcodebuild -version
     uname -a
     sysctl -n machdep.cpu.brand_string 2>/dev/null || true
