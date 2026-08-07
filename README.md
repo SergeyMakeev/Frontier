@@ -399,9 +399,10 @@ beside the currently selected command-line tools. It writes an Instruments
 `.trace`, an exported table of contents, capture metadata, and a small
 attachable `_summary.zip` under `profile_results/`. The summary contains the
 process/thread bottleneck metrics, counter samples, core placement, and
-time-profile hotspots, excluding the first five seconds of process setup. The
-raw trace remains local because hardware-counter captures can be hundreds of
-megabytes:
+time-profile hotspots. When supported by `xctrace`, export excludes the first
+five seconds of process setup; older exporters include the full interval, which
+can be filtered during analysis. The raw trace remains local because
+hardware-counter captures can be hundreds of megabytes:
 
 ```sh
 ./profile_macos_cpu.sh

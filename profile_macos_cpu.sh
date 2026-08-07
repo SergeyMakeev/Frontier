@@ -161,9 +161,20 @@ export_trace_summary() {
     measurements_query+='@schema="CoreTypeByThread" or '
     measurements_query+='@schema="time-profile"]'
     echo "Exporting focused CPU-counter measurements..."
-    if ! xcrun xctrace export --input "${source_trace}" \
-        --time-start "${EXPORT_TIME_START}" \
-        --xpath "${measurements_query}" --output "${measurements_file}"; then
+    export_focused_measurements() {
+        local export_help
+        export_help="$(xcrun xctrace help export 2>/dev/null || true)"
+        if grep -Fq -- '--time-start' <<<"${export_help}"; then
+            xcrun xctrace export --input "${source_trace}" \
+                --time-start "${EXPORT_TIME_START}" \
+                --xpath "${measurements_query}" --output "${measurements_file}"
+        else
+            echo "This xctrace cannot filter exports by time; exporting the full measurement interval."
+            xcrun xctrace export --input "${source_trace}" \
+                --xpath "${measurements_query}" --output "${measurements_file}"
+        fi
+    }
+    if ! export_focused_measurements; then
         echo "WARNING: xctrace could not export focused measurements; the TOC will still be archived." >&2
         /bin/rm -f "${measurements_file}"
     fi
