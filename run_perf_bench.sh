@@ -102,7 +102,10 @@ fi
 
 echo "Running the documented performance suite with five repetitions..."
 echo "Pass Google Benchmark arguments to this script to override the default suite."
+echo "Writing ${ROOT_DIR}/real_world_perf.json"
 exec "${bench_exe}" \
     '--benchmark_filter=BM_(View_Breakdown|View_MultiView|FlatForest100k|MixedForest100k|RootDecisionForest100k)' \
     --benchmark_repetitions=5 \
-    --benchmark_report_aggregates_only=false
+    --benchmark_report_aggregates_only=true \
+    "--benchmark_out=${ROOT_DIR}/real_world_perf.json" \
+    --benchmark_out_format=json
