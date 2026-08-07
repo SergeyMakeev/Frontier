@@ -926,16 +926,15 @@ inline float8 screenError8(const float8& geomError, float k, const float8& dist)
 // ---------------------------------------------------------------------------
 // Squared-distance variants.
 //
-// The walk only ever wants geomError * k / distance. Going through a real
-// distance costs a full-precision square root AND a full-precision divide per
-// block -- the two longest-latency instructions in the inner loop, back to
-// back on the same dependency chain. Folding them into one reciprocal square
-// root removes both: err = e * k * rsqrt(d2).
+// The walk only ever wants geomError * k / distance. Keeping squared distance
+// avoids computing a square root only to square the result again before the
+// error calculation. Each SIMD backend can then choose its fastest final
+// operation: err = e * k * rsqrt(d2), or the exact sqrt/divide equivalent.
 //
-// The hardware rsqrt seeds are approximate. Newton-Raphson refinement brings
-// them to the precision the screen-error comparison needs (one step for the
-// AVX2 seed, two for the production NEON path). The zero-distance handling
-// reproduces the max(dist, 1e-30) floor of the exact path.
+// AVX2 has a fast reciprocal-square-root seed, so one Newton-Raphson step is
+// profitable there. Apple Silicon instead executes its exact vector
+// sqrt/divide path faster than either tested NEON estimate/refinement path.
+// Both implementations reproduce the max(dist, 1e-30) zero-distance floor.
 // ---------------------------------------------------------------------------
 
 #if HLOD_SIMD_AVX2
@@ -1005,45 +1004,25 @@ inline float8 distanceToBoxesSq(const WideBounds& b, float4 qmn, float4 qmx)
     return r;
 }
 
-namespace detail {
-
-template <uint32_t Refinements>
-inline float32x4_t neonReciprocalSqrt(float32x4_t x)
-{
-    static_assert(Refinements == 1 || Refinements == 2);
-    const uint32x4_t zeroMask = vceqq_f32(x, vdupq_n_f32(0.0f));
-    const float32x4_t safeX =
-        vbslq_f32(zeroMask, vdupq_n_f32(1.0f), x);
-    float32x4_t y = vrsqrteq_f32(safeX);
-    y = vmulq_f32(y, vrsqrtsq_f32(vmulq_f32(safeX, y), y));
-    if constexpr (Refinements == 2)
-        y = vmulq_f32(y, vrsqrtsq_f32(vmulq_f32(safeX, y), y));
-    return vbslq_f32(zeroMask, vdupq_n_f32(1.0e30f), y);
-}
-
-template <uint32_t Refinements>
-inline float8 screenErrorFromSq8Neon(const float8& geomError, float k,
-                                     const float8& d2)
-{
-    const float32x4_t kk = vdupq_n_f32(k);
-    float8 r;
-    for (uint32_t h = 0; h < 2; ++h)
-    {
-        const float32x4_t inv =
-            neonReciprocalSqrt<Refinements>(vld1q_f32(d2.v + 4 * h));
-        vst1q_f32(r.v + 4 * h,
-                  vmulq_f32(vmulq_f32(vld1q_f32(geomError.v + 4 * h), kk),
-                            inv));
-    }
-    return r;
-}
-
-} // namespace detail
-
 inline float8 screenErrorFromSq8(const float8& geomError, float k,
                                  const float8& d2)
 {
-    return detail::screenErrorFromSq8Neon<2>(geomError, k, d2);
+    const float32x4_t eps = vdupq_n_f32(1.0e-30f);
+    // Issue both independent square roots before their dependent divisions;
+    // this exposes the two 128-bit halves to the out-of-order scheduler.
+    const float32x4_t d0 =
+        vmaxq_f32(vsqrtq_f32(vld1q_f32(d2.v)), eps);
+    const float32x4_t d1 =
+        vmaxq_f32(vsqrtq_f32(vld1q_f32(d2.v + 4)), eps);
+    const float32x4_t kk = vdupq_n_f32(k);
+    const float32x4_t e0 =
+        vmulq_f32(vld1q_f32(geomError.v), kk);
+    const float32x4_t e1 =
+        vmulq_f32(vld1q_f32(geomError.v + 4), kk);
+    float8 r;
+    vst1q_f32(r.v, vdivq_f32(e0, d0));
+    vst1q_f32(r.v + 4, vdivq_f32(e1, d1));
+    return r;
 }
 #else
 inline float8 distanceToBoxesSq(const WideBounds& b, float4 qmn, float4 qmx)

@@ -14,7 +14,6 @@
 #include <limits>
 #include <numeric>
 #include <string>
-#include <type_traits>
 #include <vector>
 
 #include "hlod/math.h"
@@ -446,36 +445,7 @@ static void BM_KernelWideAabb(benchmark::State& state)
 BENCHMARK(BM_KernelWideAabb)
     ->Args({1})->Args({3})->Args({6})->ArgName("active_planes");
 
-inline hlod::float8 screenErrorFromSqExact(const hlod::float8& geomError,
-                                           float k, const hlod::float8& d2)
-{
-    hlod::float8 distance;
-    for (uint32_t lane = 0; lane < hlod::kWide; ++lane)
-        distance.v[lane] = std::sqrt(d2.v[lane]);
-    return hlod::screenError8(geomError, k, distance);
-}
-
-inline hlod::float8 distanceToBoxesSqLegacy(
-    const hlod::WideBounds& b, hlod::float4 qmn, hlod::float4 qmx)
-{
-    const hlod::float8 distance = hlod::distanceToBoxes(b, qmn, qmx);
-    hlod::float8 d2;
-    for (uint32_t lane = 0; lane < hlod::kWide; ++lane)
-        d2.v[lane] = distance.v[lane] * distance.v[lane];
-    return d2;
-}
-
-enum class DistanceErrorMode
-{
-    Production,
-    DirectSqExact,
-    LegacyExact,
-    NeonRsqrt1,
-    NeonRsqrt2
-};
-
-template <DistanceErrorMode Mode>
-static void runKernelDistanceError(benchmark::State& state)
+static void BM_KernelDistanceErrorCurrent(benchmark::State& state)
 {
     constexpr int kCalls = 4096;
     const WideAabbFixture fixture = makeWideAabbFixture();
@@ -488,96 +458,17 @@ static void runKernelDistanceError(benchmark::State& state)
         for (int i = 0; i < kCalls; ++i)
         {
             const size_t index = size_t(i) & (WideAabbFixture::kCases - 1);
-            const hlod::float8 d2 =
-                Mode == DistanceErrorMode::LegacyExact
-                    ? distanceToBoxesSqLegacy(fixture.bounds[index], queryMin,
-                                              queryMax)
-                    : hlod::distanceToBoxesSq(fixture.bounds[index], queryMin,
-                                              queryMax);
-            if constexpr (Mode == DistanceErrorMode::Production)
-                output[index] = hlod::screenErrorFromSq8(
-                    fixture.geometricError[index], 935.0f, d2);
-            else if constexpr (Mode == DistanceErrorMode::DirectSqExact ||
-                               Mode == DistanceErrorMode::LegacyExact)
-                output[index] = screenErrorFromSqExact(
-                    fixture.geometricError[index], 935.0f, d2);
-#if HLOD_MACHINE_NEON
-            else if constexpr (Mode == DistanceErrorMode::NeonRsqrt1)
-                output[index] = hlod::detail::screenErrorFromSq8Neon<1>(
-                    fixture.geometricError[index], 935.0f, d2);
-            else
-                output[index] = hlod::detail::screenErrorFromSq8Neon<2>(
-                    fixture.geometricError[index], 935.0f, d2);
-#endif
+            const hlod::float8 d2 = hlod::distanceToBoxesSq(
+                fixture.bounds[index], queryMin, queryMax);
+            output[index] = hlod::screenErrorFromSq8(
+                fixture.geometricError[index], 935.0f, d2);
         }
         benchmark::ClobberMemory();
     }
     benchmark::DoNotOptimize(output.data());
     state.SetItemsProcessed(state.iterations() * kCalls * hlod::kWide);
-#if HLOD_MACHINE_NEON
-    if constexpr (Mode == DistanceErrorMode::NeonRsqrt1 ||
-                  Mode == DistanceErrorMode::NeonRsqrt2)
-    {
-        double maxRelativeError = 0.0;
-        for (size_t index = 0; index < WideAabbFixture::kCases; ++index)
-        {
-            const hlod::float8 d2 = hlod::distanceToBoxesSq(
-                fixture.bounds[index], queryMin, queryMax);
-            const hlod::float8 exact = screenErrorFromSqExact(
-                fixture.geometricError[index], 935.0f, d2);
-            const hlod::float8 approximate =
-                Mode == DistanceErrorMode::NeonRsqrt1
-                    ? hlod::detail::screenErrorFromSq8Neon<1>(
-                          fixture.geometricError[index], 935.0f, d2)
-                    : hlod::detail::screenErrorFromSq8Neon<2>(
-                          fixture.geometricError[index], 935.0f, d2);
-            for (uint32_t lane = 0; lane < hlod::kWide; ++lane)
-            {
-                if (!(exact.v[lane] > 0.0f) ||
-                    !std::isfinite(exact.v[lane]))
-                    continue;
-                maxRelativeError = std::max(
-                    maxRelativeError,
-                    double(std::fabs(approximate.v[lane] - exact.v[lane]) /
-                           exact.v[lane]));
-            }
-        }
-        state.counters["max_relative_error"] = maxRelativeError;
-    }
-#endif
-}
-
-static void BM_KernelDistanceErrorCurrent(benchmark::State& state)
-{
-    runKernelDistanceError<DistanceErrorMode::Production>(state);
 }
 BENCHMARK(BM_KernelDistanceErrorCurrent);
-
-static void BM_KernelDistanceErrorDirectSq(benchmark::State& state)
-{
-    runKernelDistanceError<DistanceErrorMode::DirectSqExact>(state);
-}
-BENCHMARK(BM_KernelDistanceErrorDirectSq);
-
-#if HLOD_MACHINE_NEON
-static void BM_KernelDistanceErrorLegacy(benchmark::State& state)
-{
-    runKernelDistanceError<DistanceErrorMode::LegacyExact>(state);
-}
-BENCHMARK(BM_KernelDistanceErrorLegacy);
-
-static void BM_KernelDistanceErrorNeonRsqrt1(benchmark::State& state)
-{
-    runKernelDistanceError<DistanceErrorMode::NeonRsqrt1>(state);
-}
-BENCHMARK(BM_KernelDistanceErrorNeonRsqrt1);
-
-static void BM_KernelDistanceErrorNeonRsqrt2(benchmark::State& state)
-{
-    runKernelDistanceError<DistanceErrorMode::NeonRsqrt2>(state);
-}
-BENCHMARK(BM_KernelDistanceErrorNeonRsqrt2);
-#endif
 
 struct alignas(32) CacheHitRecord
 {
@@ -695,18 +586,9 @@ static void BM_KernelCacheHitFixedProjection(benchmark::State& state)
 BENCHMARK(BM_KernelCacheHitFixedProjection);
 
 // The cached hierarchical workload emits four CutEntries for each of 25k
-// visible instances. Compare many-small-range append strategies in isolation;
-// one bulk insert provides the lower-bound cost of copying the same output.
-enum class OutputAppendMode
-{
-    RangeInsert,
-    PushLoop,
-    AppendBuffer,
-    BulkInsert
-};
-
-template <OutputAppendMode Mode>
-static void runOutputAppend(benchmark::State& state)
+// visible instances. Keep the production append path visible as a standalone
+// cross-machine bandwidth/loop-overhead probe.
+static void BM_OutputAppendBuffer(benchmark::State& state)
 {
     constexpr uint32_t kRanges = 25'000;
     const uint32_t entriesPerRange = uint32_t(state.range(0));
@@ -719,38 +601,16 @@ static void runOutputAppend(benchmark::State& state)
             uint8_t(i), uint32_t(i) & hlod::kInstanceIdMask);
     }
 
-    using Output = std::conditional_t<Mode == OutputAppendMode::AppendBuffer,
-                                      hlod::AppendBuffer<hlod::CutEntry>,
-                                      std::vector<hlod::CutEntry>>;
-    Output output;
+    hlod::AppendBuffer<hlod::CutEntry> output;
     output.reserve(entryCount);
     for (auto _ : state)
     {
         output.clear();
-        if constexpr (Mode == OutputAppendMode::BulkInsert)
+        for (uint32_t range = 0; range < kRanges; ++range)
         {
-            output.insert(output.end(), input.data(), input.data() + input.size());
-        }
-        else
-        {
-            for (uint32_t range = 0; range < kRanges; ++range)
-            {
-                const hlod::CutEntry* p =
-                    input.data() + size_t(range) * entriesPerRange;
-                if constexpr (Mode == OutputAppendMode::RangeInsert)
-                {
-                    output.insert(output.end(), p, p + entriesPerRange);
-                }
-                else if constexpr (Mode == OutputAppendMode::PushLoop)
-                {
-                    for (uint32_t i = 0; i < entriesPerRange; ++i)
-                        output.push_back(p[i]);
-                }
-                else
-                {
-                    output.append(p, entriesPerRange);
-                }
-            }
+            const hlod::CutEntry* p =
+                input.data() + size_t(range) * entriesPerRange;
+            output.append(p, entriesPerRange);
         }
         benchmark::DoNotOptimize(output.data());
         benchmark::ClobberMemory();
@@ -759,35 +619,6 @@ static void runOutputAppend(benchmark::State& state)
     state.SetBytesProcessed(
         state.iterations() * int64_t(entryCount * sizeof(hlod::CutEntry)));
 }
-
-static void BM_OutputAppendRangeInsert(benchmark::State& state)
-{
-    runOutputAppend<OutputAppendMode::RangeInsert>(state);
-}
-BENCHMARK(BM_OutputAppendRangeInsert)
-    ->Arg(1)
-    ->Arg(4)
-    ->Arg(8)
-    ->Arg(16)
-    ->Arg(64)
-    ->ArgName("entries_per_range");
-
-static void BM_OutputAppendPushLoop(benchmark::State& state)
-{
-    runOutputAppend<OutputAppendMode::PushLoop>(state);
-}
-BENCHMARK(BM_OutputAppendPushLoop)
-    ->Arg(1)
-    ->Arg(4)
-    ->Arg(8)
-    ->Arg(16)
-    ->Arg(64)
-    ->ArgName("entries_per_range");
-
-static void BM_OutputAppendBuffer(benchmark::State& state)
-{
-    runOutputAppend<OutputAppendMode::AppendBuffer>(state);
-}
 BENCHMARK(BM_OutputAppendBuffer)
     ->Arg(1)
     ->Arg(4)
@@ -795,12 +626,6 @@ BENCHMARK(BM_OutputAppendBuffer)
     ->Arg(16)
     ->Arg(64)
     ->ArgName("entries_per_range");
-
-static void BM_OutputAppendBulkInsert(benchmark::State& state)
-{
-    runOutputAppend<OutputAppendMode::BulkInsert>(state);
-}
-BENCHMARK(BM_OutputAppendBulkInsert)->Arg(4)->ArgName("entries_per_range");
 
 // ---- memory hierarchy ------------------------------------------------------
 

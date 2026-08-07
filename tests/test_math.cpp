@@ -231,10 +231,6 @@ TEST(ScreenError, SquaredWideMatchesScalarWithinTolerance)
     std::uniform_real_distribution<float> exponentDist(-20.0f, 20.0f);
 
     float maxRelativeError = 0.0f;
-#if HLOD_SIMD_NEON
-    float maxOneRefinementError = 0.0f;
-    float maxTwoRefinementError = 0.0f;
-#endif
     for (int iteration = 0; iteration < 2000; ++iteration)
     {
         const float k = 0.25f + float(iteration % 100);
@@ -247,12 +243,6 @@ TEST(ScreenError, SquaredWideMatchesScalarWithinTolerance)
         }
 
         const float8 actual = screenErrorFromSq8(geometricError, k, d2);
-#if HLOD_SIMD_NEON
-        const float8 one =
-            detail::screenErrorFromSq8Neon<1>(geometricError, k, d2);
-        const float8 two =
-            detail::screenErrorFromSq8Neon<2>(geometricError, k, d2);
-#endif
         for (uint32_t lane = 0; lane < kWide; ++lane)
         {
             const float expected = geometricError.v[lane] * k /
@@ -260,26 +250,10 @@ TEST(ScreenError, SquaredWideMatchesScalarWithinTolerance)
             const float relative =
                 std::fabs(actual.v[lane] - expected) / expected;
             maxRelativeError = std::max(maxRelativeError, relative);
-#if HLOD_SIMD_NEON
-            maxOneRefinementError = std::max(
-                maxOneRefinementError,
-                std::fabs(one.v[lane] - expected) / expected);
-            maxTwoRefinementError = std::max(
-                maxTwoRefinementError,
-                std::fabs(two.v[lane] - expected) / expected);
-#endif
         }
     }
 
     EXPECT_LT(maxRelativeError, 2.0e-5f);
-#if HLOD_SIMD_NEON
-    RecordProperty("one_refinement_max_relative_error",
-                   maxOneRefinementError);
-    RecordProperty("two_refinement_max_relative_error",
-                   maxTwoRefinementError);
-    EXPECT_LT(maxTwoRefinementError, maxOneRefinementError);
-    EXPECT_LT(maxTwoRefinementError, 2.0e-5f);
-#endif
 }
 
 TEST(ScreenError, ZeroDistanceSaturatesFinitePositive)
