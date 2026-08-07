@@ -170,7 +170,8 @@ struct World::TestAccess
     {
         w.flushBounds();
         const Instance* inst = w.resolveInstance(ref);
-        return inst ? w.instanceTlas_[ref.id].worldBox : AABB::empty();
+        return inst ? w.instanceTlas_[size_t(inst - w.instances_.data())].worldBox
+                    : AABB::empty();
     }
     // The runtime state a mount holds, which every instance of the asset
     // shares: used to assert that deforming one instance does not fork it.
@@ -189,7 +190,13 @@ struct World::TestAccess
         w.tlasQuery(v, minPix, -1.0f, packed, stack);
         out.reserve(packed.size());
         for (const World::VisibleItem item : packed)
-            out.emplace_back(item.instance(), item.mask());
+        {
+            uint32_t instance = item.instance();
+#if HLOD_SPATIAL_INSTANCE_LAYOUT
+            instance = w.publicInstanceId(instance);
+#endif
+            out.emplace_back(instance, item.mask());
+        }
         return out;
     }
 

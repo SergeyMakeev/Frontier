@@ -59,11 +59,12 @@ struct Scene
     AssetHandle                   asset;
     std::vector<World::InstanceRef> inst;
 
-    explicit Scene(uint32_t side = 6, uint32_t depth = 3, uint32_t fanout = 4)
+    explicit Scene(uint32_t side = 6, uint32_t depth = 3, uint32_t fanout = 4,
+                   const WorldConfig& config = WorldConfig{})
     {
         gen.fanout = fanout;
         gen.depth = depth;
-        world = std::make_unique<World>();
+        world = std::make_unique<World>(config);
         Page p = gen.makeRootPage(unitRegion(60.0f), 512.0f, 0);
         const uint32_t nodes = p.nodeCount();
         asset = world->registerAsset(std::move(p));
@@ -436,6 +437,41 @@ TEST(Cache, SurvivesStreamingAndInstanceChurn)
     }
     EXPECT_GT(reused, 0u);
     EXPECT_GT(attached, 0u) << "no pages attached; churn was not exercised";
+}
+
+TEST(Cache, SurvivesFullTlasRebuild)
+{
+    WorldConfig config;
+    config.tlasEscapeFraction = 0.0f;
+    Scene sc(8, 3, 4, config);
+    View cache;
+    CutResults cut;
+    const Camera v = viewAt(float4::vec(0, 0, 0));
+    const CutParams p{6.0f, 0.0f};
+
+    cache.selectCut(*sc.world, v, p, cut);
+    cache.selectCut(*sc.world, v, p, cut);
+    ASSERT_GT(cache.reused(), 0u);
+
+    // Escaping the exact lane with a zero budget forces a Morton rebuild. A
+    // spatial layout build changes dense positions while old InstanceRefs and
+    // public ids must remain stable, and the View must not reuse records from
+    // the previous permutation.
+    const uint32_t center = 4u * 8u + 4u;
+    sc.world->moveInstance(sc.inst[center], float4::point(10.0f, 0.0f, 3300.0f));
+    sc.world->applyUpdates();
+
+    CutResults ref;
+    selectCutUncached(*sc.world, v, p, ref);
+    cache.selectCut(*sc.world, v, p, cut);
+    EXPECT_EQ(keysOf(cut), keysOf(ref));
+#if HLOD_SPATIAL_INSTANCE_LAYOUT
+    EXPECT_EQ(cache.reused(), 0u);
+#endif
+
+    cache.selectCut(*sc.world, v, p, cut);
+    EXPECT_EQ(keysOf(cut), keysOf(ref));
+    EXPECT_GT(cache.reused(), 0u);
 }
 
 // Residency feedback is optional: a view that does not influence collection

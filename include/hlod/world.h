@@ -45,6 +45,10 @@
 // each call has its own View and outputs. LOD damping, cut reuse, query scratch,
 // and selection statistics all live in the View, never as mutable World state.
 
+#ifndef HLOD_SPATIAL_INSTANCE_LAYOUT
+#define HLOD_SPATIAL_INSTANCE_LAYOUT 0
+#endif
+
 #include <cstdint>
 #include <cstring>
 #include <initializer_list>
@@ -587,6 +591,9 @@ private:
     std::vector<CutEntry> store_;    // slab of recorded runs
     uint32_t              used_ = 0;
     uint32_t              garbage_ = 0;
+#if HLOD_SPATIAL_INSTANCE_LAYOUT
+    uint32_t              instanceLayoutVersion_ = 0;
+#endif
 
     // Distance the damped query envelope has travelled since this View was
     // created, accumulated per call. kTravel_ similarly accumulates absolute
@@ -1194,6 +1201,11 @@ private:
 
     // nullptr when the ref is stale (slot recycled) or invalid.
     Instance* resolveInstance(InstanceRef ref);
+#if HLOD_SPATIAL_INSTANCE_LAYOUT
+    InstanceId denseInstanceId(InstanceRef ref) const;
+    InstanceId publicInstanceId(InstanceId dense) const;
+    void reorderInstancesByTlas();
+#endif
 
     // Wide top-level BVH node; lanes are children (inner nodes or instances).
     struct TlasNode
@@ -1506,6 +1518,14 @@ private:
     std::vector<uint32_t> instanceCutVersions_;
     std::vector<InstanceId> liveInstances_;
     std::vector<uint32_t> freeInstances_;
+#if HLOD_SPATIAL_INSTANCE_LAYOUT
+    // Public InstanceRef/CutEntry ids remain stable while the dense storage
+    // behind them is permuted into TLAS traversal order after every rebuild.
+    std::vector<InstanceId> instanceHandleToDense_;
+    std::vector<InstanceId> instanceDenseToHandle_;
+    std::vector<InstanceId> freeInstanceHandles_;
+    uint32_t                instanceLayoutVersion_ = 0;
+#endif
 
     std::vector<Overlay>  overlays_;
     std::vector<uint32_t> freeOverlays_;
