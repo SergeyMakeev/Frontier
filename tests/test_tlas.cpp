@@ -378,6 +378,36 @@ TEST(Tlas, RemovingEveryInstanceLeavesAQueryableEmptyWorld)
     EXPECT_TRUE(instanceIdsOf(cut).count(fresh.id));
 }
 
+TEST(Tlas, OptimizeCompactsDenseSlotsAndKeepsPublicRefsStable)
+{
+    Field f;
+    std::vector<Placed> refs;
+    for (int i = 0; i < 100; ++i)
+        refs.push_back(f.add(float(i % 10) * 5.0f, float(i / 10) * 5.0f));
+
+    CutResults cut;
+    const Camera v = viewFrom(22.5f, 22.5f, 80.0f);
+    selectCutUncached(f.w, v, kParams, cut);
+    ASSERT_EQ(TAX::instanceSlotCount(f.w), 100u);
+
+    for (size_t i = 50; i < refs.size(); ++i) f.w.removeInstance(refs[i].ref);
+    f.w.optimize();
+    EXPECT_EQ(TAX::instanceSlotCount(f.w), 50u);
+    EXPECT_EQ(TAX::tlasValidate(f.w), "");
+
+    // Reordering dense storage must not invalidate the public handles held by
+    // the application. Exercise both mutation and result ids after optimize.
+    for (size_t i = 0; i < 50; ++i)
+        f.w.moveInstance(refs[i].ref,
+                         float4::point(float(i % 10) * 5.0f + 1.0f, 0.0f,
+                                       float(i / 10) * 5.0f));
+    f.w.applyUpdates();
+    selectCutUncached(f.w, v, kParams, cut);
+    const std::multiset<InstanceId> ids = instanceIdsOf(cut);
+    for (size_t i = 0; i < 50; ++i)
+        EXPECT_TRUE(ids.count(refs[i].id)) << "instance " << refs[i].id;
+}
+
 // The edit budget exists so accumulated quality loss is bounded. Sustained
 // churn must eventually rebuild rather than degrading forever.
 TEST(Tlas, SustainedChurnEventuallyForcesARebuild)

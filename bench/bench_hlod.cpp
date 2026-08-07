@@ -28,6 +28,7 @@
 #include <cmath>
 #include <limits>
 #include <memory>
+#include <numeric>
 #include <queue>
 #include <random>
 #include <thread>
@@ -1846,6 +1847,121 @@ static void BM_TlasMortonRebuild(benchmark::State& state)
 BENCHMARK(BM_TlasMortonRebuild)
     ->Args({100000, 0})->Args({500000, 0})->Args({100000, 1})
     ->Unit(benchmark::kMillisecond);
+
+// Explicit maintenance point: rebuild the quality TLAS and, with the default
+// spatial layout, compact/reorder all dense instance streams. Applications
+// call this rarely (loading screen, menu, teleport), so it is intentionally
+// separate from the routine Morton rebuild benchmark above.
+static void BM_TlasOptimize(benchmark::State& state)
+{
+    const int count = int(state.range(0));
+    const float half = 40.0f * std::sqrt(float(count));
+
+    World w;
+    TreeGen gen;
+    gen.fanout = 4;
+    gen.depth = 1;
+    Page proto = gen.makeRootPage(unitRegion(5.0f), 16.0f, 0);
+    const AssetHandle asset = w.registerAsset(std::move(proto));
+
+    std::mt19937 rng(9191);
+    std::uniform_real_distribution<float> uni(-half, half);
+    for (int i = 0; i < count; ++i)
+        w.addInstance(asset, float4::point(uni(rng), 0, uni(rng)));
+    w.applyUpdates();
+
+    for (auto _ : state)
+    {
+        w.optimize();
+        benchmark::DoNotOptimize(World::TestAccess::tlasNodeCount(w));
+    }
+    state.counters["instances"] = double(count);
+}
+BENCHMARK(BM_TlasOptimize)->Arg(100000)->Unit(benchmark::kMillisecond);
+
+// Selection after disruptive motion has randomized the relationship between
+// dense storage and TLAS traversal. The optimized arm pays World::optimize()
+// outside the timed loop, so the delta measures the locality it recovers.
+static void BM_LayoutRecovery100k(benchmark::State& state)
+{
+    constexpr uint32_t kInstances = 100000;
+    constexpr uint32_t kVisible = kInstances / 4;
+    const bool optimized = state.range(0) != 0;
+
+    WorldConfig config;
+    config.tlasEscapeFraction = 0.0f;
+    config.tlasAreaDrift = std::numeric_limits<float>::max();
+    World world(config);
+
+    HLodBuilder builder;
+    builder.createRoot(
+        1, 0.0f,
+        AABB::fromCenterExtent(float4::point(0, 0, 0), float4::vec(1, 1, 1)));
+    const AssetHandle asset = world.registerAsset(builder.build());
+
+    const auto gridPosition = [](uint32_t index, uint32_t count, float zBase)
+    {
+        const uint32_t columns =
+            uint32_t(std::ceil(std::sqrt(double(std::max(1u, count)))));
+        const uint32_t row = index / columns;
+        const uint32_t column = index - row * columns;
+        const float x = (float(column) - 0.5f * float(columns - 1)) * 6.0f;
+        return float4::point(x, 0.0f, zBase + float(row) * 6.0f);
+    };
+
+    std::vector<World::InstanceRef> refs;
+    std::vector<float4> positions;
+    refs.reserve(kInstances);
+    positions.reserve(kInstances);
+    for (uint32_t i = 0; i < kInstances; ++i)
+    {
+        const bool visible = i < kVisible;
+        const uint32_t clusterIndex = visible ? i : i - kVisible;
+        const uint32_t clusterCount = visible ? kVisible : kInstances - kVisible;
+        positions.push_back(gridPosition(
+            clusterIndex, clusterCount, visible ? 0.0f : -10000.0f));
+        refs.push_back(world.addInstance(asset, positions.back()));
+    }
+    world.applyUpdates();
+
+    std::vector<uint32_t> permutation(kInstances);
+    std::iota(permutation.begin(), permutation.end(), 0u);
+    std::mt19937 rng(5252);
+    std::shuffle(permutation.begin(), permutation.end(), rng);
+    for (uint32_t i = 0; i < kInstances; ++i)
+        world.moveInstance(refs[i], positions[permutation[i]]);
+    world.applyUpdates();
+    double optimizeMs = 0.0;
+    if (optimized)
+    {
+        const auto begin = std::chrono::steady_clock::now();
+        world.optimize();
+        optimizeMs = std::chrono::duration<double, std::milli>(
+                         std::chrono::steady_clock::now() - begin).count();
+    }
+
+    const Camera camera = makePerspectiveCamera(
+        float4::point(0, 100, -2000), float4::vec(0, -0.05f, 1),
+        float4::vec(0, 1, 0), 1.2f, 16.0f / 9.0f, 1080.0f, 0.1f, 5000.0f);
+    const CutParams params{4.0f, 0.0f};
+    View view;
+    CutResults cut;
+    view.selectCut(world, camera, params, cut);
+
+    for (auto _ : state)
+    {
+        view.selectCut(world, camera, params, cut);
+        consumeCut(cut);
+    }
+    state.SetItemsProcessed(state.iterations() * int64_t(kVisible));
+    state.counters["cut"] = double(cut.size());
+    state.counters["optimize_ms"] = optimizeMs;
+    state.counters["optimized"] = optimized ? 1.0 : 0.0;
+}
+BENCHMARK(BM_LayoutRecovery100k)
+    ->Args({0})->Args({1})
+    ->ArgName("optimized")
+    ->Unit(benchmark::kMicrosecond);
 
 // Rebuild after a world has shrunk far below its historical peak. Instance
 // slots are recycled rather than erased, so a rebuild that scans capacity pays

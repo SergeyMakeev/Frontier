@@ -135,6 +135,19 @@ World creation does not force the initial quality TLAS build; the first
 `applyUpdates` performs it before publishing the read-only snapshot. Treat the
 first published selection cycle as level warm-up rather than steady latency.
 
+That first non-empty build also places the dense instance streams in TLAS
+traversal order, allowing cached selection to use ordinary hardware
+prefetching instead of architecture-specific prefetch instructions. Routine
+motion and structural TLAS rebuilds preserve the physical order: rebuilding a
+tree around existing dense ids is cheap, while copying the entire population
+after a small change is not. After disruptive motion or heavy spawn/despawn
+churn, call `World::optimize()` at an occasional synchronization point such as
+a loading screen, menu, or teleport. It flushes pending edits, performs a
+quality rebuild, compacts dead instance slots, restores traversal order, and
+keeps public `InstanceRef` and `CutEntry::instance()` ids stable. Existing
+`View` objects remain valid and discard their indexed records on the next
+selection only when this physical reorder actually occurs.
+
 ### Steady-frame breakdown: 80,000-instance world
 
 | Machine / HLodTree work per frame | Camera and 4,000 objects moving | Static camera, 4,000 objects moving | Moving camera, static objects |

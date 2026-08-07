@@ -3,13 +3,6 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="${HLOD_PERF_BUILD_DIR:-${ROOT_DIR}/build-perf}"
-SPATIAL_INSTANCE_LAYOUT="${HLOD_SPATIAL_INSTANCE_LAYOUT:-OFF}"
-
-if [[ "${SPATIAL_INSTANCE_LAYOUT}" != "ON" &&
-      "${SPATIAL_INSTANCE_LAYOUT}" != "OFF" ]]; then
-    echo "ERROR: HLOD_SPATIAL_INSTANCE_LAYOUT must be ON or OFF." >&2
-    exit 1
-fi
 
 if ! command -v cmake >/dev/null 2>&1; then
     echo "ERROR: CMake was not found in PATH." >&2
@@ -57,7 +50,6 @@ configure_args=(
     -DHLOD_BUILD_BENCH=ON
     -DHLOD_AVX2="${avx2}"
     -DHLOD_FORCE_SCALAR=OFF
-    -DHLOD_SPATIAL_INSTANCE_LAYOUT="${SPATIAL_INSTANCE_LAYOUT}"
 )
 if [[ -n "${generator}" ]]; then
     configure_args+=(-G "${generator}")

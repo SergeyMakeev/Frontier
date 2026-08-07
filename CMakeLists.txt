@@ -8,8 +8,6 @@ option(HLOD_BUILD_TESTS "Build unit tests" ON)
 option(HLOD_BUILD_BENCH "Build performance tests" ON)
 option(HLOD_AVX2 "Enable AVX2 code generation (x86-64 only)" ON)
 option(HLOD_FORCE_SCALAR "Disable SIMD intrinsics; use the portable scalar paths" OFF)
-option(HLOD_SPATIAL_INSTANCE_LAYOUT
-       "Physically reorder dense instance streams into TLAS traversal order" OFF)
 
 if(HLOD_BUILD_TESTS OR HLOD_BUILD_BENCH)
     find_package(Threads REQUIRED)
@@ -31,9 +29,6 @@ add_library(hlod STATIC
     src/world.cpp
 )
 target_include_directories(hlod PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_compile_definitions(hlod PUBLIC
-    HLOD_SPATIAL_INSTANCE_LAYOUT=$<BOOL:${HLOD_SPATIAL_INSTANCE_LAYOUT}>
-)
 
 if(MSVC)
     target_compile_options(hlod PRIVATE /W4 /permissive-)

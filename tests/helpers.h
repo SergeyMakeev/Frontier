@@ -100,6 +100,11 @@ struct World::TestAccess
     static bool tlasDirty(World& w) { return w.tlasDirty_; }
     static uint32_t tlasEscapes(World& w) { return w.tlasEscapes_; }
     static size_t tlasNodeCount(World& w) { return w.tlasNodes_.size(); }
+    static size_t instanceSlotCount(World& w) { return w.instances_.size(); }
+    static uint32_t instanceLayoutVersion(World& w)
+    {
+        return w.instanceLayoutVersion_;
+    }
     static size_t assetRtBytes() { return sizeof(AssetRt); }
     static size_t pageRtBytes() { return sizeof(PageRt); }
     static size_t pageStampBytes() { return sizeof(PageStamp); }
@@ -191,10 +196,7 @@ struct World::TestAccess
         out.reserve(packed.size());
         for (const World::VisibleItem item : packed)
         {
-            uint32_t instance = item.instance();
-#if HLOD_SPATIAL_INSTANCE_LAYOUT
-            instance = w.publicInstanceId(instance);
-#endif
+            const uint32_t instance = w.publicInstanceId(item.instance());
             out.emplace_back(instance, item.mask());
         }
         return out;

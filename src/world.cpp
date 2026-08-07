@@ -646,13 +646,10 @@ World::InstanceRef World::addInstanceInternal(uint32_t asset, const InstanceDesc
         instances_.emplace_back();
         instanceTlas_.emplace_back();
         instanceCutVersions_.emplace_back();
-#if HLOD_SPATIAL_INSTANCE_LAYOUT
         instanceDenseToHandle_.push_back(kInvalidInstanceId);
-#endif
         id = InstanceId(instances_.size() - 1);
     }
 
-#if HLOD_SPATIAL_INSTANCE_LAYOUT
     InstanceId handle;
     if (!freeInstanceHandles_.empty())
     {
@@ -668,9 +665,6 @@ World::InstanceRef World::addInstanceInternal(uint32_t asset, const InstanceDesc
     }
     instanceHandleToDense_[handle] = id;
     instanceDenseToHandle_[id] = handle;
-#else
-    const InstanceId handle = id;
-#endif
 
     // Every instance of an asset walks the SAME root mount: one residency
     // array, one attachment graph, and one residency state for the whole
@@ -757,18 +751,10 @@ World::InstanceRef World::addInstance(Page&& page, float4 pos, float scale)
 
 World::Instance* World::resolveInstance(InstanceRef ref)
 {
-#if HLOD_SPATIAL_INSTANCE_LAYOUT
     const InstanceId id = denseInstanceId(ref);
     return id == kInvalidInstanceId ? nullptr : &instances_[id];
-#else
-    if (ref.id >= instances_.size()) return nullptr;
-    Instance& inst = instances_[ref.id];
-    if (!inst.alive() || inst.generation != ref.generation) return nullptr;
-    return &inst;
-#endif
 }
 
-#if HLOD_SPATIAL_INSTANCE_LAYOUT
 InstanceId World::denseInstanceId(InstanceRef ref) const
 {
     if (ref.id >= instanceHandleToDense_.size()) return kInvalidInstanceId;
@@ -787,7 +773,6 @@ InstanceId World::publicInstanceId(InstanceId dense) const
                 "World: live dense instance has no public handle");
     return instanceDenseToHandle_[dense];
 }
-#endif
 
 // Structural change policy: quality rebuilds are reserved for real population
 // drift — world assembly, level load, mass despawn. Under steady churn
@@ -830,13 +815,12 @@ void World::removeInstance(InstanceRef ref)
     liveInstances_[liveIndex] = moved;
     instanceTlas_[moved].liveIndex = liveIndex;
     liveInstances_.pop_back();
+    if (liveInstances_.empty()) instanceLayoutSpatialized_ = false;
     instanceTlas_[id].liveIndex = kInvalidIndex;
     instances_[id].setAlive(false);
-#if HLOD_SPATIAL_INSTANCE_LAYOUT
     instanceHandleToDense_[ref.id] = kInvalidInstanceId;
     instanceDenseToHandle_[id] = kInvalidInstanceId;
     freeInstanceHandles_.push_back(ref.id);
-#endif
     freeInstances_.push_back(id);
     markTlasStructuralChange();
 
@@ -1124,7 +1108,20 @@ void World::applyUpdates()
 {
     ++frame_;
     flushBounds();
-    if (tlasDirty_) tlasRebuild();
+    if (tlasDirty_)
+    {
+        const bool firstSpatialization =
+            !instanceLayoutSpatialized_ && !liveInstances_.empty();
+        tlasRebuild(firstSpatialization);
+    }
+}
+
+void World::optimize()
+{
+    flushBounds();
+    tlasDirty_ = true;
+    tlasQualityBuild_ = true;
+    tlasRebuild(true);
 }
 
 void World::flushBounds()
@@ -1142,7 +1139,6 @@ void World::flushBounds()
     // page detached, slot reused) self-invalidate via the generation stamps.
     for (const PendingMove& m : pendingMoves_)
     {
-#if HLOD_SPATIAL_INSTANCE_LAYOUT
         if (m.instance >= instanceHandleToDense_.size()) continue;
         const InstanceId dense = instanceHandleToDense_[m.instance];
         if (dense >= instances_.size()) continue;
@@ -1150,13 +1146,6 @@ void World::flushBounds()
         if (!inst.alive() || inst.generation != m.instGeneration) continue;
         if (!resolve(m.node)) continue;
         applyBoundsChange(dense, m.node.slot(), m.node.index(), m.box);
-#else
-        if (m.instance >= instances_.size()) continue;
-        const Instance& inst = instances_[m.instance];
-        if (!inst.alive() || inst.generation != m.instGeneration) continue;
-        if (!resolve(m.node)) continue;
-        applyBoundsChange(m.instance, m.node.slot(), m.node.index(), m.box);
-#endif
     }
     pendingMoves_.clear();
 }
@@ -1778,7 +1767,6 @@ int32_t World::tlasBuildRange(std::vector<uint32_t>& items, int lo, int hi, int3
     return idx;
 }
 
-#if HLOD_SPATIAL_INSTANCE_LAYOUT
 void World::reorderInstancesByTlas()
 {
     HLOD_ASSERT(pendingMoves_.empty(),
@@ -1874,9 +1862,9 @@ void World::reorderInstancesByTlas()
     }
     freeInstances_.clear();
 
+    instanceLayoutSpatialized_ = liveCount != 0;
     if (++instanceLayoutVersion_ == 0) ++instanceLayoutVersion_;
 }
-#endif
 
 // Two-tier rebuild policy:
 //  - structural rebuilds (add/remove) take the quality path: rare,
@@ -1885,7 +1873,7 @@ void World::reorderInstancesByTlas()
 //  - motion rebuilds (escape/area threshold) take the Morton path: one sort
 //    plus contiguous groups of kWide per level, ~5x faster to build, letting
 //    the escape policy rebuild eagerly and keep bloat low under heavy motion.
-void World::tlasRebuild()
+void World::tlasRebuild(bool reorderInstances)
 {
     tlasNodes_.clear();
     tlasFreeNodes_.clear();
@@ -1999,9 +1987,7 @@ void World::tlasRebuild()
         }
     }
 
-#if HLOD_SPATIAL_INSTANCE_LAYOUT
-    reorderInstancesByTlas();
-#endif
+    if (reorderInstances) reorderInstancesByTlas();
 
     // Baseline for the area-drift trigger: the total lane area this build
     // started from. Motion is allowed to add a configured fraction of it
@@ -2469,10 +2455,8 @@ void World::runPageImpl(const WorkItem& item, const Instance& inst,
     HLOD_STAT(w, pagesVisited, 1);
     const PageView& pg = pageView(rt);
     const uint32_t gen = rt.generation();
-    InstanceId instance = InstanceId(&inst - instances_.data());
-#if HLOD_SPATIAL_INSTANCE_LAYOUT
-    instance = publicInstanceId(instance);
-#endif
+    const InstanceId instance =
+        publicInstanceId(InstanceId(&inst - instances_.data()));
     // One bar, no history: damping is already folded into the view's camera
     // envelope, which widened the measured error rather than moving the
     // threshold. That is what makes selection a pure read of the World.
@@ -2648,10 +2632,7 @@ void World::runInstance(uint32_t instIdx, const Camera& view, const CutParams& p
                      std::find(w.touched.begin(), w.touched.end(), inst.rootSlot) ==
                          w.touched.end()))
                     w.touched.push_back(inst.rootSlot);
-                InstanceId outputInstance = instIdx;
-#if HLOD_SPATIAL_INSTANCE_LAYOUT
-                outputInstance = publicInstanceId(instIdx);
-#endif
+                const InstanceId outputInstance = publicInstanceId(instIdx);
                 w.cut.shared.push(makeCutEntry(
                     NodeHandle{inst.rootSlot, 1, rootRt.generation()}, error,
                     w.bar, w.barInv, outputInstance));
@@ -2708,10 +2689,7 @@ void World::runFlatInstance(uint32_t instIdx, const Camera& view,
                                   distanceToBox(spatial->worldBox, view.queryMin(),
                                                 view.queryMax()))
                             : 0.0f;
-    InstanceId outputInstance = instIdx;
-#if HLOD_SPATIAL_INSTANCE_LAYOUT
-    outputInstance = publicInstanceId(instIdx);
-#endif
+    const InstanceId outputInstance = publicInstanceId(instIdx);
     w.cut.shared.push(makeCutEntry(NodeHandle{slot, 1,
                                              pageStamps_[slot].generation()}, error,
                                    w.bar, w.barInv, outputInstance));
@@ -2971,9 +2949,7 @@ void View::reset()
     k_ = bar_ = 0.0f;
     stats_ = CutStats{};
     world_ = nullptr;
-#if HLOD_SPATIAL_INSTANCE_LAYOUT
     instanceLayoutVersion_ = 0;
-#endif
     rootQueryEnabled_ = true;
     rootProbeCountdown_ = 0;
     ++epoch_;
@@ -3062,7 +3038,6 @@ void World::selectCutCached(const Camera& camera, const CutParams& params,
     tlasQuery(dv, params.minPix, -1.0f, scratch.visible, scratch.tlasStack);
 
     ctx.reused_ = ctx.walked_ = 0;
-#if HLOD_SPATIAL_INSTANCE_LAYOUT
     if (ctx.instanceLayoutVersion_ != instanceLayoutVersion_)
     {
         ctx.rec_.clear();
@@ -3072,7 +3047,6 @@ void World::selectCutCached(const Camera& camera, const CutParams& params,
         ctx.used_ = ctx.garbage_ = 0;
         ctx.instanceLayoutVersion_ = instanceLayoutVersion_;
     }
-#endif
     if (ctx.rec_.size() < instances_.size())
     {
         ctx.rec_.resize(instances_.size());
@@ -3129,20 +3103,6 @@ void World::selectCutCached(const Camera& camera, const CutParams& params,
     };
     for (uint32_t i = 0; i < nVis; ++i)
     {
-#if !HLOD_SPATIAL_INSTANCE_LAYOUT
-        // TLAS order is spatial, whereas instance ids follow insertion order.
-        // With a large, randomly placed population that makes both of the
-        // indexed reads below latency-bound. Give the hardware several
-        // iterations of useful work to fetch the two records before use.
-        constexpr uint32_t kPrefetchDistance = 8;
-        if (i + kPrefetchDistance < nVis)
-        {
-            const uint32_t next = scratch.visible[i + kPrefetchDistance].instance();
-            HLOD_PREFETCH(&instanceCutVersions_[next]);
-            HLOD_PREFETCH(&ctx.rec_[next]);
-        }
-#endif
-
         const uint32_t instIdx = scratch.visible[i].instance();
         const uint8_t  mask = scratch.visible[i].mask();
         View::Rec& r = ctx.rec_[instIdx];

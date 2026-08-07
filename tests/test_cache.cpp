@@ -452,26 +452,41 @@ TEST(Cache, SurvivesFullTlasRebuild)
     cache.selectCut(*sc.world, v, p, cut);
     cache.selectCut(*sc.world, v, p, cut);
     ASSERT_GT(cache.reused(), 0u);
+    const uint32_t initialLayout = TAX::instanceLayoutVersion(*sc.world);
 
     // Escaping the exact lane with a zero budget forces a Morton rebuild. A
-    // spatial layout build changes dense positions while old InstanceRefs and
-    // public ids must remain stable, and the View must not reuse records from
-    // the previous permutation.
+    // routine rebuild must leave dense positions and warm View records alone.
     const uint32_t center = 4u * 8u + 4u;
     sc.world->moveInstance(sc.inst[center], float4::point(10.0f, 0.0f, 3300.0f));
     sc.world->applyUpdates();
+    EXPECT_EQ(TAX::instanceLayoutVersion(*sc.world), initialLayout);
 
     CutResults ref;
     selectCutUncached(*sc.world, v, p, ref);
     cache.selectCut(*sc.world, v, p, cut);
     EXPECT_EQ(keysOf(cut), keysOf(ref));
-#if HLOD_SPATIAL_INSTANCE_LAYOUT
-    EXPECT_EQ(cache.reused(), 0u);
-#endif
+    EXPECT_GT(cache.reused(), 0u);
 
+    // optimize() is the explicit expensive synchronization point. It changes
+    // dense positions, so the next cached selection must forget the old
+    // record indexing while public InstanceRefs remain usable.
+    sc.world->optimize();
+    EXPECT_NE(TAX::instanceLayoutVersion(*sc.world), initialLayout);
+    selectCutUncached(*sc.world, v, p, ref);
     cache.selectCut(*sc.world, v, p, cut);
     EXPECT_EQ(keysOf(cut), keysOf(ref));
+    EXPECT_EQ(cache.reused(), 0u);
+
+    cache.selectCut(*sc.world, v, p, cut);
     EXPECT_GT(cache.reused(), 0u);
+
+    const uint32_t optimizedLayout = TAX::instanceLayoutVersion(*sc.world);
+    sc.world->moveInstance(sc.inst[center], float4::point(20.0f, 0.0f, 3300.0f));
+    sc.world->applyUpdates();
+    EXPECT_EQ(TAX::instanceLayoutVersion(*sc.world), optimizedLayout);
+    selectCutUncached(*sc.world, v, p, ref);
+    cache.selectCut(*sc.world, v, p, cut);
+    EXPECT_EQ(keysOf(cut), keysOf(ref));
 }
 
 // Residency feedback is optional: a view that does not influence collection

@@ -45,10 +45,6 @@
 // each call has its own View and outputs. LOD damping, cut reuse, query scratch,
 // and selection statistics all live in the View, never as mutable World state.
 
-#ifndef HLOD_SPATIAL_INSTANCE_LAYOUT
-#define HLOD_SPATIAL_INSTANCE_LAYOUT 0
-#endif
-
 #include <cstdint>
 #include <cstring>
 #include <initializer_list>
@@ -591,9 +587,7 @@ private:
     std::vector<CutEntry> store_;    // slab of recorded runs
     uint32_t              used_ = 0;
     uint32_t              garbage_ = 0;
-#if HLOD_SPATIAL_INSTANCE_LAYOUT
     uint32_t              instanceLayoutVersion_ = 0;
-#endif
 
     // Distance the damped query envelope has travelled since this View was
     // created, accumulated per call. kTravel_ similarly accumulates absolute
@@ -837,6 +831,15 @@ public:
     // No World mutation (including collect) may overlap or occur before every
     // View selection using this snapshot has completed.
     void applyUpdates();
+
+    // Force a full quality TLAS rebuild, compact dead dense slots, and restore
+    // physical instance/View-record order to TLAS traversal order. Public
+    // InstanceRefs and CutEntry::instance() ids remain stable. This is
+    // intentionally heavier than applyUpdates(): call it at an occasional
+    // synchronization point after disruptive world changes (level transition,
+    // teleport, loading screen), not as routine per-frame maintenance. It
+    // flushes pending bounds edits but does not advance collection age.
+    void optimize();
 
     // ---- garbage collection ----------------------------------------------------
     // Detaches cold pages from the LRU tail until streamedPageCount() <=
@@ -1201,11 +1204,9 @@ private:
 
     // nullptr when the ref is stale (slot recycled) or invalid.
     Instance* resolveInstance(InstanceRef ref);
-#if HLOD_SPATIAL_INSTANCE_LAYOUT
     InstanceId denseInstanceId(InstanceRef ref) const;
     InstanceId publicInstanceId(InstanceId dense) const;
     void reorderInstancesByTlas();
-#endif
 
     // Wide top-level BVH node; lanes are children (inner nodes or instances).
     struct TlasNode
@@ -1430,7 +1431,7 @@ private:
     InstanceRef addInstanceInternal(uint32_t asset, const InstanceDesc& desc);
 
     void markTlasStructuralChange();
-    void tlasRebuild();
+    void tlasRebuild(bool reorderInstances);
     int32_t tlasBuildRange(std::vector<uint32_t>& items, int lo, int hi, int32_t parent);
     int  tlasSplit(std::vector<uint32_t>& items, int lo, int hi);
     void tlasQuery(const Camera& view, float minPix, float rootThreshold,
@@ -1518,14 +1519,13 @@ private:
     std::vector<uint32_t> instanceCutVersions_;
     std::vector<InstanceId> liveInstances_;
     std::vector<uint32_t> freeInstances_;
-#if HLOD_SPATIAL_INSTANCE_LAYOUT
-    // Public InstanceRef/CutEntry ids remain stable while the dense storage
-    // behind them is permuted into TLAS traversal order after every rebuild.
+    // Public InstanceRef/CutEntry ids remain stable while optimize() or the
+    // first non-empty build permutes dense storage into TLAS traversal order.
     std::vector<InstanceId> instanceHandleToDense_;
     std::vector<InstanceId> instanceDenseToHandle_;
     std::vector<InstanceId> freeInstanceHandles_;
     uint32_t                instanceLayoutVersion_ = 0;
-#endif
+    bool                    instanceLayoutSpatialized_ = false;
 
     std::vector<Overlay>  overlays_;
     std::vector<uint32_t> freeOverlays_;
