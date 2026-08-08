@@ -2,7 +2,7 @@
 
 > This is a historical engineering record. Names, measurements, APIs, and
 > implementation details below describe the revision under discussion and may
-> no longer be current. Use [README.md](README.md) for the overview,
+> no longer be current. Use [README.md](../README.md) for the overview,
 > [API.md](API.md) for the public API, [ARCHITECTURE.md](ARCHITECTURE.md) for the
 > current implementation, and [hlod_design.md](hlod_design.md) for the current
 > behavioral contract.
@@ -535,7 +535,7 @@ found two policy bugs that only continuous churn could expose:
    as five hundred spawns. Add and remove are now applied to the tree in
    place, in O(depth), and no longer mark it dirty immediately. An edit budget
    still requests a repair rebuild after enough accumulated changes. See the
-   archived [handoff, section 11.1](docs/archive/HANDOFF-2026-08-05.md)
+   archived [handoff, section 11.1](archive/HANDOFF-2026-08-05.md)
    for the measurement and `tests/test_tlas.cpp` for the invariants an in-place
    edit has to maintain.
 
@@ -768,7 +768,7 @@ the replace-only antichain for both cuts, and keeps selection read-only with
 respect to the World. Current representative measurements are in
 section 1 and the README; older output-path timings above are historical.
 
-The archived [2026-08-05 handoff](docs/archive/HANDOFF-2026-08-05.md), section
+The archived [2026-08-05 handoff](archive/HANDOFF-2026-08-05.md), section
 14, preserves the interleaved A/B tables, rejected margin vectorization,
 radix-sort tradeoffs, and full measurements. It is historical evidence, not API
 guidance.

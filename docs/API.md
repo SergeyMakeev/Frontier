@@ -1,103 +1,321 @@
-# HLodTree public API guide
+# HLodTree API and integration guide
 
-This is the integration reference for HLodTree 0.4.0. It covers the public
-types in `include/hlod`, their ownership rules, and the frame lifecycle. See
-[README.md](README.md) for a short introduction and [hlod_design.md](hlod_design.md)
-for the behavioral invariants behind the API.
+This is the self-contained integration reference for HLodTree 0.4.0. It
+explains the vocabulary, public interface, ownership rules, frame lifecycle,
+threading contract, and streaming model needed to use the library correctly.
+The [README](../README.md) is a shorter project overview; this guide is the
+place to start when writing an integration.
 
-HLodTree requires C++20. Runtime users normally include `hlod/world.h`;
-content-building tools also include `hlod/builder.h`.
+## Concepts and terminology
 
-## Complete example
+HLodTree selects a view-dependent set of renderable hierarchy elements. The
+following terms describe the data flow from authored content to a frame's
+render list.
 
-The example builds a small hierarchy, registers it once, creates two
+### Node and hierarchy
+
+A **node** is one renderable LOD choice. It contains:
+
+- an application-defined 64-bit payload;
+- local-space bounds;
+- geometric error in world units; and
+- zero or more child nodes that provide a more detailed representation.
+
+Selecting a node means rendering that node's payload instead of its
+descendants. Therefore every real node must be independently renderable,
+including a node whose deeper children are streamed separately. A
+**hierarchy** is a tree of these nodes. It may describe anything from one
+object to a terrain region or city block; it does not have to correspond to a
+single mesh or entity.
+
+### Page and expansion point
+
+A **page** is an immutable, serialized chunk of a hierarchy. A root page
+normally contains the hierarchy root. Large hierarchies can be split into
+child pages. The leaf node where a child page can be attached is an
+**expansion point**. Until that child page is attached, the expansion point is
+the renderable coarse representation of the missing subtree.
+
+`hlod::Page` owns its page bytes and is move-only. `hlod::PageView` borrows
+page bytes owned by the application, such as a memory-mapped asset bundle.
+
+### Asset
+
+An **asset** is a page registered with a world as a reusable unit of storage
+and sharing. Registering an asset returns an `hlod::AssetHandle`. Every
+instance of that asset shares the immutable page bytes, attached child-page
+graph, and payload-residency state. In this API, *asset* means a registered
+hierarchy; it does not imply one conventional game object.
+
+### Instance
+
+An **instance** places an asset in a world using a translation, positive
+uniform scale, and layer mask. Adding an instance returns an
+`hlod::World::InstanceRef`. Many instances can reference the same asset
+without copying its hierarchy or streaming state.
+
+### World
+
+A **world** (`hlod::World`) owns the runtime state: registered assets,
+instances, mounted pages, residency, and the top-level spatial acceleration
+structure. The application mutates a world serially, then calls
+`applyUpdates()` to publish a stable snapshot for selection. A world is not a
+renderer or asset loader; it stores opaque payloads and reports what should be
+rendered or streamed.
+
+### Handle and page mount
+
+A **handle** is an opaque, generation-stamped reference to world-owned runtime
+state. The application should store and pass handles, not infer internal
+indices:
+
+- `hlod::AssetHandle` identifies a registered asset;
+- `hlod::PageHandle` identifies one runtime mount of a page;
+- `hlod::NodeHandle` identifies a node inside a page mount; and
+- `hlod::World::InstanceRef` identifies a live instance.
+
+A **page mount** is one runtime placement of page data. The same registered
+asset can be mounted at more than one expansion point, so a page and a page
+mount are not interchangeable. Detaching or collecting a mount makes its page
+and node handles stale. Generation stamps prevent those handles from silently
+referring to newer objects that reuse the same internal slots.
+
+### Payload, topology, and residency
+
+A **payload** (`hlod::UserPayload`) is the application's 64-bit value stored
+on every node—typically an index or id used to find renderer resources.
+HLodTree never interprets it, and duplicate payload values are valid.
+
+**Topology** describes which hierarchy nodes are currently known. Attaching a
+child page expands topology below an expansion point; detaching it collapses
+that branch. **Residency** independently describes whether a known node's
+render payload is loaded. A page can be attached while some or all of its
+payloads remain non-resident.
+
+### Camera, View, and cut
+
+A **camera** (`hlod::Camera`) is one selection input: frustum, position,
+projection scale, viewport height, and layer mask. A **View** (`hlod::View`)
+is the persistent per-camera query object. It owns LOD damping, temporal reuse,
+scratch memory, statistics, and the default result storage. Use a distinct
+View for every concurrently selected camera, shadow cascade, or reflection.
+
+A **cut** is a set of nodes that covers the visible hierarchy without
+rendering both a node and its descendants. One query produces two logical
+cuts:
+
+- the **current cut**, which uses only resident payloads and is safe to render;
+- the **ideal cut**, which shows what full residency and attached topology
+  would select.
+
+`hlod::CutView` stores their overlap once in `shared`, current-only fallbacks
+in `currentOnly`, and ideal-only choices in `idealOnly`. Each
+`hlod::CutEntry` carries a node handle, instance id, and encoded screen error.
+
+### How the pieces fit together
+
+```text
+authored node hierarchy
+        | build or deserialize
+        v
+      Page ---- registerAsset() ----> AssetHandle
+                                         |
+                                  addInstance()
+                                         v
+World <---- InstanceRef ------------ asset instance
+  |
+  | applyUpdates(), then View::selectCut(Camera)
+  v
+CutView ---- current cut ----> renderer
+   |
+   +-------- ideal cut ------> application streamer
+```
+
+All public C++ names are in the `hlod` namespace. HLodTree requires C++20.
+Runtime code normally includes `hlod/world.h`; content-building tools also
+include `hlod/builder.h`.
+
+### Add HLodTree to a CMake target
+
+The repository exposes the `hlod` CMake target; it is not currently an
+installed package:
+
+```cmake
+add_subdirectory(path/to/HLod-tree)
+target_link_libraries(your_target PRIVATE hlod)
+```
+
+The target publishes the library's include directory and C++20 requirement.
+No third-party library is required at runtime.
+
+## Integration sequence
+
+A normal integration follows this order:
+
+1. Build page blobs offline with `HLodBuilder`, or validate serialized blobs
+   with `Page::fromBytes()` or `PageView::fromBytes()`.
+2. Construct one `World`, register reusable assets, and add their instances.
+3. Construct one persistent `View` per camera-like query.
+4. Each frame, submit world changes and call `applyUpdates()` once.
+5. Select all views from the published world snapshot.
+6. Render `shared + currentOnly`; use `shared + idealOnly` to drive external
+   payload and topology streaming.
+7. After all selections finish, apply completed loads, collect cold pages,
+   and begin the next update phase.
+
+### Find guidance by task
+
+| Task | Section |
+|---|---|
+| Add the library to a CMake target | [Add HLodTree to a CMake target](#add-hlodtree-to-a-cmake-target) |
+| Publish a frame safely or select several cameras | [Frame lifecycle and threading](#frame-lifecycle-and-threading) |
+| Build, serialize, borrow, or own hierarchy data | [Authoring pages](#authoring-pages) |
+| Share content and move instances | [Assets and instances](#assets-and-instances) |
+| Attach hierarchy data or report payload availability | [Topology and residency](#topology-and-residency) |
+| Render a cut and choose result storage | [Selection and result ownership](#selection-and-result-ownership) |
+| Feed page usage into garbage collection | [Per-view page usage and collection](#per-view-page-usage-and-collection) |
+| Update bounds for one deformed instance | [Per-instance deformation](#per-instance-deformation) |
+| Connect allocators, jobs, and fatal-error policy | [Host integration and diagnostics](#host-integration-and-diagnostics) |
+| Check every non-owning lifetime in one place | [API lifetime summary](#api-lifetime-summary) |
+
+## End-to-end example
+
+This example builds a small hierarchy, registers it once, creates two
 instances, selects a render cut, and inspects the ideal frontier for streaming.
-The application-specific renderer and content loader are represented by
-functions with descriptive names.
+The declarations at the top are application-owned renderer and loader entry
+points; HLodTree deliberately does not implement those systems.
 
 ```cpp
 #include "hlod/builder.h"
 #include "hlod/world.h"
 
-#include <array>
 #include <utility>
 
-using namespace hlod;
+// Functions supplied by the application.
+void submitToRenderer(hlod::UserPayload payload, hlod::InstanceId instance);
+bool contentHasChildPage(hlod::UserPayload payload);
+bool payloadIsLoaded(hlod::UserPayload payload);
+void requestChildPageLoad(hlod::NodeHandle node,
+                          hlod::UserPayload payload);
+void requestPayloadLoad(hlod::NodeHandle node,
+                        hlod::UserPayload payload);
+void releaseRenderPayload(hlod::UserPayload payload);
 
-Page buildTreePage()
+hlod::Page buildTreePage()
 {
-    HLodBuilder builder;
-    const auto tree = builder.createRoot(
+    hlod::HLodBuilder builder;
+    const hlod::HLodBuilder::NodeId tree = builder.createRoot(
         100, 16.0f,
-        AABB::fromCenterExtent(float4::point(0, 4, 0),
-                               float4::vec(4, 4, 4)));
+        hlod::AABB::fromCenterExtent(hlod::float4::point(0, 4, 0),
+                                     hlod::float4::vec(4, 4, 4)));
 
     builder.createNode(
         tree, 101, 2.0f,
-        AABB::fromCenterExtent(float4::point(-2, 2, 0),
-                               float4::vec(2, 2, 2)));
+        hlod::AABB::fromCenterExtent(hlod::float4::point(-2, 2, 0),
+                                     hlod::float4::vec(2, 2, 2)));
     builder.createNode(
         tree, 102, 2.0f,
-        AABB::fromCenterExtent(float4::point(2, 2, 0),
-                               float4::vec(2, 2, 2)));
+        hlod::AABB::fromCenterExtent(hlod::float4::point(2, 2, 0),
+                                     hlod::float4::vec(2, 2, 2)));
     return builder.build();
+}
+
+void renderEntry(const hlod::World& world, const hlod::CutEntry& entry)
+{
+    hlod::UserPayload payload;
+    if (world.tryGetPayload(entry.nodeHandle, payload))
+        submitToRenderer(payload, entry.instance());
+}
+
+void renderCurrentCut(const hlod::World& world, const hlod::CutView& cut)
+{
+    for (const hlod::CutEntry& entry : cut.shared)
+        renderEntry(world, entry);
+    for (const hlod::CutEntry& entry : cut.currentOnly)
+        renderEntry(world, entry);
+}
+
+void updateStreamingForEntry(hlod::World& world,
+                             const hlod::CutEntry& entry)
+{
+    hlod::UserPayload payload;
+    if (!world.tryGetPayload(entry.nodeHandle, payload))
+        return; // The page was detached while this request was pending.
+
+    if (entry.overThreshold() && contentHasChildPage(payload) &&
+        !world.isAttached(entry.nodeHandle))
+    {
+        requestChildPageLoad(entry.nodeHandle, payload);
+    }
+
+    if (!world.isResident(entry.nodeHandle))
+    {
+        if (payloadIsLoaded(payload))
+            world.markResident(entry.nodeHandle);
+        else
+            requestPayloadLoad(entry.nodeHandle, payload);
+    }
+}
+
+void updateStreamingForIdealCut(hlod::World& world,
+                                const hlod::CutView& cut)
+{
+    // Call only after every View selection reading this World has finished.
+    for (const hlod::CutEntry& entry : cut.shared)
+        updateStreamingForEntry(world, entry);
+    for (const hlod::CutEntry& entry : cut.idealOnly)
+        updateStreamingForEntry(world, entry);
+}
+
+// Call when an asynchronous topology load completes. An invalid return is the
+// expected result when the expansion point became stale while loading.
+void attachLoadedChildPage(hlod::World& world,
+                           hlod::NodeHandle expansionNode,
+                           hlod::Page childPage)
+{
+    const hlod::PageHandle childMount =
+        world.attachPage(expansionNode, std::move(childPage));
+    if (!childMount.valid())
+        return;
+}
+
+// Call when an asynchronous render-payload load completes. A stale handle is
+// ignored by markResident().
+void publishLoadedPayload(hlod::World& world, hlod::NodeHandle node)
+{
+    world.markResident(node);
 }
 
 int main()
 {
-    World world;
-    const AssetHandle treeAsset = world.registerAsset(buildTreePage());
+    hlod::World world;
+    const hlod::AssetHandle treeAsset =
+        world.registerAsset(buildTreePage());
 
-    const World::InstanceRef first =
-        world.addInstance(treeAsset, float4::point(0, 0, 0));
-    const World::InstanceRef second =
-        world.addInstance(treeAsset, float4::point(20, 0, 0));
+    const hlod::World::InstanceRef first =
+        world.addInstance(treeAsset, hlod::float4::point(0, 0, 0));
+    const hlod::World::InstanceRef second =
+        world.addInstance(treeAsset, hlod::float4::point(20, 0, 0));
 
-    View mainView(4.0f);              // four-frame LOD damping half-life
-    PageUsageContext mainUsage;       // this view influences page retention
+    hlod::View mainView(4.0f);        // four-frame LOD damping half-life
+    hlod::PageUsageContext mainUsage; // this view influences page retention
 
-    const Camera camera = makeLookAtCamera(
-        float4::point(10, 8, -30), float4::point(10, 3, 0));
+    const hlod::Camera camera = hlod::makeLookAtCamera(
+        hlod::float4::point(10, 8, -30),
+        hlod::float4::point(10, 3, 0));
 
     world.applyUpdates();             // publish the selection snapshot
-    const World& published = world;
-    const CutView cut = mainView.selectCut(
-        published, camera, CutParams{4.0f, 0.0f}, mainUsage);
+    const hlod::World& published = world;
+    const hlod::CutView cut = mainView.selectCut(
+        published, camera, hlod::CutParams{4.0f, 0.0f}, mainUsage);
 
-    const auto draw = [&](const CutEntry& entry)
-    {
-        UserPayload payload;
-        if (published.tryGetPayload(entry.nodeHandle, payload))
-            submitToRenderer(payload, entry.instance());
-    };
-
-    for (const CutEntry& entry : cut.shared) draw(entry);
-    for (const CutEntry& entry : cut.currentOnly) draw(entry);
+    renderCurrentCut(published, cut);
 
     // Every selection has finished. World mutation is serial again.
-    const auto considerForStreaming = [&](const CutEntry& entry)
-    {
-        UserPayload payload;
-        if (!world.tryGetPayload(entry.nodeHandle, payload)) return;
+    updateStreamingForIdealCut(world, cut);
 
-        if (entry.overThreshold() && contentHasChildPage(payload) &&
-            !world.isAttached(entry.nodeHandle))
-        {
-            Page child = loadChildPage(payload);
-            world.attachPage(entry.nodeHandle, std::move(child));
-        }
-        else if (!world.isResident(entry.nodeHandle) &&
-                 payloadIsLoaded(payload))
-        {
-            world.markResident(entry.nodeHandle);
-        }
-    };
-
-    for (const CutEntry& entry : cut.shared) considerForStreaming(entry);
-    for (const CutEntry& entry : cut.idealOnly) considerForStreaming(entry);
-
-    const CollectResult collected = world.collect(mainUsage, 4096, 120);
-    for (UserPayload payload : collected.freedPayloads)
+    const hlod::CollectResult collected = world.collect(mainUsage, 4096, 120);
+    for (hlod::UserPayload payload : collected.freedPayloads)
         releaseRenderPayload(payload);
 
     world.removeInstance(second);
@@ -106,9 +324,11 @@ int main()
 }
 ```
 
-In production, page and payload loads normally complete in later frames. The
-host deduplicates requests and applies IO budgets; HLodTree reports the ideal
-frontier but does not own an asynchronous loader.
+The application must deduplicate `requestChildPageLoad()` and
+`requestPayloadLoad()` calls and apply its own priorities and IO budgets. Page
+and payload completions normally arrive in later frames through functions such
+as `attachLoadedChildPage()` and `publishLoadedPayload()`. HLodTree makes stale
+completion handles safe, but it does not own the asynchronous loader.
 
 ## Frame lifecycle and threading
 
@@ -131,18 +351,38 @@ For parallelism within one uncached view, provide a blocking
 `view.setReuseEnabled(false)`. The callback may execute tasks in any order but
 must not return until all tasks have completed.
 
+### Correctness checklist
+
+- Register shared hierarchy data once and create multiple instances of its
+  `AssetHandle`; do not register a private copy for every placement.
+- Call `applyUpdates()` once before each group of selections, including frames
+  with no world mutations.
+- Give concurrent queries distinct `View`, output, and optional
+  `PageUsageContext` objects.
+- Wait for every selection to finish before mutating the world or collecting
+  pages.
+- Render `shared + currentOnly`. Use `shared + idealOnly` only to decide what
+  the external streamer should load or attach.
+- Do not retain a `CutView` across another selection on the same `View`.
+- Retain `InstanceRef`, rather than `CutEntry::instance()`, for future
+  instance mutation.
+- Deduplicate and budget external load requests. Treat stale completion
+  handles as an expected outcome of asynchronous streaming.
+- Keep borrowed page bytes and page allocator contexts alive for the full
+  lifetimes documented below.
+
 ## Authoring pages
 
-`HLodBuilder` builds one immutable page at a time:
+`hlod::HLodBuilder` builds one immutable page at a time:
 
 ```cpp
-HLodBuilder builder;
-const HLodBuilder::NodeId root =
+hlod::HLodBuilder builder;
+const hlod::HLodBuilder::NodeId root =
     builder.createRoot(rootPayload, rootError, rootBounds);
-const HLodBuilder::NodeId child =
+const hlod::HLodBuilder::NodeId child =
     builder.createNode(root, childPayload, childError, childBounds);
 builder.markExpansion(child);  // child remains renderable and has no local children
-Page page = builder.build(context);
+hlod::Page page = builder.build(context);
 ```
 
 `createRoot()` adds a root to the page forest. `createNode()` adds a child to
@@ -187,8 +427,9 @@ must outlive the page, including after the page moves into a `World`.
 Register reusable page data once:
 
 ```cpp
-AssetHandle owned = world.registerAsset(std::move(page));
-AssetHandle mapped = world.registerAsset(PageView::fromBytes(data, size));
+const hlod::AssetHandle owned = world.registerAsset(std::move(page));
+const hlod::AssetHandle mapped =
+    world.registerAsset(hlod::PageView::fromBytes(data, size));
 ```
 
 The owned overload transfers the page. The borrowed overload does not copy.
@@ -199,11 +440,11 @@ Create instances with translation, positive uniform scale, and an optional
 layer mask:
 
 ```cpp
-InstanceDesc desc;
-desc.pos = float4::point(10, 0, 5);
+hlod::InstanceDesc desc;
+desc.pos = hlod::float4::point(10, 0, 5);
 desc.scale = 2.0f;
 desc.mask = 1u << 3;
-World::InstanceRef ref = world.addInstance(asset, desc);
+const hlod::World::InstanceRef ref = world.addInstance(asset, desc);
 ```
 
 An instance is visible only when `desc.mask & camera.viewMask` is nonzero.
@@ -224,12 +465,12 @@ without another lookup.
 For a fixed cohort that moves every frame, retain a `MotionGroup`:
 
 ```cpp
-std::array<World::InstanceRef, 2> refs{first, second};
-World::MotionGroup group(refs);
+std::array<hlod::World::InstanceRef, 2> refs{first, second};
+hlod::World::MotionGroup group(refs);
 
-std::array<float4, 2> positions{
-    float4::point(1, 0, 0),
-    float4::point(21, 0, 0),
+std::array<hlod::float4, 2> positions{
+    hlod::float4::point(1, 0, 0),
+    hlod::float4::point(21, 0, 0),
 };
 world.moveInstances(group, positions);
 ```
@@ -276,9 +517,10 @@ selection phase. Retain `InstanceRef`, not the bare id, for later mutation.
 Attach deeper topology under a live expansion node:
 
 ```cpp
-PageHandle childMount = world.attachPage(expansionNode, childAsset);
+const hlod::PageHandle childMount =
+    world.attachPage(expansionNode, childAsset);
 // Or transfer a one-off page:
-PageHandle anonymousChild =
+const hlod::PageHandle anonymousChild =
     world.attachPage(expansionNode, std::move(childPage));
 ```
 
@@ -306,7 +548,8 @@ this culling.
 The simplest query returns `CutView`:
 
 ```cpp
-CutView cut = view.selectCut(publishedWorld, camera, params);
+const hlod::CutView cut =
+    view.selectCut(publishedWorld, camera, params);
 ```
 
 Its three spans are disjoint:
@@ -323,21 +566,21 @@ selection, `reset()`, or destruction. Use the explicit owning snapshot when a
 cut must survive another query on the same view:
 
 ```cpp
-CutResults retained;
+hlod::CutResults retained;
 view.selectCut(publishedWorld, camera, params, retained);
 ```
 
 For caller-owned fixed storage, use `CutResultSink`:
 
 ```cpp
-std::array<CutEntry, 4096> sharedStorage;
-std::array<CutEntry, 4096> currentStorage;
-std::array<CutEntry, 4096> idealStorage;
+std::array<hlod::CutEntry, 4096> sharedStorage;
+std::array<hlod::CutEntry, 4096> currentStorage;
+std::array<hlod::CutEntry, 4096> idealStorage;
 
-CutResultSink sink{
-    Sink<CutEntry>{sharedStorage},
-    Sink<CutEntry>{currentStorage},
-    Sink<CutEntry>{idealStorage},
+hlod::CutResultSink sink{
+    hlod::Sink<hlod::CutEntry>{sharedStorage},
+    hlod::Sink<hlod::CutEntry>{currentStorage},
+    hlod::Sink<hlod::CutEntry>{idealStorage},
 };
 view.selectCut(publishedWorld, camera, params, sink);
 
@@ -387,8 +630,9 @@ without mutating the world. A context may accumulate observations over many
 published epochs. Supply only retention-relevant contexts to collection:
 
 ```cpp
-PageUsageContext* retainedViews[] = {&mainUsage, &reflectionUsage};
-CollectResult result = world.collect(retainedViews, pageBudget, minAge);
+hlod::PageUsageContext* retainedViews[] = {&mainUsage, &reflectionUsage};
+const hlod::CollectResult result =
+    world.collect(retainedViews, pageBudget, minAge);
 ```
 
 `maxAttachedPages` counts streamed pages; pinned instance-root mounts neither
@@ -430,22 +674,22 @@ single-view parallelism, and the copied `HlodContext`. The default context uses
 the library page allocator and serial task execution.
 
 ```cpp
-HlodContext context;
+hlod::HlodContext context;
 context.alloc = engineAlignedAlloc;
 context.free = engineFree;
 context.parallelFor = engineBlockingParallelFor;
 context.workerCount = engineWorkerCount;
 context.user = engineServices;
 
-WorldConfig config;
+hlod::WorldConfig config;
 config.context = context;
-config.tlasQuality = TlasQuality::BinnedSAH;
+config.tlasQuality = hlod::TlasQuality::BinnedSAH;
 config.parallelInstanceThreshold = 4096;
-World world(config);
+hlod::World world(config);
 
-HLodBuilder builder;
+hlod::HLodBuilder builder;
 // ...author nodes...
-Page page = builder.build(context);
+hlod::Page page = builder.build(context);
 ```
 
 `HLodBuilder::build()`, `Page::fromBytes()`, and `Page::clone()` use the

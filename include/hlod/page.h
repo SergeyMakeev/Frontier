@@ -1,7 +1,7 @@
 #pragma once
 // Immutable flat page: preorder SoA arrays + BVH8-style wide child blocks,
 // laid out as ONE contiguous blob. Produced by HLodBuilder::build();
-// see hlod_design.md §3.
+// see docs/hlod_design.md §3.
 //
 // The in-memory layout IS the on-disk format. A streamed page can be read into
 // one aligned buffer and validated in place, with no unpacking, fixups, or

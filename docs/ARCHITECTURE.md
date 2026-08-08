@@ -1,6 +1,7 @@
 # HLodTree architecture
 
-This document describes the current implementation. For public API usage and
+This document describes the current implementation. See the
+[README](../README.md) for an overview. For public API usage and
 lifetime rules, see [API.md](API.md). For behavioral invariants and complexity,
 see [hlod_design.md](hlod_design.md). Historical measurements and superseded
 designs are kept separately in [HISTORY.md](HISTORY.md).

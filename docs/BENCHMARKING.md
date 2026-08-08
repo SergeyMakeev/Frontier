@@ -2,7 +2,7 @@
 
 This guide describes the current performance executables, repeatable
 cross-machine collection, and macOS CPU-counter capture. For headline results,
-see [README.md](README.md); for implementation analysis, see
+see [README.md](../README.md); for implementation analysis, see
 [ARCHITECTURE.md](ARCHITECTURE.md).
 
 Always benchmark a Release build on an otherwise idle machine in its normal

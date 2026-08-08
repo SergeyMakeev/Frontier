@@ -1,7 +1,7 @@
 # HLodTree design and runtime contract
 
 This is the current design implemented by `include/hlod` and `src`. Start with
-the [README](README.md) for the general overview, a compilable minimal example,
+the [README](../README.md) for the general overview, a compilable minimal example,
 and representative performance numbers. See [API.md](API.md) for detailed
 integration guidance and [ARCHITECTURE.md](ARCHITECTURE.md) for the current
 implementation structure.

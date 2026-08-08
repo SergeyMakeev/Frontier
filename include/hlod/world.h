@@ -1,5 +1,5 @@
 #pragma once
-// Runtime side of HLodTree (see hlod_design.md):
+// Runtime side of HLodTree (see docs/hlod_design.md):
 //  - BLASes: independently rooted renderable hierarchies in immutable pages;
 //    a BLAS may represent anything from one flat object to a city block
 //  - instances of those BLAS roots over a non-renderable dynamic TLAS

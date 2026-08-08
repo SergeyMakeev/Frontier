@@ -14,7 +14,7 @@ buildings, and stream deeper topology only where the camera needs it. The
 library owns no meshes, materials, jobs, or renderer state, so it can sit in
 front of an existing asset and rendering system.
 
-See [API.md](API.md) for the complete integration guide and lifetime rules.
+See [API.md](docs/API.md) for the complete integration guide and lifetime rules.
 
 ### BLAS and TLAS terminology
 
@@ -115,7 +115,7 @@ These are deterministic 600-frame Release benchmarks using scheduler-default
 placement: AVX2 on x86-64 and NEON on arm64. They exclude rendering, streaming
 IO, and other engine work, so treat them as scale indicators rather than frame
 time guarantees. The captures use revision `bf60f39`. See
-[ARCHITECTURE.md](ARCHITECTURE.md) for design analysis, or use
+[ARCHITECTURE.md](docs/ARCHITECTURE.md) for design analysis, or use
 `run_all_perf.sh` / `run_all_perf.bat` to collect a complete report on another
 machine.
 
@@ -207,7 +207,7 @@ mutations using it become safe no-ops.
   the same threading contract as cached selection.
 
 The current contracts, algorithms, lifecycle rules, and complexity bounds are
-in [hlod_design.md](hlod_design.md).
+in [hlod_design.md](docs/hlod_design.md).
 
 ## Integrating
 
@@ -246,7 +246,7 @@ ctest --test-dir build -C Release --output-on-failure
 Run `run_perf_bench.sh` or `run_perf_bench.bat` for a focused Release
 benchmark. Run `run_all_perf.sh <machine-label>` on macOS/Linux or
 `run_all_perf.bat <machine-label>` on Windows to produce a complete,
-self-contained cross-machine report. See [BENCHMARKING.md](BENCHMARKING.md) for
+self-contained cross-machine report. See [BENCHMARKING.md](docs/BENCHMARKING.md) for
 the datasets, platform behavior, environment overrides, and macOS CPU-counter
 capture.
 
@@ -268,11 +268,11 @@ fallback listed above.
 
 ## Documentation map
 
-- [API.md](API.md): public API, examples, ownership, and lifetime rules.
-- [ARCHITECTURE.md](ARCHITECTURE.md): current implementation architecture.
-- [hlod_design.md](hlod_design.md): behavioral invariants and complexity.
-- [BENCHMARKING.md](BENCHMARKING.md): reproducible performance collection and profiling.
-- [HISTORY.md](HISTORY.md): implementation history and experimental evidence.
+- [API.md](docs/API.md): public API, examples, ownership, and lifetime rules.
+- [ARCHITECTURE.md](docs/ARCHITECTURE.md): current implementation architecture.
+- [hlod_design.md](docs/hlod_design.md): behavioral invariants and complexity.
+- [BENCHMARKING.md](docs/BENCHMARKING.md): reproducible performance collection and profiling.
+- [HISTORY.md](docs/HISTORY.md): implementation history and experimental evidence.
 - [docs/archive](docs/archive): archived engineering records.
 
 Dependencies: GoogleTest v1.17.0 plus upstream commit `fa8438ae` for the Clang
