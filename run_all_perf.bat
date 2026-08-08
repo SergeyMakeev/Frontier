@@ -213,7 +213,7 @@ type "%REPORT_DIR%\arch_kernel_perf.log"
 if not "!RUN_RC!"=="0" goto package
 
 set "FAILURE_STAGE=validate-results"
-powershell -NoProfile -Command "$names='real_world_perf.json','machine_perf.json','arch_kernel_perf.json'; foreach($name in $names) { $path=Join-Path '%REPORT_DIR%' $name; if(!(Test-Path -LiteralPath $path)) { Write-Error ($name + ' is missing'); exit 1 }; try { $json=Get-Content -Raw -LiteralPath $path | ConvertFrom-Json } catch { Write-Error ($name + ' is invalid JSON'); exit 1 }; if(@($json.benchmarks).Count -eq 0) { Write-Error ($name + ' contains no benchmark records'); exit 1 } }"
+powershell -NoProfile -Command "$names='real_world_perf.json','machine_perf.json','arch_kernel_perf.json'; foreach($name in $names) { $path=Join-Path '%REPORT_DIR%' $name; if(-not (Test-Path -LiteralPath $path)) { Write-Error ($name + ' is missing'); exit 1 }; $json=$null; try { $json=Get-Content -Raw -LiteralPath $path | ConvertFrom-Json -ErrorAction Stop } catch { Write-Error ($name + ' is invalid JSON'); exit 1 }; if(@($json.benchmarks).Count -eq 0) { Write-Error ($name + ' contains no benchmark records'); exit 1 } }"
 if errorlevel 1 goto package
 
 set "RUN_STATUS=COMPLETE"

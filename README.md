@@ -110,26 +110,48 @@ The representative workload resembles a forest, city, or prop field:
   calls with six persistent worker threads. Measurements exclude rendering,
   asset IO, residency changes, and instance spawning or removal.
 
-All values are the best observed result from five 600-frame runs. Taking the
-best result estimates the algorithm's uncontended cost; real frame time can be
-higher under host load. Both builds use MSVC Release `/O2 /arch:AVX2`.
+All steady-frame values below are median wall times from five 600-frame runs.
+The three reports use the same source revision, deterministic workload seeds,
+Release builds, benchmark order, and scheduler-default affinity. The Windows
+builds use MSVC `/O2 /arch:AVX2`; the M2 Max build uses Apple Clang's AArch64
+NEON backend. Real frame time can be higher under host load.
 
 | Label | Hardware | Compiler | Captured |
 |---|---|---|---|
-| EPYC | Shared 64-hardware-thread, 2.4 GHz EPYC host | MSVC 19.51 | 2026-08-05 |
-| i9-12900K | Core i9-12900K, 128 GB, Windows | MSVC 19.44 | 2026-08-06 |
+| EPYC | EPYC 9654, 96C/192T, 768 GiB DDR5-4800, Windows | MSVC 19.51 | 2026-08-07 |
+| i9-12900K | Core i9-12900K, 16C/24T, 128 GiB DDR4-2667, Windows | MSVC 19.44 | 2026-08-07 |
+| M2 Max | M2 Max, 8 performance + 4 efficiency cores, 64 GiB unified memory, macOS | Apple Clang 21 | 2026-08-07 |
 
-The i9-12900K run showed substantial scheduler and CPU-state variance; the
-same best-of-five rule is used for both machines.
+Across all 36 real-world cases, the geometric mean of median wall time makes
+EPYC **1.44× faster** and M2 Max **2.32× faster** than the i9-12900K. M2 Max is
+**1.61× faster** than EPYC. This is not an ALU ranking: the i9 still leads
+representative scalar and 128-bit multiply/add throughput probes. The large
+single-thread memory probes line up much better with the end-to-end result.
+The rates below are derived from median wall time, so scheduler stalls remain
+part of the normal-affinity measurement on all three platforms:
+
+| 64 MiB machine probe | EPYC | i9-12900K | M2 Max |
+|---|---:|---:|---:|
+| Sequential read | 46.1 GiB/s | 16.9 GiB/s | 58.9 GiB/s |
+| `memcpy` | 25.4 GiB/s | 8.6 GiB/s | 53.6 GiB/s |
+
+The current workloads therefore remain substantially data-movement bound.
+Their dense traversal order lets the hardware prefetchers work, and the M2's
+strong single-thread memory subsystem is now an advantage rather than the
+performance outlier seen before the layout and output-buffer changes. The i9
+also ran its nominal DDR4-3600 DIMMs at 2667 MT/s and showed the most scheduler
+variance: five of 36 cases had coefficient of variation above 5%, including
+three above 10%. Treat its concurrent-view number as a normal-scheduler sample,
+not a pinned P-core limit.
 
 ### Startup
 
-| Operation | EPYC | i9-12900K | Included work |
-|---|---:|---:|---|
-| Create the 80,000-instance world | 10.2 ms | 8.1 ms | Build and register the shared asset, add instances, and mark payloads resident |
-| First 80,000-instance selection cycle | 53.1 ms | 52.8 ms | Build the initial quality TLAS, publish, select the first cut, and populate the `View` |
-| Create the 10,000-instance / 700-asset world | 13.1 ms | 15.2 ms | Build and register 700 assets, add instances, and mark payloads resident |
-| First 10,000-instance selection cycle | 5.4 ms | 9.7 ms | Build the initial quality TLAS, publish, select the first cut, and populate the `View` |
+| Operation | EPYC | i9-12900K | M2 Max | Included work |
+|---|---:|---:|---:|---|
+| Create the 80,000-instance world | 6.9 ms | 7.1 ms | 1.7 ms | Build and register the shared asset, add instances, and mark payloads resident |
+| First 80,000-instance selection cycle | 56.1 ms | 96.4 ms | 30.9 ms | Build the initial quality TLAS, publish, select the first cut, and populate the `View` |
+| Create the 10,000-instance / 700-asset world | 13.0 ms | 18.9 ms | 4.7 ms | Build and register 700 assets, add instances, and mark payloads resident |
+| First 10,000-instance selection cycle | 5.9 ms | 10.6 ms | 3.5 ms | Build the initial quality TLAS, publish, select the first cut, and populate the `View` |
 
 World creation does not force the initial quality TLAS build; the first
 `applyUpdates` performs it before publishing the read-only snapshot. Treat the
@@ -152,21 +174,25 @@ selection only when this physical reorder actually occurs.
 
 | Machine / HLodTree work per frame | Camera and 4,000 objects moving | Static camera, 4,000 objects moving | Moving camera, static objects |
 |---|---:|---:|---:|
-| EPYC — submit transforms | 0.144 ms | 0.139 ms | 0 calls |
+| EPYC — submit transforms | 0.183 ms | 0.180 ms | 0 calls |
 | EPYC — publish updates and maintain TLAS | <0.001 ms | <0.001 ms | <0.001 ms |
-| EPYC — `selectCut` | 0.400 ms | 0.296 ms | 0.330 ms |
-| **EPYC — total HLodTree work** | **0.544 ms** | **0.435 ms** | **0.330 ms** |
-| i9-12900K — submit transforms | 0.667 ms | 0.501 ms | 0 calls |
+| EPYC — `selectCut` | 0.402 ms | 0.310 ms | 0.339 ms |
+| **EPYC — total HLodTree work** | **0.585 ms** | **0.491 ms** | **0.339 ms** |
+| i9-12900K — submit transforms | 0.567 ms | 0.579 ms | 0 calls |
 | i9-12900K — publish updates and maintain TLAS | <0.001 ms | <0.001 ms | <0.001 ms |
-| i9-12900K — `selectCut` | 0.659 ms | 0.442 ms | 0.269 ms |
-| **i9-12900K — total HLodTree work** | **1.326 ms** | **0.943 ms** | **0.269 ms** |
+| i9-12900K — `selectCut` | 0.623 ms | 0.507 ms | 0.480 ms |
+| **i9-12900K — total HLodTree work** | **1.192 ms** | **1.083 ms** | **0.480 ms** |
+| M2 Max — submit transforms | 0.060 ms | 0.060 ms | 0 calls |
+| M2 Max — publish updates and maintain TLAS | <0.001 ms | <0.001 ms | <0.001 ms |
+| M2 Max — `selectCut` | 0.291 ms | 0.241 ms | 0.254 ms |
+| **M2 Max — total HLodTree work** | **0.351 ms** | **0.301 ms** | **0.254 ms** |
 
-The moving-camera cases average about 21,919 visible instances and a
-24,986-entry render cut. With objects moving, the `View` reuses 92.6% of
-visible instance cuts; with static objects it reuses 97.6%. The fixed-camera
-case averages 19,602 visible instances, a 22,872-entry cut, and 94.1% reuse.
-The `View` occupies 5.98 MiB after the fly-through and 3.22 MiB for the fixed
-view.
+The moving-camera cases average roughly 21,750-21,860 visible instances and a
+24,780-25,020-entry render cut. With objects moving, the `View` reuses about
+92.5%; with static objects it reuses 97.6%. The fixed-camera case averages
+roughly 19,340-19,600 visible instances, a 22,060-22,680-entry cut, and 94%
+reuse. The ranges reflect small architecture-specific floating-point changes at
+LOD decision boundaries; the seeded worlds and camera paths are identical.
 
 Bounded motion of the same 5% cohort stays on the grow-only refit path in these
 runs. The escape budget counts distinct leaves since the last TLAS build, so the
@@ -183,20 +209,23 @@ moving-object cases update exactly 1,000 instances per frame.
 
 | Machine / HLodTree work per frame | Camera and 1,000 objects moving | Static camera, 1,000 objects moving | Moving camera, static objects |
 |---|---:|---:|---:|
-| EPYC — submit transforms | 34 µs | 34 µs | 0 calls |
+| EPYC — submit transforms | 43 µs | 43 µs | 0 calls |
 | EPYC — publish updates and maintain TLAS | <0.1 µs | <0.1 µs | <0.1 µs |
-| EPYC — `selectCut` | 89 µs | 74 µs | 63 µs |
-| **EPYC — total HLodTree work** | **123 µs** | **108 µs** | **63 µs** |
-| i9-12900K — submit transforms | 76 µs | 82 µs | 0 calls |
+| EPYC — `selectCut` | 88 µs | 61 µs | 65 µs |
+| **EPYC — total HLodTree work** | **131 µs** | **104 µs** | **65 µs** |
+| i9-12900K — submit transforms | 80 µs | 64 µs | 0 calls |
 | i9-12900K — publish updates and maintain TLAS | <0.1 µs | <0.1 µs | <0.1 µs |
-| i9-12900K — `selectCut` | 139 µs | 128 µs | 91 µs |
-| **i9-12900K — total HLodTree work** | **216 µs** | **210 µs** | **91 µs** |
+| i9-12900K — `selectCut` | 136 µs | 87 µs | 86 µs |
+| **i9-12900K — total HLodTree work** | **208 µs** | **152 µs** | **86 µs** |
+| M2 Max — submit transforms | 18 µs | 17 µs | 0 calls |
+| M2 Max — publish updates and maintain TLAS | <0.1 µs | <0.1 µs | <0.1 µs |
+| M2 Max — `selectCut` | 55 µs | 36 µs | 39 µs |
+| **M2 Max — total HLodTree work** | **73 µs** | **53 µs** | **39 µs** |
 
-The moving-camera cases average about 2,782 visible instances (27.8% of the
-world) and a 5,920-entry cut. Reuse is 82.4% with 1,000 movers and 93.3% with
-static objects; the `View` occupies 1.87 MiB. The fixed-camera case averages
-2,501 visible instances (25.0%), a 5,792-entry cut, 85.8% reuse, and a 0.45 MiB
-of view state.
+The moving-camera cases average roughly 2,740-2,810 visible instances and a
+5,700-6,070-entry cut. Reuse is about 83-84% with 1,000 movers and 93% with
+static objects. As above, close LOD decisions can differ slightly between the
+x86 and Arm floating-point kernels.
 
 ### Multiple views
 
@@ -206,16 +235,20 @@ six selections is:
 
 | Machine | Object motion | Serial | Concurrent | Speedup |
 |---|---|---:|---:|---:|
-| EPYC | Static objects | 2.500 ms | 0.445 ms | 5.6× |
-| EPYC | 4,000 moving objects | 2.990 ms | 0.538 ms | 5.6× |
-| i9-12900K | Static objects | 2.366 ms | 1.654 ms | 1.43× |
-| i9-12900K | 4,000 moving objects | 4.161 ms | 1.765 ms | 2.36× |
+| EPYC | Static objects | 2.041 ms | 0.388 ms | 5.26× |
+| EPYC | 4,000 moving objects | 2.413 ms | 0.629 ms | 3.83× |
+| i9-12900K | Static objects | 2.961 ms | 1.727 ms | 1.71× |
+| i9-12900K | 4,000 moving objects | 3.777 ms | 2.100 ms | 1.80× |
+| M2 Max | Static objects | 1.506 ms | 0.442 ms | 3.41× |
+| M2 Max | 4,000 moving objects | 1.741 ms | 0.637 ms | 2.73× |
 
 Object transforms are applied once before these selections and are not included
 in the table. The concurrent arms use six persistent worker threads; thread
-creation is excluded. Six `View` objects occupy about 36 MiB. Scaling is below 6×
-because the views share memory bandwidth and cache capacity, but the read-only
-selection phase removes serialization between them.
+creation is excluded. Scaling is below 6× because the views share memory
+bandwidth and cache capacity, but the read-only selection phase removes
+serialization between them. The i9 static concurrent arm had 21.7% coefficient
+of variation, so its 1.727 ms median is notably less stable than the other table
+entries.
 
 The main distinction is visible immediately: creating the quality TLAS is a
 one-time cost, transform updates are relatively small, and object motion makes
