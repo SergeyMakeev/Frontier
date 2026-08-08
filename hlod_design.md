@@ -110,14 +110,14 @@ desc.pos = float4::point(100, 0, 20);
 desc.scale = 1.0f;
 World::InstanceRef instance = world.addInstance(tree, desc);
 
-CutResults cut;
 Camera camera = makeLookAtCamera(eye, target);
-View view;                         // persistent state for this camera
+View view;                         // owns cache, scratch, and cut storage
 PageUsageContext primaryUsage;    // only retention-relevant views need one
 
 world.applyUpdates();              // apply changes and publish the read-only world
 const World& published = world;
-view.selectCut(published, camera, CutParams{4.0f, 0.0f}, primaryUsage, cut);
+const CutView cut = view.selectCut(
+    published, camera, CutParams{4.0f, 0.0f}, primaryUsage);
 
 const auto render = [&](const CutEntry& entry)
 {
@@ -144,7 +144,9 @@ const auto streamIdeal = [&](const CutEntry& entry)
 for (const CutEntry& entry : cut.shared) streamIdeal(entry);
 for (const CutEntry& entry : cut.idealOnly) streamIdeal(entry);
 
-world.collect(primaryUsage, pageBudget, minPageAge);
+const CollectResult collected =
+    world.collect(primaryUsage, pageBudget, minPageAge);
+for (UserPayload payload : collected.freedPayloads) releasePayload(payload);
 ```
 
 In a real asynchronous streamer, completions normally arrive in later frames.
@@ -314,7 +316,7 @@ in [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## 6. Selection outputs and traversal
 
-`selectCut` fills a `CutResults` with three vectors:
+`selectCut` returns a `CutView` with three spans:
 
 - `shared` belongs to both the current and ideal cuts;
 - `currentOnly` is a resident fallback needed only by the current cut; and
@@ -336,12 +338,14 @@ Magnitude is logarithmically quantized at roughly eight steps per octave and
 are not repeated in the output; use `tryGetPayload(nodeHandle, payload)` or the
 caller's external graph when needed.
 
-There is no request output. The caller inspects ideal-side entries, tests
+The spans point into retained storage owned by the `View` and remain valid
+until its next selection or reset. `CutResults` is an explicit owning snapshot
+for the less common case that a cut must survive another query. There is no
+request output. The caller inspects ideal-side entries, tests
 residency, deduplicates whatever it considers the same content, and applies its
-own IO priorities and budgets. Each member of `CutResultSink` can target a
-growable `std::vector` or fixed caller memory; a fixed sink reports dropped
-entries, so the caller can grow its capacity without an allocation inside the
-traversal. Vector-backed sinks may grow like any vector.
+own IO priorities and budgets. Each member of `CutResultSink` targets fixed
+caller memory and reports dropped entries, so the caller can grow its capacity
+without an allocation inside the traversal.
 
 `applyUpdates` first flushes queued bounds and performs any requested TLAS
 build or repair. Selection then proceeds against that stable snapshot:
@@ -533,7 +537,7 @@ never mutates it. `applyUpdates` advances the age epoch. A
 `PageUsageContext` records the latest epoch in which its view needed each page
 and accumulates that feedback until collection.
 
-`collect(usageContexts, maxAttachedPages, minAge, freedPayloads)` first consumes
+`collect(usageContexts, maxAttachedPages, minAge)` first consumes
 only the supplied views' accumulated feedback, then detaches cold leaf mounts
 until `streamedPageCount()` is no larger than the requested budget. The
 single-`PageUsageContext` and no-feedback overloads are conveniences. Pinned root mounts
@@ -543,7 +547,8 @@ do not count because they cannot be collected. A candidate must:
 - have no attached child pages; and
 - have been untouched for at least `minAge` frames.
 
-The optional output receives resident payload values that became unreachable.
+`CollectResult::freedPayloads` is a span over World-owned resident payload
+values that became unreachable. It remains valid until the next collection.
 Collection works from the cold tail and is proportional to feedback consumed,
 candidates examined, and pages detached; it does not scan the entire world.
 

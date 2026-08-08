@@ -72,11 +72,11 @@ int main()
     const Camera camera = makeLookAtCamera(
         float4::point(0, 2, -8), float4::point(0, 0, 0));
 
-    View view;                            // persistent state for this camera
-    CutResults cut;
+    View view;                            // owns cache, scratch, and cut storage
     world.applyUpdates();                 // publish a stable read-only snapshot
     const World& published = world;
-    view.selectCut(published, camera, CutParams{4.0f, 0.0f}, cut);
+    const CutView cut =
+        view.selectCut(published, camera, CutParams{4.0f, 0.0f});
 
     const auto draw = [&](const CutEntry& entry)
     {
@@ -99,7 +99,7 @@ The representative workload resembles a forest, city, or prop field:
 
 - 80,000 instances share one fully resident 85-node asset and are spread over
   a roughly 6.8 km square.
-- A per-view `View` is always used. Selection returns `CutResults` with a
+- A per-view `View` is always used. Selection returns a `CutView` with a
   4-pixel error threshold and `minPix=0`; because this workload is fully
   resident, every entry is in `shared`.
 - Moving-camera cases use the same continuous 600-frame fly-through at 1080p
@@ -225,7 +225,7 @@ than platform promises; selection remains output-sensitive. See
 
 ## What selection returns
 
-One traversal fills three disjoint, contiguous `CutResults` buffers:
+One traversal returns a `CutView` over three disjoint, contiguous buffers:
 
 - `shared`: selected in both the current render cut and fully-resident ideal
   cut;
@@ -233,11 +233,11 @@ One traversal fills three disjoint, contiguous `CutResults` buffers:
   ideal entries are not resident; and
 - `idealOnly`: selected only by the fully-resident ideal cut.
 
-Each field is an `AppendBuffer<CutEntry>`: contiguous, iterable storage with
-`data()`, `size()`, `capacity()`, `clear()`, and retained capacity between
-queries. It deliberately has no middle insertion or erasure. Construct a
-`std::vector` from its iterators only when an owning STL copy is actually
-needed.
+Each field is a `std::span<const CutEntry>`. The owning storage lives in the
+`View`, retains capacity between queries, and is valid until the next selection
+or reset on that View. Use the explicit `CutResults` snapshot overload only
+when a cut must outlive the next query. Engines that already own output memory
+can instead use `CutResultSink` to write directly into fixed spans.
 
 Render `shared + currentOnly`; inspect the fully-resident frontier as
 `shared + idealOnly`. A high-error leaf on the ideal side is the point where

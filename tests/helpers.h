@@ -16,7 +16,31 @@ namespace hlod {
 
 struct RefResult
 {
-    CutResults cut;
+    detail::CutBuffers buffers;
+    CutView cut;
+
+    RefResult() { sync(); }
+    RefResult(const RefResult& other) : buffers(other.buffers) { sync(); }
+    RefResult(RefResult&& other) noexcept : buffers(std::move(other.buffers))
+    {
+        sync();
+        other.sync();
+    }
+    RefResult& operator=(const RefResult& other)
+    {
+        buffers = other.buffers;
+        sync();
+        return *this;
+    }
+    RefResult& operator=(RefResult&& other) noexcept
+    {
+        buffers = std::move(other.buffers);
+        sync();
+        other.sync();
+        return *this;
+    }
+
+    void sync() { cut = buffers.view(); }
 };
 
 // Exercise the uncached public path without carrying a View between calls.
@@ -344,6 +368,7 @@ struct World::TestAccess
             const Camera local = toLocal(view, inst.pos, inst.scale);
             refChildren(w, inst, id, inst.rootSlot, 0, true, true, local, p, out);
         }
+        out.sync();
         return out;
     }
 
@@ -390,14 +415,14 @@ private:
         {
             if (rt.isResident(i))
             {
-                out.cut.currentOnly.emplace_back(here, err, p.threshold, instance);
+                out.buffers.currentOnly.emplace_back(here, err, p.threshold, instance);
                 return;
             }
         }
         else if (!wants)
         {
             const bool shared = current && rt.isResident(i);
-            (shared ? out.cut.shared : out.cut.idealOnly)
+            (shared ? out.buffers.shared : out.buffers.idealOnly)
                 .emplace_back(here, err, p.threshold, instance);
             if (!current || shared) return;
         }
@@ -407,7 +432,7 @@ private:
         if (ideal && wants && exp && childSlot == kInvalidIndex)
         {
             const CutEntry entry{here, err, p.threshold, instance};
-            (current ? out.cut.shared : out.cut.idealOnly).push_back(entry);
+            (current ? out.buffers.shared : out.buffers.idealOnly).push_back(entry);
             return;
         }
 
@@ -419,7 +444,7 @@ private:
                 !current || w.visibleDescendantsCovered(slot, i, mask, inst, local);
             if (current && !canDescend)
             {
-                out.cut.currentOnly.emplace_back(here, err, p.threshold, instance);
+                out.buffers.currentOnly.emplace_back(here, err, p.threshold, instance);
             }
             nextCurrent = current && canDescend;
             nextIdeal = true;
@@ -445,26 +470,26 @@ using TAX = World::TestAccess;
 // payload. The alias keeps test code reading naturally.
 using UserId = UserPayload;
 
-inline std::vector<CutEntry> currentCut(const CutResults& cut)
+inline std::vector<CutEntry> currentCut(const CutView& cut)
 {
     std::vector<CutEntry> out(cut.shared.begin(), cut.shared.end());
     out.insert(out.end(), cut.currentOnly.begin(), cut.currentOnly.end());
     return out;
 }
 
-inline std::vector<CutEntry> idealCut(const CutResults& cut)
+inline std::vector<CutEntry> idealCut(const CutView& cut)
 {
     std::vector<CutEntry> out(cut.shared.begin(), cut.shared.end());
     out.insert(out.end(), cut.idealOnly.begin(), cut.idealOnly.end());
     return out;
 }
 
-inline size_t currentCutSize(const CutResults& cut)
+inline size_t currentCutSize(const CutView& cut)
 {
     return cut.currentSize();
 }
 
-inline size_t idealCutSize(const CutResults& cut)
+inline size_t idealCutSize(const CutView& cut)
 {
     return cut.idealSize();
 }

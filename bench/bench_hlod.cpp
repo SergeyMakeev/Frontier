@@ -52,7 +52,7 @@ struct Outputs
     CutResults cut;
 };
 
-void consumeCut(const CutResults& cut)
+void consumeCut(const CutView& cut)
 {
     benchmark::DoNotOptimize(cut.shared.data());
     benchmark::DoNotOptimize(cut.currentOnly.data());
@@ -89,7 +89,7 @@ struct XorShift32
 // attach set depend on walk order and over-refines wherever the walk went
 // deep first (measurably worse: the hot set churns instead of converging).
 size_t attachTopByPriority(World& w, TreeGen& gen,
-                           const CutResults& cut, size_t budget)
+                           const CutView& cut, size_t budget)
 {
     static std::vector<const CutEntry*> candidates;
     candidates.clear();
@@ -126,7 +126,7 @@ size_t attachTopByPriority(World& w, TreeGen& gen,
 // Example streaming policy: make every ideal-cut payload resident.
 // A production streamer would normally deduplicate shared payload ids, apply
 // priorities/budgets, and complete these calls asynchronously.
-size_t makeIdealResident(World& w, const CutResults& cut)
+size_t makeIdealResident(World& w, const CutView& cut)
 {
     const auto mark = [&](const auto& entries)
     {
@@ -188,7 +188,7 @@ static void BM_DeepTree_StaticCamera(benchmark::State& state)
 }
 BENCHMARK(BM_DeepTree_StaticCamera)->Arg(4)->Arg(5)->Arg(6)->Unit(benchmark::kMicrosecond);
 
-// Same scene through the direct vector overload. The fully resident result is
+// Same scene through an explicit owning snapshot. The fully resident result is
 // entirely Shared.
 static void BM_DeepTree_CutOnly(benchmark::State& state)
 {
@@ -357,7 +357,7 @@ static void BM_GcStress_FastFlythrough(benchmark::State& state)
 
         attaches += attachTopByPriority(w, gen, o.cut, 16);
         const size_t currentCount = makeIdealResident(w, o.cut);
-        collected += w.collect(usage, pageBudget, minAge);
+        collected += w.collect(usage, pageBudget, minAge).detachedPages;
 
         cutTotal += currentCount;
         ++frames;
@@ -812,7 +812,7 @@ static void BM_Combined_KitchenSink(benchmark::State& state)
 
         attaches += attachTopByPriority(w, planetGen, o.cut, 12);
         const size_t currentCount = makeIdealResident(w, o.cut);
-        collected += w.collect(usage, 300, 8);
+        collected += w.collect(usage, 300, 8).detachedPages;
 
         cutTotal += currentCount;
         ++frames;
@@ -1308,7 +1308,7 @@ namespace {
 
 // One frame of the predictive policy, entirely content-side (the streamer
 // owns the page data and the recipes; the World only sees attachPage).
-void predictiveAttachFrame(World& w, TreeGen& gen, const CutResults& cut,
+void predictiveAttachFrame(World& w, TreeGen& gen, const CutView& cut,
                            const Camera& view, float threshold, size_t budget)
 {
     struct Cand
@@ -1565,7 +1565,7 @@ static void BM_FlatForest100k(benchmark::State& state)
     World::TestAccess::TlasQueryScratch tlasScratch;
     View view;
     view.setReuseEnabled(mode == 2);
-    CutResults cut;
+    CutView cut;
 
     size_t visible = 0;
     if (mode == 0)
@@ -1575,7 +1575,7 @@ static void BM_FlatForest100k(benchmark::State& state)
     {
         // Warm output and View capacities; the benchmark measures steady
         // culling/materialization rather than first-use allocation.
-        view.selectCut(world, camera, params, cut);
+        cut = view.selectCut(world, camera, params);
         visible = view.reused() + view.walked();
     }
 
@@ -1589,7 +1589,7 @@ static void BM_FlatForest100k(benchmark::State& state)
         }
         else
         {
-            view.selectCut(world, camera, params, cut);
+            cut = view.selectCut(world, camera, params);
             visible = view.reused() + view.walked();
             consumeCut(cut);
         }
@@ -1681,13 +1681,12 @@ static void BM_MixedForest100k(benchmark::State& state)
 
     View view;
     view.setReuseEnabled(cached);
-    CutResults cut;
-    view.selectCut(world, camera, params, cut);
+    CutView cut = view.selectCut(world, camera, params);
     size_t visible = view.reused() + view.walked();
 
     for (auto _ : state)
     {
-        view.selectCut(world, camera, params, cut);
+        cut = view.selectCut(world, camera, params);
         visible = view.reused() + view.walked();
         consumeCut(cut);
     }
@@ -1764,13 +1763,12 @@ static void BM_RootDecisionForest100k(benchmark::State& state)
     world.applyUpdates();
     View view;
     view.setReuseEnabled(cached);
-    CutResults cut;
-    view.selectCut(world, camera, params, cut);
+    CutView cut = view.selectCut(world, camera, params);
     size_t visible = view.reused() + view.walked();
 
     for (auto _ : state)
     {
-        view.selectCut(world, camera, params, cut);
+        cut = view.selectCut(world, camera, params);
         visible = view.reused() + view.walked();
         consumeCut(cut);
     }
@@ -1945,12 +1943,12 @@ static void BM_LayoutRecovery100k(benchmark::State& state)
         float4::vec(0, 1, 0), 1.2f, 16.0f / 9.0f, 1080.0f, 0.1f, 5000.0f);
     const CutParams params{4.0f, 0.0f};
     View view;
-    CutResults cut;
-    view.selectCut(world, camera, params, cut);
+    CutView cut;
+    cut = view.selectCut(world, camera, params);
 
     for (auto _ : state)
     {
-        view.selectCut(world, camera, params, cut);
+        cut = view.selectCut(world, camera, params);
         consumeCut(cut);
     }
     state.SetItemsProcessed(state.iterations() * int64_t(kVisible));
@@ -2279,7 +2277,7 @@ static void BM_View_FlyThrough(benchmark::State& state)
 
     const int movers = count * movePct / 100;
 
-    CutResults cut;
+    CutView cut;
     View cache;
     cache.setReuseEnabled(cached);
     const CutParams p{4.0f, 0.0f};
@@ -2308,7 +2306,7 @@ static void BM_View_FlyThrough(benchmark::State& state)
         w.applyUpdates();
 
         const auto t0 = clock::now();
-        cache.selectCut(w, v, p, cut);
+        cut = cache.selectCut(w, v, p);
         const auto t1 = clock::now();
         cutNs += std::chrono::duration<double, std::nano>(t1 - t0).count();
 
@@ -2403,7 +2401,7 @@ static void BM_View_Breakdown(benchmark::State& state)
     };
 
     View viewState;
-    CutResults cut;
+    CutView cut;
     const CutParams params{4.0f, 0.0f};
 
     // The first published selection cycle builds the initial TLAS and
@@ -2411,7 +2409,7 @@ static void BM_View_Breakdown(benchmark::State& state)
     const auto cold0 = clock::now();
     w.applyUpdates();
     const Camera coldView = viewAt(0);
-    viewState.selectCut(w, coldView, params, cut);
+    cut = viewState.selectCut(w, coldView, params);
     const auto cold1 = clock::now();
 
     XorShift32 fast;
@@ -2438,7 +2436,7 @@ static void BM_View_Breakdown(benchmark::State& state)
         w.applyUpdates();
         const auto maintenance1 = clock::now();
 
-        viewState.selectCut(w, view, params, cut);
+        cut = viewState.selectCut(w, view, params);
         const auto cut1 = clock::now();
 
         moveNs += std::chrono::duration<double, std::nano>(move1 - move0).count();
@@ -2531,12 +2529,12 @@ static void BM_View_MultiView(benchmark::State& state)
     };
 
     std::vector<View> contexts(static_cast<size_t>(viewCount));
-    std::vector<CutResults> cuts(static_cast<size_t>(viewCount));
+    std::vector<CutView> cuts(static_cast<size_t>(viewCount));
     const CutParams params{4.0f, 0.0f};
 
     w.applyUpdates();
     for (int v = 0; v < viewCount; ++v)
-        contexts[size_t(v)].selectCut(w, viewAt(0, v), params, cuts[size_t(v)]);
+        cuts[size_t(v)] = contexts[size_t(v)].selectCut(w, viewAt(0, v), params);
 
     std::vector<Camera> currentViews(static_cast<size_t>(viewCount));
     std::atomic<bool> stop{false};
@@ -2553,9 +2551,8 @@ static void BM_View_MultiView(benchmark::State& state)
                 {
                     start.arrive_and_wait();
                     if (stop.load(std::memory_order_relaxed)) return;
-                    contexts[size_t(v)].selectCut(
-                        static_cast<const World&>(w), currentViews[size_t(v)], params,
-                        cuts[size_t(v)]);
+                    cuts[size_t(v)] = contexts[size_t(v)].selectCut(
+                        static_cast<const World&>(w), currentViews[size_t(v)], params);
                     done.arrive_and_wait();
                 }
             });
@@ -2590,8 +2587,8 @@ static void BM_View_MultiView(benchmark::State& state)
         {
             const auto select0 = clock::now();
             for (int v = 0; v < viewCount; ++v)
-                contexts[size_t(v)].selectCut(w, viewAt(frames, v), params,
-                                              cuts[size_t(v)]);
+                cuts[size_t(v)] =
+                    contexts[size_t(v)].selectCut(w, viewAt(frames, v), params);
             const auto select1 = clock::now();
             selectNs +=
                 std::chrono::duration<double, std::nano>(select1 - select0).count();

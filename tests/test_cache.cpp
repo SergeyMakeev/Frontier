@@ -27,7 +27,7 @@ namespace {
 // cached error and emission order are dropped.
 using Keys = std::vector<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t>>;
 
-Keys keysOf(const CutResults& cut)
+Keys keysOf(const CutView& cut)
 {
     Keys k;
     k.reserve(cut.size());

@@ -47,8 +47,8 @@
 
 #include <cstdint>
 #include <cstring>
-#include <initializer_list>
 #include <memory>
+#include <span>
 #include <vector>
 
 #include "append_buffer.h"
@@ -179,7 +179,26 @@ static_assert(sizeof(CutEntry) == 12, "CutEntry must stay 12 bytes");
 // render cut is shared + currentOnly. The fully-resident ideal frontier is
 // shared + idealOnly. A high-error leaf on that ideal side is enough for caller-side
 // policy to decide whether its external content graph can expand it.
-struct CutResults
+// Non-owning result of one View selection. The spans remain valid until the
+// next selection or reset on that View, or until the View is destroyed.
+struct CutView
+{
+    std::span<const CutEntry> shared;
+    std::span<const CutEntry> currentOnly;
+    std::span<const CutEntry> idealOnly;
+
+    size_t currentSize() const { return shared.size() + currentOnly.size(); }
+    size_t idealSize() const { return shared.size() + idealOnly.size(); }
+    size_t size() const
+    {
+        return shared.size() + currentOnly.size() + idealOnly.size();
+    }
+    bool empty() const { return size() == 0; }
+};
+
+namespace detail {
+
+struct CutBuffers
 {
     AppendBuffer<CutEntry> shared;
     AppendBuffer<CutEntry> currentOnly;
@@ -191,13 +210,57 @@ struct CutResults
         currentOnly.clear();
         idealOnly.clear();
     }
-    size_t currentSize() const { return shared.size() + currentOnly.size(); }
-    size_t idealSize() const { return shared.size() + idealOnly.size(); }
-    size_t size() const
+
+    CutView view() const
     {
-        return shared.size() + currentOnly.size() + idealOnly.size();
+        return {{shared.data(), shared.size()},
+                {currentOnly.data(), currentOnly.size()},
+                {idealOnly.data(), idealOnly.size()}};
     }
-    bool empty() const { return size() == 0; }
+};
+
+} // namespace detail
+
+// Explicit owning snapshot for callers that need to retain a cut across the
+// next selection. The normal API returns CutView and keeps ownership in View;
+// this compatibility/storage type exposes only spans, not its container.
+class CutResults : public CutView
+{
+public:
+    CutResults() = default;
+    CutResults(const CutResults& other) : buffers_(other.buffers_) { sync(); }
+    CutResults(CutResults&& other) noexcept : buffers_(std::move(other.buffers_))
+    {
+        sync();
+        other.sync();
+    }
+    CutResults& operator=(const CutResults& other)
+    {
+        if (this != &other)
+        {
+            buffers_ = other.buffers_;
+            sync();
+        }
+        return *this;
+    }
+    CutResults& operator=(CutResults&& other) noexcept
+    {
+        if (this != &other)
+        {
+            buffers_ = std::move(other.buffers_);
+            sync();
+            other.sync();
+        }
+        return *this;
+    }
+
+private:
+    friend class View;
+    friend class World;
+
+    void sync() { static_cast<CutView&>(*this) = buffers_.view(); }
+
+    detail::CutBuffers buffers_;
 };
 
 struct CutParams
@@ -221,9 +284,9 @@ struct InstanceDesc
 // Output sinks
 //
 // selectCut writes through a Sink so the same out-of-line traversal can fill
-// either an AppendBuffer (grows, never drops) or caller memory (fixed, reports
-// what did not fit). Engines that write straight into a draw list or a mapped
-// instance buffer want the second one.
+// either retained internal storage or fixed caller memory that reports what
+// did not fit. Engines that write straight into a draw list or mapped instance
+// buffer use the public span constructor.
 // ---------------------------------------------------------------------------
 
 template <class T>
@@ -232,11 +295,13 @@ class Sink
 public:
     Sink() = default;
 
-    // Growable: appends to `v`, which is cleared first. Never drops.
-    explicit Sink(AppendBuffer<T>& v) : vec_(&v) { v.clear(); }
-
     // Fixed: writes into caller memory, counting (not writing) the overflow.
-    Sink(T* data, uint32_t capacity) : data_(data), capacity_(capacity) {}
+    explicit Sink(std::span<T> storage) : data_(storage.data())
+    {
+        HLOD_CHECK(storage.size() <= UINT32_MAX,
+                   "Sink capacity exceeds 32-bit result count");
+        capacity_ = uint32_t(storage.size());
+    }
 
     void push(const T& v)
     {
@@ -273,6 +338,12 @@ public:
     bool     overflowed() const { return dropped_ != 0; }
 
 private:
+    friend class View;
+    friend class World;
+
+    // Internal growable sink. Public callers see only fixed spans.
+    explicit Sink(AppendBuffer<T>& v) : vec_(&v) { v.clear(); }
+
     AppendBuffer<T>* vec_ = nullptr;
     T*              data_ = nullptr;
     uint32_t        capacity_ = 0;
@@ -287,9 +358,6 @@ struct CutResultSink
     Sink<CutEntry> idealOnly;
 
     CutResultSink() = default;
-    explicit CutResultSink(CutResults& out)
-        : shared(out.shared), currentOnly(out.currentOnly), idealOnly(out.idealOnly)
-    {}
     CutResultSink(Sink<CutEntry> sharedSink,
                   Sink<CutEntry> currentOnlySink,
                   Sink<CutEntry> idealOnlySink)
@@ -361,6 +429,14 @@ private:
     const World*     world_ = nullptr;
     std::vector<Rec> rec_;
     std::vector<uint32_t> dirty_;
+};
+
+// Result of one collection pass. freedPayloads refers to World-owned storage
+// and remains valid until the next collect() call or World destruction.
+struct CollectResult
+{
+    size_t detachedPages = 0;
+    std::span<const UserPayload> freedPayloads;
 };
 
 // ---------------------------------------------------------------------------
@@ -485,11 +561,20 @@ public:
     // and must not be used concurrently; any number of distinct Views may read
     // the same const World concurrently. A View binds to the first World it
     // queries and reset() releases that binding.
+    CutView selectCut(const World& world, const Camera& camera,
+                      const CutParams& params);
+    CutView selectCut(const World& world, const Camera& camera,
+                      const CutParams& params, PageUsageContext& usage);
+
+    // Advanced zero-copy path: write directly to fixed caller storage.
     void selectCut(const World& world, const Camera& camera,
                    const CutParams& params, CutResultSink& outCut);
     void selectCut(const World& world, const Camera& camera,
                    const CutParams& params, PageUsageContext& usage,
                    CutResultSink& outCut);
+
+    // Explicit snapshot path for callers that must retain a cut after the
+    // next selection on this View.
     void selectCut(const World& world, const Camera& camera,
                    const CutParams& params, CutResults& outCut);
     void selectCut(const World& world, const Camera& camera,
@@ -839,18 +924,15 @@ public:
     // maxAttachedPages (pinned root pages are not counted: they can never be
     // collected). Only pages untouched for >= minAge frames, with no attached
     // child pages, and not pinned are eligible. Returns the number of pages
-    // detached; freedPayloads (if given) receives the payloads whose content
-    // became unreachable (they were resident). Overloads taking page-usage
-    // contexts consume their accumulated feedback before examining the tail;
-    // omitted views do not influence page retention.
-    size_t collect(size_t maxAttachedPages, uint32_t minAge,
-                   std::vector<UserPayload>* freedPayloads = nullptr);
-    size_t collect(PageUsageContext& usage, size_t maxAttachedPages,
-                   uint32_t minAge,
-                   std::vector<UserPayload>* freedPayloads = nullptr);
-    size_t collect(std::initializer_list<PageUsageContext*> usage,
-                   size_t maxAttachedPages, uint32_t minAge,
-                   std::vector<UserPayload>* freedPayloads = nullptr);
+    // detached together with a non-owning view of payloads whose resident
+    // content became unreachable. Overloads taking page-usage contexts consume
+    // their accumulated feedback before examining the tail; omitted views do
+    // not influence page retention.
+    CollectResult collect(size_t maxAttachedPages, uint32_t minAge);
+    CollectResult collect(PageUsageContext& usage, size_t maxAttachedPages,
+                          uint32_t minAge);
+    CollectResult collect(std::span<PageUsageContext* const> usage,
+                          size_t maxAttachedPages, uint32_t minAge);
 
     // ---- introspection -----------------------------------------------------------
     size_t   attachedPageCount() const { return attachedPages_; }
@@ -1330,9 +1412,9 @@ private:
         std::vector<NodeItem> nodeStack;
 
         // Backing storage for the parallel path, where each worker collects
-        // into its own vectors; the serial path points the sinks straight at
+        // into its own buffers; the serial path points the sinks straight at
         // the caller's output instead.
-        CutResults cutBuf;
+        detail::CutBuffers cutBuf;
 
         CutResultSink cut;
 
@@ -1380,8 +1462,9 @@ private:
 
     uint32_t allocSlot();
     uint32_t registerPage(uint32_t asset, NodeRef owner, bool pinned);
-    void     detachSlot(uint32_t slot, std::vector<UserPayload>* freedPayloads);
-    void     detachMountTree(uint32_t rootSlot, std::vector<UserPayload>* freedPayloads);
+    void     detachSlot(uint32_t slot, AppendBuffer<UserPayload>* freedPayloads);
+    void     detachMountTree(uint32_t rootSlot,
+                             AppendBuffer<UserPayload>* freedPayloads);
     void     pinRootPayloads(uint32_t slot);
     bool     descendantsCovered(uint32_t slot, uint32_t node) const;
     bool     computeCovered(uint32_t slot, uint32_t node) const;
@@ -1391,7 +1474,13 @@ private:
     void lruPushFront(uint32_t slot);
     void lruTouch(uint32_t slot, uint32_t epoch);
     void consumePageUsage(PageUsageContext& usage);
-    void consumePageUsage(std::initializer_list<PageUsageContext*> usage);
+    void consumePageUsage(std::span<PageUsageContext* const> usage);
+    static CutResultSink makeSink(detail::CutBuffers& buffers)
+    {
+        return {Sink<CutEntry>(buffers.shared),
+                Sink<CutEntry>(buffers.currentOnly),
+                Sink<CutEntry>(buffers.idealOnly)};
+    }
 
     // ---- copy-on-write bounds ----
     // Live overlay for (instance, slot), or nullptr. Stale overlays (the
@@ -1553,6 +1642,11 @@ private:
     };
     static_assert(sizeof(PendingMove) == 48, "queued bounds edit must stay 48 bytes");
     std::vector<PendingMove> pendingMoves_;
+
+    // Backing storage for CollectResult::freedPayloads. Collection is a World
+    // mutation, so one retained buffer has the same synchronization contract
+    // as the rest of World state.
+    AppendBuffer<UserPayload> collectPayloads_;
 
     // Shared TLAS build scratch. Per-selection scratch lives in View.
     struct TlasItem

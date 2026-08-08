@@ -97,7 +97,7 @@ WorldConfig neverRebuild()
     return c;
 }
 
-std::multiset<InstanceId> instanceIdsOf(const CutResults& cut)
+std::multiset<InstanceId> instanceIdsOf(const CutView& cut)
 {
     std::multiset<uint32_t> out;
     for (const CutEntry& e : currentCut(cut)) out.insert(e.instance());

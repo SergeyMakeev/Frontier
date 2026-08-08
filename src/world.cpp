@@ -113,12 +113,16 @@ struct ViewScratch
     std::vector<World::Worker>      workers{1};
     std::vector<World::VisibleItem> visible;
     std::vector<World::TlasItem>    tlasStack;
+    detail::CutBuffers              output;
 
     size_t bytes() const
     {
         size_t n = visible.capacity() * sizeof(visible[0]) +
                    tlasStack.capacity() * sizeof(tlasStack[0]) +
-                   workers.capacity() * sizeof(World::Worker);
+                   workers.capacity() * sizeof(World::Worker) +
+                   output.shared.capacity() * sizeof(CutEntry) +
+                   output.currentOnly.capacity() * sizeof(CutEntry) +
+                   output.idealOnly.capacity() * sizeof(CutEntry);
         for (const World::Worker& w : workers)
         {
             n += w.work.capacity() * sizeof(World::WorkItem);
@@ -433,7 +437,7 @@ bool World::isAttached(NodeHandle expansionNode) const
            rt->expSlot[expansionNode.index()] != kInvalidIndex;
 }
 
-void World::detachSlot(uint32_t slot, std::vector<UserPayload>* freedPayloads)
+void World::detachSlot(uint32_t slot, AppendBuffer<UserPayload>* freedPayloads)
 {
     PageRt& rt = slots_[slot];
     if (freedPayloads)
@@ -482,7 +486,8 @@ void World::detachSlot(uint32_t slot, std::vector<UserPayload>* freedPayloads)
     }
 }
 
-void World::detachMountTree(uint32_t rootSlot, std::vector<UserPayload>* freedPayloads)
+void World::detachMountTree(uint32_t rootSlot,
+                            AppendBuffer<UserPayload>* freedPayloads)
 {
     if (rootSlot == kInvalidIndex || !slots_[rootSlot].inUse()) return;
     // Collect the page tree from its root (preorder via the expansion-slot
@@ -2122,10 +2127,11 @@ void World::lruTouch(uint32_t slot, uint32_t epoch)
 
 void World::consumePageUsage(PageUsageContext& usage)
 {
-    consumePageUsage({&usage});
+    PageUsageContext* usages[] = {&usage};
+    consumePageUsage(usages);
 }
 
-void World::consumePageUsage(std::initializer_list<PageUsageContext*> usages)
+void World::consumePageUsage(std::span<PageUsageContext* const> usages)
 {
     struct Event
     {
@@ -2233,9 +2239,9 @@ void World::tlasQuery(const Camera& view, float minPix, float rootThreshold,
                                            outVisible, stack);
 }
 
-size_t World::collect(size_t maxAttachedPages, uint32_t minAge,
-                      std::vector<UserPayload>* freedPayloads)
+CollectResult World::collect(size_t maxAttachedPages, uint32_t minAge)
 {
+    collectPayloads_.clear();
     size_t detached = 0;
     uint32_t slot = lruTail_;
     while (streamedPageCount() > maxAttachedPages && slot != kInvalidIndex)
@@ -2247,27 +2253,27 @@ size_t World::collect(size_t maxAttachedPages, uint32_t minAge,
                               (frame_ - rt.lastTouched) >= minAge;
         if (eligible)
         {
-            detachSlot(slot, freedPayloads);
+            detachSlot(slot, &collectPayloads_);
             ++detached;
         }
         slot = prev;
     }
-    return detached;
+    return {detached,
+            {collectPayloads_.data(), collectPayloads_.size()}};
 }
 
-size_t World::collect(PageUsageContext& usage, size_t maxAttachedPages,
-                      uint32_t minAge, std::vector<UserPayload>* freedPayloads)
+CollectResult World::collect(PageUsageContext& usage, size_t maxAttachedPages,
+                             uint32_t minAge)
 {
     consumePageUsage(usage);
-    return collect(maxAttachedPages, minAge, freedPayloads);
+    return collect(maxAttachedPages, minAge);
 }
 
-size_t World::collect(std::initializer_list<PageUsageContext*> usage,
-                      size_t maxAttachedPages, uint32_t minAge,
-                      std::vector<UserPayload>* freedPayloads)
+CollectResult World::collect(std::span<PageUsageContext* const> usage,
+                             size_t maxAttachedPages, uint32_t minAge)
 {
     consumePageUsage(usage);
-    return collect(maxAttachedPages, minAge, freedPayloads);
+    return collect(maxAttachedPages, minAge);
 }
 
 // ============================================================================
@@ -2862,7 +2868,7 @@ void World::selectCutUncached(const Camera& camera, const CutParams& params,
         w.trackTouches = usage != nullptr;
         w.uniqueTouches = false;
         w.cutBuf.clear();
-        w.cut = CutResultSink(w.cutBuf);
+        w.cut = makeSink(w.cutBuf);
         w.stats = CutStats{};
         w.bar = params.threshold;
         w.barInv = params.threshold > 0.0f ? 1.0f / params.threshold : 0.0f;
@@ -2952,6 +2958,7 @@ void View::reset()
     instanceLayoutVersion_ = 0;
     rootQueryEnabled_ = true;
     rootProbeCountdown_ = 0;
+    if (scratch_) scratch_->output.clear();
     ++epoch_;
     // The half-life is configuration and survives; the accumulated window is
     // state and does not. This is the half that reset() exists for: records
@@ -3156,7 +3163,7 @@ void World::selectCutCached(const Camera& camera, const CutParams& params,
         HLOD_PREFETCH(&instances_[instIdx]);
         const Instance& inst = instances_[instIdx];
         w.cutBuf.clear();
-        w.cut = CutResultSink(w.cutBuf);
+        w.cut = makeSink(w.cutBuf);
         w.touched.clear();
         w.margin = FLT_MAX;
         w.maxError = 0.0f;
@@ -3274,16 +3281,36 @@ void View::selectCut(const World& world, const Camera& camera,
                      const CutParams& params,
                      CutResults& outCut)
 {
-    CutResultSink cut(outCut);
+    CutResultSink cut = World::makeSink(outCut.buffers_);
     selectCut(world, camera, params, cut);
+    outCut.sync();
 }
 
 void View::selectCut(const World& world, const Camera& camera,
                      const CutParams& params, PageUsageContext& usage,
                      CutResults& outCut)
 {
-    CutResultSink cut(outCut);
+    CutResultSink cut = World::makeSink(outCut.buffers_);
     selectCut(world, camera, params, usage, cut);
+    outCut.sync();
+}
+
+CutView View::selectCut(const World& world, const Camera& camera,
+                        const CutParams& params)
+{
+    detail::CutBuffers& output = scratch_->output;
+    CutResultSink cut = World::makeSink(output);
+    selectCut(world, camera, params, cut);
+    return output.view();
+}
+
+CutView View::selectCut(const World& world, const Camera& camera,
+                        const CutParams& params, PageUsageContext& usage)
+{
+    detail::CutBuffers& output = scratch_->output;
+    CutResultSink cut = World::makeSink(output);
+    selectCut(world, camera, params, usage, cut);
+    return output.view();
 }
 
 } // namespace hlod

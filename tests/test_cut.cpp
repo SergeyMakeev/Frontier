@@ -13,14 +13,14 @@ using TA = World::TestAccess;
 
 namespace {
 
-std::map<UserId, uint8_t> cutMap(World& world, const CutResults& cut)
+std::map<UserId, uint8_t> cutMap(World& world, const CutView& cut)
 {
     std::map<UserId, uint8_t> m;
     for (const auto& e : currentCut(cut))
         m.emplace(payloadOf(world, e), e.errorCode());
     return m;
 }
-std::map<UserId, uint8_t> idealMap(World& world, const CutResults& cut)
+std::map<UserId, uint8_t> idealMap(World& world, const CutView& cut)
 {
     std::map<UserId, uint8_t> m;
     for (const auto& e : idealCut(cut))
@@ -28,7 +28,7 @@ std::map<UserId, uint8_t> idealMap(World& world, const CutResults& cut)
     return m;
 }
 
-void expectSameCut(World& world, const CutResults& got, const CutResults& want)
+void expectSameCut(World& world, const CutView& got, const CutView& want)
 {
     const auto g = cutMap(world, got), w = cutMap(world, want);
     ASSERT_EQ(g.size(), currentCutSize(got)) << "duplicate ids in current cut";
@@ -41,7 +41,7 @@ void expectSameCut(World& world, const CutResults& got, const CutResults& want)
     }
 }
 
-void expectSameIdeal(World& world, const CutResults& got, const CutResults& want)
+void expectSameIdeal(World& world, const CutView& got, const CutView& want)
 {
     const auto g = idealMap(world, got), w = idealMap(world, want);
     ASSERT_EQ(g.size(), idealCutSize(got)) << "duplicate ids in ideal cut";

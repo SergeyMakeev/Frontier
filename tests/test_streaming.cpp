@@ -124,7 +124,7 @@ TEST(Streaming, AllOrNothingRefinement)
 
 using ResultKey = std::tuple<uint32_t, UserPayload, uint8_t>;
 
-std::vector<ResultKey> resultKeys(World& world, const CutResults& cut)
+std::vector<ResultKey> resultKeys(World& world, const CutView& cut)
 {
     std::vector<ResultKey> keys;
     const auto append = [&](const auto& entries, uint32_t bucket)
@@ -476,16 +476,16 @@ TEST(Streaming, GarbageCollection)
     // Selection only accumulates feedback. The World LRU is updated when the
     // caller explicitly chooses this camera at collect time.
     EXPECT_LT(TA::lastTouched(w, pageProbe[0]), w.frame());
-    EXPECT_EQ(w.collect({&usage}, 1, 100), 0u);
+    PageUsageContext* usageList[] = {&usage};
+    EXPECT_EQ(w.collect(usageList, 1, 100).detachedPages, 0u);
     EXPECT_EQ(TA::lastTouched(w, pageProbe[0]), w.frame());
     EXPECT_EQ(w.attachedPageCount(), allAttached);
 
     // With a small dwell, unseen pages collapse; the viewed page, its
     // ancestors, and the pinned root survive. freed ids are reported.
-    std::vector<UserId> freed;
-    const size_t collected = w.collect(2, 3, &freed);
-    EXPECT_GT(collected, 0u);
-    EXPECT_FALSE(freed.empty());
+    const CollectResult collected = w.collect(2, 3);
+    EXPECT_GT(collected.detachedPages, 0u);
+    EXPECT_FALSE(collected.freedPayloads.empty());
     EXPECT_TRUE(isAttached(w, level1[0]));           // still in view
     EXPECT_FALSE(isAttached(w, level1[1]));          // shadow view was untracked
     for (UserId id : rootIds) EXPECT_TRUE(contains(w, id));   // pinned root intact
@@ -550,17 +550,20 @@ TEST(Streaming, CollectMinAgeBoundaryAndExactFreedPayloads)
     for (uint32_t f = 0; f + 1 < minAge; ++f) w.applyUpdates();
 
     // One frame short of the dwell: nothing may be collected.
-    std::vector<UserId> freed;
-    EXPECT_EQ(w.collect(0, minAge, &freed), 0u);
-    EXPECT_TRUE(freed.empty());
+    const CollectResult beforeBoundary = w.collect(0, minAge);
+    EXPECT_EQ(beforeBoundary.detachedPages, 0u);
+    EXPECT_TRUE(beforeBoundary.freedPayloads.empty());
     for (UserId id : exps) EXPECT_TRUE(isAttached(w, id));
 
     // At exactly minAge every streamed page is eligible; the freed report is
     // exactly the resident payloads of the collected pages.
     w.applyUpdates();
-    EXPECT_EQ(w.collect(0, minAge, &freed), exps.size());
-    const std::set<UserId> freedSet(freed.begin(), freed.end());
-    EXPECT_EQ(freedSet.size(), freed.size()) << "duplicate payloads in freed report";
+    const CollectResult atBoundary = w.collect(0, minAge);
+    EXPECT_EQ(atBoundary.detachedPages, exps.size());
+    const std::set<UserId> freedSet(atBoundary.freedPayloads.begin(),
+                                    atBoundary.freedPayloads.end());
+    EXPECT_EQ(freedSet.size(), atBoundary.freedPayloads.size())
+        << "duplicate payloads in freed report";
     EXPECT_EQ(freedSet, expectFreed);
     for (UserId id : exps) EXPECT_FALSE(isAttached(w, id));
 
@@ -634,7 +637,7 @@ TEST(Streaming, GcChurnStress)
             if (!expandable && !w.isResident(entry.nodeHandle))
                 w.markResident(entry.nodeHandle);
         }
-        collected += w.collect(usage, 6, 2);
+        collected += w.collect(usage, 6, 2).detachedPages;
     }
 
     // The stress actually stressed: pages were expanded, collapsed, and

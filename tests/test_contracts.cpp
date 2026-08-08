@@ -31,7 +31,7 @@ Outputs run(World& w, const Camera& v, const CutParams& p)
     return o;
 }
 
-std::set<UserId> cutIds(World& world, const CutResults& cut)
+std::set<UserId> cutIds(World& world, const CutView& cut)
 {
     std::set<UserId> s;
     for (const auto& e : currentCut(cut)) s.insert(payloadOf(world, e));
@@ -41,7 +41,7 @@ std::set<UserId> cutIds(World& world, const CutResults& cut)
 using ResultKey = std::tuple<uint32_t, UserPayload, uint8_t, InstanceId,
                              uint32_t, uint32_t>;
 
-std::vector<ResultKey> resultKeys(World& world, const CutResults& cut)
+std::vector<ResultKey> resultKeys(World& world, const CutView& cut)
 {
     std::vector<ResultKey> keys;
     keys.reserve(cut.size());
@@ -365,19 +365,16 @@ TEST(Contracts, StaleInstanceRefIsIgnored)
 
     // Stale move: B must not teleport.
     w.moveInstance(refA, float4::point(50000, 0, 0));
-    cut.clear();
     selectCutUncached(w, v, {4, 0}, cut);
     EXPECT_FALSE(cut.empty()) << "stale moveInstance displaced the new instance";
 
     // Stale remove: B must survive.
     w.removeInstance(refA);
-    cut.clear();
     selectCutUncached(w, v, {4, 0}, cut);
     EXPECT_FALSE(cut.empty()) << "stale removeInstance killed the new instance";
 
     // The live ref still works.
     w.removeInstance(refB);
-    cut.clear();
     selectCutUncached(w, v, {4, 0}, cut);
     EXPECT_TRUE(cut.empty());
 }
@@ -570,9 +567,9 @@ TEST(Contracts, CompactCutRepresentation)
     CutEntry sharedStorage[1];
     CutEntry currentStorage[1];
     CutEntry idealStorage[1];
-    CutResultSink sink{Sink<CutEntry>{sharedStorage, 1},
-                       Sink<CutEntry>{currentStorage, 1},
-                       Sink<CutEntry>{idealStorage, 1}};
+    CutResultSink sink{Sink<CutEntry>{std::span{sharedStorage}},
+                       Sink<CutEntry>{std::span{currentStorage}},
+                       Sink<CutEntry>{std::span{idealStorage}}};
     sink.shared.push(entry);
     sink.shared.push(entry);
     sink.currentOnly.push(entry);
@@ -581,6 +578,49 @@ TEST(Contracts, CompactCutRepresentation)
     EXPECT_EQ(sink.shared.dropped(), 1u);
     EXPECT_EQ(sink.currentOnly.count(), 1u);
     EXPECT_EQ(sink.idealOnly.count(), 1u);
+}
+
+TEST(Contracts, ViewReturnsSpansBackedByRetainedStorage)
+{
+    TreeGen gen;
+    gen.fanout = 4;
+    gen.depth = 2;
+    Page page = gen.makeRootPage(unitRegion(20.0f), 64.0f, 0);
+    const uint32_t nodes = page.nodeCount();
+
+    World world;
+    const auto instance =
+        world.addInstance(std::move(page), float4::point(0, 0, 0));
+    markAllResident(world, instance.rootPage, nodes);
+    world.applyUpdates();
+
+    const Camera camera = makeLookAtCamera(float4::point(0, 10, -40),
+                                            float4::point(0, 0, 0));
+    const CutParams params{4.0f, 0.0f};
+    View view;
+    view.setReuseEnabled(false);
+
+    const CutView first = view.selectCut(world, camera, params);
+    ASSERT_FALSE(first.empty());
+    const CutEntry* firstData = !first.shared.empty()
+                                    ? first.shared.data()
+                                    : (!first.currentOnly.empty()
+                                           ? first.currentOnly.data()
+                                           : first.idealOnly.data());
+
+    const CutView second = view.selectCut(world, camera, params);
+    const CutEntry* secondData = !second.shared.empty()
+                                     ? second.shared.data()
+                                     : (!second.currentOnly.empty()
+                                            ? second.currentOnly.data()
+                                            : second.idealOnly.data());
+    EXPECT_EQ(secondData, firstData) << "View should retain result capacity";
+
+    View snapshotView;
+    snapshotView.setReuseEnabled(false);
+    CutResults snapshot;
+    snapshotView.selectCut(world, camera, params, snapshot);
+    EXPECT_EQ(resultKeys(world, second), resultKeys(world, snapshot));
 }
 
 TEST(Contracts, AppendBufferRetainsAndOwnsContiguousStorage)

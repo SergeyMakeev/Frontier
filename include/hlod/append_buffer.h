@@ -136,10 +136,8 @@ public:
     const T* data() const noexcept { return data_; }
     T* begin() noexcept { return data_; }
     const T* begin() const noexcept { return data_; }
-    const T* cbegin() const noexcept { return data_; }
     T* end() noexcept { return size_ ? data_ + size_ : data_; }
     const T* end() const noexcept { return size_ ? data_ + size_ : data_; }
-    const T* cend() const noexcept { return size_ ? data_ + size_ : data_; }
     T& operator[](size_t i) noexcept { return data_[i]; }
     const T& operator[](size_t i) const noexcept { return data_[i]; }
     T& front() noexcept { return data_[0]; }
