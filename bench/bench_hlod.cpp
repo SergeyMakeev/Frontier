@@ -30,7 +30,6 @@
 #include <memory>
 #include <numeric>
 #include <queue>
-#include <random>
 #include <thread>
 #include <vector>
 
@@ -66,22 +65,7 @@ Camera orbitView(float t, float dist, float4 center = float4::point(0, 0, 0))
     return makeLookAtCamera(pos, center);
 }
 
-// Cheap deterministic RNG so the timed loops don't measure std::mt19937.
-struct XorShift32
-{
-    uint32_t s = 0x9E3779B9u;
-    uint32_t next()
-    {
-        s ^= s << 13;
-        s ^= s >> 17;
-        s ^= s << 5;
-        return s;
-    }
-    float uniform(float lo, float hi)
-    {
-        return lo + (hi - lo) * float(next() >> 8) * (1.0f / 16777216.0f);
-    }
-};
+constexpr uint32_t kDynamicWorkloadSeed = 0x9e3779b9u;
 
 // Attach up to `budget` candidate expansions, most-visible (largest screen
 // error) first. The order of ideal-cut entries is traversal-defined, so a
@@ -375,10 +359,10 @@ BENCHMARK(BM_GcStress_FastFlythrough)->Arg(96)->Arg(768)->Unit(benchmark::kMicro
 // ---------------------------------------------------------------------------
 static void BM_ManyShallowTrees(benchmark::State& state)
 {
-    std::mt19937 rng(1234);
+    DeterministicRng rng(1234);
     const int count = int(state.range(0));
     const float area = 60.0f * std::sqrt(float(count));
-    std::uniform_real_distribution<float> uni(-area, area);
+    DeterministicUniformFloat uni(-area, area);
 
     TreeGen gen;
     gen.fanout = 4;
@@ -413,11 +397,11 @@ BENCHMARK(BM_ManyShallowTrees)
 // ---------------------------------------------------------------------------
 static void BM_MovingInstances(benchmark::State& state)
 {
-    std::mt19937 rng(555);
+    DeterministicRng rng(555);
     const int count = int(state.range(0));
     const int movers = int(state.range(1));
     const float area = 60.0f * std::sqrt(float(count));
-    std::uniform_real_distribution<float> uni(-area, area);
+    DeterministicUniformFloat uni(-area, area);
 
     TreeGen gen;
     gen.fanout = 4;
@@ -430,7 +414,7 @@ static void BM_MovingInstances(benchmark::State& state)
 
     Outputs o;
     const CutParams p{4.0f, 0.0f};
-    XorShift32 fast;
+    DeterministicRng fast(kDynamicWorkloadSeed);
 
     float t = 0.0f;
     size_t cursor = 0;
@@ -495,7 +479,7 @@ static void BM_LeafRefit_LocalJitter(benchmark::State& state)
     const auto mwp = makeMoverWorld();
     MoverWorld& mw = *mwp;
     const int movers = int(state.range(0));
-    XorShift32 rng;
+    DeterministicRng rng(kDynamicWorkloadSeed);
     size_t cursor = 0;
     for (auto _ : state)
     {
@@ -523,7 +507,7 @@ static void BM_LeafRefit_Teleport(benchmark::State& state)
     const auto mwp = makeMoverWorld();
     MoverWorld& mw = *mwp;
     const int movers = int(state.range(0));
-    XorShift32 rng;
+    DeterministicRng rng(kDynamicWorkloadSeed);
     size_t cursor = 0;
     for (auto _ : state)
     {
@@ -554,7 +538,7 @@ static void BM_LeafRefit_RepeatedMoves(benchmark::State& state)
     MoverWorld& mw = *mwp;
     const int distinct = int(state.range(0));
     const int repeats = int(state.range(1));
-    XorShift32 rng;
+    DeterministicRng rng(kDynamicWorkloadSeed);
     size_t cursor = 0;
     for (auto _ : state)
     {
@@ -587,7 +571,7 @@ static void BM_LeafMotion_TeleportWithCut(benchmark::State& state)
     const auto mwp = makeMoverWorld();
     MoverWorld& mw = *mwp;
     const int movers = int(state.range(0));
-    XorShift32 rng;
+    DeterministicRng rng(kDynamicWorkloadSeed);
     Outputs o;
     const CutParams p{16.0f, 0.0f};
 
@@ -639,7 +623,7 @@ static void BM_MovingLeafNodes(benchmark::State& state)
         for (uint32_t i : leafIdx) leaves.push_back(nodeAt(inst.rootPage, i));
     }
 
-    XorShift32 rng;
+    DeterministicRng rng(kDynamicWorkloadSeed);
     const int movers = int(state.range(0));
 
     Outputs o;
@@ -686,7 +670,7 @@ static void BM_ResidencyChurn(benchmark::State& state)
     std::vector<NodeHandle> nodes;
     for (uint32_t i = 2; i < nodeCount; ++i) nodes.push_back(nodeAt(inst.rootPage, i));
 
-    std::mt19937 rng(2020);
+    DeterministicRng rng(2020);
     const int churn = int(state.range(0));
 
     Outputs o;
@@ -736,8 +720,8 @@ static void BM_Combined_KitchenSink(benchmark::State& state)
     propGen.fanout = 4;
     propGen.depth = 1;
     propGen.nextId = 1u << 20;   // avoid id collisions with the planet
-    std::mt19937 rng(4242);
-    std::uniform_real_distribution<float> uni(-half, half);
+    DeterministicRng rng(4242);
+    DeterministicUniformFloat uni(-half, half);
     std::vector<World::InstanceRef> props;
     std::vector<float4> propHome;
     for (int i = 0; i < 20000; ++i)
@@ -771,7 +755,7 @@ static void BM_Combined_KitchenSink(benchmark::State& state)
     Outputs o;
     PageUsageContext usage;
     const CutParams p{8.0f, 0.5f};
-    XorShift32 fast;
+    DeterministicRng fast(kDynamicWorkloadSeed);
 
     float x = -half;
     size_t frames = 0, cutTotal = 0, attaches = 0, collected = 0;
@@ -846,8 +830,8 @@ static void BM_TypicalForest_Breakdown(benchmark::State& state)
     const int count = int(state.range(0));
     // ~20 m spacing: 10k trees live on a ~2x2 km map.
     const float half = 10.0f * std::sqrt(float(count));
-    std::mt19937 rng(777);
-    std::uniform_real_distribution<float> uni(-half, half);
+    DeterministicRng rng(777);
+    DeterministicUniformFloat uni(-half, half);
 
     TreeGen gen;
     World w;
@@ -884,7 +868,7 @@ static void BM_TypicalForest_Breakdown(benchmark::State& state)
 
     CutResults cut;
     const CutParams p{4.0f, 1.0f};
-    XorShift32 fast;
+    DeterministicRng fast(kDynamicWorkloadSeed);
 
     double moveNs = 0, refitNs = 0, cutNs = 0;
     size_t frames = 0, cutTotal = 0;
@@ -950,8 +934,8 @@ static void BM_TypicalForest_Churn(benchmark::State& state)
     const int count = int(state.range(0));
     const int churnPct = int(state.range(1));
     const float half = 10.0f * std::sqrt(float(count));
-    std::mt19937 rng(777);
-    std::uniform_real_distribution<float> uni(-half, half);
+    DeterministicRng rng(777);
+    DeterministicUniformFloat uni(-half, half);
 
     TreeGen gen;
     gen.fanout = 4;
@@ -999,7 +983,7 @@ static void BM_TypicalForest_Churn(benchmark::State& state)
 
     CutResults cut;
     const CutParams p{4.0f, 1.0f};
-    XorShift32 fast;
+    DeterministicRng fast(kDynamicWorkloadSeed);
     const size_t churnN = size_t(count) * size_t(churnPct) / 100;
 
     double churnNs = 0, moveNs = 0, refitNs = 0, cutNs = 0;
@@ -1162,9 +1146,9 @@ static void BM_CameraTeleport_ColdFrame(benchmark::State& state)
 {
     UncachedView selection;
     using clock = std::chrono::steady_clock;
-    std::mt19937 rng(777);
+    DeterministicRng rng(777);
     const float half = 6000.0f;
-    std::uniform_real_distribution<float> uni(-half, half);
+    DeterministicUniformFloat uni(-half, half);
 
     TreeGen propGen;
     propGen.fanout = 4;
@@ -1182,7 +1166,7 @@ static void BM_CameraTeleport_ColdFrame(benchmark::State& state)
 
     CutResults cut;
     const CutParams p{4.0f, 1.0f};
-    XorShift32 fast;
+    DeterministicRng fast(kDynamicWorkloadSeed);
 
     double steadyNs = 0, teleportNs = 0;
     size_t steadyFrames = 0, teleportFrames = 0;
@@ -1221,9 +1205,9 @@ static void BM_MultiView(benchmark::State& state)
 {
     UncachedView selection;
     using clock = std::chrono::steady_clock;
-    std::mt19937 rng(4321);
+    DeterministicRng rng(4321);
     const float half = 4000.0f;
-    std::uniform_real_distribution<float> uni(-half, half);
+    DeterministicUniformFloat uni(-half, half);
 
     TreeGen propGen;
     propGen.fanout = 4;
@@ -1386,7 +1370,7 @@ static void BM_StreamingConvergence(benchmark::State& state)
     Outputs o;
     PageUsageContext usage;
     const CutParams p{4.0f, 0.0f};
-    XorShift32 fast;
+    DeterministicRng fast(kDynamicWorkloadSeed);
 
     constexpr int kPeriod = 33;                          // teleport every 33 frames
     constexpr int kSampleAt[6] = {1, 2, 4, 8, 16, 32};   // frames after teleport
@@ -1464,8 +1448,8 @@ static void BM_TlasScale(benchmark::State& state)
     using clock = std::chrono::steady_clock;
     const int count = int(state.range(0));
     const float half = 40.0f * std::sqrt(float(count));
-    std::mt19937 rng(1717);
-    std::uniform_real_distribution<float> uni(-half, half);
+    DeterministicRng rng(1717);
+    DeterministicUniformFloat uni(-half, half);
 
     TreeGen gen;
     gen.fanout = 4;
@@ -1810,8 +1794,8 @@ static void BM_TlasMortonRebuild(benchmark::State& state)
     const uint32_t nodes = proto.nodeCount();
     const AssetHandle asset = w.registerAsset(std::move(proto));
 
-    std::mt19937 rng(1919);
-    std::uniform_real_distribution<float> uni(-half, half);
+    DeterministicRng rng(1919);
+    DeterministicUniformFloat uni(-half, half);
     std::vector<World::InstanceRef> refs;
     refs.reserve(count);
     for (int i = 0; i < count; ++i)
@@ -1862,8 +1846,8 @@ static void BM_TlasOptimize(benchmark::State& state)
     Page proto = gen.makeRootPage(unitRegion(5.0f), 16.0f, 0);
     const AssetHandle asset = w.registerAsset(std::move(proto));
 
-    std::mt19937 rng(9191);
-    std::uniform_real_distribution<float> uni(-half, half);
+    DeterministicRng rng(9191);
+    DeterministicUniformFloat uni(-half, half);
     for (int i = 0; i < count; ++i)
         w.addInstance(asset, float4::point(uni(rng), 0, uni(rng)));
     w.applyUpdates();
@@ -1924,8 +1908,8 @@ static void BM_LayoutRecovery100k(benchmark::State& state)
 
     std::vector<uint32_t> permutation(kInstances);
     std::iota(permutation.begin(), permutation.end(), 0u);
-    std::mt19937 rng(5252);
-    std::shuffle(permutation.begin(), permutation.end(), rng);
+    DeterministicRng rng(5252);
+    deterministicShuffle(permutation.begin(), permutation.end(), rng);
     for (uint32_t i = 0; i < kInstances; ++i)
         world.moveInstance(refs[i], positions[permutation[i]]);
     world.applyUpdates();
@@ -1984,8 +1968,8 @@ static void BM_TlasSparseRebuild(benchmark::State& state)
     const AssetHandle asset = w.registerAsset(std::move(proto));
 
     const float half = 40.0f * std::sqrt(float(peak));
-    std::mt19937 rng(1717);
-    std::uniform_real_distribution<float> uni(-half, half);
+    DeterministicRng rng(1717);
+    DeterministicUniformFloat uni(-half, half);
     std::vector<World::InstanceRef> refs;
     refs.reserve(peak);
     for (int i = 0; i < peak; ++i)
@@ -2199,8 +2183,8 @@ static void BM_DeformationSubmissionOrder(benchmark::State& state)
     for (uint32_t i = 0; i < uint32_t(count); ++i) order[i] = i;
     if (shuffled)
     {
-        std::mt19937 rng(7331);
-        std::shuffle(order.begin(), order.end(), rng);
+        DeterministicRng rng(7331);
+        deterministicShuffle(order.begin(), order.end(), rng);
     }
 
     double submitNs = 0.0;
@@ -2262,8 +2246,8 @@ static void BM_View_FlyThrough(benchmark::State& state)
     World w;
     const AssetHandle asset = w.registerAsset(std::move(proto));
     const float half = 12.0f * std::sqrt(float(count));
-    std::mt19937 rng(4242);
-    std::uniform_real_distribution<float> uni(-half, half);
+    DeterministicRng rng(4242);
+    DeterministicUniformFloat uni(-half, half);
     std::vector<World::InstanceRef> insts;
     std::vector<float4>             home;
     insts.reserve(count);
@@ -2281,7 +2265,7 @@ static void BM_View_FlyThrough(benchmark::State& state)
     View cache;
     cache.setReuseEnabled(cached);
     const CutParams p{4.0f, 0.0f};
-    XorShift32 fast;
+    DeterministicRng fast(kDynamicWorkloadSeed);
 
     // Fixed iteration count, and the camera's path is a function of the frame
     // index: both arms therefore fly exactly the same route past exactly the
@@ -2376,8 +2360,8 @@ static void BM_View_Breakdown(benchmark::State& state)
         assets.push_back(w.registerAsset(std::move(proto)));
     }
     const float half = 12.0f * std::sqrt(float(count));
-    std::mt19937 rng(4242);
-    std::uniform_real_distribution<float> uni(-half, half);
+    DeterministicRng rng(4242);
+    DeterministicUniformFloat uni(-half, half);
     std::vector<World::InstanceRef> insts;
     std::vector<float4> home;
     insts.reserve(count);
@@ -2412,7 +2396,7 @@ static void BM_View_Breakdown(benchmark::State& state)
     cut = viewState.selectCut(w, coldView, params);
     const auto cold1 = clock::now();
 
-    XorShift32 fast;
+    DeterministicRng fast(kDynamicWorkloadSeed);
     double moveNs = 0.0;
     double maintenanceNs = 0.0;
     double cutNs = 0.0;
@@ -2505,8 +2489,8 @@ static void BM_View_MultiView(benchmark::State& state)
     World w;
     const AssetHandle asset = w.registerAsset(std::move(proto));
     const float half = 12.0f * std::sqrt(float(count));
-    std::mt19937 rng(4242);
-    std::uniform_real_distribution<float> uni(-half, half);
+    DeterministicRng rng(4242);
+    DeterministicUniformFloat uni(-half, half);
     std::vector<World::InstanceRef> insts;
     std::vector<float4> home;
     insts.reserve(count);
@@ -2559,7 +2543,7 @@ static void BM_View_MultiView(benchmark::State& state)
     }
 
     const int movers = count * movePct / 100;
-    XorShift32 fast;
+    DeterministicRng fast(kDynamicWorkloadSeed);
     double selectNs = 0.0;
     double entries = 0.0;
     double reuse = 0.0;
@@ -2664,8 +2648,8 @@ static void BM_View_Zoom(benchmark::State& state)
     World w;
     const AssetHandle asset = w.registerAsset(std::move(proto));
     const float half = 12.0f * std::sqrt(float(count));
-    std::mt19937 rng(4242);
-    std::uniform_real_distribution<float> uni(-half, half);
+    DeterministicRng rng(4242);
+    DeterministicUniformFloat uni(-half, half);
     for (int i = 0; i < count; ++i)
         w.addInstance(asset, float4::point(uni(rng), 0, uni(rng)));
     markAllResident(w, w.assetRootPage(asset), nodes);
@@ -2732,8 +2716,8 @@ static void BM_View_Reset(benchmark::State& state)
     World w;
     const AssetHandle asset = w.registerAsset(std::move(proto));
     const float half = 12.0f * std::sqrt(float(count));
-    std::mt19937 rng(4242);
-    std::uniform_real_distribution<float> uni(-half, half);
+    DeterministicRng rng(4242);
+    DeterministicUniformFloat uni(-half, half);
     for (int i = 0; i < count; ++i)
         w.addInstance(asset, float4::point(uni(rng), 0, uni(rng)));
     markAllResident(w, w.assetRootPage(asset), nodes);
@@ -2801,8 +2785,8 @@ static void BM_Spawn_MarginalCost(benchmark::State& state)
     World w(cfg);
     const AssetHandle asset = w.registerAsset(std::move(proto));
     const float half = 12.0f * std::sqrt(float(count));
-    std::mt19937 rng(4242);
-    std::uniform_real_distribution<float> uni(-half, half);
+    DeterministicRng rng(4242);
+    DeterministicUniformFloat uni(-half, half);
     std::vector<World::InstanceRef> insts;
     insts.reserve(size_t(count) + size_t(churn) + 1);
     for (int i = 0; i < count; ++i)
@@ -2811,7 +2795,7 @@ static void BM_Spawn_MarginalCost(benchmark::State& state)
 
     CutResults cut;
     const CutParams p{6.0f, 0.0f};
-    XorShift32 fast;
+    DeterministicRng fast(kDynamicWorkloadSeed);
     double churnNs = 0, cutNs = 0;
     size_t frames = 0, cutTotal = 0;
 
@@ -2875,7 +2859,7 @@ static void BM_Adversarial_StackedInstances(benchmark::State& state)
     const Page proto = gen.makeRootPage(unitRegion(5.0f), 16.0f, 0);
 
     World w;
-    XorShift32 fast;
+    DeterministicRng fast(kDynamicWorkloadSeed);
     for (int i = 0; i < 10000; ++i)
         addResidentInstance(w, proto.clone(),
                             float4::point(fast.uniform(-0.01f, 0.01f), 0,
@@ -2905,7 +2889,7 @@ static void BM_Adversarial_WideNode(benchmark::State& state)
     UncachedView selection;
     HLodBuilder b;
     const auto root = b.createRoot(1, 512.0f, AABB::empty());
-    XorShift32 fast;
+    DeterministicRng fast(kDynamicWorkloadSeed);
     for (uint32_t i = 0; i < kMaxChildren; ++i)
     {
         const float4 c = float4::vec(fast.uniform(-200, 200), fast.uniform(-20, 20),
@@ -2979,35 +2963,12 @@ static void BM_Adversarial_DeepPageChain(benchmark::State& state)
 BENCHMARK(BM_Adversarial_DeepPageChain)->Unit(benchmark::kMicrosecond);
 
 // ---------------------------------------------------------------------------
-// Harness self-check: the cost of the random numbers themselves, arg = draws
-// per iteration. Measures the generator, not the library.
-//
-// std::uniform_real_distribution over libstdc++ is pathologically slow under
-// clang: generate_canonical() computes logl() of a constant, which GCC folds
-// at compile time but clang calls at runtime, per sample — ~90 ns on x86-64
-// (x87 fp80) and ~480 ns on aarch64 where long double is software binary128
-// (llvm/llvm-project#19916). BM_MovingLeafNodes/10000 used to draw 30k such
-// samples per frame inside its timed loop, which made it look 6-25x slower
-// on linux-clang. All timed loops now use XorShift32; these two benches keep
-// the harness cost visible so a regression of this kind is obvious.
+// Harness self-check: cost of the deterministic generator used by workloads,
+// arg = draws per iteration. Measures the generator, not the library.
 // ---------------------------------------------------------------------------
-static void BM_Harness_StdUniformReal(benchmark::State& state)
+static void BM_Harness_DeterministicRng(benchmark::State& state)
 {
-    std::mt19937 rng(31337);
-    std::uniform_real_distribution<float> uni(-900.0f, 900.0f);
-    const int draws = int(state.range(0));
-    float acc = 0.0f;
-    for (auto _ : state)
-    {
-        for (int i = 0; i < draws; ++i) acc += uni(rng);
-        benchmark::DoNotOptimize(acc);
-    }
-}
-BENCHMARK(BM_Harness_StdUniformReal)->Arg(30000)->Unit(benchmark::kMicrosecond);
-
-static void BM_Harness_XorShift(benchmark::State& state)
-{
-    XorShift32 rng;
+    DeterministicRng rng(kDynamicWorkloadSeed);
     const int draws = int(state.range(0));
     float acc = 0.0f;
     for (auto _ : state)
@@ -3016,4 +2977,4 @@ static void BM_Harness_XorShift(benchmark::State& state)
         benchmark::DoNotOptimize(acc);
     }
 }
-BENCHMARK(BM_Harness_XorShift)->Arg(30000)->Unit(benchmark::kMicrosecond);
+BENCHMARK(BM_Harness_DeterministicRng)->Arg(30000)->Unit(benchmark::kMicrosecond);

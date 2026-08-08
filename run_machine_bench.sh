@@ -78,7 +78,6 @@ fi
 exec "${bench_exe}" \
     --benchmark_min_time=0.15s \
     --benchmark_repetitions=5 \
-    --benchmark_enable_random_interleaving=true \
     --benchmark_report_aggregates_only=true \
     "--benchmark_out=${ROOT_DIR}/machine_perf.json" \
     --benchmark_out_format=json

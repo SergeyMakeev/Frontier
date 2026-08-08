@@ -9,7 +9,6 @@ HLOD_MACHINE_BUILD_DIR="${ROOT_DIR}/build-arch-perf" \
     '--benchmark_filter=BM_(Kernel(WideAabb|DistanceError|CacheHit)|OutputAppend)' \
     --benchmark_min_time=0.75s \
     --benchmark_repetitions=11 \
-    --benchmark_enable_random_interleaving=true \
     --benchmark_report_aggregates_only=true \
     "--benchmark_out=${ROOT_DIR}/arch_kernel_perf.json" \
     --benchmark_out_format=json

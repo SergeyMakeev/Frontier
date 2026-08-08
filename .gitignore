@@ -1,4 +1,5 @@
 build*/
+perf_reports/
 profile_results/
 *.json
 *.trace

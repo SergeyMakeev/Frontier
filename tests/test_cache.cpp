@@ -11,7 +11,6 @@
 #include <array>
 #include <barrier>
 #include <exception>
-#include <random>
 #include <thread>
 #include <tuple>
 
@@ -222,8 +221,8 @@ TEST(Cache, MatchesUncachedUnderDamping)
     CutResults cut;
     CameraDamper refDamper(6.0f);
     CutParams p{6.0f, 0.0f};
-    std::mt19937 rng(99);
-    std::uniform_real_distribution<float> jit(-2.0f, 2.0f);
+    DeterministicRng rng(99);
+    DeterministicUniformFloat jit(-2.0f, 2.0f);
 
     ASSERT_EQ(cache.halfLife(), 6.0f);
 

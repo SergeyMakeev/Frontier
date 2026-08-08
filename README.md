@@ -368,6 +368,50 @@ arguments in the same way:
 
 Set `HLOD_PERF_BUILD_DIR` to use a build directory other than `build-perf`.
 
+### Complete cross-machine report
+
+Use `run_all_perf.sh` or `run_all_perf.bat` when comparing machines. The
+collector builds Release tests and both benchmark executables, runs the full
+correctness suite, and captures all three performance datasets used in this
+project: real-world workloads, machine-characterization probes, and the
+longer-running production-kernel probes. It also records the CPU, memory, OS,
+power mode, compiler, build options, Git revision, and exact commands.
+
+Give each run a short machine label:
+
+```sh
+./run_all_perf.sh m2-max
+./run_all_perf.sh epyc
+```
+
+```bat
+run_all_perf.bat i9
+```
+
+The scripts use normal scheduler placement without an affinity mask. Run them
+while the machine is plugged in, in its normal high-performance power mode,
+and otherwise idle. A complete run takes roughly 15 minutes on the reference
+i9 and can vary with machine speed. Each invocation creates a timestamped
+directory under `perf_reports/` and packages it as one `.zip` (`.tar.gz` only
+when `zip` is not installed). Send the three archives for comparison; each
+contains:
+
+- `real_world_perf.json`, `machine_perf.json`, and `arch_kernel_perf.json`;
+- a concise `REPORT.md` and machine-readable `manifest.txt`;
+- hardware, source, toolchain, command, build, test, and benchmark logs.
+
+All randomized benchmark and test workloads use repository-owned xorshift32
+generation with explicit fixed seeds. Float mapping, bounded integers, and
+shuffle order are also implemented locally rather than through the standard
+library, whose distribution and shuffle algorithms may differ by platform.
+Thus a seed and source commit describe the same generated workload on MSVC,
+libc++, and libstdc++. Google Benchmark's unseeded random-interleaving mode is
+disabled as well, so benchmark cases run in registration order. The policy
+identifier is stored in every report manifest.
+
+Set `HLOD_ALL_PERF_BUILD_DIR`, `HLOD_PERF_REPORT_ROOT`, or `HLOD_PERF_LABEL` to
+override the unified build directory, report location, or label respectively.
+
 For cross-machine diagnosis, `run_machine_bench.sh` builds a separate
 `hlod_machine_bench` executable and writes `machine_perf.json`. Its synthetic
 probes isolate scalar dependency and throughput, 128-bit SIMD arithmetic and

@@ -1,10 +1,29 @@
 #include <gtest/gtest.h>
 
-#include <random>
+#include <array>
 
 #include "hlod/math.h"
+#include "deterministic_rng.h"
 
 using namespace hlod;
+using namespace hlodtest;
+
+TEST(DeterministicRandom, StableSequenceMappingAndShuffle)
+{
+    DeterministicRng integers(0x12345678u);
+    constexpr std::array<uint32_t, 5> expected = {
+        2274908837u, 358294691u, 1210119364u, 2176035992u, 1882851208u};
+    for (uint32_t value : expected) EXPECT_EQ(integers.next(), value);
+
+    DeterministicRng floats(0x12345678u);
+    EXPECT_FLOAT_EQ(floats.uniform(-2.0f, 2.0f), 0.11867380142211914f);
+
+    std::array<uint32_t, 8> order = {0, 1, 2, 3, 4, 5, 6, 7};
+    DeterministicRng shuffle(0x42424242u);
+    deterministicShuffle(order.begin(), order.end(), shuffle);
+    constexpr std::array<uint32_t, 8> expectedOrder = {1, 5, 3, 2, 0, 6, 4, 7};
+    EXPECT_EQ(order, expectedOrder);
+}
 
 TEST(Float8, LaneWiseOps)
 {
@@ -50,9 +69,9 @@ TEST(Aabb, DistanceToBox)
 
 TEST(Aabb, SquaredWideMatchesScalarEnvelopes)
 {
-    std::mt19937 rng(0xd157u);
-    std::uniform_real_distribution<float> centerDist(-1000.0f, 1000.0f);
-    std::uniform_real_distribution<float> extentDist(0.0f, 100.0f);
+    DeterministicRng rng(0xd157u);
+    DeterministicUniformFloat centerDist(-1000.0f, 1000.0f);
+    DeterministicUniformFloat extentDist(0.0f, 100.0f);
 
     for (int iteration = 0; iteration < 1000; ++iteration)
     {
@@ -129,10 +148,10 @@ TEST(Frustum, MaskedTestSkipsClearedPlanes)
 
 TEST(Frustum, WideMatchesScalarOnRandomBoxes)
 {
-    std::mt19937 rng(12345);
-    std::uniform_real_distribution<float> uni(-50.0f, 50.0f);
-    std::uniform_real_distribution<float> ext(0.1f, 20.0f);
-    std::uniform_int_distribution<int> maskDist(0, kAllPlanes);
+    DeterministicRng rng(12345);
+    DeterministicUniformFloat uni(-50.0f, 50.0f);
+    DeterministicUniformFloat ext(0.1f, 20.0f);
+    DeterministicUniformInt<int> maskDist(0, int(kAllPlanes));
 
     const Camera v = makeLookAtCamera(float4::point(5, -3, -40), float4::point(0, 0, 0));
 
@@ -204,9 +223,9 @@ TEST(Frustum, WideMatchesScalarOnDegenerateBoxes)
 
 TEST(ScreenError, Wide8MatchesScalarFuzz)
 {
-    std::mt19937 rng(31337);
-    std::uniform_real_distribution<float> errDist(0.0f, 1.0e5f);
-    std::uniform_real_distribution<float> distDist(0.0f, 1.0e6f);
+    DeterministicRng rng(31337);
+    DeterministicUniformFloat errDist(0.0f, 1.0e5f);
+    DeterministicUniformFloat distDist(0.0f, 1.0e6f);
 
     for (int iter = 0; iter < 500; ++iter)
     {
@@ -226,9 +245,9 @@ TEST(ScreenError, Wide8MatchesScalarFuzz)
 
 TEST(ScreenError, SquaredWideMatchesScalarWithinTolerance)
 {
-    std::mt19937 rng(0x51a7u);
-    std::uniform_real_distribution<float> errorDist(0.01f, 1000.0f);
-    std::uniform_real_distribution<float> exponentDist(-20.0f, 20.0f);
+    DeterministicRng rng(0x51a7u);
+    DeterministicUniformFloat errorDist(0.01f, 1000.0f);
+    DeterministicUniformFloat exponentDist(-20.0f, 20.0f);
 
     float maxRelativeError = 0.0f;
     for (int iteration = 0; iteration < 2000; ++iteration)

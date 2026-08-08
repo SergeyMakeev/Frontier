@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <cmath>
 #include <iterator>
-#include <random>
 #include <set>
 #include <tuple>
 
@@ -67,14 +66,14 @@ struct RandomWorld
 
     explicit RandomWorld(uint32_t seed)
     {
-        std::mt19937 rng(seed);
-        std::uniform_real_distribution<float> uni(0.0f, 1.0f);
+        DeterministicRng rng(seed);
+        DeterministicUniformFloat uni(0.0f, 1.0f);
 
         TreeGen gen;
-        gen.fanout = 2 + uint32_t(rng() % 3);
-        gen.depth = 1 + uint32_t(rng() % 2);
+        gen.fanout = 2 + rng.index(3);
+        gen.depth = 1 + rng.index(2);
 
-        const int numInstances = 1 + int(rng() % 3);
+        const int numInstances = 1 + int(rng.index(3));
         for (int inst = 0; inst < numInstances; ++inst)
         {
             Page pg = gen.makeRootPage(unitRegion(40.0f), 64.0f, 2);
@@ -110,9 +109,9 @@ struct RandomWorld
     }
 };
 
-Camera randomView(std::mt19937& rng)
+Camera randomView(DeterministicRng& rng)
 {
-    std::uniform_real_distribution<float> uni(0.0f, 1.0f);
+    DeterministicUniformFloat uni(0.0f, 1.0f);
     const float4 pos = float4::point(uni(rng) * 800 - 400, uni(rng) * 300 - 150,
                                      uni(rng) * 800 - 400);
     const float4 tgt = float4::point(uni(rng) * 200 - 100, 0, uni(rng) * 200 - 100);
@@ -130,8 +129,8 @@ Camera randomView(std::mt19937& rng)
 // ---------------------------------------------------------------------------
 TEST(Contracts, CutInvariantsHoldOnRandomWorlds)
 {
-    std::mt19937 rng(2024);
-    std::uniform_real_distribution<float> uni(0.0f, 1.0f);
+    DeterministicRng rng(2024);
+    DeterministicUniformFloat uni(0.0f, 1.0f);
 
     for (int iter = 0; iter < 15; ++iter)
     {
@@ -190,7 +189,7 @@ TEST(Contracts, DeterministicAcrossIdenticalWorlds)
         RandomWorld a(seed), b(seed);
         // Damping on: the camera envelope history must match too.
         CameraDamper da(4.0f), db(4.0f);
-        std::mt19937 rngA(seed * 3), rngB(seed * 3);
+        DeterministicRng rngA(seed * 3), rngB(seed * 3);
         const CutParams p{6.0f, 0.5f};
 
         for (int frame = 0; frame < 6; ++frame)

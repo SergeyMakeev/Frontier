@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <map>
-#include <random>
 #include <set>
 
 #include "helpers.h"
@@ -176,19 +175,19 @@ TEST(Cut, IsAntichain)
 // ---------------------------------------------------------------------------
 TEST(Cut, MatchesBruteForceReference)
 {
-    std::mt19937 rng(777);
-    std::uniform_real_distribution<float> uni(0.0f, 1.0f);
+    DeterministicRng rng(777);
+    DeterministicUniformFloat uni(0.0f, 1.0f);
 
     for (int iter = 0; iter < 40; ++iter)
     {
         TreeGen gen;
-        gen.fanout = 2 + uint32_t(rng() % 3);
-        gen.depth = 1 + uint32_t(rng() % 2);
+        gen.fanout = 2 + rng.index(3);
+        gen.depth = 1 + rng.index(2);
 
         World w;
         std::vector<UserId> allIds;
 
-        const int numInstances = 1 + int(rng() % 3);
+        const int numInstances = 1 + int(rng.index(3));
         for (int inst = 0; inst < numInstances; ++inst)
         {
             Page pg = gen.makeRootPage(unitRegion(40.0f), 64.0f, 2);

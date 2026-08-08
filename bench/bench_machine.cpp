@@ -18,6 +18,7 @@
 
 #include "hlod/math.h"
 #include "hlod/world.h"
+#include "deterministic_rng.h"
 
 #if defined(__aarch64__) || defined(_M_ARM64) || defined(_M_ARM64EC)
 #include <arm_neon.h>
@@ -344,13 +345,11 @@ static void BM_VectorCompareMask128(benchmark::State& state)
 {
     constexpr size_t kLanes = 4096;
     std::vector<float> a(kLanes), b(kLanes);
-    uint32_t rng = 0x12345678u;
+    hlodtest::DeterministicRng rng(0x12345678u);
     for (size_t i = 0; i < kLanes; ++i)
     {
-        rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
-        a[i] = float(int32_t(rng)) * (1.0f / 2147483648.0f);
-        rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
-        b[i] = float(int32_t(rng)) * (1.0f / 2147483648.0f);
+        a[i] = float(int32_t(rng.next())) * (1.0f / 2147483648.0f);
+        b[i] = float(int32_t(rng.next())) * (1.0f / 2147483648.0f);
     }
     uint32_t result = 0;
     for (auto _ : state)
@@ -391,13 +390,8 @@ WideAabbFixture makeWideAabbFixture()
     f.frustum.plane[4] = { 0.00000f,  0.00000f,  1.00000f,  5.0f};
     f.frustum.plane[5] = { 0.00000f,  0.00000f, -1.00000f, 80.0f};
 
-    uint32_t rng = 0x6d2b79f5u;
-    const auto random = [&rng](float lo, float hi)
-    {
-        rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
-        const float unit = float(rng >> 8) * (1.0f / 16777216.0f);
-        return lo + (hi - lo) * unit;
-    };
+    hlodtest::DeterministicRng rng(0x6d2b79f5u);
+    const auto random = [&rng](float lo, float hi) { return rng.uniform(lo, hi); };
     for (size_t i = 0; i < f.bounds.size(); ++i)
     {
         hlod::WideBounds& wide = f.bounds[i];
@@ -832,11 +826,11 @@ static void BM_BranchDispatch(benchmark::State& state)
     constexpr size_t kCount = 16384;
     const int pattern = int(state.range(0)); // 0 constant, 1 alternating, 2 random
     std::vector<uint8_t> choices(kCount);
-    uint32_t rng = 0x31415926u;
+    hlodtest::DeterministicRng rng(0x31415926u);
     for (size_t i = 0; i < kCount; ++i)
     {
-        rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
-        choices[i] = pattern == 0 ? 0 : pattern == 1 ? uint8_t(i & 1) : uint8_t(rng >> 31);
+        choices[i] = pattern == 0 ? 0 : pattern == 1 ? uint8_t(i & 1)
+                                                      : uint8_t(rng.next() >> 31);
     }
 
     uint32_t value = 1;

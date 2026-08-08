@@ -15,7 +15,6 @@
 
 #include <gtest/gtest.h>
 
-#include <random>
 #include <set>
 
 #include "helpers.h"
@@ -161,8 +160,8 @@ TEST(Tlas, RemoveVanishesWithoutRebuilding)
 TEST(Tlas, IncrementalEditsMatchARebuiltTree)
 {
     Field f;
-    std::mt19937 rng(20260804);
-    std::uniform_real_distribution<float> uni(-60.0f, 60.0f);
+    DeterministicRng rng(20260804);
+    DeterministicUniformFloat uni(-60.0f, 60.0f);
 
     std::vector<Placed> refs;
     for (int i = 0; i < 400; ++i) refs.push_back(f.add(uni(rng), uni(rng)));
@@ -171,7 +170,7 @@ TEST(Tlas, IncrementalEditsMatchARebuiltTree)
     {
         for (int k = 0; k < 3; ++k)
         {
-            const size_t i = rng() % refs.size();
+            const size_t i = rng.index(uint32_t(refs.size()));
             f.w.removeInstance(refs[i].ref);
             refs[i] = refs.back();
             refs.pop_back();
@@ -179,7 +178,7 @@ TEST(Tlas, IncrementalEditsMatchARebuiltTree)
         for (int k = 0; k < 3; ++k) refs.push_back(f.add(uni(rng), uni(rng)));
         for (int k = 0; k < 5; ++k)
         {
-            const size_t i = rng() % refs.size();
+            const size_t i = rng.index(uint32_t(refs.size()));
             f.w.moveInstance(refs[i].ref, float4::point(uni(rng), 0, uni(rng)));
         }
 
@@ -413,8 +412,8 @@ TEST(Tlas, OptimizeCompactsDenseSlotsAndKeepsPublicRefsStable)
 TEST(Tlas, SustainedChurnEventuallyForcesARebuild)
 {
     Field f(onlyEditBudget());
-    std::mt19937 rng(7);
-    std::uniform_real_distribution<float> uni(-60.0f, 60.0f);
+    DeterministicRng rng(7);
+    DeterministicUniformFloat uni(-60.0f, 60.0f);
     std::vector<Placed> refs;
     for (int i = 0; i < 200; ++i) refs.push_back(f.add(uni(rng), uni(rng)));
 
@@ -427,7 +426,7 @@ TEST(Tlas, SustainedChurnEventuallyForcesARebuild)
     bool rebuilt = false;
     for (int round = 0; round < 40 && !rebuilt; ++round)
     {
-        const size_t i = rng() % refs.size();
+        const size_t i = rng.index(uint32_t(refs.size()));
         f.w.removeInstance(refs[i].ref);
         refs[i] = refs.back();
         refs.pop_back();

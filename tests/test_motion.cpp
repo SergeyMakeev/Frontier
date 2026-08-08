@@ -1,7 +1,6 @@
 #include <gtest/gtest.h>
 
 #include <memory>
-#include <random>
 #include <set>
 
 #include "helpers.h"
@@ -294,8 +293,8 @@ TEST(Motion, InstanceMove)
 // ---------------------------------------------------------------------------
 TEST(Motion, TlasMatchesBruteForce)
 {
-    std::mt19937 rng(4242);
-    std::uniform_real_distribution<float> uni(-2000.0f, 2000.0f);
+    DeterministicRng rng(4242);
+    DeterministicUniformFloat uni(-2000.0f, 2000.0f);
 
     TreeGen gen;
     World w;
@@ -334,8 +333,8 @@ TEST(Motion, TlasMatchesBruteForce)
 // ---------------------------------------------------------------------------
 TEST(Motion, ManyMovesStayCorrect)
 {
-    std::mt19937 rng(99);
-    std::uniform_real_distribution<float> uni(-500.0f, 500.0f);
+    DeterministicRng rng(99);
+    DeterministicUniformFloat uni(-500.0f, 500.0f);
 
     TreeGen gen;
     World w;
@@ -375,8 +374,8 @@ TEST(Motion, ManyMovesStayCorrect)
 // ---------------------------------------------------------------------------
 TEST(Motion, InstanceChurnStaysCorrect)
 {
-    std::mt19937 rng(1234);
-    std::uniform_real_distribution<float> uni(-400.0f, 400.0f);
+    DeterministicRng rng(1234);
+    DeterministicUniformFloat uni(-400.0f, 400.0f);
 
     TreeGen gen;
     gen.fanout = 4;
@@ -415,7 +414,7 @@ TEST(Motion, InstanceChurnStaysCorrect)
                                                    float4::vec(0.5f, 0.5f, 0.5f)));
         for (int k = 0; k < 8; ++k)
         {
-            const size_t i = size_t(rng()) % trees.size();
+            const size_t i = rng.index(uint32_t(trees.size()));
             w.removeInstance(trees[i].ref);
             trees[i] = std::move(trees.back());
             trees.pop_back();
@@ -443,8 +442,8 @@ TEST(Motion, InstanceChurnStaysCorrect)
 // ---------------------------------------------------------------------------
 TEST(Motion, ManyLeafMovesStayConservative)
 {
-    std::mt19937 rng(5150);
-    std::uniform_real_distribution<float> uni(-80.0f, 80.0f);
+    DeterministicRng rng(5150);
+    DeterministicUniformFloat uni(-80.0f, 80.0f);
 
     TreeGen gen;
     gen.fanout = 4;

@@ -11,6 +11,7 @@
 
 #include "hlod/builder.h"
 #include "hlod/world.h"
+#include "deterministic_rng.h"
 
 namespace hlod {
 
