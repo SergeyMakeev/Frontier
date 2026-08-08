@@ -65,9 +65,10 @@ inline Vec4 vload(const float* p) { return vld1q_f32(p); }
 inline void vstore(float* p, Vec4 v) { vst1q_f32(p, v); }
 inline uint32_t compareMask(Vec4 a, Vec4 b)
 {
+    // MSVC represents NEON vectors as __n128 and has no vector literals.
+    alignas(16) static constexpr uint32_t kWeights[4] = {1u, 2u, 4u, 8u};
     const uint32x4_t bits = vshrq_n_u32(vcltq_f32(a, b), 31);
-    const uint32x4_t weights = {1u, 2u, 4u, 8u};
-    return vaddvq_u32(vmulq_u32(bits, weights));
+    return vaddvq_u32(vmulq_u32(bits, vld1q_u32(kWeights)));
 }
 #elif HLOD_MACHINE_SSE2
 using Vec4 = __m128;
