@@ -3,11 +3,11 @@
 // laid out as ONE contiguous blob. Produced by HLodBuilder::build();
 // see hlod_design.md §3.
 //
-// The in-memory layout IS the on-disk format. A streamed page is one read
-// into one aligned buffer with no parsing, no fixups and no per-array
-// allocation; a memory-mapped page is wrapped by PageView with zero copies.
-// That is what makes attachPage() allocation-free and what lets thousands of
-// instances share a single asset.
+// The in-memory layout IS the on-disk format. A streamed page can be read into
+// one aligned buffer and validated in place, with no unpacking, fixups, or
+// per-array allocation; a memory-mapped page is wrapped by PageView with zero
+// copies. Registration and attachment need no page-data transformation, and
+// thousands of instances can share a single asset blob.
 //
 //   PageView — borrows a blob somebody else owns (mmap, a bundle file, an
 //              asset the World already holds). Trivially copyable, 88 bytes.
@@ -50,13 +50,9 @@ inline uint32_t metaWideOffset(uint32_t m) { return m >> kMetaOffsetShift; }
 //
 // EXACTLY four cache lines, and the blob keeps the array 64-byte aligned, so
 // block b occupies lines [4b, 4b+4) and never straddles a fifth. That is the
-// whole reason the two lane masks live in a side array (PageView::blockMask)
-// instead of here: with them inline the block was 272 bytes, padded to 288 by
-// the 32-byte cadence, which is 4.5 lines -- so every block touched five lines
-// whatever its parity, 320 bytes of line traffic to read 272 bytes of data.
-// The masks are 4 bytes per block in a dense sequential array, sixteen blocks
-// to a line, which is far cheaper than the padding they replaced. The cut walk
-// is memory-bound, so lines touched is the number that matters.
+// two lane masks live in a dense side array (`PageView::blockMask`) so a block
+// remains four cache lines without internal padding. Each mask word is 4 bytes,
+// placing sixteen consecutive block masks in one 64-byte cache line.
 struct WideBlock
 {
     WideBounds bounds;              // children's bounds, one child per lane
@@ -133,8 +129,7 @@ struct MutWideBoundsRef
 // ---------------------------------------------------------------------------
 
 inline constexpr uint32_t kPageMagic   = 0x444F4C48u;   // 'HLOD', little-endian
-// 2: lane masks moved out of WideBlock into the blockMask side array, taking
-//    the block from 288 bytes to 256. Not backward compatible.
+// Readers require an exact format-version match.
 inline constexpr uint16_t kPageVersion = 2;
 
 // Blob alignment. 64 keeps the header on its own cache line and every array
@@ -292,6 +287,6 @@ private:
     const HlodContext* ctx_ = nullptr;
 };
 static_assert(sizeof(void*) != 8 || sizeof(Page) == 96,
-              "Page must stay a 96-byte view plus ownership pointer");
+              "Page must stay an 88-byte view plus ownership pointer");
 
 } // namespace hlod

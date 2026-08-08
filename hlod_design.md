@@ -2,8 +2,9 @@
 
 This is the current design implemented by `include/hlod` and `src`. Start with
 the [README](README.md) for the general overview, a compilable minimal example,
-and representative performance numbers. The performance history and rejected
-experiments live in [ARCHITECTURE.md](ARCHITECTURE.md).
+and representative performance numbers. See [API.md](API.md) for detailed
+integration guidance and [ARCHITECTURE.md](ARCHITECTURE.md) for the current
+implementation structure.
 
 ## 1. Problem and model
 
@@ -88,9 +89,9 @@ owns that table outside the library.
 - `mask`, ANDed with `Camera::viewMask` for cheap layer filtering.
 
 `World::addInstance` returns the generation-stamped owner reference. Selection
-packs its dense 24-bit `InstanceId` into each `CutEntry`; callers normally use
-that id to index the same placement/transform table that stores the returned
-`InstanceRef`.
+packs its stable 24-bit public `InstanceId` into each `CutEntry`; callers
+normally use that id to index the same placement/transform table that stores
+the returned `InstanceRef`.
 
 Rotation and non-uniform scale are not represented by `InstanceDesc`. Bake
 them into authored bounds/proxies or place such objects in an integration layer
@@ -176,8 +177,7 @@ Index zero is a sentinel representing the page owner. Real page roots begin at
 index one. The sentinel gives the runtime one uniform root-child block and one
 coverage summary for both instance roots and attached pages.
 
-The current blob version is 2. It is little-endian and deliberately versioned;
-version 1 is not compatible because lane masks moved out of `WideBlock`.
+The current blob version is 2. It is little-endian and deliberately versioned.
 `Page::fromBytes` validates and copies untrusted bytes into aligned owned
 storage. `PageView::fromBytes` validates a borrowed blob without taking
 ownership; the storage must remain valid and suitably aligned for the lifetime
@@ -310,9 +310,8 @@ levels ~= ceil(log2(error / threshold) / errorHalvingsPerPage)
 Keep candidates from all regions in one max-heap, attach the globally worst,
 inspect the new page, estimate the next expansion errors, and continue until
 the page budget is exhausted. A depth-first lookahead can starve other regions
-under fanout. The measured global-heap policy reduced worst residual error two
-frames after a teleport by about 120x at the same page budget; see experiment N
-in [ARCHITECTURE.md](ARCHITECTURE.md).
+under fanout, while the global heap applies the budget to the worst remaining
+error across the whole view.
 
 ## 6. Selection outputs and traversal
 
@@ -328,7 +327,7 @@ payload were resident. Keeping membership in the container rather than every
 entry avoids two per-entry tags and makes each `CutEntry` exactly 12 bytes:
 
 - an 8-byte `NodeHandle`;
-- a dense 24-bit `InstanceId`; and
+- a stable 24-bit public `InstanceId`; and
 - an 8-bit threshold-relative screen-error code.
 
 Error codes 0 through 127 mean at or below the query threshold; 128 through
@@ -472,6 +471,10 @@ the selection snapshot:
 - `TlasQuality::Median` uses recursive longest-axis median splits; and
 - `TlasQuality::Morton` is the cheapest, loosest quality choice.
 
+That first non-empty build also compacts and spatially orders the physical
+instance streams. Public `InstanceRef` values and `CutEntry::instance()` ids
+are mapped separately and remain stable.
+
 After the tree exists, individual adds and removes are applied incrementally in
 O(depth). Inserts descend toward the least-growing leaf and use a free lane or
 split the leaf; removals invalidate a lane. `tlasEditFraction` bounds how many
@@ -485,20 +488,31 @@ bounded cohort consume the budget repeatedly. Sufficient aggregate area growth
 can promote a later rebuild to restore quality. These thresholds are exposed as
 `tlasEscapeFraction` and `tlasAreaDrift`.
 
+Routine repairs preserve physical instance order. `World::optimize()` is the
+explicit synchronization-point operation that flushes pending bounds, compacts
+dead dense slots, performs a quality rebuild, and restores TLAS traversal order
+to the physical instance and view-record streams. Call it after disruptive
+world changes at a menu, loading screen, teleport, or level transition rather
+than as per-frame maintenance.
+
 Morton builds quantize each centroid to 21 bits per axis for a 63-bit key.
 Populations of at least 1,024 use a stable LSD radix sort with up to six 11-bit
 passes and retained scratch; smaller populations use `std::sort`. The dense
 live-instance list makes rebuild enumeration proportional to the current
-population rather than the historical slot high-water mark.
+population rather than the allocated-slot high-water mark.
 
 Quality builds can be a visible level-load cost at hundreds of thousands of
-instances. Build the world before an interactive frame, keep the incremental
-edit path active for steady churn, and use the measured first-cut numbers in
-the README when budgeting a loading transition.
+instances. Build the initial world before an interactive frame and keep the
+incremental edit path active for steady churn.
 
 ## 10. Motion and copy-on-write bounds
 
 `moveInstance` updates translation and uniform scale and refits its TLAS path.
+For a persistent fixed-order cohort, `MotionGroup` retains the caller's order
+and caches the corresponding physical instance order for `moveInstances`.
+Stale references are skipped, duplicate references use the last supplied
+position, and the physical-order cache refreshes after a world layout change.
+
 `setNodeBounds(instance, node, localBounds)` deforms one node for one instance.
 The instance argument is essential: immutable topology and payload data remain
 shared, while bounds become instance-specific.
@@ -518,7 +532,8 @@ last submitted value. Ancestors grow conservatively and stop at the first box
 that already contains the change; that early-out cheaply coalesces shared
 ancestors and repeated moves without a dirty-node table. Grouping submissions
 by instance or page preserves overlay locality; the library does not sort them
-because the measured sort cost exceeded the recovered locality.
+because sorting adds whole-batch work and discards useful locality already
+provided by the caller.
 
 Ancestor page bounds do not currently shrink after deformation. Long-running
 large teleports can therefore make culling looser, never incorrect. TLAS
@@ -564,6 +579,7 @@ candidates examined, and pages detached; it does not scan the entire world.
 | Incremental add / move / remove instance | O(TLAS depth), excluding asset teardown |
 | Bounds submission | O(1) queue append |
 | `applyUpdates` | O(changed ancestor paths + any scheduled TLAS repair) |
+| `optimize` | O(live instances + quality TLAS rebuild + physical reorder) |
 | `collect` | O(feedback consumed + cold candidates examined + mounts detached) |
 
 Current integration limits and tuning decisions are:
@@ -575,8 +591,8 @@ Current integration limits and tuning decisions are:
   slots, a page at 1,048,576 entries including its sentinel, and the dense
   instance table at 16,777,215 live slots; a mount generation wraps only after
   that same slot has been recycled more than 16 million times;
-- cached views parallelize across calls; parallelizing within one cached call
-  remains unnecessary for the measured multi-view workload;
+- cached views parallelize across calls; one cached call does not fan out
+  internally;
 - translation plus uniform scale is the built-in instance transform;
 - internal deformation needs caller-maintained proxy fidelity and has no
   page-level shrink pass; and

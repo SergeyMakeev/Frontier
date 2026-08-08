@@ -26,7 +26,7 @@ public:
     // Marks a node whose children live in another page. Must remain a leaf.
     void markExpansion(NodeId node);
 
-    // Consumes the builder. Establishes invariants (A)-(D), emits wide child
+    // Consumes the builder. Establishes invariants (A)-(E), emits wide child
     // blocks, verifies the contract, and packs everything into one blob
     // allocated through `ctx`. Fires HLOD_FATAL on contract violations.
     //

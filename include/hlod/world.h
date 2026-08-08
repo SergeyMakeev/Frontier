@@ -19,14 +19,15 @@
 //
 // Deformation does not break that. Bounds are the only part of a page the
 // runtime rewrites, so an instance that is deformed with setNodeBounds gets a
-// private copy of just its bounds (a copy-on-write overlay, roughly 60% of a
-// page) and keeps sharing topology, payloads, errors, residency and streaming
-// with every other instance. There is no "private page" mode: the thing that
+// private copy-on-write overlay for bounds and keeps sharing topology,
+// payloads, errors, residency and streaming with every other instance. Large
+// page overlays keep modified wide blocks sparse until edits justify a dense
+// copy. There is no "private page" mode: the thing that
 // would actually hurt at scale is ten thousand duplicated *streaming graphs*,
 // not ten thousand duplicated boxes, and duplicating the page duplicates both.
 //
-// THE API IS FULLY HANDLE-BASED — the World keeps no id index at all (no
-// hash maps anywhere). Handles are the only currency:
+// THE API IS FULLY HANDLE-BASED — the World keeps no payload/user-id index or
+// hash map. Handles are the only currency:
 //  - registerAsset returns an AssetHandle; addInstance returns an InstanceRef
 //    containing its root PageHandle, and attachPage returns a PageHandle.
 //    Node handles are composed from a page handle plus the packed page-local
@@ -142,8 +143,8 @@ uint8_t encodeCutError(float error, float threshold);
 float   decodeCutError(uint8_t code, float threshold);
 
 // A cut entry is deliberately 12 bytes: one logical 64-bit node handle plus
-// a packed 24-bit dense InstanceId and 8-bit screen-error code. User payloads
-// and application entity data stay in caller-side tables indexed by the dense
+// a packed stable 24-bit InstanceId and 8-bit screen-error code. User payloads
+// and application entity data stay in caller-side tables indexed by the
 // instance id, rather than being repeated in every view's cut.
 struct CutEntry
 {
@@ -224,7 +225,7 @@ struct CutBuffers
 
 // Explicit owning snapshot for callers that need to retain a cut across the
 // next selection. The normal API returns CutView and keeps ownership in View;
-// this compatibility/storage type exposes only spans, not its container.
+// this storage type exposes only spans, not its container.
 class CutResults : public CutView
 {
 public:
@@ -469,13 +470,10 @@ struct CollectResult
 // absolute k travel and charges that per-record slope against the same validity
 // margin used for camera travel.
 //
-// This matters most for damped zoom-out: k changes a little for roughly 24
-// half-lives. The old all-or-nothing epoch invalidated the whole cache on each
-// of those frames. The slope budget keeps unaffected records reusable while
-// preserving the exact node set. Measured by BM_View_Zoom at 20k
-// instances, halfLife 8 and a zoom step every 120 frames, it removes 39% of the
-// cut time without growing the compact record. Threshold changes still bump an
-// epoch because they change every stored slope at once.
+// During damped zoom-out, k changes a little over many frames. The slope
+// budget keeps unaffected records reusable while preserving the exact node
+// set. Threshold changes still bump an epoch because they change every stored
+// slope at once.
 //
 // Damping and reuse are independent. A half-life of 0 makes the arithmetic
 // bit-identical to an undamped query; setReuseEnabled(false) selects the
@@ -605,12 +603,9 @@ private:
     //
     // This record is read for every visible instance, indexed by instance id,
     // so it is a random access per instance -- the one new memory stream the
-    // cache introduces. It has to be cheaper than the walk it replaces, and
-    // the walk it usually replaces is cheap: with a shared asset the page is
-    // the same bytes for every instance and sits in L1. A first version of
-    // this record was 128 bytes and lost 1.4x at 80k instances while reusing
-    // 93% of them, purely on its own footprint. Everything here is therefore
-    // either a scalar or absent:
+    // cache introduces. It has to be cheaper than the walk it replaces, which
+    // is often already cheap because shared page bytes stay hot. Everything
+    // here is therefore either a scalar or absent:
     //  - no camera envelope: validity is a single scalar budget against the
     //    view's accumulated travel (see travel_);
     //  - no per-record k / threshold copies: threshold changes bump epoch_,
@@ -748,11 +743,6 @@ struct WorldConfig
     // which deepens that subtree by one; a removal invalidates a lane and
     // leaves its box loose. Both are O(depth) and both cost a little quality,
     // so this bounds how much of it accumulates.
-    //
-    // Do not read this as a tuning knob of last resort: before it existed,
-    // every add or remove marked the whole TLAS dirty, so ONE spawn cost a full
-    // rebuild -- 2.1 ms at 20k instances and 9.5 ms at 80k, the same as five
-    // hundred spawns. See ARCHITECTURE.md, experiment L.
     float tlasEditFraction = 0.05f;
 
     // Minimum number of visible instances before an uncached View fans
@@ -771,8 +761,8 @@ public:
     explicit World(const WorldConfig& config = WorldConfig{});
     ~World();
 
-    // Non-copyable and non-movable: pages the World owns hold a pointer to
-    // config_.context, and instances/mounts refer to each other by slot.
+    // Non-copyable and non-movable: registered owned pages retain allocator
+    // context pointers, and instances/mounts refer to each other by slot.
     World(const World&) = delete;
     World& operator=(const World&) = delete;
     World(World&&) = delete;
@@ -1075,11 +1065,9 @@ private:
         // Effective error ceiling for every node in this page: the owning
         // expansion node's effective error, or FLT_MAX for a root page.
         //
-        // Invariant (D) across a page boundary used to be established by
-        // REWRITING the child page's error array at attach time. It is a
-        // per-attachment scalar instead, folded into the wide test with one
-        // min8. That is what lets a single page back many attachments — and
-        // it turns attach from an O(nodeCount) write pass into O(1).
+        // The per-attachment scalar is folded into the wide error test. It
+        // lets a single immutable page back mounts with different parent
+        // error ceilings without rewriting the page's node data.
         float                 errClamp = FLT_MAX;
         // Two bits per node in one byte: payload residency and whether the
         // node has a complete resident cut. Keeping them together halves the

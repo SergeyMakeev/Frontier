@@ -60,12 +60,11 @@
 namespace hlod {
 
 // ---------------------------------------------------------------------------
-// Host context: allocation and optional task parallelism.
+// Host context: page-blob allocation and optional task parallelism.
 //
-// Page blobs, asset storage and per-worker output buffers are allocated
-// through this. The World's small per-call scratch stays in std::vector: it
-// amortizes to zero allocations after the first few frames, so routing it
-// through the context would buy nothing and cost a lot of template churn.
+// HLodBuilder and the owned Page factories use alloc/free. World uses the
+// blocking parallelFor callback and workerCount for an enabled uncached
+// parallel selection. Other retained runtime storage is library-owned.
 // ---------------------------------------------------------------------------
 
 using AllocFn = void* (*)(size_t bytes, size_t alignment, void* user);

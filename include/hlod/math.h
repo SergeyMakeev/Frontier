@@ -1,10 +1,7 @@
 #pragma once
-// Minimal SIMD-friendly math for HLodTree: float4 / float8 only.
-//
-// Everything is written as branch-free lane loops over fixed-size arrays so
-// the compiler can auto-vectorize; the types and call sites are shaped so the
-// implementation can later be swapped for a real SIMD math library without
-// touching the callers.
+// Minimal SIMD-friendly math for HLodTree. float4 is the public vector
+// interface; float8 and WideBounds form the fixed eight-lane working set used
+// by the AVX2, SSE2, NEON, and scalar backends.
 
 #include <bit>
 #include <cassert>
