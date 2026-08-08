@@ -45,6 +45,7 @@
 // each call has its own View and outputs. LOD damping, cut reuse, query scratch,
 // and selection statistics all live in the View, never as mutable World state.
 
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <memory>
@@ -1284,20 +1285,23 @@ private:
     void reorderInstancesByTlas();
 
     // Wide top-level BVH node; lanes are children (inner nodes or instances).
-    struct TlasNode
+    // Query-hot bounds, links and flags occupy the first four cache lines.
+    // Error/layer metadata follows in the fifth, keeping one predictable AoS
+    // stream for queries that need it while cached queries stop after 256 B.
+    struct alignas(64) TlasNode
     {
         static constexpr uint32_t kValidLaneMask = (1u << kWide) - 1u;
         static constexpr uint32_t kSingleRootShift = kWide;
 
         WideBounds bounds;
-        float8     maxErr{};
         int32_t    child[kWide];   // >= 0: node index; < 0: instance ~child
-        uint32_t   laneMask[kWide];// union of the lane subtree's instance masks
         // Low eight bits are valid lanes. The next eight mark leaf lanes whose
         // root page has exactly one renderable BLAS root. Packing the flags
-        // here preserves the five-cache-line node layout.
+        // here preserves the four-cache-line hot node layout.
         uint32_t   validMask = 0;
         int32_t    parent = -1;
+        float8     maxErr{};
+        uint32_t   laneMask[kWide]{};// union of lane subtree instance masks
 
         uint32_t validLanes() const { return validMask & kValidLaneMask; }
         bool singleRoot(uint32_t lane) const
@@ -1316,6 +1320,8 @@ private:
                            (1u << (kSingleRootShift + lane)));
         }
     };
+    static_assert(offsetof(TlasNode, maxErr) == 256,
+                  "cached TLAS query data must end at four cache lines");
     static_assert(sizeof(TlasNode) == 320,
                   "SIMD TLAS node must stay five cache lines");
 
