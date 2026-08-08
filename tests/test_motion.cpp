@@ -288,6 +288,48 @@ TEST(Motion, InstanceMove)
     EXPECT_FALSE(cutIds(w, frame(w, vThere, {4, 0})).empty());
 }
 
+TEST(Motion, MotionGroupPreservesCallerOrderAndTracksPhysicalReorders)
+{
+    TreeGen gen;
+    Page proto = gen.makeRootPage(unitRegion(2.0f), 8.0f, 0);
+    const uint32_t nodes = proto.nodeCount();
+
+    World w;
+    const AssetHandle asset = w.registerAsset(std::move(proto));
+    std::vector<World::InstanceRef> refs;
+    refs.reserve(128);
+    for (int i = 0; i < 128; ++i)
+        refs.push_back(w.addInstance(
+            asset, float4::point(float((i * 37) % 127), 0, float((i * 61) % 127))));
+    markAllResident(w, w.assetRootPage(asset), nodes);
+    w.applyUpdates();   // spatializes physical storage
+
+    // Duplicate refs retain the last caller position.
+    const World::InstanceRef duplicateRefs[] = {refs[7], refs[83], refs[7]};
+    World::MotionGroup group(duplicateRefs);
+    const float4 first[] = {float4::point(100, 0, 10),
+                            float4::point(200, 0, 20),
+                            float4::point(300, 0, 30)};
+    w.moveInstances(group, first);
+    EXPECT_FLOAT_EQ(TA::instanceWorldBox(w, refs[7]).center().x, 300.0f);
+    EXPECT_FLOAT_EQ(TA::instanceWorldBox(w, refs[83]).center().x, 200.0f);
+
+    // optimize() changes dense ids; the group must rebuild transparently.
+    w.optimize();
+    const float4 second[] = {float4::point(400, 0, 40),
+                             float4::point(500, 0, 50),
+                             float4::point(600, 0, 60)};
+    w.moveInstances(group, second);
+    EXPECT_FLOAT_EQ(TA::instanceWorldBox(w, refs[7]).center().x, 600.0f);
+    EXPECT_FLOAT_EQ(TA::instanceWorldBox(w, refs[83]).center().x, 500.0f);
+
+    // A removed ref remains stale even if its dense slot is reused.
+    w.removeInstance(refs[83]);
+    const auto replacement = w.addInstance(asset, float4::point(700, 0, 70));
+    w.moveInstances(group, first);
+    EXPECT_FLOAT_EQ(TA::instanceWorldBox(w, replacement).center().x, 700.0f);
+}
+
 // ---------------------------------------------------------------------------
 // TLAS query against a brute-force instance sweep on a freshly built BVH.
 // ---------------------------------------------------------------------------

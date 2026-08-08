@@ -819,6 +819,39 @@ public:
         bool valid() const { return id != kInvalidInstanceId; }
     };
 
+    // A persistent cohort whose caller-visible order stays fixed while World
+    // caches the corresponding physical instance order. This is intended for
+    // groups that move together every frame. The cache rebuilds automatically
+    // after optimize() or another physical layout change.
+    class MotionGroup
+    {
+    public:
+        MotionGroup() = default;
+        explicit MotionGroup(std::span<const InstanceRef> instances);
+        void reset(std::span<const InstanceRef> instances);
+        size_t size() const { return instances_.size(); }
+
+    private:
+        friend class World;
+        struct Slot
+        {
+            InstanceId dense;
+            uint32_t source;
+
+            bool operator<(const Slot& other) const
+            {
+                return dense < other.dense ||
+                       (dense == other.dense && source < other.source);
+            }
+        };
+        static_assert(sizeof(Slot) == 8, "motion-group slot must stay 8 bytes");
+
+        AppendBuffer<InstanceRef> instances_;
+        AppendBuffer<Slot> physicalOrder_;
+        uint32_t layoutVersion_ = 0;
+        bool physicalOrderValid_ = false;
+    };
+
     // During initial assembly, additions are accumulated for the first build.
     // Once a TLAS exists, insertion is O(depth) and may allocate a TLAS node
     // when a full leaf splits; it never scans the whole instance population.
@@ -834,6 +867,12 @@ public:
 
     void removeInstance(InstanceRef ref);                                    // no-op if stale
     void moveInstance(InstanceRef ref, float4 pos, float scale = 1.0f);      // no-op if stale
+
+    // positions[i] belongs to the InstanceRef at i in the MotionGroup.
+    // Stale refs are ignored and duplicate refs use the final position.
+    void moveInstances(MotionGroup& group,
+                       std::span<const float4> positions,
+                       float scale = 1.0f);
 
     // ---- topology streaming -------------------------------------------------
     // An expansion handle comes from a high-error ideal-side CutEntry (or is
@@ -1282,6 +1321,8 @@ private:
     Instance* resolveInstance(InstanceRef ref);
     InstanceId denseInstanceId(InstanceRef ref) const;
     InstanceId publicInstanceId(InstanceId dense) const;
+    void moveInstanceDense(InstanceId dense, float4 pos, float scale);
+    void refreshMotionGroup(MotionGroup& group) const;
     void reorderInstancesByTlas();
 
     // Wide top-level BVH node; lanes are children (inner nodes or instances).
@@ -1514,7 +1555,7 @@ private:
     void applyBoundsChange(InstanceId id, uint32_t slot, uint32_t index, const AABB& box);
     void patchParentLane(const PageView& pg, AABB* bbox, Overlay& overlay,
                          uint32_t index);
-    void refreshInstanceBounds(InstanceId id);
+    void refreshInstanceBounds(InstanceId id, bool recomputeError);
 
     InstanceRef addInstanceInternal(uint32_t asset, const InstanceDesc& desc);
 
@@ -1530,7 +1571,7 @@ private:
                        std::vector<VisibleItem>& outVisible,
                        std::vector<TlasItem>& stack) const;
     bool instanceHasSingleRoot(InstanceId id) const;
-    void recomputeInstanceBounds(InstanceId id);
+    void recomputeInstanceBounds(InstanceId id, bool recomputeError);
     void tlasOnInstanceMoved(InstanceId id);
     void tlasNoteGrowth(float addedArea);
 

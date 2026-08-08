@@ -2266,6 +2266,9 @@ static void BM_View_FlyThrough(benchmark::State& state)
     cache.setReuseEnabled(cached);
     const CutParams p{4.0f, 0.0f};
     DeterministicRng fast(kDynamicWorkloadSeed);
+    std::vector<float4> movingPositions(static_cast<size_t>(movers));
+    World::MotionGroup movingGroup(
+        std::span<const World::InstanceRef>(insts.data(), size_t(movers)));
 
     // Fixed iteration count, and the camera's path is a function of the frame
     // index: both arms therefore fly exactly the same route past exactly the
@@ -2282,8 +2285,10 @@ static void BM_View_FlyThrough(benchmark::State& state)
         const float t = float(frames % 600) / 600.0f;
         const float z = (t * 2.0f - 1.0f) * half * 0.8f;
         for (int i = 0; i < movers; ++i)
-            w.moveInstance(insts[i], home[i] + float4::vec(fast.uniform(-0.4f, 0.4f), 0,
-                                                           fast.uniform(-0.4f, 0.4f)));
+            movingPositions[size_t(i)] =
+                home[i] + float4::vec(fast.uniform(-0.4f, 0.4f), 0,
+                                      fast.uniform(-0.4f, 0.4f));
+        w.moveInstances(movingGroup, movingPositions);
         const Camera v = makePerspectiveCamera(
             float4::point(0, 2.0f, z), float4::vec(0.0f, 0.0f, 1.0f),
             float4::vec(0, 1, 0), 1.0f, 16.0f / 9.0f, 1080.0f, 0.1f, 1.0e9f);
@@ -2397,6 +2402,9 @@ static void BM_View_Breakdown(benchmark::State& state)
     const auto cold1 = clock::now();
 
     DeterministicRng fast(kDynamicWorkloadSeed);
+    std::vector<float4> movingPositions(static_cast<size_t>(movers));
+    World::MotionGroup movingGroup(
+        std::span<const World::InstanceRef>(insts.data(), size_t(movers)));
     double moveNs = 0.0;
     double maintenanceNs = 0.0;
     double cutNs = 0.0;
@@ -2413,8 +2421,10 @@ static void BM_View_Breakdown(benchmark::State& state)
 
         const auto move0 = frame0;
         for (int i = 0; i < movers; ++i)
-            w.moveInstance(insts[i], home[i] + float4::vec(fast.uniform(-0.4f, 0.4f), 0,
-                                                           fast.uniform(-0.4f, 0.4f)));
+            movingPositions[size_t(i)] =
+                home[i] + float4::vec(fast.uniform(-0.4f, 0.4f), 0,
+                                      fast.uniform(-0.4f, 0.4f));
+        w.moveInstances(movingGroup, movingPositions);
         const auto move1 = clock::now();
 
         w.applyUpdates();
@@ -2544,6 +2554,9 @@ static void BM_View_MultiView(benchmark::State& state)
 
     const int movers = count * movePct / 100;
     DeterministicRng fast(kDynamicWorkloadSeed);
+    std::vector<float4> movingPositions(static_cast<size_t>(movers));
+    World::MotionGroup movingGroup(
+        std::span<const World::InstanceRef>(insts.data(), size_t(movers)));
     double selectNs = 0.0;
     double entries = 0.0;
     double reuse = 0.0;
@@ -2552,8 +2565,10 @@ static void BM_View_MultiView(benchmark::State& state)
     for (auto _ : state)
     {
         for (int i = 0; i < movers; ++i)
-            w.moveInstance(insts[i], home[i] + float4::vec(fast.uniform(-0.4f, 0.4f), 0,
-                                                           fast.uniform(-0.4f, 0.4f)));
+            movingPositions[size_t(i)] =
+                home[i] + float4::vec(fast.uniform(-0.4f, 0.4f), 0,
+                                      fast.uniform(-0.4f, 0.4f));
+        w.moveInstances(movingGroup, movingPositions);
         w.applyUpdates();
 
         if (concurrent)

@@ -717,7 +717,7 @@ World::InstanceRef World::addInstanceInternal(uint32_t asset, const InstanceDesc
     // refreshInstanceBounds here would hand a not-yet-inserted instance to the
     // motion refit, whose kInvalidIndex case exists to catch exactly that as a
     // bug and would dirty the whole tree.
-    recomputeInstanceBounds(id);
+    recomputeInstanceBounds(id, true);
     tlasInsert(id);
     markTlasStructuralChange();
     return InstanceRef{handle, inst.generation,
@@ -777,6 +777,20 @@ InstanceId World::publicInstanceId(InstanceId dense) const
                     instanceDenseToHandle_[dense] != kInvalidInstanceId,
                 "World: live dense instance has no public handle");
     return instanceDenseToHandle_[dense];
+}
+
+World::MotionGroup::MotionGroup(std::span<const InstanceRef> instances)
+{
+    reset(instances);
+}
+
+void World::MotionGroup::reset(std::span<const InstanceRef> instances)
+{
+    instances_.clear();
+    instances_.append(instances.data(), instances.size());
+    physicalOrder_.clear();
+    layoutVersion_ = 0;
+    physicalOrderValid_ = false;
 }
 
 // Structural change policy: quality rebuilds are reserved for real population
@@ -848,20 +862,82 @@ void World::removeInstance(InstanceRef ref)
 void World::moveInstance(InstanceRef ref, float4 pos, float scale)
 {
     HLOD_CHECK(scale > 0.0f, "World::moveInstance: non-positive scale");
-    Instance* inst = resolveInstance(ref);
-    if (!inst) return;   // stale ref: never touch the slot's new occupant
-    inst->pos = pos;
-    inst->scale = scale;
-    refreshInstanceBounds(InstanceId(inst - instances_.data()));
+    const InstanceId dense = denseInstanceId(ref);
+    if (dense == kInvalidInstanceId) return;
+    moveInstanceDense(dense, pos, scale);
 }
 
-void World::refreshInstanceBounds(InstanceId id)
+void World::moveInstanceDense(InstanceId dense, float4 pos, float scale)
 {
-    recomputeInstanceBounds(id);
+    Instance& inst = instances_[dense];
+    // Translation and bounds deformation cannot change geometric error.
+    // Uniform scale can, so only that uncommon case rescans the root nodes.
+    const bool scaleChanged = inst.scale != scale;
+    inst.pos = pos;
+    inst.scale = scale;
+    refreshInstanceBounds(dense, scaleChanged);
+}
+
+void World::refreshMotionGroup(MotionGroup& group) const
+{
+    group.physicalOrder_.clear();
+    group.physicalOrder_.reserve(group.instances_.size());
+    for (uint32_t source = 0; source < group.instances_.size(); ++source)
+    {
+        const InstanceId dense = denseInstanceId(group.instances_[source]);
+        if (dense != kInvalidInstanceId)
+            group.physicalOrder_.push_back({dense, source});
+    }
+    if (group.physicalOrder_.size() > 1)
+        std::sort(group.physicalOrder_.begin(), group.physicalOrder_.end());
+
+    // Duplicate refs retain the last caller position, matching scalar calls.
+    size_t out = 0;
+    for (size_t i = 0; i < group.physicalOrder_.size();)
+    {
+        size_t last = i;
+        while (last + 1 < group.physicalOrder_.size() &&
+               group.physicalOrder_[last + 1].dense ==
+                   group.physicalOrder_[i].dense)
+            ++last;
+        group.physicalOrder_[out++] = group.physicalOrder_[last];
+        i = last + 1;
+    }
+    group.physicalOrder_.resize_uninitialized(out);
+    group.layoutVersion_ = instanceLayoutVersion_;
+    group.physicalOrderValid_ = true;
+}
+
+void World::moveInstances(MotionGroup& group,
+                          std::span<const float4> positions,
+                          float scale)
+{
+    HLOD_CHECK(group.instances_.size() == positions.size(),
+               "World::moveInstances: motion-group/position count mismatch");
+    HLOD_CHECK(scale > 0.0f, "World::moveInstances: non-positive scale");
+    if (!group.physicalOrderValid_ ||
+        group.layoutVersion_ != instanceLayoutVersion_)
+        refreshMotionGroup(group);
+
+    for (const MotionGroup::Slot slot : group.physicalOrder_)
+    {
+        if (slot.dense >= instances_.size()) continue;
+        const InstanceRef ref = group.instances_[slot.source];
+        const Instance& inst = instances_[slot.dense];
+        if (!inst.alive() || inst.generation != ref.generation ||
+            instanceDenseToHandle_[slot.dense] != ref.id)
+            continue;
+        moveInstanceDense(slot.dense, positions[slot.source], scale);
+    }
+}
+
+void World::refreshInstanceBounds(InstanceId id, bool recomputeError)
+{
+    recomputeInstanceBounds(id, recomputeError);
     tlasOnInstanceMoved(id);
 }
 
-void World::recomputeInstanceBounds(InstanceId id)
+void World::recomputeInstanceBounds(InstanceId id, bool recomputeError)
 {
     Instance& inst = instances_[id];
     InstanceTlas& spatial = instanceTlas_[id];
@@ -872,15 +948,18 @@ void World::recomputeInstanceBounds(InstanceId id)
     const AABB* bbox = boundsFor(inst, inst.rootSlot, rt);
     spatial.worldBox = toWorld(bbox[0], inst.pos, inst.scale);
 
-    float maxErr = 0.0f;
-    uint32_t c = 1;
-    const PageView& page = pageView(rt);
-    for (uint32_t k = 0; k < page.childCount(0); ++k)
+    if (recomputeError)
     {
-        maxErr = std::max(maxErr, std::min(page.geometricError[c], rt.errClamp));
-        c += page.subtreeSize[c];
+        float maxErr = 0.0f;
+        uint32_t c = 1;
+        const PageView& page = pageView(rt);
+        for (uint32_t k = 0; k < page.childCount(0); ++k)
+        {
+            maxErr = std::max(maxErr, std::min(page.geometricError[c], rt.errClamp));
+            c += page.subtreeSize[c];
+        }
+        spatial.maxErrWorld = maxErr * inst.scale;
     }
-    spatial.maxErrWorld = maxErr * inst.scale;
 }
 
 // ============================================================================
@@ -1203,7 +1282,7 @@ void World::applyBoundsChange(InstanceId id, uint32_t slot, uint32_t index,
         const NodeRef owner = slots_[curSlot].owner;
         if (!owner.valid())
         {
-            refreshInstanceBounds(id);
+            refreshInstanceBounds(id, false);
             return;
         }
         curBox  = bbox[0];

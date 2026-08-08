@@ -286,11 +286,13 @@ of an engine and sustained mobile thermal throttling.
 
 The main distinction is visible immediately: creating the quality TLAS is a
 one-time cost, and object motion makes selection rewalk only the affected
-instances. On the SBC, transform submission accounts for roughly 57-68% of the
-moving-object totals, making bulk-update submission the clearest mobile-class
-path to investigate next. These are scale estimates rather than platform
-promises; selection remains output-sensitive. See
-[ARCHITECTURE.md](ARCHITECTURE.md) for specialized measurements and methodology.
+instances. In these `e2c9c91` captures, scalar instance-motion updates account
+for roughly 57-68% of the SBC moving-object totals. `World::MotionGroup`, added
+after these captures, processes a persistent moving cohort in physical TLAS
+order; the numbers above do not yet include that optimization. These are scale
+estimates rather than platform promises; selection remains output-sensitive.
+See [ARCHITECTURE.md](ARCHITECTURE.md) for specialized measurements and
+methodology.
 
 ## What selection returns
 
@@ -357,6 +359,12 @@ mutations using it become safe no-ops.
   sorting can cost more than the refit. In the 80,000-update locality benchmark,
   grouped submission reduced submit-plus-refit time from 11.12 ms to 4.02 ms
   on the test i9.
+- For a persistent cohort of rigid instances that moves every frame, construct
+  a `World::MotionGroup` from its `InstanceRef` values and pass its positions
+  to `World::moveInstances`. Positions retain the group's caller-visible order;
+  the group caches a physical TLAS-friendly order internally and refreshes it
+  automatically after `optimize()`. Use scalar `moveInstance` for occasional
+  or continually changing cohorts.
 - Every camera or shadow cascade owns a `View`. It contains damping, reusable
   cut records, traversal scratch, and selection statistics. Reuse is enabled
   by default and can be disabled with `setReuseEnabled(false)` for highly
