@@ -111,47 +111,66 @@ The representative workload resembles a forest, city, or prop field:
   asset IO, residency changes, and instance spawning or removal.
 
 All steady-frame values below are median wall times from five 600-frame runs.
-The three reports use the same source revision, deterministic workload seeds,
-Release builds, benchmark order, and scheduler-default affinity. The Windows
-builds use MSVC `/O2 /arch:AVX2`; the M2 Max build uses Apple Clang's AArch64
+The four reports use source revision `e2c9c91`, deterministic workload seeds,
+Release builds, registration-order benchmarks, and scheduler-default affinity.
+The Windows builds use MSVC `/O2 /arch:AVX2`; both Arm builds use the AArch64
 NEON backend. Real frame time can be higher under host load.
 
-| Label | Hardware | Compiler | Captured |
+| Label | Hardware | Compiler | Captured (UTC) |
 |---|---|---|---|
-| EPYC | EPYC 9654, 96C/192T, 768 GiB DDR5-4800, Windows | MSVC 19.51 | 2026-08-07 |
-| i9-12900K | Core i9-12900K, 16C/24T, 128 GiB DDR4-2667, Windows | MSVC 19.44 | 2026-08-07 |
-| M2 Max | M2 Max, 8 performance + 4 efficiency cores, 64 GiB unified memory, macOS | Apple Clang 21 | 2026-08-07 |
+| EPYC | EPYC 9654, 96C/192T, 768 GiB DDR5-4800, Windows | MSVC 19.51 | 2026-08-08 |
+| i9-12900K | Core i9-12900K, 16C/24T, 128 GiB DDR4-2667, Windows | MSVC 19.44 | 2026-08-08 |
+| M2 Max | M2 Max, 8 performance + 4 efficiency cores, 64 GiB unified memory, macOS | Apple Clang 21 | 2026-08-08 |
+| Mobile-class Arm SBC | 4× Cortex-A72 + 4× Cortex-A53, 7.7 GiB, Linux | GCC 13.3 | 2026-08-08 |
 
-Across all 36 real-world cases, the geometric mean of median wall time makes
-EPYC **1.44× faster** and M2 Max **2.32× faster** than the i9-12900K. M2 Max is
-**1.61× faster** than EPYC. This is not an ALU ranking: the i9 still leads
-representative scalar and 128-bit multiply/add throughput probes. The large
-single-thread memory probes line up much better with the end-to-end result.
-The rates below are derived from median wall time, so scheduler stalls remain
-part of the normal-affinity measurement on all three platforms:
+Across all 36 real-world cases, the geometric mean of median wall time is:
 
-| 64 MiB machine probe | EPYC | i9-12900K | M2 Max |
-|---|---:|---:|---:|
-| Sequential read | 46.1 GiB/s | 16.9 GiB/s | 58.9 GiB/s |
-| `memcpy` | 25.4 GiB/s | 8.6 GiB/s | 53.6 GiB/s |
+| Machine | Geometric mean | Throughput relative to i9-12900K |
+|---|---:|---:|
+| EPYC | 0.489 ms | 1.40× |
+| i9-12900K | 0.684 ms | 1.00× |
+| M2 Max | 0.315 ms | 2.17× |
+| Mobile-class Arm SBC | 2.367 ms | 0.29× |
 
-The current workloads therefore remain substantially data-movement bound.
-Their dense traversal order lets the hardware prefetchers work, and the M2's
-strong single-thread memory subsystem is now an advantage rather than the
-performance outlier seen before the layout and output-buffer changes. The i9
-also ran its nominal DDR4-3600 DIMMs at 2667 MT/s and showed the most scheduler
-variance: five of 36 cases had coefficient of variation above 5%, including
-three above 10%. Treat its concurrent-view number as a normal-scheduler sample,
-not a pinned P-core limit.
+M2 Max is 1.55× faster than EPYC and 7.52× faster than the mobile-class
+SBC in this aggregate. The SBC is 3.46× slower than the i9. This is not an ALU
+ranking: the i9 still leads representative scalar and 128-bit multiply/add
+throughput probes. Dense memory and production-like probes explain the results
+better, although no single synthetic benchmark predicts the whole workload:
+
+| 64 MiB machine probe | EPYC | i9-12900K | M2 Max | Mobile Arm SBC |
+|---|---:|---:|---:|---:|
+| Sequential read | 43.7 GiB/s | 35.7 GiB/s | 59.0 GiB/s | 7.1 GiB/s |
+| `memcpy` | 24.4 GiB/s | 17.6 GiB/s | 53.5 GiB/s | 4.8 GiB/s |
+
+The current workloads therefore remain substantially data-movement bound, with
+SIMD kernel throughput becoming important on the smaller Arm cores. Relative
+to the i9, EPYC is 1.40× faster end to end and has 1.22× sequential-read and
+1.38× copy bandwidth. Relative to the M2 Max, the SBC is 7.52× slower end to
+end, 8.26× slower on sequential reads, 11.1× slower on `memcpy`, and 6.27×
+slower in the six-plane wide-AABB kernel. Its dense traversal order still lets
+ordinary hardware prefetchers work; there is no new Arm-specific performance
+cliff in these results.
+
+The i9 ran nominal DDR4-3600 DIMMs at 2667 MT/s. Across the 36 end-to-end
+medians, one EPYC case, two i9 cases, and one SBC case had coefficient of
+variation above 5%; only one i9 case exceeded 10%, while none of the M2 cases
+exceeded 5%. These remain normal-scheduler measurements, not pinned best-core
+limits. The SBC additionally used its `ondemand` governor and could schedule on
+either Cortex-A72 or Cortex-A53 cores, so treat it as a useful mobile-class
+proxy rather than an Android device guarantee.
 
 ### Startup
 
-| Operation | EPYC | i9-12900K | M2 Max | Included work |
-|---|---:|---:|---:|---|
-| Create the 80,000-instance world | 6.9 ms | 7.1 ms | 1.7 ms | Build and register the shared asset, add instances, and mark payloads resident |
-| First 80,000-instance selection cycle | 56.1 ms | 96.4 ms | 30.9 ms | Build the initial quality TLAS, publish, select the first cut, and populate the `View` |
-| Create the 10,000-instance / 700-asset world | 13.0 ms | 18.9 ms | 4.7 ms | Build and register 700 assets, add instances, and mark payloads resident |
-| First 10,000-instance selection cycle | 5.9 ms | 10.6 ms | 3.5 ms | Build the initial quality TLAS, publish, select the first cut, and populate the `View` |
+These startup counters come from the camera-and-objects-moving arm at each
+world size; startup does not depend on the later steady-frame motion mode.
+
+| Operation | EPYC | i9-12900K | M2 Max | Mobile Arm SBC | Included work |
+|---|---:|---:|---:|---:|---|
+| Create the 80,000-instance world | 6.7 ms | 7.3 ms | 1.6 ms | 17.7 ms | Build and register the shared asset, add instances, and mark payloads resident |
+| First 80,000-instance selection cycle | 55.1 ms | 95.7 ms | 30.9 ms | 321.3 ms | Build the initial quality TLAS, publish, select the first cut, and populate the `View` |
+| Create the 10,000-instance / 700-asset world | 13.4 ms | 18.9 ms | 4.3 ms | 25.4 ms | Build and register 700 assets, add instances, and mark payloads resident |
+| First 10,000-instance selection cycle | 5.9 ms | 10.5 ms | 3.4 ms | 24.3 ms | Build the initial quality TLAS, publish, select the first cut, and populate the `View` |
 
 World creation does not force the initial quality TLAS build; the first
 `applyUpdates` performs it before publishing the read-only snapshot. Treat the
@@ -174,18 +193,22 @@ selection only when this physical reorder actually occurs.
 
 | Machine / HLodTree work per frame | Camera and 4,000 objects moving | Static camera, 4,000 objects moving | Moving camera, static objects |
 |---|---:|---:|---:|
-| EPYC — submit transforms | 0.183 ms | 0.180 ms | 0 calls |
+| EPYC — submit transforms | 0.185 ms | 0.183 ms | 0 calls |
 | EPYC — publish updates and maintain TLAS | <0.001 ms | <0.001 ms | <0.001 ms |
-| EPYC — `selectCut` | 0.402 ms | 0.310 ms | 0.339 ms |
-| **EPYC — total HLodTree work** | **0.585 ms** | **0.491 ms** | **0.339 ms** |
-| i9-12900K — submit transforms | 0.567 ms | 0.579 ms | 0 calls |
+| EPYC — `selectCut` | 0.398 ms | 0.300 ms | 0.337 ms |
+| **EPYC — total HLodTree work** | **0.583 ms** | **0.482 ms** | **0.337 ms** |
+| i9-12900K — submit transforms | 0.489 ms | 0.515 ms | 0 calls |
 | i9-12900K — publish updates and maintain TLAS | <0.001 ms | <0.001 ms | <0.001 ms |
-| i9-12900K — `selectCut` | 0.623 ms | 0.507 ms | 0.480 ms |
-| **i9-12900K — total HLodTree work** | **1.192 ms** | **1.083 ms** | **0.480 ms** |
-| M2 Max — submit transforms | 0.060 ms | 0.060 ms | 0 calls |
+| i9-12900K — `selectCut` | 0.570 ms | 0.474 ms | 0.450 ms |
+| **i9-12900K — total HLodTree work** | **1.053 ms** | **0.994 ms** | **0.450 ms** |
+| M2 Max — submit transforms | 0.058 ms | 0.058 ms | 0 calls |
 | M2 Max — publish updates and maintain TLAS | <0.001 ms | <0.001 ms | <0.001 ms |
-| M2 Max — `selectCut` | 0.291 ms | 0.241 ms | 0.254 ms |
-| **M2 Max — total HLodTree work** | **0.351 ms** | **0.301 ms** | **0.254 ms** |
+| M2 Max — `selectCut` | 0.289 ms | 0.240 ms | 0.255 ms |
+| **M2 Max — total HLodTree work** | **0.346 ms** | **0.298 ms** | **0.256 ms** |
+| Mobile Arm SBC — submit transforms | 2.485 ms | 2.488 ms | 0 calls |
+| Mobile Arm SBC — publish updates and maintain TLAS | <0.001 ms | <0.001 ms | <0.001 ms |
+| Mobile Arm SBC — `selectCut` | 1.897 ms | 1.645 ms | 1.261 ms |
+| **Mobile Arm SBC — total HLodTree work** | **4.384 ms** | **4.130 ms** | **1.261 ms** |
 
 The moving-camera cases average roughly 21,750-21,860 visible instances and a
 24,780-25,020-entry render cut. With objects moving, the `View` reuses about
@@ -209,18 +232,22 @@ moving-object cases update exactly 1,000 instances per frame.
 
 | Machine / HLodTree work per frame | Camera and 1,000 objects moving | Static camera, 1,000 objects moving | Moving camera, static objects |
 |---|---:|---:|---:|
-| EPYC — submit transforms | 43 µs | 43 µs | 0 calls |
+| EPYC — submit transforms | 44 µs | 44 µs | 0 calls |
 | EPYC — publish updates and maintain TLAS | <0.1 µs | <0.1 µs | <0.1 µs |
-| EPYC — `selectCut` | 88 µs | 61 µs | 65 µs |
-| **EPYC — total HLodTree work** | **131 µs** | **104 µs** | **65 µs** |
-| i9-12900K — submit transforms | 80 µs | 64 µs | 0 calls |
+| EPYC — `selectCut` | 86 µs | 60 µs | 63 µs |
+| **EPYC — total HLodTree work** | **130 µs** | **104 µs** | **63 µs** |
+| i9-12900K — submit transforms | 74 µs | 63 µs | 0 calls |
 | i9-12900K — publish updates and maintain TLAS | <0.1 µs | <0.1 µs | <0.1 µs |
-| i9-12900K — `selectCut` | 136 µs | 87 µs | 86 µs |
-| **i9-12900K — total HLodTree work** | **208 µs** | **152 µs** | **86 µs** |
-| M2 Max — submit transforms | 18 µs | 17 µs | 0 calls |
+| i9-12900K — `selectCut` | 128 µs | 84 µs | 86 µs |
+| **i9-12900K — total HLodTree work** | **202 µs** | **147 µs** | **86 µs** |
+| M2 Max — submit transforms | 17 µs | 17 µs | 0 calls |
 | M2 Max — publish updates and maintain TLAS | <0.1 µs | <0.1 µs | <0.1 µs |
-| M2 Max — `selectCut` | 55 µs | 36 µs | 39 µs |
-| **M2 Max — total HLodTree work** | **73 µs** | **53 µs** | **39 µs** |
+| M2 Max — `selectCut` | 52 µs | 35 µs | 39 µs |
+| **M2 Max — total HLodTree work** | **69 µs** | **53 µs** | **39 µs** |
+| Mobile Arm SBC — submit transforms | 735 µs | 741 µs | 0 calls |
+| Mobile Arm SBC — publish updates and maintain TLAS | 0.2 µs | 0.2 µs | 0.1 µs |
+| Mobile Arm SBC — `selectCut` | 515 µs | 356 µs | 265 µs |
+| **Mobile Arm SBC — total HLodTree work** | **1,259 µs** | **1,095 µs** | **265 µs** |
 
 The moving-camera cases average roughly 2,740-2,810 visible instances and a
 5,700-6,070-entry cut. Reuse is about 83-84% with 1,000 movers and 93% with
@@ -235,25 +262,34 @@ six selections is:
 
 | Machine | Object motion | Serial | Concurrent | Speedup |
 |---|---|---:|---:|---:|
-| EPYC | Static objects | 2.041 ms | 0.388 ms | 5.26× |
-| EPYC | 4,000 moving objects | 2.413 ms | 0.629 ms | 3.83× |
-| i9-12900K | Static objects | 2.961 ms | 1.727 ms | 1.71× |
-| i9-12900K | 4,000 moving objects | 3.777 ms | 2.100 ms | 1.80× |
-| M2 Max | Static objects | 1.506 ms | 0.442 ms | 3.41× |
-| M2 Max | 4,000 moving objects | 1.741 ms | 0.637 ms | 2.73× |
+| EPYC | Static objects | 2.019 ms | 0.387 ms | 5.21× |
+| EPYC | 4,000 moving objects | 2.386 ms | 0.578 ms | 4.13× |
+| i9-12900K | Static objects | 2.723 ms | 1.478 ms | 1.84× |
+| i9-12900K | 4,000 moving objects | 3.395 ms | 1.498 ms | 2.27× |
+| M2 Max | Static objects | 1.520 ms | 0.452 ms | 3.36× |
+| M2 Max | 4,000 moving objects | 1.746 ms | 0.720 ms | 2.43× |
+| Mobile Arm SBC | Static objects | 7.979 ms | 3.406 ms | 2.34× |
+| Mobile Arm SBC | 4,000 moving objects | 11.705 ms | 4.796 ms | 2.44× |
 
 Object transforms are applied once before these selections and are not included
 in the table. The concurrent arms use six persistent worker threads; thread
 creation is excluded. Scaling is below 6× because the views share memory
 bandwidth and cache capacity, but the read-only selection phase removes
-serialization between them. The i9 static concurrent arm had 21.7% coefficient
-of variation, so its 1.727 ms median is notably less stable than the other table
-entries.
+serialization between them. The EPYC static concurrent arm, i9 moving
+concurrent arm, and SBC moving concurrent arm had coefficients of variation of
+6.2%, 8.6%, and 7.5%, respectively; the remaining entries were below 5%.
+
+On the mobile-class SBC, the representative 10,000-instance cases consume
+0.265-1.259 ms per frame and the 80,000-instance cases consume 1.261-4.384 ms.
+That is useful headroom inside a 16.7 ms frame, but the figures exclude the rest
+of an engine and sustained mobile thermal throttling.
 
 The main distinction is visible immediately: creating the quality TLAS is a
-one-time cost, transform updates are relatively small, and object motion makes
-selection rewalk only the affected instances. These are scale estimates rather
-than platform promises; selection remains output-sensitive. See
+one-time cost, and object motion makes selection rewalk only the affected
+instances. On the SBC, transform submission accounts for roughly 57-68% of the
+moving-object totals, making bulk-update submission the clearest mobile-class
+path to investigate next. These are scale estimates rather than platform
+promises; selection remains output-sensitive. See
 [ARCHITECTURE.md](ARCHITECTURE.md) for specialized measurements and methodology.
 
 ## What selection returns
@@ -426,7 +462,7 @@ while the machine is plugged in, in its normal high-performance power mode,
 and otherwise idle. A complete run takes roughly 15 minutes on the reference
 i9 and can vary with machine speed. Each invocation creates a timestamped
 directory under `perf_reports/` and packages it as one `.zip` (`.tar.gz` only
-when `zip` is not installed). Send the three archives for comparison; each
+when `zip` is not installed). Send the archives for comparison; each
 contains:
 
 - `real_world_perf.json`, `machine_perf.json`, and `arch_kernel_perf.json`;
