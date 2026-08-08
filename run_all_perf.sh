@@ -225,11 +225,6 @@ Random workloads:
   Float mapping and shuffle are repository-owned and standard-library independent.
 EOF
 
-generator=()
-if [[ ! -f "${BUILD_DIR}/CMakeCache.txt" ]] && command -v ninja >/dev/null 2>&1; then
-    generator=(-G Ninja)
-fi
-
 avx2=OFF
 target_architecture=""
 if [[ "${host_system}" == "Darwin" ]]; then
@@ -256,7 +251,9 @@ configure_args=(
     -DHLOD_AVX2="${avx2}"
     -DHLOD_FORCE_SCALAR=OFF
 )
-configure_args+=("${generator[@]}")
+if [[ ! -f "${BUILD_DIR}/CMakeCache.txt" ]] && command -v ninja >/dev/null 2>&1; then
+    configure_args+=(-G Ninja)
+fi
 if [[ -n "${target_architecture}" ]]; then
     configure_args+=("-DCMAKE_OSX_ARCHITECTURES=${target_architecture}")
 fi
