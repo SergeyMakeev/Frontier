@@ -1,5 +1,5 @@
 #pragma once
-// Authoring-time builders. SubtreeBuilder assembles reusable implicit-root
+// Authoring-time builders. SubtreeBuilder assembles reusable mount-only
 // components; HierarchyBuilder authors one monolithic logical tree with
 // splitBelow() boundaries. PageBuilder is the
 // low-level physical-page escape hatch. See docs/frontier_design.md §3.
@@ -128,9 +128,10 @@ private:
     bool                   built_ = false;
 };
 
-// Assembly-first authoring API. The builder's root() is an implicit,
-// non-renderable anchor. Real nodes may be added directly below it; an
-// expansion leaf can permanently reference another reusable SubtreeKey.
+// Assembly-first authoring API. root() names the fragment's mount sentinel,
+// not a hierarchy root. Real descendant nodes may be added directly below it;
+// at runtime they acquire the renderable TLAS/expansion node passed to mount()
+// as their parent. An expansion leaf can permanently reference another key.
 class SubtreeBuilder
 {
 public:
@@ -148,7 +149,7 @@ public:
     void setExpansion(NodeId node, SubtreeKey target,
                       const SubtreeTransform& transform = {});
 
-    // Consumes the builder and emits one packed implicit-root page plus the
+    // Consumes the builder and emits one packed mount-sentinel page plus the
     // deduplicated external dependency/placement sidecar.
     Subtree build(const FrontierContext& ctx = defaultContext());
 

@@ -16,8 +16,9 @@ describe runtime roles rather than object size.
   object. Every real node carries a `UserPayload`, so selection may stop at
   any level.
 - The TLAS is a dynamic 8-wide BVH over translated, uniformly scaled BLAS
-  instances. It performs coarse frustum, layer, and contribution culling. Its
-  internal nodes are acceleration data and never appear in a frontier.
+  instances. Every leaf owns one permanent renderable root record; the BVH's
+  internal nodes perform coarse frustum, layer, and contribution culling and
+  never appear in a frontier.
 
 `HierarchyBuilder` accepts one logical tree and turns natural `splitBelow()`
 boundaries into immutable, deterministically indexed pages. Each generated page
@@ -29,13 +30,14 @@ payload uniqueness and independent hierarchies may reuse local ids. Instances
 of a registered root asset share page bytes, residency, and the attached-page
 graph; per-instance deformation allocates bounds-only copy-on-write overlays.
 
-`SubtreeBuilder` is the composition path. It emits a packed forest beneath an
-implicit, non-renderable anchor plus a deduplicated dependency table and dense
-32-byte expansion-site records. Authored definitions therefore form a DAG:
+`SubtreeBuilder` is the composition path. It emits a packed descendant forest
+beneath a mount sentinel plus a deduplicated dependency table and dense
+32-byte expansion-site records. The sentinel is not a hierarchy node. Authored definitions therefore form a DAG:
 many city nodes can reference one house `SubtreeKey`. At runtime every
 reference becomes a distinct mount with an accumulated local transform, while
-the immutable house bytes remain shared. A top-level subtree instance uses the
-TLAS leaf as its implicit anchor; a nested mount uses its expansion node.
+the immutable house bytes remain shared. Top-level code instantiates a
+renderable root record in the TLAS and mounts its first subtree beneath that
+root; nested mounts use ordinary renderable expansion nodes.
 
 ## Published-database lifecycle
 
@@ -57,7 +59,7 @@ Selection is output-sensitive:
 
 1. Query the TLAS and discard instances outside the frustum, layer mask, or
    optional minimum projected contribution.
-2. Emit exact one-node BLASes and acceptable hierarchical roots directly when
+2. Emit page-free one-node TLAS roots and acceptable hierarchical roots directly when
    possible.
 3. Transform the camera into each remaining instance's local space.
 4. Transform again at a non-identity subtree mount without rewriting its

@@ -30,9 +30,10 @@ valid and is useful for things such as vehicles, characters, and other content
 with no authored hierarchy.
 
 The TLAS is the dynamic spatial acceleration structure over placements of
-those independent BLAS roots. Its internal nodes provide bounds, layer masks,
-and coarse contribution information; they are not renderable proxies and do
-not appear in a render frontier. This lets a database mix large authored
+those independent BLAS roots. Each TLAS leaf owns one permanent renderable
+root node. The TLAS's internal BVH nodes provide bounds, layer masks, and
+coarse contribution information; they are not renderable proxies and do not
+appear in a render frontier. This lets a database mix large authored
 regions, reusable hierarchies, and flat objects without imposing one artificial root for the
 whole map. In API names such as `AssetHandle`, *asset* means a registered unit
 of immutable page storage and sharing; it does not constrain what part of the
@@ -52,13 +53,13 @@ Frontier to own an IO system.
 
 ## Minimal example
 
-This one-node BLAS is intentionally small so the complete build, instance,
-query, and selection loop is visible. Real hierarchies may be assembled from
-reusable implicit-root components with `SubtreeBuilder`, or authored
+This one-node hierarchy is intentionally small so the complete instance,
+query, and selection loop is visible. It allocates no page: the renderable
+node lives directly in the TLAS. Real hierarchies may be assembled from
+reusable mount-only components with `SubtreeBuilder`, or authored
 monolithically with `HierarchyBuilder` and partitioned using `splitBelow()`.
 
 ```cpp
-#include "frontier/builder.h"
 #include "frontier/spatial_database.h"
 
 void drawEntry(const frontier::SpatialDatabase& database, const frontier::FrontierEntry& entry)
@@ -70,17 +71,14 @@ void drawEntry(const frontier::SpatialDatabase& database, const frontier::Fronti
 
 int main()
 {
-    frontier::HierarchyBuilder builder;
-    builder.createRoot(
-        42,                       // opaque payload, e.g. a mesh-table index
-        0.0f,                     // geometric error in world units
-        frontier::AABB::fromCenterExtent(frontier::float4::point(0, 0, 0),
-                                     frontier::float4::vec(1, 1, 1)));
-
-    frontier::Hierarchy hierarchy = builder.build();
     frontier::SpatialDatabase database;
-    database.addInstance(hierarchy.takePage(hierarchy.rootPage()),
-                      frontier::float4::point(0, 0, 0));
+    const frontier::RootNodeDesc root{
+        42,                       // opaque payload, e.g. a mesh-table index
+        0.0f,                     // geometric error in local units
+        frontier::AABB::fromCenterExtent(frontier::float4::point(0, 0, 0),
+                                         frontier::float4::vec(1, 1, 1)),
+        {}};                      // no mounted subtree: exactly one node
+    database.instantiate(root, frontier::float4::point(0, 0, 0));
 
     const frontier::Camera camera = frontier::makeLookAtCamera(
         frontier::float4::point(0, 2, -8), frontier::float4::point(0, 0, 0));
@@ -104,10 +102,12 @@ contribution is smaller than that value; zero disables contribution culling.
 
 ## Reusable subtree assembly
 
-`SubtreeBuilder` builds the real nodes below an implicit anchor. Instantiating
-the result places that anchor in the TLAS; mounting it places the anchor at an
-expansion node in another subtree. This lets content form a DAG of reusable
-definitions while each runtime placement remains an ordinary tree mount.
+`SubtreeBuilder` builds descendants below a mount sentinel. That sentinel is not a
+hierarchy node and a `Subtree` cannot be instantiated by itself. Instantiate a
+renderable `RootNodeDesc` in the TLAS, give it a permanent `SubtreeKey` target,
+then `mount()` the matching subtree beneath `InstanceRef::rootNode()`. Nested
+subtrees mount beneath ordinary renderable expansion nodes. Every resulting
+hierarchy therefore has exactly one valid renderable parent at its root.
 
 For example, build detailed house nodes once, give every coarse house proxy in
 a city the same permanent `SubtreeKey`, then call `mount()` as those proxies
@@ -193,18 +193,19 @@ mutations using it become safe no-ops.
 ## Runtime model
 
 - Authored subtree definitions form a DAG keyed by stable `SubtreeKey` values;
-  runtime `MountHandle` placements form a tree. A top-level `InstanceRef` is a
-  subtree mount whose implicit anchor belongs to the TLAS.
+  runtime `MountHandle` placements form a tree. A top-level `InstanceRef` owns
+  one always-resident renderable root in the TLAS; its optional subtree is the
+  first mounted descendant fragment.
 - Immutable, versioned page blobs hold each BLAS's preorder node arrays and
   8-lane wide child blocks. A registered root-page asset can be instanced
   thousands of times while sharing page bytes, residency, and its attachment
   graph.
-- A dynamic wide TLAS owns placement of independent BLAS roots, layer masks,
-  coarse frustum and contribution culling, and incremental spawn/remove edits.
-  TLAS leaves may reference either deep hierarchies or one-node BLASes. When a
-  hierarchical root already satisfies the view's error threshold, selection
-  can emit that renderable root before entering its page hierarchy; the TLAS
-  itself remains non-renderable.
+- A dynamic wide TLAS owns renderable root records, their placement, layer
+  masks, coarse frustum and contribution culling, and incremental spawn/remove
+  edits. A root with no mounted subtree is a page-free one-node hierarchy. When
+  a deep hierarchy's root satisfies the view's error threshold, selection emits
+  it before touching the mounted page hierarchy. Only the TLAS's internal BVH
+  nodes are non-renderable.
 - Expansion points connect independently streamed pages. Residency changes
   propagate complete descendant coverage upward. Selection can therefore skip
   a missing intermediate proxy when resident descendants cover the visible

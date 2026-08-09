@@ -226,7 +226,6 @@ TEST(Cache, LargeAssembledSubtreeCoalescesDependenciesAndInvalidates)
     const uint32_t houseNodes = houseSubtree.page().nodeCount();
 
     SubtreeBuilder city(cityKey);
-    const auto root = city.createNode(city.root(), 1, 64.0f, AABB::empty());
     constexpr uint32_t side = 12;
     for (uint32_t i = 0; i < houseCount; ++i)
     {
@@ -234,7 +233,7 @@ TEST(Cache, LargeAssembledSubtreeCoalescesDependenciesAndInvalidates)
             float(int(i % side) - int(side / 2)) * 10.0f, 0,
             float(int(i / side) - 5) * 10.0f);
         const auto proxy = city.createNode(
-            root, 10 + i, 16.0f,
+            city.root(), 10 + i, 16.0f,
             AABB::fromCenterExtent(pos, float4::vec(4, 2, 2)));
         city.setExpansion(proxy, houseKey, SubtreeTransform{pos, 1.0f});
     }
@@ -242,17 +241,23 @@ TEST(Cache, LargeAssembledSubtreeCoalescesDependenciesAndInvalidates)
     SpatialDatabase world;
     const SubtreeHandle houseAsset =
         world.registerSubtree(std::move(houseSubtree));
-    const SubtreeHandle cityAsset = world.registerSubtree(city.build());
+    Subtree citySubtree = city.build();
+    const AABB cityBounds = citySubtree.page().bbox[0];
+    const SubtreeHandle cityAsset =
+        world.registerSubtree(std::move(citySubtree));
     const auto instance =
-        world.instantiate(cityAsset, float4::point(0, 0, 2500));
-    markAllResident(world, instance.rootPage, houseCount + 2);
+        world.instantiate(RootNodeDesc{1, 64.0f, cityBounds, cityKey},
+                          float4::point(0, 0, 2500));
+    const MountHandle cityMount = world.mount(instance.rootNode(), cityAsset);
+    ASSERT_TRUE(cityMount.valid());
+    markAllResident(world, cityMount, houseCount + 1);
 
     std::vector<MountHandle> mounts;
     mounts.reserve(houseCount);
     for (uint32_t i = 0; i < houseCount; ++i)
     {
         mounts.push_back(
-            world.mount(nodeAt(instance.rootPage, i + 2), houseAsset));
+            world.mount(nodeAt(cityMount, i + 1), houseAsset));
         markAllResident(world, mounts.back(), houseNodes);
     }
     world.applyUpdates();

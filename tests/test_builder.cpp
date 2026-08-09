@@ -117,7 +117,7 @@ TEST(Builder, MultiRootForestPage)
     verifyInvariants(pg);
 }
 
-TEST(SubtreeBuilder, ImplicitRootAndRepeatedDependencyArePackedOnce)
+TEST(SubtreeBuilder, MountSentinelAndRepeatedDependencyArePackedOnce)
 {
     constexpr SubtreeKey cityKey{100};
     constexpr SubtreeKey houseKey{200};
@@ -170,13 +170,12 @@ TEST(SubtreeAssembly, SharedHouseMountsKeepDistinctPlacements)
     const uint32_t houseNodes = houseSubtree.page().nodeCount();
 
     SubtreeBuilder city(cityKey);
-    const auto cityProxy = city.createNode(city.root(), 1, 64.0f, AABB::empty());
     const auto left = city.createNode(
-        cityProxy, 10, 16.0f,
+        city.root(), 10, 16.0f,
         AABB::fromCenterExtent(float4::point(-10, 0, 0),
                                float4::vec(2, 2, 2)));
     const auto right = city.createNode(
-        cityProxy, 11, 16.0f,
+        city.root(), 11, 16.0f,
         AABB::fromCenterExtent(float4::point(10, 0, 0),
                                float4::vec(2, 2, 2)));
     city.setExpansion(
@@ -189,12 +188,19 @@ TEST(SubtreeAssembly, SharedHouseMountsKeepDistinctPlacements)
     SpatialDatabase world;
     const SubtreeHandle houseHandle =
         world.registerSubtree(std::move(houseSubtree));
-    const SubtreeHandle cityHandle = world.registerSubtree(city.build());
+    Subtree citySubtree = city.build();
+    const AABB cityBounds = citySubtree.page().bbox[0];
+    const SubtreeHandle cityHandle =
+        world.registerSubtree(std::move(citySubtree));
     const SpatialDatabase::InstanceRef instance =
-        world.instantiate(cityHandle, float4::point(0, 0, 0));
+        world.instantiate(RootNodeDesc{1, 64.0f, cityBounds, cityKey},
+                          float4::point(0, 0, 0));
+    ASSERT_TRUE(instance.rootNode().valid());
+    const MountHandle cityMount = world.mount(instance.rootNode(), cityHandle);
+    ASSERT_TRUE(cityMount.valid());
 
-    const NodeHandle leftNode = nodeAt(instance.rootPage, 2);
-    const NodeHandle rightNode = nodeAt(instance.rootPage, 3);
+    const NodeHandle leftNode = nodeAt(cityMount, 1);
+    const NodeHandle rightNode = nodeAt(cityMount, 2);
     EXPECT_EQ(world.expansionTarget(leftNode), houseKey);
     EXPECT_EQ(world.expansionTarget(rightNode), houseKey);
 
@@ -251,9 +257,8 @@ TEST(SubtreeAssembly, TransformedBoundsPropagateInOwnerSpacePerInstance)
                                float4::vec(1, 1, 1)));
 
     SubtreeBuilder parent(parentKey);
-    const auto root = parent.createNode(parent.root(), 1, 32.0f, AABB::empty());
     const auto proxy = parent.createNode(
-        root, 10, 8.0f,
+        parent.root(), 10, 8.0f,
         AABB::fromCenterExtent(float4::point(-10, 0, 0),
                                float4::vec(2, 2, 2)));
     parent.setExpansion(
@@ -262,30 +267,40 @@ TEST(SubtreeAssembly, TransformedBoundsPropagateInOwnerSpacePerInstance)
 
     SpatialDatabase world;
     const SubtreeHandle detailHandle = world.registerSubtree(detail.build());
-    const SubtreeHandle parentHandle = world.registerSubtree(parent.build());
-    const auto first = world.instantiate(parentHandle, float4::point(0, 0, 0));
-    const auto second = world.instantiate(parentHandle, float4::point(100, 0, 0));
-    const NodeHandle proxyNode = nodeAt(first.rootPage, 2);
-    const MountHandle detailMount = world.mount(proxyNode, detailHandle);
-    ASSERT_TRUE(detailMount.valid());
+    Subtree parentSubtree = parent.build();
+    const AABB parentBounds = parentSubtree.page().bbox[0];
+    const SubtreeHandle parentHandle =
+        world.registerSubtree(std::move(parentSubtree));
+    const RootNodeDesc rootDesc{1, 32.0f, parentBounds, parentKey};
+    const auto first = world.instantiate(rootDesc, float4::point(0, 0, 0));
+    const auto second = world.instantiate(rootDesc, float4::point(100, 0, 0));
+    const MountHandle firstParent = world.mount(first.rootNode(), parentHandle);
+    const MountHandle secondParent = world.mount(second.rootNode(), parentHandle);
+    ASSERT_TRUE(firstParent.valid());
+    ASSERT_TRUE(secondParent.valid());
+    const NodeHandle firstProxy = nodeAt(firstParent, 1);
+    const NodeHandle secondProxy = nodeAt(secondParent, 1);
+    const MountHandle firstDetail = world.mount(firstProxy, detailHandle);
+    const MountHandle secondDetail = world.mount(secondProxy, detailHandle);
+    ASSERT_TRUE(firstDetail.valid());
+    ASSERT_TRUE(secondDetail.valid());
 
     const AABB moved = AABB::fromCenterExtent(float4::point(-4, 0, 0),
                                                float4::vec(1, 1, 1));
-    world.setNodeBounds(first, nodeAt(detailMount, 1), moved);
+    world.setNodeBounds(first, nodeAt(firstDetail, 1), moved);
     world.flushBounds();
 
-    const AABB firstProxy = world.nodeBounds(first, proxyNode);
-    const AABB secondProxy = world.nodeBounds(second, proxyNode);
-    EXPECT_FLOAT_EQ(firstProxy.mn.x, -15.0f); // child-local -5, mounted at -10
-    EXPECT_FLOAT_EQ(secondProxy.mn.x, -12.0f);
-    EXPECT_FLOAT_EQ(secondProxy.mx.x, -8.0f);
+    const AABB firstProxyBounds = world.nodeBounds(first, firstProxy);
+    const AABB secondProxyBounds = world.nodeBounds(second, secondProxy);
+    EXPECT_FLOAT_EQ(firstProxyBounds.mn.x, -15.0f); // child-local -5, mounted at -10
+    EXPECT_FLOAT_EQ(secondProxyBounds.mn.x, -12.0f);
+    EXPECT_FLOAT_EQ(secondProxyBounds.mx.x, -8.0f);
 }
 
-TEST(SubtreeAssembly, NestedMountTransformsComposeThroughImplicitRoots)
+TEST(SubtreeAssembly, NestedMountTransformsComposeThroughMountSentinels)
 {
     constexpr SubtreeKey detailKey{2501};
     constexpr SubtreeKey blockKey{2502};
-    constexpr SubtreeKey cityKey{2503};
 
     SubtreeBuilder detail(detailKey);
     detail.createNode(
@@ -302,24 +317,20 @@ TEST(SubtreeAssembly, NestedMountTransformsComposeThroughImplicitRoots)
         building, detailKey,
         SubtreeTransform{float4::point(3, 0, 0), 0.5f});
 
-    SubtreeBuilder city(cityKey);
-    const auto cityBlock = city.createNode(
-        city.root(), 1, 32.0f,
-        AABB::fromCenterExtent(float4::point(16, 0, 0),
-                               float4::vec(3, 3, 3)));
-    city.setExpansion(
-        cityBlock, blockKey,
-        SubtreeTransform{float4::point(10, 0, 0), 2.0f});
-
     SpatialDatabase world;
     const SubtreeHandle detailHandle = world.registerSubtree(detail.build());
     const SubtreeHandle blockHandle = world.registerSubtree(block.build());
-    const SubtreeHandle cityHandle = world.registerSubtree(city.build());
     const auto instance =
-        world.instantiate(cityHandle, float4::point(100, 0, 0));
+        world.instantiate(
+            RootNodeDesc{1, 32.0f,
+                         AABB::fromCenterExtent(float4::point(16, 0, 0),
+                                                float4::vec(3, 3, 3)),
+                         blockKey},
+            float4::point(100, 0, 0));
 
     const MountHandle blockMount =
-        world.mount(nodeAt(instance.rootPage, 1), blockHandle);
+        world.mount(instance.rootNode(), blockHandle,
+                    SubtreeTransform{float4::point(10, 0, 0), 2.0f});
     ASSERT_TRUE(blockMount.valid());
     const MountHandle detailMount =
         world.mount(nodeAt(blockMount, 1), detailHandle);
@@ -336,7 +347,6 @@ TEST(SubtreeAssembly, MountRejectsTheWrongPermanentTarget)
 {
     constexpr SubtreeKey expectedKey{3001};
     constexpr SubtreeKey wrongKey{3002};
-    constexpr SubtreeKey parentKey{3003};
 
     auto makeLeaf = [](SubtreeKey key, UserPayload payload) {
         SubtreeBuilder builder(key);
@@ -347,19 +357,110 @@ TEST(SubtreeAssembly, MountRejectsTheWrongPermanentTarget)
         return builder.build();
     };
 
-    SubtreeBuilder parent(parentKey);
-    const auto proxy = parent.createNode(
-        parent.root(), 1, 8.0f,
-        AABB::fromCenterExtent(float4::point(0, 0, 0),
-                               float4::vec(2, 2, 2)));
-    parent.setExpansion(proxy, expectedKey);
-
     SpatialDatabase world;
     const SubtreeHandle wrong = world.registerSubtree(makeLeaf(wrongKey, 20));
-    const SubtreeHandle parentHandle = world.registerSubtree(parent.build());
-    const auto instance = world.instantiate(parentHandle, float4::point(0, 0, 0));
-    EXPECT_THROW(world.mount(nodeAt(instance.rootPage, 1), wrong),
+    const auto instance = world.instantiate(
+        RootNodeDesc{1, 8.0f,
+                     AABB::fromCenterExtent(float4::point(0, 0, 0),
+                                            float4::vec(2, 2, 2)),
+                     expectedKey},
+        float4::point(0, 0, 0));
+    EXPECT_THROW(world.mount(instance.rootNode(), wrong),
                  std::logic_error);
+}
+
+TEST(TlasRoot, SingleNodeUsesNoPageAndKeepsAUniformRenderableHandle)
+{
+    SpatialDatabase world;
+    const AABB authored = AABB::fromCenterExtent(
+        float4::point(0, 0, 0), float4::vec(2, 1, 1));
+    const auto instance = world.instantiate(
+        RootNodeDesc{42, 0.0f, authored, {}},
+        float4::point(10, 0, 0));
+    const NodeHandle root = instance.rootNode();
+
+    EXPECT_TRUE(root.valid());
+    EXPECT_TRUE(root.isTlasRoot());
+    EXPECT_FALSE(instance.rootPage.valid());
+    EXPECT_EQ(world.attachedPageCount(), 0u);
+    EXPECT_TRUE(world.isResident(root));
+    EXPECT_FALSE(world.expansionTarget(root).valid());
+
+    UserPayload payload = 0;
+    ASSERT_TRUE(world.tryGetPayload(root, payload));
+    EXPECT_EQ(payload, 42u);
+    SubtreeTransform transform;
+    ASSERT_TRUE(world.tryGetNodeTransform(root, transform));
+    EXPECT_FLOAT_EQ(transform.pos.x, 0.0f);
+    EXPECT_FLOAT_EQ(transform.scale, 1.0f);
+    EXPECT_THROW(world.markNonResident(root), std::logic_error);
+
+    world.applyUpdates();
+    SpatialQuery query;
+    query.setReuseEnabled(false);
+    const FrontierResultView cut = query.selectFrontier(
+        world,
+        makeLookAtCamera(float4::point(10, 4, -20),
+                         float4::point(10, 0, 0)),
+        SelectionParams{1.0f, 0.0f});
+    ASSERT_EQ(currentFrontier(cut).size(), 1u);
+    EXPECT_EQ(currentFrontier(cut)[0].nodeHandle, root);
+
+    const AABB moved = AABB::fromCenterExtent(
+        float4::point(3, 0, 0), float4::vec(1, 1, 1));
+    world.setNodeBounds(instance, root, moved);
+    EXPECT_FLOAT_EQ(world.nodeBounds(instance, root).mn.x, 2.0f);
+    world.moveInstance(instance, float4::point(20, 0, 0), 2.0f);
+    EXPECT_FLOAT_EQ(world.nodeBounds(instance, root).mn.x, 2.0f);
+
+    world.removeInstance(instance);
+    EXPECT_FALSE(world.isResident(root));
+    EXPECT_FALSE(world.tryGetPayload(root, payload));
+    EXPECT_TRUE(world.nodeBounds(instance, root).isEmpty());
+}
+
+TEST(TlasRoot, CollectedMountedSubtreeFallsBackToPermanentRoot)
+{
+    constexpr SubtreeKey detailKey{0xD001};
+    SubtreeBuilder detail(detailKey);
+    detail.createNode(
+        detail.root(), 100, 0.0f,
+        AABB::fromCenterExtent(float4::point(0, 0, 0),
+                               float4::vec(1, 1, 1)));
+    Subtree detailSubtree = detail.build();
+    const uint32_t detailNodes = detailSubtree.page().nodeCount();
+
+    SpatialDatabase world;
+    const SubtreeHandle detailHandle =
+        world.registerSubtree(std::move(detailSubtree));
+    const auto instance = world.instantiate(
+        RootNodeDesc{1, 32.0f,
+                     AABB::fromCenterExtent(float4::point(0, 0, 0),
+                                            float4::vec(2, 2, 2)),
+                     detailKey});
+    const MountHandle mounted = world.mount(instance.rootNode(), detailHandle);
+    ASSERT_TRUE(mounted.valid());
+    markAllResident(world, mounted, detailNodes);
+    world.applyUpdates();
+
+    SpatialQuery query;
+    query.setReuseEnabled(false);
+    const Camera camera = makeLookAtCamera(float4::point(0, 2, -8),
+                                           float4::point(0, 0, 0));
+    const SelectionParams params{1.0f, 0.0f};
+    FrontierResultView cut = query.selectFrontier(world, camera, params);
+    ASSERT_EQ(currentFrontier(cut).size(), 1u);
+    EXPECT_EQ(payloadOf(world, currentFrontier(cut)[0]), 100u);
+
+    const CollectResult collected = world.collect(0, 0);
+    EXPECT_EQ(collected.detachedPages, 1u);
+    EXPECT_FALSE(world.isAttached(instance.rootNode()));
+    EXPECT_EQ(world.attachedPageCount(), 0u);
+
+    cut = query.selectFrontier(world, camera, params);
+    ASSERT_EQ(currentFrontier(cut).size(), 1u);
+    EXPECT_EQ(currentFrontier(cut)[0].nodeHandle, instance.rootNode());
+    EXPECT_EQ(payloadOf(world, currentFrontier(cut)[0]), 1u);
 }
 
 TEST(Builder, WideFanoutChainsBlocks)

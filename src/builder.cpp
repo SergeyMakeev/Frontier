@@ -421,7 +421,7 @@ Hierarchy HierarchyBuilder::build(const FrontierContext& ctx)
 }
 
 // ---------------------------------------------------------------------------
-// SubtreeBuilder -- reusable implicit-root component assembly
+// SubtreeBuilder -- reusable mount-fragment assembly
 // ---------------------------------------------------------------------------
 
 SubtreeBuilder::NodeId SubtreeBuilder::createNode(NodeId parent,
@@ -449,7 +449,7 @@ SubtreeBuilder::NodeId SubtreeBuilder::createNode(NodeId parent,
     {
         roots_.push_back(id);
         FRONTIER_CHECK(roots_.size() <= kMaxChildren,
-                       "SubtreeBuilder: too many implicit-root children");
+                       "SubtreeBuilder: too many mount-root children");
     }
     else
     {
@@ -489,7 +489,7 @@ Subtree SubtreeBuilder::build(const FrontierContext& ctx)
     PageBuilder pageBuilder;
     Subtree result;
     result.key_ = key_;
-    uint32_t packedIndex = 1; // packed index zero is the implicit anchor
+    uint32_t packedIndex = 1; // packed index zero is the mount sentinel
 
     const auto dependencyIndex = [&](SubtreeKey target) -> uint32_t
     {

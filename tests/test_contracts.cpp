@@ -540,6 +540,12 @@ TEST(Contracts, CompactFrontierRepresentation)
     EXPECT_EQ(handle.index(), NodeHandle::kIndexMask);
     EXPECT_EQ(handle.generation(), NodeHandle::kGenerationMask);
 
+    const NodeHandle tlasRoot = NodeHandle::tlasRoot(0xabcdefu, 0x54321u);
+    EXPECT_TRUE(tlasRoot.valid());
+    EXPECT_TRUE(tlasRoot.isTlasRoot());
+    EXPECT_EQ(tlasRoot.tlasInstance(), 0xabcdefu);
+    EXPECT_EQ(tlasRoot.tlasGeneration(), 0x54321u);
+
     constexpr float threshold = 4.0f;
     EXPECT_LT(encodeFrontierError(threshold, threshold), kFrontierErrorThreshold);
     EXPECT_LT(encodeFrontierError(std::nextafter(threshold, 0.0f), threshold),

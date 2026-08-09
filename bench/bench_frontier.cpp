@@ -1489,13 +1489,15 @@ BENCHMARK(BM_TlasScale)
 // renderable node. This separates the BVH8 query from the per-visible
 // materialization that currently still enters the page traversal.
 //
-// arg0 = 1: one shared flat asset, 0: one anonymous flat asset per instance
+// arg0 = 0: one anonymous flat asset per instance, 1: one shared flat asset,
+//        2: one renderable node stored directly in the TLAS
 // arg1 = target visible population percentage (25 or 100)
 // arg2 = 0: TLAS query only, 1: uncached selectFrontier, 2: cached selectFrontier
 static void BM_FlatForest100k(benchmark::State& state)
 {
     constexpr uint32_t kInstances = 100000;
-    const bool sharedAsset = state.range(0) != 0;
+    const int representation = int(state.range(0));
+    const bool sharedAsset = representation == 1;
     const uint32_t visibleTarget =
         kInstances * uint32_t(state.range(1)) / 100u;
     const int mode = int(state.range(2));
@@ -1509,6 +1511,11 @@ static void BM_FlatForest100k(benchmark::State& state)
     SpatialDatabase world;
     AssetHandle shared;
     if (sharedAsset) shared = world.registerAsset(prototype.clone());
+    const RootNodeDesc tlasRoot{
+        1, 0.0f,
+        AABB::fromCenterExtent(float4::point(0, 0, 0),
+                               float4::vec(1, 1, 1)),
+        {}};
 
     const auto gridPosition = [](uint32_t index, uint32_t count, float zBase)
     {
@@ -1520,6 +1527,7 @@ static void BM_FlatForest100k(benchmark::State& state)
         return float4::point(x, 0.0f, zBase + float(row) * 6.0f);
     };
 
+    const auto assembly0 = std::chrono::steady_clock::now();
     for (uint32_t i = 0; i < kInstances; ++i)
     {
         float4 position;
@@ -1530,11 +1538,17 @@ static void BM_FlatForest100k(benchmark::State& state)
             // reject the invisible 75% high in the tree.
             position = gridPosition(i - visibleTarget,
                                     kInstances - visibleTarget, -10000.0f);
-        if (sharedAsset)
+        if (representation == 2)
+            world.instantiate(tlasRoot, position);
+        else if (sharedAsset)
             world.addInstance(shared, position);
         else
             world.addInstance(prototype.clone(), position);
     }
+
+    const auto assembly1 = std::chrono::steady_clock::now();
+    const double assemblyMs =
+        std::chrono::duration<double, std::milli>(assembly1 - assembly0).count();
 
     const Camera camera = makePerspectiveCamera(
         float4::point(0, 100, -2000), float4::vec(0, -0.05f, 1),
@@ -1586,6 +1600,7 @@ static void BM_FlatForest100k(benchmark::State& state)
     state.counters["query_MB"] =
         mode == 2 ? double(query.bytes()) / (1024.0 * 1024.0) : 0.0;
     state.counters["build_ms"] = buildMs;
+    state.counters["assembly_ms"] = assemblyMs;
     state.counters["pages"] = double(world.attachedPageCount());
     state.counters["tlas_nodes"] =
         double(SpatialDatabase::TestAccess::tlasNodeCount(world));
@@ -1593,9 +1608,11 @@ static void BM_FlatForest100k(benchmark::State& state)
 BENCHMARK(BM_FlatForest100k)
     ->Args({1, 25, 0})->Args({1, 25, 1})->Args({1, 25, 2})
     ->Args({1, 100, 0})->Args({1, 100, 1})->Args({1, 100, 2})
+    ->Args({2, 25, 0})->Args({2, 25, 1})->Args({2, 25, 2})
+    ->Args({2, 100, 0})->Args({2, 100, 1})->Args({2, 100, 2})
     ->Args({0, 25, 0})->Args({0, 25, 1})->Args({0, 25, 2})
     ->Args({0, 100, 0})->Args({0, 100, 1})->Args({0, 100, 2})
-    ->ArgNames({"shared", "visible_pct", "mode"})
+    ->ArgNames({"representation", "visible_pct", "mode"})
     ->Unit(benchmark::kMicrosecond);
 
 // Mixed-forest control: one shared flat asset and one shared, fully resident
@@ -2049,17 +2066,17 @@ static void BM_SubtreeAssembly_FrontierCost(benchmark::State& state)
         immutableBytes += houseSubtree.page().byteSize();
 
         SubtreeBuilder city(cityKey);
-        const auto root = city.createNode(city.root(), 1, 64.0f, AABB::empty());
         for (uint32_t i = 0; i < count; ++i)
         {
             const float4 pos = position(i);
             const auto proxy = city.createNode(
-                root, 10 + i, 16.0f,
+                city.root(), 10 + i, 16.0f,
                 AABB::fromCenterExtent(pos, float4::vec(4, 2, 2)));
             city.setExpansion(proxy, houseKey,
                               SubtreeTransform{pos, 1.0f});
         }
         Subtree citySubtree = city.build();
+        const AABB cityBounds = citySubtree.page().bbox[0];
         immutableBytes += citySubtree.page().byteSize() +
                           citySubtree.expansions().size() * sizeof(SubtreeExpansion) +
                           citySubtree.dependencies().size() * sizeof(SubtreeKey);
@@ -2069,12 +2086,14 @@ static void BM_SubtreeAssembly_FrontierCost(benchmark::State& state)
         const SubtreeHandle cityAsset =
             world.registerSubtree(std::move(citySubtree));
         const auto instance =
-            world.instantiate(cityAsset, float4::point(0, 0, 0));
-        markAllResident(world, instance.rootPage, count + 2);
+            world.instantiate(RootNodeDesc{1, 64.0f, cityBounds, cityKey},
+                              float4::point(0, 0, 0));
+        const MountHandle cityMount = world.mount(instance.rootNode(), cityAsset);
+        markAllResident(world, cityMount, count + 1);
         for (uint32_t i = 0; i < count; ++i)
         {
             const MountHandle mount =
-                world.mount(nodeAt(instance.rootPage, i + 2), houseAsset);
+                world.mount(nodeAt(cityMount, i + 1), houseAsset);
             markAllResident(world, mount, houseNodes);
         }
     }
@@ -2166,13 +2185,11 @@ static void BM_SubtreeAssembly_ConstructCost(benchmark::State& state)
                                  detailBounds(d));
 
             SubtreeBuilder city(cityKey);
-            const auto root =
-                city.createNode(city.root(), 1, 64.0f, AABB::empty());
             for (uint32_t i = 0; i < count; ++i)
             {
                 const float4 pos = position(i);
                 const auto proxy = city.createNode(
-                    root, 10 + i, 16.0f,
+                    city.root(), 10 + i, 16.0f,
                     AABB::fromCenterExtent(pos, float4::vec(4, 2, 2)));
                 city.setExpansion(proxy, houseKey,
                                   SubtreeTransform{pos, 1.0f});
@@ -2180,12 +2197,17 @@ static void BM_SubtreeAssembly_ConstructCost(benchmark::State& state)
 
             const SubtreeHandle houseAsset =
                 world.registerSubtree(house.build());
+            Subtree citySubtree = city.build();
+            const AABB cityBounds = citySubtree.page().bbox[0];
             const SubtreeHandle cityAsset =
-                world.registerSubtree(city.build());
+                world.registerSubtree(std::move(citySubtree));
             const auto instance =
-                world.instantiate(cityAsset, float4::point(0, 0, 0));
+                world.instantiate(RootNodeDesc{1, 64.0f, cityBounds, cityKey},
+                                  float4::point(0, 0, 0));
+            const MountHandle cityMount =
+                world.mount(instance.rootNode(), cityAsset);
             for (uint32_t i = 0; i < count; ++i)
-                world.mount(nodeAt(instance.rootPage, i + 2), houseAsset);
+                world.mount(nodeAt(cityMount, i + 1), houseAsset);
         }
         else
         {

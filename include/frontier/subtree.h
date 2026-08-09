@@ -1,7 +1,8 @@
 #pragma once
 // Logical reusable hierarchy fragments. A Subtree's packed Page contains the
-// real nodes below an implicit anchor. At runtime that anchor is either a TLAS
-// instance or an expansion node in another Subtree.
+// real descendants below a mount anchor. The anchor is serialization/build
+// machinery, not a hierarchy node: at runtime the real parent is always a
+// renderable TLAS root or an expansion node in another Subtree.
 
 #include <cstddef>
 #include <cstdint>

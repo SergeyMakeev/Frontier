@@ -184,6 +184,7 @@ SpatialDatabase::~SpatialDatabase() = default;
 
 const SpatialDatabase::PageRt* SpatialDatabase::resolve(NodeHandle h) const
 {
+    if (h.isTlasRoot()) return nullptr;
     const uint32_t slot = h.slot();
     const uint32_t index = h.index();
     if (slot >= slots_.size()) return nullptr;
@@ -192,6 +193,21 @@ const SpatialDatabase::PageRt* SpatialDatabase::resolve(NodeHandle h) const
     const PageRt& rt = slots_[slot];
     if (index == 0 || index >= pageView(rt).nodeCount()) return nullptr;
     return &rt;
+}
+
+InstanceId SpatialDatabase::resolveTlasRoot(NodeHandle h) const
+{
+    if (!h.isTlasRoot()) return kInvalidInstanceId;
+    const InstanceId publicId = h.tlasInstance();
+    if (publicId >= instanceHandleToDense_.size()) return kInvalidInstanceId;
+    const InstanceId dense = instanceHandleToDense_[publicId];
+    if (dense >= instances_.size()) return kInvalidInstanceId;
+    const Instance& inst = instances_[dense];
+    if (!inst.alive() || !inst.hasTlasRoot() ||
+        (inst.generation & NodeHandle::kTlasGenerationMask) !=
+            h.tlasGeneration())
+        return kInvalidInstanceId;
+    return dense;
 }
 
 const SpatialDatabase::AssetRt* SpatialDatabase::resolveAsset(AssetHandle h) const
@@ -270,6 +286,9 @@ void SpatialDatabase::bumpContentVersion(uint32_t slot)
     ++pageStamps_[slot].contentVersion;
     const uint32_t root = slots_[slot].rootSlot;
     if (root != slot) ++pageStamps_[root].contentVersion;
+    const NodeRef owner = slots_[root].owner;
+    if (owner.isTlasRoot() && owner.index < instanceFrontierVersions_.size())
+        instanceFrontierVersions_[owner.index] = ++generationCounter_;
 }
 
 // ============================================================================
@@ -694,6 +713,10 @@ MountHandle SpatialDatabase::mount(NodeHandle expansionNode,
     FRONTIER_CHECK(child != nullptr,
                    "SpatialDatabase::mount: invalid or released subtree");
 
+    const InstanceId root = resolveTlasRoot(expansionNode);
+    if (root != kInvalidInstanceId)
+        return mountTlasRoot(root, subtreeHandle, SubtreeTransform{});
+
     const PageRt* owner = resolve(expansionNode);
     if (!owner) return MountHandle{};
     const SubtreeExpansion* expansion =
@@ -710,8 +733,76 @@ MountHandle SpatialDatabase::mount(NodeHandle expansionNode,
                                  expansion->transform());
 }
 
+MountHandle SpatialDatabase::mount(NodeHandle rootNode,
+                                   SubtreeHandle subtree,
+                                   const SubtreeTransform& transform)
+{
+    const SubtreeAssetRt* child = resolveSubtree(subtree);
+    FRONTIER_CHECK(child != nullptr,
+                   "SpatialDatabase::mount: invalid or released subtree");
+    const InstanceId root = resolveTlasRoot(rootNode);
+    if (root == kInvalidInstanceId) return MountHandle{};
+    return mountTlasRoot(root, subtree, transform);
+}
+
+MountHandle SpatialDatabase::mountTlasRoot(
+    InstanceId dense, SubtreeHandle subtreeHandle,
+    const SubtreeTransform& transform)
+{
+    FRONTIER_CHECK(transform.scale > 0.0f && std::isfinite(transform.scale) &&
+                       std::isfinite(transform.pos.x) &&
+                       std::isfinite(transform.pos.y) &&
+                       std::isfinite(transform.pos.z),
+                   "SpatialDatabase::mount: invalid mount transform");
+    Instance& inst = instances_[dense];
+    FRONTIER_CHECK(inst.hasTlasRoot(),
+                   "SpatialDatabase::mount: node is not a TLAS root");
+    FRONTIER_CHECK(inst.rootSlot == kInvalidIndex,
+                   "SpatialDatabase::mount: already attached");
+
+    const SubtreeAssetRt* child = resolveSubtree(subtreeHandle);
+    FRONTIER_CHECK(child != nullptr,
+                   "SpatialDatabase::mount: invalid or released subtree");
+    const SubtreeKey target = tlasRootTargets_.empty()
+                                  ? SubtreeKey{}
+                                  : tlasRootTargets_[dense];
+    FRONTIER_CHECK(target.valid(),
+                   "SpatialDatabase::mount: root has no subtree target");
+    FRONTIER_CHECK(target == child->key,
+                   "SpatialDatabase::mount: subtree key does not match expansion target");
+
+    const InstanceTlas& spatial = instanceTlas_[dense];
+    const float invInstanceScale = 1.0f / inst.scale;
+    const AABB rootLocal = AABB::fromMinMax(
+        (spatial.worldBox.mn - inst.pos) * invInstanceScale,
+        (spatial.worldBox.mx - inst.pos) * invInstanceScale);
+    const AABB childBounds = toWorld(assets_[subtreeHandle.slot].page.bbox[0],
+                                     transform.pos, transform.scale);
+    FRONTIER_CHECK(rootLocal.contains(childBounds),
+                   "SpatialDatabase::mount: mounted subtree escapes the TLAS root's "
+                   "authored bounds");
+
+    const float rootError = spatial.maxErrWorld * invInstanceScale;
+    const float childClamp = rootError / transform.scale;
+    const uint32_t slot = registerPage(
+        subtreeHandle.slot, NodeRef{kInvalidIndex, dense}, false);
+    slots_[slot].errClamp = childClamp;
+    MountTransformRt& mounted = mountTransforms_[slot];
+    mounted.pos = transform.pos;
+    mounted.pos.w = 1.0f;
+    mounted.scale = transform.scale;
+    mounted.errClamp = childClamp;
+    inst.rootSlot = slot;
+    instanceFrontierVersions_[dense] = ++generationCounter_;
+    return MountHandle{slot, pageStamps_[slot].generation()};
+}
+
 SubtreeKey SpatialDatabase::expansionTarget(NodeHandle expansionNode) const
 {
+    const InstanceId root = resolveTlasRoot(expansionNode);
+    if (root != kInvalidInstanceId)
+        return tlasRootTargets_.empty() ? SubtreeKey{}
+                                        : tlasRootTargets_[root];
     const PageRt* owner = resolve(expansionNode);
     if (!owner) return {};
     const SubtreeExpansion* expansion =
@@ -726,6 +817,11 @@ SubtreeKey SpatialDatabase::expansionTarget(NodeHandle expansionNode) const
 bool SpatialDatabase::tryGetNodeTransform(
     NodeHandle node, SubtreeTransform& outTransform) const
 {
+    if (resolveTlasRoot(node) != kInvalidInstanceId)
+    {
+        outTransform = SubtreeTransform{};
+        return true;
+    }
     if (!resolve(node)) return false;
     const MountTransformRt& transform = mountTransforms_[node.slot()];
     outTransform.pos = transform.pos;
@@ -753,6 +849,17 @@ DetailPageRef SpatialDatabase::detailPage(NodeHandle expansionNode) const
 
 void SpatialDatabase::detachPage(NodeHandle expansionNode)
 {
+    const InstanceId root = resolveTlasRoot(expansionNode);
+    if (root != kInvalidInstanceId)
+    {
+        const uint32_t child = instances_[root].rootSlot;
+        FRONTIER_CHECK(child != kInvalidIndex,
+                       "SpatialDatabase::detachPage: not attached");
+        FRONTIER_CHECK(slots_[child].attachedChildPages() == 0,
+                       "SpatialDatabase::detachPage: attached child pages remain");
+        detachSlot(child, nullptr);
+        return;
+    }
     const PageRt* ownerRt = resolve(expansionNode);
     if (!ownerRt) return;   // parent page already gone; nothing to detach
     const uint32_t child =
@@ -767,6 +874,9 @@ void SpatialDatabase::detachPage(NodeHandle expansionNode)
 
 bool SpatialDatabase::isAttached(NodeHandle expansionNode) const
 {
+    const InstanceId root = resolveTlasRoot(expansionNode);
+    if (root != kInvalidInstanceId)
+        return instances_[root].rootSlot != kInvalidIndex;
     const PageRt* rt = resolve(expansionNode);
     return rt && attachedChildSlot(*rt, expansionNode.index()) != kInvalidIndex;
 }
@@ -792,6 +902,17 @@ void SpatialDatabase::detachSlot(uint32_t slot, AppendBuffer<UserPayload>* freed
         propagateFullResidency(rt.owner.slot, ownerWasFullyResident);
         bumpContentVersion(rt.owner.slot);   // it collapses to a leaf
         propagateCoverage(rt.owner.slot, rt.owner.index);
+    }
+    else if (rt.owner.isTlasRoot())
+    {
+        const InstanceId root = rt.owner.index;
+        if (root < instances_.size() && instances_[root].alive() &&
+            instances_[root].hasTlasRoot() &&
+            instances_[root].rootSlot == slot)
+        {
+            instances_[root].rootSlot = kInvalidIndex;
+            instanceFrontierVersions_[root] = ++generationCounter_;
+        }
     }
     lruUnlink(slot);
     if (rt.pinned()) --pinnedPages_;
@@ -906,6 +1027,13 @@ void SpatialDatabase::propagateCoverage(uint32_t slot, uint32_t node)
 
         if (node == 0)
         {
+            if (rt.owner.isTlasRoot())
+            {
+                const InstanceId root = rt.owner.index;
+                if (root < instanceFrontierVersions_.size())
+                    instanceFrontierVersions_[root] = ++generationCounter_;
+                return;
+            }
             if (!rt.owner.valid()) return;
             const NodeRef owner = rt.owner;
             bumpContentVersion(owner.slot);
@@ -925,6 +1053,7 @@ void SpatialDatabase::propagateCoverage(uint32_t slot, uint32_t node)
 
 void SpatialDatabase::markResident(NodeHandle h)
 {
+    if (resolveTlasRoot(h) != kInvalidInstanceId) return;
     PageRt* rt = resolve(h);
     if (!rt) return;   // page collected while the payload was loading
     const uint32_t index = h.index();
@@ -939,6 +1068,8 @@ void SpatialDatabase::markResident(NodeHandle h)
 
 void SpatialDatabase::markNonResident(NodeHandle h)
 {
+    if (resolveTlasRoot(h) != kInvalidInstanceId)
+        FRONTIER_FATAL("SpatialDatabase::markNonResident: TLAS root is permanent");
     PageRt* rt = resolve(h);
     if (!rt) return;
     const uint32_t index = h.index();
@@ -957,12 +1088,19 @@ void SpatialDatabase::markNonResident(NodeHandle h)
 
 bool SpatialDatabase::isResident(NodeHandle h) const
 {
+    if (resolveTlasRoot(h) != kInvalidInstanceId) return true;
     const PageRt* rt = resolve(h);
     return rt && rt->isResident(h.index());
 }
 
 bool SpatialDatabase::tryGetPayload(NodeHandle h, UserPayload& outPayload) const
 {
+    const InstanceId root = resolveTlasRoot(h);
+    if (root != kInvalidInstanceId)
+    {
+        outPayload = tlasRootPayloads_[root];
+        return true;
+    }
     const PageRt* rt = resolve(h);
     if (!rt) return false;
     outPayload = pageView(*rt).payload[h.index()];
@@ -989,6 +1127,8 @@ SpatialDatabase::InstanceRef SpatialDatabase::addInstanceInternal(uint32_t asset
                    "SpatialDatabase: exhausted the 24-bit InstanceId space");
         instances_.emplace_back();
         instanceTlas_.emplace_back();
+        if (!tlasRootPayloads_.empty()) tlasRootPayloads_.emplace_back();
+        if (!tlasRootTargets_.empty()) tlasRootTargets_.emplace_back();
         instanceFrontierVersions_.emplace_back();
         instanceDenseToHandle_.push_back(kInvalidInstanceId);
         id = InstanceId(instances_.size() - 1);
@@ -1025,6 +1165,8 @@ SpatialDatabase::InstanceRef SpatialDatabase::addInstanceInternal(uint32_t asset
     InstanceTlas& spatial = instanceTlas_[id];
     inst = Instance{};
     spatial = InstanceTlas{};
+    if (!tlasRootPayloads_.empty()) tlasRootPayloads_[id] = 0;
+    if (!tlasRootTargets_.empty()) tlasRootTargets_[id] = {};
     inst.pos = desc.pos;
     inst.scale = desc.scale;
     inst.rootSlot = slot;
@@ -1078,21 +1220,124 @@ SpatialDatabase::InstanceRef SpatialDatabase::addInstance(AssetHandle asset, flo
     return addInstance(asset, d);
 }
 
-SpatialDatabase::InstanceRef SpatialDatabase::instantiate(
-    SubtreeHandle subtree, const InstanceDesc& desc)
+SpatialDatabase::InstanceRef SpatialDatabase::addTlasRootInstance(
+    const RootNodeDesc& root, const InstanceDesc& desc)
 {
-    FRONTIER_CHECK(resolveSubtree(subtree) != nullptr,
-                   "SpatialDatabase::instantiate: invalid or released subtree");
-    return addInstanceInternal(subtree.slot, desc);
+    FRONTIER_CHECK(desc.scale > 0.0f && std::isfinite(desc.scale),
+                   "SpatialDatabase::instantiate: non-positive or non-finite scale");
+    FRONTIER_CHECK(root.geometricError >= 0.0f &&
+                       std::isfinite(root.geometricError),
+                   "SpatialDatabase::instantiate: invalid geometric error");
+    FRONTIER_CHECK(!root.bounds.isEmpty() &&
+                       std::isfinite(root.bounds.mn.x) &&
+                       std::isfinite(root.bounds.mn.y) &&
+                       std::isfinite(root.bounds.mn.z) &&
+                       std::isfinite(root.bounds.mx.x) &&
+                       std::isfinite(root.bounds.mx.y) &&
+                       std::isfinite(root.bounds.mx.z),
+                   "SpatialDatabase::instantiate: empty or non-finite root bounds");
+
+    InstanceId id;
+    if (!freeInstances_.empty())
+    {
+        id = freeInstances_.back();
+        freeInstances_.pop_back();
+    }
+    else
+    {
+        FRONTIER_CHECK(instances_.size() < kInvalidInstanceId,
+                       "SpatialDatabase: exhausted the 24-bit InstanceId space");
+        instances_.emplace_back();
+        instanceTlas_.emplace_back();
+        if (!tlasRootPayloads_.empty()) tlasRootPayloads_.emplace_back();
+        if (!tlasRootTargets_.empty()) tlasRootTargets_.emplace_back();
+        instanceFrontierVersions_.emplace_back();
+        instanceDenseToHandle_.push_back(kInvalidInstanceId);
+        id = InstanceId(instances_.size() - 1);
+    }
+
+    InstanceId handle;
+    if (!freeInstanceHandles_.empty())
+    {
+        handle = freeInstanceHandles_.back();
+        freeInstanceHandles_.pop_back();
+    }
+    else
+    {
+        FRONTIER_CHECK(instanceHandleToDense_.size() < kInvalidInstanceId,
+                       "SpatialDatabase: exhausted the 24-bit instance-handle space");
+        handle = InstanceId(instanceHandleToDense_.size());
+        instanceHandleToDense_.push_back(kInvalidInstanceId);
+    }
+    instanceHandleToDense_[handle] = id;
+    instanceDenseToHandle_[id] = handle;
+    if (tlasRootPayloads_.size() < instances_.size())
+        tlasRootPayloads_.resize(instances_.size());
+    if (root.expansionTarget.valid() &&
+        tlasRootTargets_.size() < instances_.size())
+        tlasRootTargets_.resize(instances_.size());
+
+    Instance& inst = instances_[id];
+    InstanceTlas& spatial = instanceTlas_[id];
+    inst = Instance{};
+    spatial = InstanceTlas{};
+    tlasRootPayloads_[id] = root.payload;
+    if (!tlasRootTargets_.empty())
+        tlasRootTargets_[id] = root.expansionTarget;
+    inst.pos = desc.pos;
+    inst.scale = desc.scale;
+    inst.rootSlot = kInvalidIndex;
+    inst.setTlasRoot(true);
+    inst.setZeroErrorRoot(!(root.geometricError > 0.0f));
+    inst.setAlive(true);
+    do
+        inst.generation = ++generationCounter_;
+    while ((inst.generation & NodeHandle::kTlasGenerationMask) == 0 ||
+           NodeHandle::tlasRoot(handle, inst.generation).hi == kInvalidIndex);
+    spatial.mask = desc.mask;
+    spatial.worldBox = toWorld(root.bounds, desc.pos, desc.scale);
+    spatial.maxErrWorld = root.geometricError * desc.scale;
+    instanceFrontierVersions_[id] = ++generationCounter_;
+    spatial.liveIndex = uint32_t(liveInstances_.size());
+    liveInstances_.push_back(id);
+    if (!instanceFlatSlots_.empty())
+        if (instanceFlatSlots_.size() < instances_.size())
+            instanceFlatSlots_.resize(instances_.size(), kInvalidIndex);
+    if (!root.expansionTarget.valid())
+    {
+        if (instanceFlatSlots_.empty())
+            instanceFlatSlots_.resize(instances_.size(), kInvalidIndex);
+        const NodeHandle rootHandle =
+            NodeHandle::tlasRoot(handle, inst.generation);
+        instanceFlatSlots_[id] = rootHandle.hi;
+        ++flatInstanceCount_;
+        ++tlasFlatInstanceCount_;
+        if (!(root.geometricError > 0.0f))
+            ++tlasZeroErrorFlatInstanceCount_;
+    }
+    else
+    {
+        if (!instanceFlatSlots_.empty())
+            instanceFlatSlots_[id] = kInvalidIndex;
+    }
+    tlasInsert(id);
+    markTlasStructuralChange();
+    return InstanceRef{handle, inst.generation, PageHandle{}};
 }
 
 SpatialDatabase::InstanceRef SpatialDatabase::instantiate(
-    SubtreeHandle subtree, float4 pos, float scale)
+    const RootNodeDesc& root, const InstanceDesc& desc)
+{
+    return addTlasRootInstance(root, desc);
+}
+
+SpatialDatabase::InstanceRef SpatialDatabase::instantiate(
+    const RootNodeDesc& root, float4 pos, float scale)
 {
     InstanceDesc desc;
     desc.pos = pos;
     desc.scale = scale;
-    return instantiate(subtree, desc);
+    return instantiate(root, desc);
 }
 
 SpatialDatabase::InstanceRef SpatialDatabase::addInstance(Page&& page, const InstanceDesc& desc)
@@ -1173,17 +1418,33 @@ void SpatialDatabase::removeInstance(InstanceRef ref)
     Instance* inst = resolveInstance(ref);
     if (!inst) return;   // stale ref: the instance is already gone
     const InstanceId id = InstanceId(inst - instances_.data());
-    const uint32_t   asset = slots_[inst->rootSlot].asset;
+    const bool tlasRoot = inst->hasTlasRoot();
+    const uint32_t asset = tlasRoot ? kInvalidIndex
+                                    : slots_[inst->rootSlot].asset;
 
     if (!instanceFlatSlots_.empty() &&
         instanceFlatSlots_[id] != kInvalidIndex)
     {
         FRONTIER_CHECK(flatInstanceCount_ != 0, "SpatialDatabase: flat-instance count underflow");
+        if (tlasRoot)
+        {
+            FRONTIER_CHECK(tlasFlatInstanceCount_ != 0,
+                           "SpatialDatabase: TLAS-flat instance count underflow");
+            --tlasFlatInstanceCount_;
+            if (inst->hasZeroErrorRoot())
+            {
+                FRONTIER_CHECK(tlasZeroErrorFlatInstanceCount_ != 0,
+                               "SpatialDatabase: zero-error TLAS-flat count underflow");
+                --tlasZeroErrorFlatInstanceCount_;
+            }
+        }
         --flatInstanceCount_;
         instanceFlatSlots_[id] = kInvalidIndex;
     }
 
     freeOverlays(*inst);
+    if (tlasRoot && inst->rootSlot != kInvalidIndex)
+        detachMountTree(inst->rootSlot, nullptr);
     tlasRemove(id);
     const uint32_t liveIndex = instanceTlas_[id].liveIndex;
     const InstanceId moved = liveInstances_.back();
@@ -1198,6 +1459,13 @@ void SpatialDatabase::removeInstance(InstanceRef ref)
     freeInstanceHandles_.push_back(ref.id);
     freeInstances_.push_back(id);
     markTlasStructuralChange();
+
+    if (tlasRoot)
+    {
+        tlasRootPayloads_[id] = 0;
+        if (!tlasRootTargets_.empty()) tlasRootTargets_[id] = {};
+        return;
+    }
 
     AssetRt& as = assets_[asset];
     --as.instanceRefs;
@@ -1226,6 +1494,22 @@ void SpatialDatabase::moveInstance(InstanceRef ref, float4 pos, float scale)
 void SpatialDatabase::moveInstanceDense(InstanceId dense, float4 pos, float scale)
 {
     Instance& inst = instances_[dense];
+    if (inst.hasTlasRoot())
+    {
+        InstanceTlas& spatial = instanceTlas_[dense];
+        const float invOldScale = 1.0f / inst.scale;
+        const AABB localBounds = AABB::fromMinMax(
+            (spatial.worldBox.mn - inst.pos) * invOldScale,
+            (spatial.worldBox.mx - inst.pos) * invOldScale);
+        const float localError = spatial.maxErrWorld * invOldScale;
+        inst.pos = pos;
+        inst.scale = scale;
+        spatial.worldBox = toWorld(localBounds, pos, scale);
+        spatial.maxErrWorld = localError * scale;
+        instanceFrontierVersions_[dense] = ++generationCounter_;
+        tlasOnInstanceMoved(dense);
+        return;
+    }
     // Translation and bounds deformation cannot change geometric error.
     // Uniform scale can, so only that uncommon case rescans the root nodes.
     const bool scaleChanged = inst.scale != scale;
@@ -1300,6 +1584,7 @@ void SpatialDatabase::recomputeInstanceBounds(InstanceId id, bool recomputeError
     // Globally unique rather than per-instance so a recycled slot can never
     // match the previous occupant's SpatialQuery record.
     instanceFrontierVersions_[id] = ++generationCounter_;
+    if (inst.hasTlasRoot()) return;
     const PageRt& rt = slots_[inst.rootSlot];
     const AABB* bbox = boundsFor(inst, inst.rootSlot, rt);
     spatial.worldBox = toWorld(bbox[0], inst.pos, inst.scale);
@@ -1584,6 +1869,14 @@ void SpatialDatabase::setNodeBounds(InstanceRef ref, NodeHandle h, const AABB& l
     if (!h.valid()) return;
     const Instance* inst = resolveInstance(ref);
     if (!inst) return;         // stale instance ref
+    const InstanceId root = resolveTlasRoot(h);
+    if (root != kInvalidInstanceId)
+    {
+        FRONTIER_ASSERT(root == InstanceId(inst - instances_.data()),
+                        "SpatialDatabase::setNodeBounds: root belongs to another instance");
+        pendingMoves_.push_back({localBounds, h, ref.id, ref.generation});
+        return;
+    }
     if (!resolve(h)) return;   // stale handle: the page was detached or collected
     FRONTIER_ASSERT(mountBelongsTo(*inst, h.slot()),
                 "SpatialDatabase::setNodeBounds: the node is not in this instance's page tree");
@@ -1630,6 +1923,14 @@ void SpatialDatabase::flushBounds()
         if (dense >= instances_.size()) continue;
         const Instance& inst = instances_[dense];
         if (!inst.alive() || inst.generation != m.instGeneration) continue;
+        if (resolveTlasRoot(m.node) == dense)
+        {
+            instanceTlas_[dense].worldBox =
+                toWorld(m.box, inst.pos, inst.scale);
+            instanceFrontierVersions_[dense] = ++generationCounter_;
+            tlasOnInstanceMoved(dense);
+            continue;
+        }
         if (!resolve(m.node)) continue;
         applyBoundsChange(dense, m.node.slot(), m.node.index(), m.box);
     }
@@ -1684,6 +1985,22 @@ void SpatialDatabase::applyBoundsChange(InstanceId id, uint32_t slot, uint32_t i
         const NodeRef owner = slots_[curSlot].owner;
         if (!owner.valid())
         {
+            if (owner.isTlasRoot())
+            {
+                Instance& rootInst = instances_[id];
+                InstanceTlas& rootSpatial = instanceTlas_[id];
+                const float invScale = 1.0f / rootInst.scale;
+                AABB rootLocal = AABB::fromMinMax(
+                    (rootSpatial.worldBox.mn - rootInst.pos) * invScale,
+                    (rootSpatial.worldBox.mx - rootInst.pos) * invScale);
+                const MountTransformRt& transform = mountTransforms_[curSlot];
+                rootLocal.expand(toWorld(bbox[0], transform.pos,
+                                         transform.scale));
+                rootSpatial.worldBox =
+                    toWorld(rootLocal, rootInst.pos, rootInst.scale);
+                tlasOnInstanceMoved(id);
+                return;
+            }
             refreshInstanceBounds(id, false);
             return;
         }
@@ -1729,6 +2046,14 @@ AABB SpatialDatabase::nodeBounds(InstanceRef ref, NodeHandle h)
 {
     flushBounds();
     Instance* inst = resolveInstance(ref);
+    const InstanceId root = resolveTlasRoot(h);
+    if (inst && root == InstanceId(inst - instances_.data()))
+    {
+        const InstanceTlas& spatial = instanceTlas_[root];
+        const float invScale = 1.0f / inst->scale;
+        return AABB::fromMinMax((spatial.worldBox.mn - inst->pos) * invScale,
+                                (spatial.worldBox.mx - inst->pos) * invScale);
+    }
     const PageRt* rt = resolve(h);
     if (!inst || !rt) return AABB::empty();
     return boundsFor(*inst, h.slot(), *rt)[h.index()];
@@ -1808,6 +2133,8 @@ bool SpatialDatabase::instanceHasSingleRoot(InstanceId id) const
     const Instance& inst = instances_[id];
     const bool flat = !instanceFlatSlots_.empty() &&
                       instanceFlatSlots_[id] != kInvalidIndex;
+    if (flat) return false;
+    if (inst.hasTlasRoot()) return true;
     return !flat && pageView(slots_[inst.rootSlot]).childCount(0) == 1;
 }
 
@@ -2321,6 +2648,12 @@ void SpatialDatabase::reorderInstancesByTlas()
     // rather than with the database's historical peak.
     std::vector<Instance> newInstances(liveCount);
     std::vector<InstanceTlas> newSpatial(liveCount);
+    std::vector<UserPayload> newTlasRootPayloads;
+    const bool hadTlasRootPayloads = !tlasRootPayloads_.empty();
+    if (hadTlasRootPayloads) newTlasRootPayloads.resize(liveCount);
+    std::vector<SubtreeKey> newTlasRootTargets;
+    const bool hadTlasRootTargets = !tlasRootTargets_.empty();
+    if (hadTlasRootTargets) newTlasRootTargets.resize(liveCount);
     std::vector<uint32_t> newFrontierVersions(liveCount);
     std::vector<InstanceId> newDenseToHandle(liveCount, kInvalidInstanceId);
     std::vector<uint32_t> newFlat;
@@ -2332,12 +2665,23 @@ void SpatialDatabase::reorderInstancesByTlas()
         const InstanceId old = order[next];
         newInstances[next] = std::move(instances_[old]);
         newSpatial[next] = std::move(instanceTlas_[old]);
+        if (hadTlasRootPayloads)
+            newTlasRootPayloads[next] = tlasRootPayloads_[old];
+        if (hadTlasRootTargets)
+            newTlasRootTargets[next] = tlasRootTargets_[old];
         newFrontierVersions[next] = instanceFrontierVersions_[old];
         newDenseToHandle[next] = instanceDenseToHandle_[old];
         if (hadFlatStream) newFlat[next] = instanceFlatSlots_[old];
+        if (newInstances[next].hasTlasRoot() &&
+            newInstances[next].rootSlot != kInvalidIndex)
+            slots_[newInstances[next].rootSlot].owner.index = next;
     }
     instances_.swap(newInstances);
     instanceTlas_.swap(newSpatial);
+    if (hadTlasRootPayloads)
+        tlasRootPayloads_.swap(newTlasRootPayloads);
+    if (hadTlasRootTargets)
+        tlasRootTargets_.swap(newTlasRootTargets);
     instanceFrontierVersions_.swap(newFrontierVersions);
     instanceDenseToHandle_.swap(newDenseToHandle);
     if (hadFlatStream) instanceFlatSlots_.swap(newFlat);
@@ -3246,6 +3590,11 @@ void SpatialDatabase::runInstance(uint32_t instIdx, const Camera& view, const Se
                         uint8_t mask, bool tryRoot, Worker& w) const
 {
     const Instance& inst = instances_[instIdx];
+    if (inst.hasTlasRoot())
+    {
+        runTlasRootInstance(instIdx, view, params, mask, w);
+        return;
+    }
     FRONTIER_STAT(w, instancesVisited, 1);
 
     // A root page normally contains one BLAS root. The TLAS already maintains
@@ -3309,6 +3658,71 @@ void SpatialDatabase::runInstance(uint32_t instIdx, const Camera& view, const Se
     }
 }
 
+void SpatialDatabase::runTlasRootInstance(
+    uint32_t instIdx, const Camera& view, const SelectionParams& params,
+    uint8_t mask, Worker& w) const
+{
+    const Instance& inst = instances_[instIdx];
+    const InstanceTlas& spatial = instanceTlas_[instIdx];
+    FRONTIER_STAT(w, instancesVisited, 1);
+
+    if (mask != 0 &&
+        testAabb(spatial.worldBox, view.frustum, mask) == CullState::Outside)
+        return;
+
+    const float worldDistance =
+        spatial.maxErrWorld > 0.0f
+            ? distanceToBox(spatial.worldBox, view.queryMin(), view.queryMax())
+            : 0.0f;
+    const float error = spatial.maxErrWorld > 0.0f
+                            ? screenError(spatial.maxErrWorld, view.k,
+                                          worldDistance)
+                            : 0.0f;
+    if (w.trackMargin && spatial.maxErrWorld > 0.0f)
+    {
+        const float worldFlip = spatial.maxErrWorld * view.k / w.bar;
+        const float worldSlack = worldDistance > worldFlip
+                                     ? worldDistance - worldFlip
+                                     : worldFlip - worldDistance;
+        w.margin = std::min(w.margin, worldSlack / inst.scale);
+        w.maxError = std::max(w.maxError,
+                              spatial.maxErrWorld / inst.scale);
+    }
+
+    const InstanceId outputInstance = publicInstanceId(instIdx);
+    const NodeHandle root = NodeHandle::tlasRoot(outputInstance,
+                                                 inst.generation);
+    const uint32_t childSlot = inst.rootSlot;
+    if (!(error > params.threshold) || childSlot == kInvalidIndex)
+    {
+        w.result.shared.push(makeFrontierEntry(
+            root, error, w.bar, w.barInv, outputInstance));
+        return;
+    }
+
+    const Camera local = toLocal(view, inst.pos, inst.scale);
+    const bool fullyResident = pageTreeFullyResident(childSlot);
+    const bool currentCanDescend =
+        fullyResident ||
+        visibleDescendantsCovered(childSlot, 0, mask, inst, local,
+                                  w.trackTouches ? &w : nullptr);
+    if (!currentCanDescend)
+        w.result.currentOnly.push(makeFrontierEntry(
+            root, error, w.bar, w.barInv, outputInstance));
+
+    w.work.push_back(makeWorkItem(childSlot, inst,
+                                  uint8_t(currentCanDescend), 1, mask));
+    while (!w.work.empty())
+    {
+        const WorkItem item = w.work.back();
+        w.work.pop_back();
+        if (fullyResident)
+            runPage<true>(item, inst, local, params, w);
+        else
+            runPage<false>(item, inst, local, params, w);
+    }
+}
+
 void SpatialDatabase::runFlatInstance(uint32_t instIdx, const Camera& view,
                             uint8_t mask, Worker& w) const
 {
@@ -3339,9 +3753,63 @@ void SpatialDatabase::runFlatInstance(uint32_t instIdx, const Camera& view,
                                                 view.queryMax()))
                             : 0.0f;
     const InstanceId outputInstance = publicInstanceId(instIdx);
-    w.result.shared.push(makeFrontierEntry(NodeHandle{slot, 1,
-                                             pageStamps_[slot].generation()}, error,
-                                   w.bar, w.barInv, outputInstance));
+    const NodeHandle handle{slot, 1, pageStamps_[slot].generation()};
+    w.result.shared.push(makeFrontierEntry(handle, error, w.bar, w.barInv,
+                                           outputInstance));
+}
+
+void SpatialDatabase::runTlasFlatInstance(uint32_t instIdx,
+                                          const Camera& view,
+                                          uint8_t mask, Worker& w) const
+{
+    const uint32_t marker = instanceFlatSlots_[instIdx];
+    const bool zeroError = instances_[instIdx].hasZeroErrorRoot();
+    const InstanceTlas* spatial = nullptr;
+
+    uint8_t exactMask = mask;
+    if (exactMask != 0 || !zeroError)
+    {
+        spatial = &instanceTlas_[instIdx];
+        if (exactMask != 0 &&
+            testAabb(spatial->worldBox, view.frustum, exactMask) ==
+                CullState::Outside)
+            return;
+    }
+
+    FRONTIER_STAT(w, instancesVisited, 1);
+    const float error = !zeroError && spatial->maxErrWorld > 0.0f
+                            ? screenError(
+                                  spatial->maxErrWorld, view.k,
+                                  distanceToBox(spatial->worldBox,
+                                                view.queryMin(),
+                                                view.queryMax()))
+                            : 0.0f;
+    const InstanceId outputInstance = publicInstanceId(instIdx);
+    NodeHandle handle;
+    handle.lo = NodeHandle::kInvalidSlot |
+                ((outputInstance & 0xfffu) << NodeHandle::kSlotBits);
+    handle.hi = marker;
+    w.result.shared.push(makeFrontierEntry(
+        handle,
+        error, w.bar, w.barInv, outputInstance));
+}
+
+void SpatialDatabase::runZeroErrorTlasFlatInstance(
+    uint32_t instIdx, const Camera& view, uint8_t mask, Worker& w) const
+{
+    if (mask != 0 &&
+        testAabb(instanceTlas_[instIdx].worldBox, view.frustum, mask) ==
+            CullState::Outside)
+        return;
+
+    FRONTIER_STAT(w, instancesVisited, 1);
+    const InstanceId outputInstance = publicInstanceId(instIdx);
+    NodeHandle handle;
+    handle.lo = NodeHandle::kInvalidSlot |
+                ((outputInstance & 0xfffu) << NodeHandle::kSlotBits);
+    handle.hi = instanceFlatSlots_[instIdx];
+    w.result.shared.push(makeFrontierEntry(
+        handle, 0.0f, w.bar, w.barInv, outputInstance));
 }
 
 void SpatialDatabase::selectFrontierUncached(const Camera& camera, const SelectionParams& params,
@@ -3397,7 +3865,36 @@ void SpatialDatabase::selectFrontierUncached(const Camera& camera, const Selecti
         w.bar = params.threshold;
         w.barInv = params.threshold > 0.0f ? 1.0f / params.threshold : 0.0f;
 
-        if (flatInstanceCount_ == 0)
+        if (tlasFlatInstanceCount_ == liveInstances_.size())
+        {
+            constexpr uint32_t kFlatPrefetchDistance = 8;
+            if (tlasZeroErrorFlatInstanceCount_ == liveInstances_.size())
+            {
+                for (uint32_t i = 0; i < nVis; ++i)
+                {
+                    if (i + kFlatPrefetchDistance < nVis)
+                    {
+                        const VisibleItem next =
+                            scratch.visible[i + kFlatPrefetchDistance];
+                        if (next.mask() != 0)
+                            FRONTIER_PREFETCH(&instanceTlas_[next.instance()]);
+                    }
+                    const uint32_t instIdx = scratch.visible[i].instance();
+                    runZeroErrorTlasFlatInstance(
+                        instIdx, damped, scratch.visible[i].mask(), w);
+                }
+            }
+            else
+            {
+                for (uint32_t i = 0; i < nVis; ++i)
+                {
+                    const uint32_t instIdx = scratch.visible[i].instance();
+                    runTlasFlatInstance(instIdx, damped,
+                                        scratch.visible[i].mask(), w);
+                }
+            }
+        }
+        else if (flatInstanceCount_ == 0)
         {
             // Preserve the hierarchical loop exactly: databases with
             // no one-node assets pay only this call-level dispatch.
@@ -3409,11 +3906,14 @@ void SpatialDatabase::selectFrontierUncached(const Camera& camera, const Selecti
                 {
                     const Instance& next =
                         instances_[scratch.visible[i + 1].instance()];
-                    const PageRt& nrt = slots_[next.rootSlot];
-                    const PageView& nextPage = pageView(nrt);
-                    FRONTIER_PREFETCH(nextPage.wide);
-                    FRONTIER_PREFETCH(nextPage.meta);
-                    FRONTIER_PREFETCH(nextPage.payload);
+                    if (!next.hasTlasRoot())
+                    {
+                        const PageRt& nrt = slots_[next.rootSlot];
+                        const PageView& nextPage = pageView(nrt);
+                        FRONTIER_PREFETCH(nextPage.wide);
+                        FRONTIER_PREFETCH(nextPage.meta);
+                        FRONTIER_PREFETCH(nextPage.payload);
+                    }
                 }
                 runInstance(scratch.visible[i].instance(), damped, params,
                             scratch.visible[i].mask(),
@@ -3458,16 +3958,32 @@ void SpatialDatabase::selectFrontierUncached(const Camera& camera, const Selecti
                     if (instanceFlatSlots_[nextIdx] == kInvalidIndex)
                     {
                         const Instance& next = instances_[nextIdx];
-                        const PageRt& nrt = slots_[next.rootSlot];
-                        const PageView& nextPage = pageView(nrt);
-                        FRONTIER_PREFETCH(nextPage.wide);
-                        FRONTIER_PREFETCH(nextPage.meta);
-                        FRONTIER_PREFETCH(nextPage.payload);
+                        if (!next.hasTlasRoot())
+                        {
+                            const PageRt& nrt = slots_[next.rootSlot];
+                            const PageView& nextPage = pageView(nrt);
+                            FRONTIER_PREFETCH(nextPage.wide);
+                            FRONTIER_PREFETCH(nextPage.meta);
+                            FRONTIER_PREFETCH(nextPage.payload);
+                        }
                     }
                 }
                 const uint32_t instIdx = scratch.visible[i].instance();
                 if (instanceFlatSlots_[instIdx] != kInvalidIndex)
-                    runFlatInstance(instIdx, damped, scratch.visible[i].mask(), w);
+                {
+                    if (instances_[instIdx].hasTlasRoot())
+                    {
+                        if (instances_[instIdx].hasZeroErrorRoot())
+                            runZeroErrorTlasFlatInstance(
+                                instIdx, damped, scratch.visible[i].mask(), w);
+                        else
+                            runTlasFlatInstance(instIdx, damped,
+                                                scratch.visible[i].mask(), w);
+                    }
+                    else
+                        runFlatInstance(instIdx, damped,
+                                        scratch.visible[i].mask(), w);
+                }
                 else
                     runInstance(instIdx, damped, params,
                                 scratch.visible[i].mask(),
@@ -3497,11 +4013,17 @@ void SpatialDatabase::selectFrontierUncached(const Camera& camera, const Selecti
         const SelectionParams* params;
         uint32_t         nVis;
         uint32_t         workerCount;
-        uint32_t         flatMode;   // 0 none, 1 mixed, 2 all
+        uint32_t         flatMode;   // 0 none, 1 mixed, 2 all page/mixed,
+                                     // 3 all zero-error TLAS, 4 all TLAS
     } chunk{this, &scratch, &damped, &params, nVis, workerCount,
-            flatInstanceCount_ == 0
-                ? 0u
-                : (flatInstanceCount_ == liveInstances_.size() ? 2u : 1u)};
+            tlasFlatInstanceCount_ == liveInstances_.size()
+                ? (tlasZeroErrorFlatInstanceCount_ == liveInstances_.size()
+                       ? 3u
+                       : 4u)
+                : (flatInstanceCount_ == 0
+                       ? 0u
+                       : (flatInstanceCount_ == liveInstances_.size() ? 2u
+                                                                      : 1u))};
 
     for (uint32_t k = 0; k < workerCount; ++k)
     {
@@ -3542,7 +4064,27 @@ void SpatialDatabase::selectFrontierUncached(const Camera& camera, const Selecti
                 {
                     const uint32_t instIdx = c->scratch->visible[i].instance();
                     database.runFlatInstance(instIdx, *c->camera,
-                                          c->scratch->visible[i].mask(), w);
+                                           c->scratch->visible[i].mask(), w);
+                }
+            }
+            else if (c->flatMode == 3)
+            {
+                for (uint32_t i = lo; i < hi; ++i)
+                {
+                    const uint32_t instIdx = c->scratch->visible[i].instance();
+                    database.runZeroErrorTlasFlatInstance(
+                        instIdx, *c->camera,
+                        c->scratch->visible[i].mask(), w);
+                }
+            }
+            else if (c->flatMode == 4)
+            {
+                for (uint32_t i = lo; i < hi; ++i)
+                {
+                    const uint32_t instIdx = c->scratch->visible[i].instance();
+                    database.runTlasFlatInstance(
+                        instIdx, *c->camera,
+                        c->scratch->visible[i].mask(), w);
                 }
             }
             else
@@ -3551,8 +4093,23 @@ void SpatialDatabase::selectFrontierUncached(const Camera& camera, const Selecti
                 {
                     const uint32_t instIdx = c->scratch->visible[i].instance();
                     if (database.instanceFlatSlots_[instIdx] != kInvalidIndex)
-                        database.runFlatInstance(instIdx, *c->camera,
-                                              c->scratch->visible[i].mask(), w);
+                    {
+                        if (database.instances_[instIdx].hasTlasRoot())
+                        {
+                            if (database.instances_[instIdx].hasZeroErrorRoot())
+                                database.runZeroErrorTlasFlatInstance(
+                                    instIdx, *c->camera,
+                                    c->scratch->visible[i].mask(), w);
+                            else
+                                database.runTlasFlatInstance(
+                                    instIdx, *c->camera,
+                                    c->scratch->visible[i].mask(), w);
+                        }
+                        else
+                            database.runFlatInstance(
+                                instIdx, *c->camera,
+                                c->scratch->visible[i].mask(), w);
+                    }
                     else
                         database.runInstance(instIdx, *c->camera, *c->params,
                                           c->scratch->visible[i].mask(),
@@ -3841,7 +4398,17 @@ void SpatialDatabase::selectFrontierCached(const Camera& camera, const Selection
         w.trackMargin = true;
         if (flatInstanceCount_ != 0 &&
             instanceFlatSlots_[instIdx] != kInvalidIndex)
-            runFlatInstance(instIdx, dv, mask, w);
+        {
+            if (instances_[instIdx].hasTlasRoot())
+            {
+                if (instances_[instIdx].hasZeroErrorRoot())
+                    runZeroErrorTlasFlatInstance(instIdx, dv, mask, w);
+                else
+                    runTlasFlatInstance(instIdx, dv, mask, w);
+            }
+            else
+                runFlatInstance(instIdx, dv, mask, w);
+        }
         else
             runInstance(instIdx, dv, params, mask, true, w);
         w.trackMargin = false;

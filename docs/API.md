@@ -36,11 +36,13 @@ shared subtree data.
 
 ### Subtree and assembly
 
-A **subtree** is a reusable hierarchy fragment whose root is an implicit,
-non-renderable anchor. Its real nodes live in one packed page. When the
-subtree is instantiated, the anchor is its TLAS leaf. When it is mounted, the
-anchor is the parent expansion node, which remains the renderable coarse
-fallback.
+A **subtree** is a reusable descendant fragment. Its packed sentinel is a
+mount anchor, not a hierarchy node and not a renderable root. A subtree cannot
+be instantiated directly. A top-level instance instead stores one permanent
+renderable root node in the TLAS; mounting the subtree makes that root the
+fragment's parent and coarse fallback. Nested subtrees likewise mount beneath
+ordinary renderable expansion nodes. Thus every runtime hierarchy has exactly
+one valid renderable root.
 
 Every subtree has a stable application/package `SubtreeKey`. An expansion site
 stores a permanent target key and a relative translation/uniform scale.
@@ -116,7 +118,8 @@ indices:
 - `frontier::SubtreeHandle` identifies a registered logical subtree;
 - `frontier::PageHandle` identifies one runtime mount of a page;
 - `frontier::MountHandle` is the assembly name for a page mount;
-- `frontier::NodeHandle` identifies a node inside a page mount; and
+- `frontier::NodeHandle` identifies either a TLAS-owned root or a node inside
+  a page mount; and
 - `frontier::SpatialDatabase::InstanceRef` identifies a live instance.
 
 A **page mount** is one runtime placement of page data. The same registered
@@ -205,8 +208,9 @@ A normal integration follows this order:
 1. Build reusable components with `SubtreeBuilder` and connect expansion sites
    with permanent `SubtreeKey` values. Monolithic content may instead use
    `HierarchyBuilder::splitBelow()`.
-2. Construct one `SpatialDatabase`, register subtrees, and instantiate top-level
-   components. Register or transfer legacy pages as needed.
+2. Construct one `SpatialDatabase`, register subtrees, instantiate one
+   `RootNodeDesc` per top-level hierarchy, and mount its first subtree if any.
+   Register or transfer legacy pages as needed.
 3. Construct one persistent `SpatialQuery` per camera-like query.
 4. Each frame, submit database changes and call `applyUpdates()` once.
 5. Execute all spatial queries against the published database snapshot.
@@ -447,8 +451,9 @@ must not return until all tasks have completed.
 ## Assembling reusable subtrees
 
 Use `SubtreeBuilder` when several hierarchy sites refine into the same authored
-component. The builder exposes an implicit root through `root()`; pass it as
-the parent of every real top-level node in the component.
+component. `root()` names the component's mount sentinel; pass it as the build
+parent of every real top-level descendant. At runtime those nodes' parent is
+the renderable node on which the component is mounted.
 
 This example authors detailed house contents once and references them from two
 coarse house proxies:
@@ -465,11 +470,8 @@ house.createNode(
 frontier::Subtree houseDetails = house.build();
 
 frontier::SubtreeBuilder city(cityKey);
-const auto cityProxy =
-    city.createNode(city.root(), cityPayload, 64.0f, frontier::AABB::empty());
-
 const auto leftHouse = city.createNode(
-    cityProxy, houseProxyPayload, 16.0f,
+    city.root(), houseProxyPayload, 16.0f,
     frontier::AABB::fromCenterExtent(frontier::float4::point(-10, 0, 0),
                                      frontier::float4::vec(2, 3, 2)));
 city.setExpansion(
@@ -477,7 +479,7 @@ city.setExpansion(
     frontier::SubtreeTransform{frontier::float4::point(-10, 0, 0), 1.0f});
 
 const auto rightHouse = city.createNode(
-    cityProxy, houseProxyPayload, 16.0f,
+    city.root(), houseProxyPayload, 16.0f,
     frontier::AABB::fromCenterExtent(frontier::float4::point(10, 0, 0),
                                      frontier::float4::vec(2, 3, 2)));
 city.setExpansion(
@@ -487,11 +489,22 @@ city.setExpansion(
 frontier::SpatialDatabase database;
 const frontier::SubtreeHandle houseAsset =
     database.registerSubtree(std::move(houseDetails));
+frontier::Subtree cityDescendants = city.build();
+const frontier::AABB cityBounds = cityDescendants.page().bbox[0];
 const frontier::SubtreeHandle cityAsset =
-    database.registerSubtree(city.build());
+    database.registerSubtree(std::move(cityDescendants));
 const frontier::SpatialDatabase::InstanceRef cityInstance =
-    database.instantiate(cityAsset, frontier::float4::point(0, 0, 0));
+    database.instantiate(
+        frontier::RootNodeDesc{cityPayload, 64.0f, cityBounds, cityKey},
+        frontier::float4::point(0, 0, 0));
+const frontier::MountHandle cityMount =
+    database.mount(cityInstance.rootNode(), cityAsset);
 ```
+
+`instantiate(SubtreeHandle, ...)` intentionally does not exist. A single-node
+hierarchy uses `RootNodeDesc` with an invalid `expansionTarget` and allocates no
+page or mount state. A deep hierarchy gives its root a target and can only add
+descendants by mounting the matching subtree beneath `rootNode()`.
 
 Before mounting, an over-threshold ideal-frontier entry still selects the
 coarse house proxy. Query its permanent content target and attach the already
@@ -513,8 +526,9 @@ if (entry.overThreshold() &&
 ```
 
 Each call to `mount()` creates distinct placement state but retains the same
-immutable house page bytes. Mount transforms are authored in the parent
-subtree and therefore shared by every top-level instance of that parent. Use
+immutable house page bytes. Nested mount transforms are authored in the parent
+subtree. A non-identity transform directly beneath a TLAS root is instance data
+passed to the three-argument `mount(rootNode, subtree, transform)` overload. Use
 `tryGetNodeTransform()` to recover a selected node's accumulated
 mount-to-instance transform; compose it with the transform indexed by
 `FrontierEntry::instance()` when submitting renderer work.
@@ -621,31 +635,36 @@ The owned overload transfers the page. The borrowed overload does not copy.
 All instances of a root asset share its immutable page data, residency state,
 and attached child-page graph.
 
-Create instances with translation, positive uniform scale, and an optional
-layer mask:
+The assembly API creates a renderable root directly in the TLAS, with
+translation, positive uniform scale, and an optional layer mask:
 
 ```cpp
 frontier::InstanceDesc desc;
 desc.pos = frontier::float4::point(10, 0, 5);
 desc.scale = 2.0f;
 desc.mask = 1u << 3;
-const frontier::SpatialDatabase::InstanceRef ref = database.addInstance(asset, desc);
+const frontier::RootNodeDesc root{payload, error, bounds, optionalSubtreeKey};
+const frontier::SpatialDatabase::InstanceRef ref = database.instantiate(root, desc);
 ```
 
 An instance is visible only when `desc.mask & camera.viewMask` is nonzero.
 Rotation and non-uniform scale are not part of `InstanceDesc`; bake them into
 authored data or adapt them outside the library.
 
-`addInstance(Page&&, ...)` is a convenience for one-off, single-page content.
+When `optionalSubtreeKey` is invalid, this is a page-free one-node hierarchy.
+Otherwise mount the matching registered subtree on `ref.rootNode()`.
+
+`addInstance(Page&&, ...)` is the legacy convenience for one-off, single-page content.
 Paged hierarchies should use `registerAsset()` and retain the root
 `AssetHandle`: it scopes `DetailPageRef` values and also lets repeated instances
 share pages and streaming state. `removeInstance()` and `moveInstance()` ignore
 stale references. `releaseAsset()` requires that no live instances still
 reference the asset.
 
-`assetRootPage()` returns the shared root mount after at least one instance has
-materialized it. `InstanceRef::rootPage` provides the same kind of handle
-without another lookup.
+`assetRootPage()` returns a legacy asset's shared root mount after at least one
+instance has materialized it. `InstanceRef::rootPage` provides the same kind of
+handle for legacy page/asset instances. Assembly instances instead expose the
+tagged TLAS root through `InstanceRef::rootNode()`.
 
 ### Moving persistent cohorts
 
@@ -683,7 +702,7 @@ The API uses generation-stamped handles:
 |---|---|---|
 | `AssetHandle` | a registered page asset | `releaseAsset()` |
 | `PageHandle` | one mounted page | detaching or collecting that mount |
-| `NodeHandle` | one packed node in a mount | invalidation of its page mount |
+| `NodeHandle` | one TLAS root or packed mounted node | root: `removeInstance()`; mounted node: invalidation of its page mount |
 | `SpatialDatabase::InstanceRef` | one live instance slot | `removeInstance()` |
 
 Use `nodeAt(pageHandle, packedIndex)` only when the packed page-local index is
@@ -731,7 +750,9 @@ expansion point, or invalid child-page bounds is a contract violation.
 
 Topology and payload residency are independent. Use `markResident()` and
 `markNonResident()` when a node's render payload becomes available or is
-evicted. Root payloads are pinned resident. Coverage propagates incrementally,
+evicted. TLAS-root and legacy pinned-root payloads are permanent;
+`markResident()` is already satisfied and `markNonResident()` is a contract
+violation for them. Coverage propagates incrementally,
 so the current frontier refines only when resident descendants cover the required
 visible region.
 
@@ -954,7 +975,7 @@ internal structures.
 | Member | Result |
 |---|---|
 | `key()` | stable authored `SubtreeKey` |
-| `page()` | borrowed view of the packed real nodes below the implicit root |
+| `page()` | borrowed view of packed descendants below the mount sentinel |
 | `dependencies()` | deduplicated permanent child keys |
 | `expansions()` | packed-node/dependency/transform records sorted by node |
 
@@ -984,13 +1005,14 @@ subsequent `page()` or `clonePage()` access for that id.
 | `isSubtree(handle)` | whether a logical subtree handle is live |
 | `assetCount()` | number of registered live assets |
 | `assetRootPage(asset)` | shared root mount, or invalid before materialization/stale asset |
+| `InstanceRef::rootNode()` | tagged renderable TLAS root for an assembly instance |
 | `isAttached(node)` | whether an expansion point currently has a child page |
 | `detailPage(node)` | generated `DetailPageRef`, scoped by root asset, or invalid |
 | `expansionTarget(node)` | permanent `SubtreeKey`, or invalid for legacy/stale nodes |
 | `tryGetNodeTransform(node, out)` | accumulated mount-to-instance translation/scale |
 | `isResident(node)` | whether a live node payload is resident |
 | `tryGetPayload(node, out)` | resolves a live node's opaque payload |
-| `attachedPageCount()` | all mounted pages, including pinned roots |
+| `attachedPageCount()` | all mounted pages, including legacy pinned root pages; TLAS roots are not pages |
 | `streamedPageCount()` | mounted pages eligible for the streaming budget |
 | `frame()` | update epoch advanced by `applyUpdates()` |
 | `overlayCount()` / `overlayBytes()` | live deformation-overlay count and storage |

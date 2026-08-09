@@ -65,26 +65,30 @@ The runtime has six distinct concepts:
 - An `AssetHandle` names page bytes registered with a `SpatialDatabase` for reuse. Here
   *asset* is an API/storage term and does not mean that the BLAS represents one
   object.
-- A `Subtree` owns one implicit-root page plus permanent external expansion
-  targets. `SubtreeHandle` names its registered logical definition.
-- A page mount places an asset at an instance root or below an expansion point;
+- A `Subtree` owns one mount-sentinel page plus permanent external expansion
+  targets. It is a descendant fragment, not an independently instantiable
+  root. `SubtreeHandle` names its registered logical definition.
+- A page mount places an asset below a TLAS root or another expansion point;
   a `PageHandle` names that mount.
 - `MountHandle` is the assembly-facing alias for a page mount. A subtree mount
   also carries an accumulated translation and positive uniform scale.
-- An instance applies a translation and positive uniform scale to one
-  independent BLAS root. `SpatialDatabase::InstanceRef` also contains a generation and
-  its root page handle.
+- An instance owns one permanent renderable TLAS root and applies a translation
+  and positive uniform scale to it. `SpatialDatabase::InstanceRef` contains a
+  generation and exposes that node through `rootNode()`; `rootPage` remains for
+  legacy page/asset instances.
 
-`NodeHandle{slot, index, generation}` names a node in a mounted page and packs
-those fields into 64 bits: 20 bits each for mount slot and page-local index,
-plus a 24-bit per-slot generation.
+`NodeHandle` packs either a mounted-page node or a TLAS root into 64 bits.
+Mounted nodes use 20-bit mount and page-local indices plus a 24-bit generation.
+The reserved mount-slot code tags a TLAS root and leaves 24 bits for its stable
+public instance id plus 20 bits for its generation.
 `nodeAt(page, index)` composes one from a `PageHandle` and a packed page-local
 index. Generations prevent ABA bugs when page or instance slots are recycled.
 An asynchronous completion using a handle whose page was collected is an
 expected race: mutating calls ignore it and queries report it absent.
 
 The `SpatialDatabase` keeps no payload-to-node index and no hash map. Persistent systems
-should retain handles from `FrontierEntry`, `InstanceRef::rootPage`, or
+should retain handles from `FrontierEntry`, `InstanceRef::rootNode`, legacy
+`InstanceRef::rootPage`, or
 `attachPage`. Generated expansion nodes embed their `HierarchyPageId`; only a
 low-level custom partitioner needs to own additional page-index metadata.
 
@@ -98,7 +102,8 @@ state.
 - `pos` and positive uniform `scale`;
 - `mask`, ANDed with `Camera::viewMask` for cheap layer filtering.
 
-`SpatialDatabase::addInstance` returns the generation-stamped owner reference. Selection
+`SpatialDatabase::instantiate(RootNodeDesc, ...)` returns the generation-stamped
+owner reference. Legacy page assets use `addInstance`. Selection
 packs its stable 24-bit public `InstanceId` into each `FrontierEntry`; callers
 normally use that id to index the same placement/transform table that stores
 the returned `InstanceRef`.
@@ -180,8 +185,9 @@ free to discard or cache the loaded page.
 
 ## 3. Logical hierarchy pages and packed-page invariants
 
-`SubtreeBuilder` exposes the packed sentinel as a public implicit-root concept.
-Every real top-level node is created with `builder.root()` as its parent. An
+`SubtreeBuilder::root()` names the packed mount sentinel, not a hierarchy root.
+Every real top-level descendant is created with it as the build parent. At
+runtime the node passed to `mount()` is the fragment's real renderable parent. An
 expansion leaf may reference an independently built `SubtreeKey` without
 authoring or copying that child's descendants. The content definitions form a
 DAG, but every runtime reference produces a distinct mount, so traversal still
@@ -271,9 +277,11 @@ execute lane loops, so page blobs do not vary by CPU backend.
 ## 4. Assets, mounts, and sharing
 
 `registerSubtree(Subtree&&)` transfers the immutable page and logical
-dependency metadata together. `instantiate()` places its implicit anchor in
-the TLAS. `mount()` places the same definition beneath an authored expansion
-site and validates transformed child bounds plus the permanent target key.
+dependency metadata together. `instantiate(RootNodeDesc, ...)` creates one
+permanent renderable TLAS root; it does not accept a `SubtreeHandle`.
+`mount()` places a registered definition beneath that root or beneath an
+authored nested expansion site and validates transformed child bounds plus the
+permanent target key.
 
 Different sites mounting one subtree share page bytes but have distinct owner,
 transform, error clamp, residency coverage, and LRU records. Accumulated mount
@@ -419,14 +427,12 @@ build or repair. Selection then proceeds against that stable snapshot:
 
 1. Walk the wide TLAS with tri-state frustum and optional `minPix` contribution
    culling.
-2. A TLAS leaf compactly marks a hierarchical BLAS whose root page has one
-   renderable root. When a vector error test says that root may satisfy the
-   threshold, retest its precise world box and error and emit the pinned root
-   directly into `shared`. Uncached queries enable this work adaptively;
-   cached queries do the exact root test only for cache misses.
-3. For an exact one-node BLAS, retest its precise world box and emit its pinned
-   root directly into `shared`. A compact per-instance marker identifies this
-   case without fetching the normal instance/page traversal state.
+2. A TLAS leaf's renderable root record carries permanent payload identity.
+   Retest its precise world box and error; if it satisfies the threshold, emit
+   the tagged root handle directly into `shared` without touching a page.
+3. For a root with no mounted subtree, emit through the exact one-node fast
+   path. A compact per-instance marker contains the prepacked handle bits, so
+   this path fetches neither normal instance traversal state nor a page stamp.
 4. For hierarchical BLASes that did not terminate at the root, transform the
    view into each surviving instance's local space.
 5. Walk attached pages with an explicit DFS stack, carrying current- and
@@ -530,11 +536,12 @@ ones. No selection may overlap a SpatialDatabase mutation, another `applyUpdates
 ## 9. TLAS lifecycle
 
 The top level is an 8-wide dynamic BVH over live placements of independent
-BLAS roots, including one-node BLASes. It stores world bounds, maximum
-effective error, layer masks, and parent/lane back-pointers in maintenance
-arrays separate from the selection-path instance record. TLAS nodes have no
-renderable payload and are never selected; after coarse culling, a surviving
-leaf identifies the BLAS instance whose renderable hierarchy is evaluated.
+renderable roots, including page-free one-node hierarchies. Parallel root
+records own payload identity; maintenance arrays store world bounds, maximum
+effective error, layer masks, and parent/lane back-pointers separately from the
+selection-path instance record. Internal TLAS BVH nodes have no renderable
+payload and are never selected. A surviving leaf identifies its renderable root
+and optional mounted descendant hierarchy.
 
 The first `applyUpdates` builds the configured quality tier before publishing
 the selection snapshot:

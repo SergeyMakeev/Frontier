@@ -111,11 +111,11 @@ struct PageHandle
 static_assert(sizeof(PageHandle) == 8, "PageHandle must stay 64 bits");
 using MountHandle = PageHandle;
 
-// Resolved node reference: page slot + node index + generation stamp, packed
-// into 64 bits. A mount slot and a page-local node index each get 20 bits; the
-// remaining 24 bits are a per-slot generation. The invalid slot code is
-// reserved, so a stale handle cannot alias a live mount until that one slot
-// has itself been recycled more than 16 million times.
+// Resolved node reference, packed into 64 bits. Mounted-page nodes use a
+// 20-bit page slot, a 20-bit page-local index, and a 24-bit generation. The
+// reserved page-slot code tags a TLAS-owned renderable root instead: its other
+// 44 bits carry a stable 24-bit InstanceId and a 20-bit generation. This keeps
+// FrontierEntry at 12 bytes while making top-level and mounted nodes uniform.
 struct NodeHandle
 {
     static constexpr uint32_t kSlotBits = 20;
@@ -125,6 +125,9 @@ struct NodeHandle
     static constexpr uint32_t kIndexMask = (1u << kIndexBits) - 1u;
     static constexpr uint32_t kGenerationMask = (1u << kGenerationBits) - 1u;
     static constexpr uint32_t kInvalidSlot = kSlotMask;
+    static constexpr uint32_t kTlasGenerationBits = 20;
+    static constexpr uint32_t kTlasGenerationMask =
+        (1u << kTlasGenerationBits) - 1u;
 
     uint32_t lo = kInvalidSlot;
     uint32_t hi = 0;
@@ -142,7 +145,30 @@ struct NodeHandle
         return ((lo >> kSlotBits) & 0xfffu) | ((hi & 0xffu) << 12);
     }
     constexpr uint32_t generation() const { return hi >> 8; }
-    constexpr bool valid() const { return slot() != kInvalidSlot; }
+    constexpr bool isTlasRoot() const
+    {
+        return slot() == kInvalidSlot &&
+               (generation() & kTlasGenerationMask) != 0;
+    }
+    constexpr bool valid() const
+    {
+        return slot() != kInvalidSlot || isTlasRoot();
+    }
+    constexpr uint32_t tlasInstance() const
+    {
+        return index() | ((generation() >> kTlasGenerationBits) << kIndexBits);
+    }
+    constexpr uint32_t tlasGeneration() const
+    {
+        return generation() & kTlasGenerationMask;
+    }
+    static constexpr NodeHandle tlasRoot(uint32_t instance,
+                                         uint32_t instanceGeneration)
+    {
+        return NodeHandle{kInvalidSlot, instance & kIndexMask,
+                          ((instance >> kIndexBits) << kTlasGenerationBits) |
+                              (instanceGeneration & kTlasGenerationMask)};
+    }
 
     friend constexpr bool operator==(NodeHandle a, NodeHandle b)
     {
@@ -307,6 +333,18 @@ struct InstanceDesc
     // the top level. Cheap layer visibility: shadow-only props, editor-only
     // gizmos, per-view opt-outs.
     uint32_t mask = ~0u;
+};
+
+// One renderable node stored directly in the TLAS. It is the permanent,
+// always-resident root of one instance. An optional expansion target permits a
+// reusable Subtree to be mounted beneath it; the Subtree never exists as a
+// top-level instance on its own.
+struct RootNodeDesc
+{
+    UserPayload payload = 0;
+    float       geometricError = 0.0f;
+    AABB        bounds = AABB::empty();
+    SubtreeKey  expansionTarget{};
 };
 
 // ---------------------------------------------------------------------------
@@ -842,8 +880,9 @@ public:
     PageHandle assetRootPage(AssetHandle asset) const;
 
     // ---- database assembly -------------------------------------------------
-    // An instance's root page is pinned: attached forever, roots' payloads
-    // implicitly resident, never garbage-collected.
+    // RootNodeDesc instances own a permanent, always-resident renderable TLAS
+    // root and may have no page at all. Legacy page/asset instances retain a
+    // pinned root page whose renderable roots are likewise implicitly resident.
     //
     // InstanceRef carries a generation stamp, like NodeHandle: instance slots
     // are recycled, and a ref that outlives its instance (remove + later add
@@ -855,6 +894,14 @@ public:
         uint32_t   generation = 0;
         PageHandle rootPage;
         bool valid() const { return id != kInvalidInstanceId; }
+        // Valid for instances created from RootNodeDesc. Legacy page/asset
+        // instances retain rootPage and do not have one unambiguous root node.
+        NodeHandle rootNode() const
+        {
+            return !rootPage.valid() && valid()
+                       ? NodeHandle::tlasRoot(id, generation)
+                       : NodeHandle{};
+        }
     };
 
     // A persistent cohort whose caller-visible order stays fixed while SpatialDatabase
@@ -896,9 +943,13 @@ public:
     InstanceRef addInstance(AssetHandle asset, const InstanceDesc& desc);
     InstanceRef addInstance(AssetHandle asset, float4 pos, float scale = 1.0f);
 
-    // Top-level placement of an implicit-root Subtree beneath the TLAS.
-    InstanceRef instantiate(SubtreeHandle subtree, const InstanceDesc& desc);
-    InstanceRef instantiate(SubtreeHandle subtree, float4 pos,
+    // Instantiate exactly one renderable node in the TLAS. A hierarchy is
+    // assembled by giving that node an expansionTarget and mounting a Subtree
+    // beneath instance.rootNode(). Single-node instances allocate no page or
+    // mount state.
+    InstanceRef instantiate(const RootNodeDesc& root,
+                            const InstanceDesc& desc = {});
+    InstanceRef instantiate(const RootNodeDesc& root, float4 pos,
                             float scale = 1.0f);
 
     // Convenience for one-off content: registers the page as an anonymous
@@ -941,6 +992,11 @@ public:
     // The site's authored relative transform is applied without rewriting the
     // shared child bytes. A mismatched child key is a contract violation.
     MountHandle mount(NodeHandle expansionNode, SubtreeHandle subtree);
+    // TLAS roots have no authored containing-Subtree placement, so their mount
+    // transform is supplied as instance data here. For mounted-page expansion
+    // nodes, use the two-argument overload and its authored transform.
+    MountHandle mount(NodeHandle rootNode, SubtreeHandle subtree,
+                      const SubtreeTransform& transform);
 
     // Stable content target authored on a Subtree expansion site. Invalid for
     // stale handles and legacy/generated page expansions.
@@ -1062,6 +1118,10 @@ private:
         uint32_t slot  = kInvalidIndex;
         uint32_t index = kInvalidIndex;
         bool valid() const { return slot != kInvalidIndex; }
+        bool isTlasRoot() const
+        {
+            return slot == kInvalidIndex && index != kInvalidIndex;
+        }
     };
     static_assert(sizeof(NodeRef) == 8, "internal node reference must stay 8 bytes");
 
@@ -1382,6 +1442,8 @@ private:
     struct Instance
     {
         static constexpr uint32_t kAlive = 1u << 31;
+        static constexpr uint32_t kTlasRoot = 1u << 30;
+        static constexpr uint32_t kZeroErrorRoot = 1u << 29;
         static constexpr uint32_t kOverlayListMask = kInvalidInstanceId;
 
         float4   pos{};
@@ -1391,6 +1453,24 @@ private:
         uint32_t overlayListAndAlive = kOverlayListMask;
 
         bool alive() const { return (overlayListAndAlive & kAlive) != 0; }
+        bool hasTlasRoot() const
+        {
+            return (overlayListAndAlive & kTlasRoot) != 0;
+        }
+        void setTlasRoot(bool value)
+        {
+            if (value) overlayListAndAlive |= kTlasRoot;
+            else overlayListAndAlive &= ~kTlasRoot;
+        }
+        bool hasZeroErrorRoot() const
+        {
+            return (overlayListAndAlive & kZeroErrorRoot) != 0;
+        }
+        void setZeroErrorRoot(bool value)
+        {
+            if (value) overlayListAndAlive |= kZeroErrorRoot;
+            else overlayListAndAlive &= ~kZeroErrorRoot;
+        }
         void setAlive(bool value)
         {
             if (value) overlayListAndAlive |= kAlive;
@@ -1408,12 +1488,17 @@ private:
         {
             FRONTIER_ASSERT(index < kOverlayListMask,
                         "SpatialDatabase: exhausted overlay-list index space");
-            overlayListAndAlive = (overlayListAndAlive & kAlive) | index;
+            overlayListAndAlive =
+                (overlayListAndAlive &
+                 (kAlive | kTlasRoot | kZeroErrorRoot)) |
+                index;
         }
         void clearOverlayList()
         {
-            overlayListAndAlive = (overlayListAndAlive & kAlive) |
-                                  kOverlayListMask;
+            overlayListAndAlive =
+                (overlayListAndAlive &
+                 (kAlive | kTlasRoot | kZeroErrorRoot)) |
+                kOverlayListMask;
         }
     };
     static_assert(sizeof(Instance) == 32, "selection-path Instance must stay 32 bytes");
@@ -1450,7 +1535,7 @@ private:
         }
     };
     static_assert(sizeof(InstanceTlas) == 48,
-                  "TLAS instance state must stay 48 bytes");
+                   "TLAS instance state must stay 48 bytes");
 
     // nullptr when the ref is stale (slot recycled) or invalid.
     Instance* resolveInstance(InstanceRef ref);
@@ -1632,6 +1717,7 @@ private:
     {
         return const_cast<PageRt*>(static_cast<const SpatialDatabase*>(this)->resolve(h));
     }
+    InstanceId resolveTlasRoot(NodeHandle h) const;
 
     uint32_t allocAsset();
     uint32_t createAsset(Page&& page, bool registered);
@@ -1660,6 +1746,8 @@ private:
     void releaseExpansionSlots(PageRt& page);
     PageHandle attachPageTransformed(NodeHandle expansionNode, uint32_t asset,
                                      const SubtreeTransform& transform);
+    MountHandle mountTlasRoot(InstanceId dense, SubtreeHandle subtree,
+                              const SubtreeTransform& transform);
     void     detachSlot(uint32_t slot, AppendBuffer<UserPayload>* freedPayloads);
     void     detachMountTree(uint32_t rootSlot,
                              AppendBuffer<UserPayload>* freedPayloads);
@@ -1709,6 +1797,8 @@ private:
     void refreshInstanceBounds(InstanceId id, bool recomputeError);
 
     InstanceRef addInstanceInternal(uint32_t asset, const InstanceDesc& desc);
+    InstanceRef addTlasRootInstance(const RootNodeDesc& root,
+                                    const InstanceDesc& desc);
 
     void markTlasStructuralChange();
     void tlasRebuild(bool reorderInstances);
@@ -1751,6 +1841,13 @@ private:
                      uint8_t mask, bool tryRoot, Worker& w) const;
     void runFlatInstance(uint32_t instIdx, const Camera& view,
                          uint8_t mask, Worker& w) const;
+    void runTlasFlatInstance(uint32_t instIdx, const Camera& view,
+                             uint8_t mask, Worker& w) const;
+    void runZeroErrorTlasFlatInstance(uint32_t instIdx, const Camera& view,
+                                      uint8_t mask, Worker& w) const;
+    void runTlasRootInstance(uint32_t instIdx, const Camera& view,
+                             const SelectionParams& params, uint8_t mask,
+                             Worker& w) const;
     template<bool FullyResident>
     void runPage(const WorkItem& item, const Instance& inst, const Camera& local,
                  const SelectionParams& params, Worker& w) const;
@@ -1805,6 +1902,10 @@ private:
 
     std::vector<Instance> instances_;
     std::vector<InstanceTlas> instanceTlas_;
+    // Cold root identity streams. Payload exists after the first TLAS root;
+    // targets remain entirely unallocated until one root is extendable.
+    std::vector<UserPayload> tlasRootPayloads_;
+    std::vector<SubtreeKey> tlasRootTargets_;
     // Root mount for exact one-node assets, kInvalidIndex otherwise; a cold
     // high bit also records the common zero-error case. Keeping this as a
     // lazily allocated compact stream lets mixed forests bypass the 64-byte
@@ -1812,6 +1913,8 @@ private:
     // have never contained a flat instance allocate no stream at all.
     std::vector<uint32_t> instanceFlatSlots_;
     size_t                flatInstanceCount_ = 0;
+    size_t                tlasFlatInstanceCount_ = 0;
+    size_t                tlasZeroErrorFlatInstanceCount_ = 0;
     // Cache hits need only this stamp, not the 32-byte Instance record. It is
     // parallel to instances_ and bumped for transform or deformation changes.
     std::vector<uint32_t> instanceFrontierVersions_;
