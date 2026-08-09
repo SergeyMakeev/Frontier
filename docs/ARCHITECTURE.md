@@ -1,14 +1,14 @@
-# HLodTree architecture
+# Frontier architecture
 
 This document describes the current implementation. See the
 [README](../README.md) for an overview. For public API usage and
 lifetime rules, see [API.md](API.md). For behavioral invariants and complexity,
-see [hlod_design.md](hlod_design.md). Historical measurements and superseded
+see [frontier_design.md](frontier_design.md). Historical measurements and superseded
 designs are kept separately in [HISTORY.md](HISTORY.md).
 
 ## Spatial model
 
-HLodTree has two spatial levels. The names mirror ray-tracing terminology but
+Frontier has two spatial levels. The names mirror ray-tracing terminology but
 describe runtime roles rather than object size.
 
 - A BLAS is an independently rooted renderable hierarchy. It may represent a
@@ -17,7 +17,7 @@ describe runtime roles rather than object size.
   any level.
 - The TLAS is a dynamic 8-wide BVH over translated, uniformly scaled BLAS
   instances. It performs coarse frustum, layer, and contribution culling. Its
-  internal nodes are acceleration data and never appear in a cut.
+  internal nodes are acceleration data and never appear in a frontier.
 
 `HierarchyBuilder` accepts one logical tree and turns natural `splitBelow()`
 boundaries into immutable, deterministically indexed pages. Each generated page
@@ -29,18 +29,18 @@ payload uniqueness and independent hierarchies may reuse local ids. Instances
 of a registered root asset share page bytes, residency, and the attached-page
 graph; per-instance deformation allocates bounds-only copy-on-write overlays.
 
-## Published-world lifecycle
+## Published-database lifecycle
 
-`World` is single-writer. Mutations, streaming completions, residency changes,
-and collection happen outside selection. `World::applyUpdates()` flushes queued
+`SpatialDatabase` is single-writer. Mutations, streaming completions, residency changes,
+and collection happen outside selection. `SpatialDatabase::applyUpdates()` flushes queued
 bounds edits, performs required TLAS maintenance, and publishes a stable
-snapshot. Distinct `View` objects may then query the same `const World`
+snapshot. Distinct `SpatialQuery` objects may then query the same `const SpatialDatabase`
 concurrently. All queries must finish before the next mutation or collection.
 
-Each `View` owns its camera damper, temporal reuse records, traversal scratch,
-output storage, and statistics. A view therefore has no mutable query state in
-the world and cannot interfere with another camera. Cached selection is the
-default. An uncached view can use the host's blocking `parallelFor` when
+Each `SpatialQuery` owns its camera damper, temporal reuse records, traversal scratch,
+output storage, and statistics. A camera therefore has no mutable query state in
+the database and cannot interfere with another camera. Cached selection is the
+default. An uncached query can use the host's blocking `parallelFor` when
 `parallelInstanceThreshold` and `workerCount` enable it.
 
 ## Selection pipeline
@@ -53,14 +53,14 @@ Selection is output-sensitive:
    possible.
 3. Transform the camera into each remaining instance's local space.
 4. Walk attached pages with an explicit DFS carrying the undecided frustum
-   planes plus current- and ideal-cut liveness.
+   planes plus current- and ideal-frontier liveness.
 5. Test up to eight children together. Plain leaves emit directly; interior
    and expansion nodes continue through the stack.
 
 The walk returns three disjoint sequences. `shared + currentOnly` is the
-resident, hole-free render cut. `shared + idealOnly` is the frontier known
+resident, hole-free render frontier. `shared + idealOnly` is the frontier known
 topology would choose if every payload were resident. Membership lives in the
-sequence rather than in each entry, keeping `CutEntry` at 12 bytes.
+sequence rather than in each entry, keeping `FrontierEntry` at 12 bytes.
 
 Residency changes maintain a complete-descendant-cover summary. A fully
 covered subtree passes in constant time. A partially visible uncovered branch
@@ -78,10 +78,10 @@ Hot multiplied data is deliberately compact:
 
 | Structure | 64-bit size | Purpose |
 |---|---:|---|
-| `CutEntry` | 12 B | node handle, 24-bit instance id, encoded error |
-| `View` reuse record | 32 B hot + 4 B cold | cut validity proof and slab location |
+| `FrontierEntry` | 12 B | node handle, 24-bit instance id, encoded error |
+| `SpatialQuery` reuse record | 32 B hot + 4 B cold | frontier validity proof and slab location |
 | `PageUsageContext` record | 8 B | generation, pending flag, last-use epoch |
-| instance cut / TLAS state | 32 B + 48 B | selection state separated from maintenance |
+| instance selection / TLAS state | 32 B + 48 B | selection state separated from maintenance |
 | visible hit / TLAS stack item | 4 B / 4 B | packed instance or node index and flags |
 | mounted-node residency state | 3 B | flags plus covered-child count |
 
@@ -94,13 +94,13 @@ completions cheap to reject without a hash table or payload index.
 The first published snapshot builds the configured TLAS quality tier:
 `BinnedSAH`, `Median`, or `Morton`. Later insertions and removals update the
 tree in expected O(depth). Count drift, escaped leaves, accumulated edit cost,
-and area growth trigger repair or rebuild according to `WorldConfig`.
+and area growth trigger repair or rebuild according to `SpatialDatabaseConfig`.
 
 The first TLAS build spatially reorders physical instance storage while public
-`InstanceRef` values and cut instance ids remain stable. Routine repair builds
+`InstanceRef` values and frontier instance ids remain stable. Routine repair builds
 keep that physical order to avoid turning maintenance into a data shuffle.
-`World::optimize()` is the explicit safe-point operation that compacts dead
-slots, performs a quality rebuild, and restores spatial instance/View-record
+`SpatialDatabase::optimize()` is the explicit safe-point operation that compacts dead
+slots, performs a quality rebuild, and restores spatial instance/SpatialQuery-record
 locality after disruptive changes such as a teleport or level transition.
 
 `MotionGroup` serves a persistent cohort whose caller-visible order is fixed.
@@ -120,8 +120,8 @@ Topology attachment is shared per mounted asset graph. Attaching a child page
 under a shared root makes it available to every instance of that root. Payload
 residency is tracked independently from topology.
 
-Selection does not mutate the world to update recency. An optional
-`PageUsageContext` records pages needed by a view. `World::collect()` consumes
+Selection does not mutate the database to update recency. An optional
+`PageUsageContext` records pages needed by a query. `SpatialDatabase::collect()` consumes
 only the contexts selected by the host, updates the intrusive LRU, and detaches
 old leaf mounts until the requested streamed-page budget is met. Pinned root
 mounts are never collected and do not count toward that budget.
@@ -134,9 +134,9 @@ retention.
 
 - Instances support translation and positive uniform scale. Rotation and
   non-uniform scale must be baked or adapted by the integration layer.
-- Cached parallelism is across independent views. Parallel work within one
-  view is available on the uncached selection path.
-- View reuse records at most two page dependencies per instance; deeper walks
+- Cached parallelism is across independent queries. Parallel work within one
+  query is available on the uncached selection path.
+- SpatialQuery reuse records at most two page dependencies per instance; deeper walks
   are simply re-evaluated.
 - Page overlay refits are grow-only. TLAS rebuilds retighten the top level but
   do not shrink internal overlay ancestors.

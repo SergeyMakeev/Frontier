@@ -1,4 +1,4 @@
-# Benchmarking HLodTree
+# Benchmarking Frontier
 
 This guide describes the current performance executables, repeatable
 cross-machine collection, and macOS CPU-counter capture. For headline results,
@@ -58,11 +58,11 @@ back to `.tar.gz`. A failed run still packages partial data and identifies the
 failed stage in `REPORT.md`.
 
 The optional label is only for report naming. It can also be supplied through
-`HLOD_PERF_LABEL`. Override the build and report directories with:
+`FRONTIER_PERF_LABEL`. Override the build and report directories with:
 
 ```sh
-HLOD_ALL_PERF_BUILD_DIR=/fast/build \
-HLOD_PERF_REPORT_ROOT=/results \
+FRONTIER_ALL_PERF_BUILD_DIR=/fast/build \
+FRONTIER_PERF_REPORT_ROOT=/results \
 ./run_all_perf.sh test-machine
 ```
 
@@ -108,22 +108,22 @@ run_perf_bench.bat --benchmark_filter=BM_RootDecisionForest100k --benchmark_repe
 
 These scripts configure and verify a Release-only performance build. On Apple
 Silicon the shell runner explicitly targets native arm64 even when launched
-from a Rosetta terminal. Set `HLOD_PERF_BUILD_DIR` to choose another build
+from a Rosetta terminal. Set `FRONTIER_PERF_BUILD_DIR` to choose another build
 directory.
 
 The executable can also be run directly after a normal build:
 
 ```sh
-build/bench/hlod_bench --benchmark_list_tests
+build/bench/frontier_bench --benchmark_list_tests
 ```
 
 For a multi-config generator, use the Release subdirectory, for example
-`build/bench/Release/hlod_bench` or
-`build\bench\Release\hlod_bench.exe`.
+`build/bench/Release/frontier_bench` or
+`build\bench\Release\frontier_bench.exe`.
 
 ## Machine and production-kernel probes
 
-`run_machine_bench.sh` builds a separate `hlod_machine_bench` executable and
+`run_machine_bench.sh` builds a separate `frontier_machine_bench` executable and
 writes `machine_perf.json` by default:
 
 ```sh
@@ -131,16 +131,16 @@ writes `machine_perf.json` by default:
 ```
 
 Pass Google Benchmark arguments to replace the default run. Set
-`HLOD_MACHINE_BUILD_DIR` to select another build directory. The synthetic
+`FRONTIER_MACHINE_BUILD_DIR` to select another build directory. The synthetic
 probes cover scalar dependency and throughput, 128-bit SIMD arithmetic and
 compare-to-mask cost, square root/divide, sequential cache and memory
 bandwidth, constant-stride hardware prefetch, dependent-load latency,
 random-load parallelism, branch prediction, and sparse-mask iteration.
 
 The diagnostic executable is separate so adding a probe cannot perturb the
-code layout of `hlod_bench`. Architecture-neutral SIMD probes use one 128-bit
+code layout of `frontier_bench`. Architecture-neutral SIMD probes use one 128-bit
 vector on both x86-64 and arm64. The `BM_Kernel*` group instead uses the active
-production backend recorded as `hlod_kernel_backend` in the JSON context.
+production backend recorded as `frontier_kernel_backend` in the JSON context.
 
 For only the focused production kernels with longer sampling:
 
@@ -180,14 +180,14 @@ Useful overrides are:
 
 | Variable | Purpose |
 |---|---|
-| `HLOD_PROFILE_BUILD_DIR` | profiling build directory |
-| `HLOD_PROFILE_OUTPUT_DIR` | trace and summary output directory |
-| `HLOD_PROFILE_FILTER` | Google Benchmark case to record |
-| `HLOD_PROFILE_MIN_TIME` | benchmark minimum run time |
-| `HLOD_PROFILE_TIME_LIMIT` | Instruments recording limit |
-| `HLOD_PROFILE_EXPORT_START` | beginning of the focused export window |
-| `HLOD_DEVELOPER_DIR` | exact Xcode developer directory |
-| `HLOD_XCTRACE_TEMPLATE` | exact template name or `.tracetemplate` path |
+| `FRONTIER_PROFILE_BUILD_DIR` | profiling build directory |
+| `FRONTIER_PROFILE_OUTPUT_DIR` | trace and summary output directory |
+| `FRONTIER_PROFILE_FILTER` | Google Benchmark case to record |
+| `FRONTIER_PROFILE_MIN_TIME` | benchmark minimum run time |
+| `FRONTIER_PROFILE_TIME_LIMIT` | Instruments recording limit |
+| `FRONTIER_PROFILE_EXPORT_START` | beginning of the focused export window |
+| `FRONTIER_DEVELOPER_DIR` | exact Xcode developer directory |
+| `FRONTIER_XCTRACE_TEMPLATE` | exact template name or `.tracetemplate` path |
 
 Hardware-counter capture requires a full Xcode with `xctrace`; Command Line
 Tools alone are insufficient. macOS may also require enabling the terminal
@@ -199,11 +199,11 @@ data includes process setup and should be filtered during analysis.
 
 | Option | Default | Meaning |
 |---|---:|---|
-| `HLOD_BUILD_TESTS` | `ON` | build the correctness suite |
-| `HLOD_BUILD_BENCH` | `ON` | build the benchmark executables |
-| `HLOD_AVX2` | `ON` | use AVX2/FMA on supported x86-64 targets |
-| `HLOD_FORCE_SCALAR` | `OFF` | disable intrinsic implementations |
-| `HLOD_PROFILE_SYMBOLS` | `OFF` | add optimized Clang line tables for profiling |
+| `FRONTIER_BUILD_TESTS` | `ON` | build the correctness suite |
+| `FRONTIER_BUILD_BENCH` | `ON` | build the benchmark executables |
+| `FRONTIER_AVX2` | `ON` | use AVX2/FMA on supported x86-64 targets |
+| `FRONTIER_FORCE_SCALAR` | `OFF` | disable intrinsic implementations |
+| `FRONTIER_PROFILE_SYMBOLS` | `OFF` | add optimized Clang line tables for profiling |
 
 When comparing a scalar or fallback build, use a separate build directory so
 cached CMake options and stale binaries cannot contaminate the result.

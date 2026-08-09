@@ -1,11 +1,11 @@
 #pragma once
-// Runtime side of HLodTree (see docs/hlod_design.md):
+// Runtime side of Frontier (see docs/frontier_design.md):
 //  - BLASes: independently rooted renderable hierarchies in immutable pages;
 //    a BLAS may represent anything from one flat object to a city block
 //  - instances of those BLAS roots over a non-renderable dynamic TLAS
 //  - topology streaming (attach/detach pages under expansion points)
 //  - payload residency with incrementally propagated subtree coverage
-//  - single-pass pruned cut selection, with no required per-node view scratch
+//  - single-pass pruned frontier selection, with no required per-node query scratch
 //  - LRU garbage collection of cold pages
 //  - sublinear conservative bounds refit for moving nodes and instances
 //
@@ -26,25 +26,25 @@
 // would actually hurt at scale is ten thousand duplicated *streaming graphs*,
 // not ten thousand duplicated boxes, and duplicating the page duplicates both.
 //
-// THE API IS FULLY HANDLE-BASED — the World keeps no payload/user-id index or
+// THE API IS FULLY HANDLE-BASED — the SpatialDatabase keeps no payload/user-id index or
 // hash map. Handles are the only currency:
 //  - registerAsset returns an AssetHandle; addInstance returns an InstanceRef
 //    containing its root PageHandle, and attachPage returns a PageHandle.
 //    Node handles are composed from a page handle plus the packed page-local
 //    index, which is immutable after build.
-//  - selectCut outputs carry a compact NodeHandle wherever the caller might
+//  - selectFrontier outputs carry a compact NodeHandle wherever the caller might
 //    act on the entry (payload residency or topology expansion).
 //  - the 64-bit UserPayload stays in immutable page data and can be resolved
 //    from a live NodeHandle when the caller needs it; it is not copied into
-//    every cut entry.
+//    every frontier entry.
 // A handle dies with its page (detachPage / collect). Stale handles are
 // detected by the generation stamp: mutating calls ignore them, queries
 // report them absent — the normal race between streaming completion and GC.
 //
-// World updates are single-writer. applyUpdates() publishes a stable snapshot;
-// View::selectCut then reads only that snapshot and may run concurrently when
-// each call has its own View and outputs. LOD damping, cut reuse, query scratch,
-// and selection statistics all live in the View, never as mutable World state.
+// SpatialDatabase updates are single-writer. applyUpdates() publishes a stable snapshot;
+// SpatialQuery::selectFrontier then reads only that snapshot and may run concurrently when
+// each call has its own SpatialQuery and outputs. LOD damping, frontier reuse, query scratch,
+// and selection statistics all live in the SpatialQuery, never as mutable SpatialDatabase state.
 
 #include <cstddef>
 #include <cstdint>
@@ -58,10 +58,10 @@
 #include "math.h"
 #include "page.h"
 
-namespace hlod {
+namespace frontier {
 
-class World;
-struct ViewScratch;
+class SpatialDatabase;
+struct QueryScratch;
 
 // Registered BLAS page asset: the unit of storage and sharing, not necessarily
 // one object. Returned by registerAsset().
@@ -88,7 +88,7 @@ struct DetailPageRef
 static_assert(sizeof(DetailPageRef) == 12,
               "detail-page reference must stay 12 bytes");
 
-// Attached page (a "mount"): one placement of an asset in the world. Returned
+// Attached page (a "mount"): one placement of an asset in the database. Returned
 // by addInstance/attachPage. Compose node handles with nodeAt(); node indices
 // are page-local, fixed at build time.
 struct PageHandle
@@ -148,32 +148,32 @@ using InstanceId = uint32_t;
 inline constexpr uint32_t kInstanceIdBits = 24;
 inline constexpr InstanceId kInstanceIdMask = (1u << kInstanceIdBits) - 1u;
 inline constexpr InstanceId kInvalidInstanceId = kInstanceIdMask;
-inline constexpr uint8_t kCutErrorThreshold = 128;
+inline constexpr uint8_t kFrontierErrorThreshold = 128;
 
 // Threshold-relative logarithmic error. Codes [0, 127] are at or below the
 // selection threshold and [128, 255] are above it. The boundary decision is
 // exact even though magnitude is quantized; roughly eight codes cover each
 // power-of-two step away from the threshold.
-uint8_t encodeCutError(float error, float threshold);
-float   decodeCutError(uint8_t code, float threshold);
+uint8_t encodeFrontierError(float error, float threshold);
+float   decodeFrontierError(uint8_t code, float threshold);
 
-// A cut entry is deliberately 12 bytes: one logical 64-bit node handle plus
+// A frontier entry is deliberately 12 bytes: one logical 64-bit node handle plus
 // a packed stable 24-bit InstanceId and 8-bit screen-error code. User payloads
 // and application entity data stay in caller-side tables indexed by the
-// instance id, rather than being repeated in every view's cut.
-struct CutEntry
+// instance id, rather than being repeated in every query result.
+struct FrontierEntry
 {
     NodeHandle nodeHandle;
     uint32_t   instanceAndError = kInvalidInstanceId;
 
-    CutEntry() = default;
-    CutEntry(NodeHandle node, float error, float threshold, InstanceId instance)
+    FrontierEntry() = default;
+    FrontierEntry(NodeHandle node, float error, float threshold, InstanceId instance)
         : nodeHandle(node),
           instanceAndError((instance & kInstanceIdMask) |
-                           (uint32_t(encodeCutError(error, threshold)) <<
+                           (uint32_t(encodeFrontierError(error, threshold)) <<
                             kInstanceIdBits))
     {}
-    CutEntry(NodeHandle node, uint8_t encodedError, InstanceId instance)
+    FrontierEntry(NodeHandle node, uint8_t encodedError, InstanceId instance)
         : nodeHandle(node),
           instanceAndError((instance & kInstanceIdMask) |
                            (uint32_t(encodedError) << kInstanceIdBits))
@@ -184,25 +184,25 @@ struct CutEntry
     {
         return uint8_t(instanceAndError >> kInstanceIdBits);
     }
-    bool overThreshold() const { return errorCode() >= kCutErrorThreshold; }
+    bool overThreshold() const { return errorCode() >= kFrontierErrorThreshold; }
     float approximateError(float threshold) const
     {
-        return decodeCutError(errorCode(), threshold);
+        return decodeFrontierError(errorCode(), threshold);
     }
 };
-static_assert(sizeof(CutEntry) == 12, "CutEntry must stay 12 bytes");
+static_assert(sizeof(FrontierEntry) == 12, "FrontierEntry must stay 12 bytes");
 
 // One traversal produces both realities without per-entry tags. The current
-// render cut is shared + currentOnly. The fully-resident ideal frontier is
+// render frontier is shared + currentOnly. The fully-resident ideal frontier is
 // shared + idealOnly. For a high-error ideal-side leaf, detailPage() reports
 // whether HierarchyBuilder generated a finer page for caller-side streaming.
-// Non-owning result of one View selection. The spans remain valid until the
-// next selection or reset on that View, or until the View is destroyed.
-struct CutView
+// Non-owning result of one SpatialQuery selection. The spans remain valid until the
+// next selection or reset on that SpatialQuery, or until the SpatialQuery is destroyed.
+struct FrontierResultView
 {
-    std::span<const CutEntry> shared;
-    std::span<const CutEntry> currentOnly;
-    std::span<const CutEntry> idealOnly;
+    std::span<const FrontierEntry> shared;
+    std::span<const FrontierEntry> currentOnly;
+    std::span<const FrontierEntry> idealOnly;
 
     size_t currentSize() const { return shared.size() + currentOnly.size(); }
     size_t idealSize() const { return shared.size() + idealOnly.size(); }
@@ -215,11 +215,11 @@ struct CutView
 
 namespace detail {
 
-struct CutBuffers
+struct FrontierBuffers
 {
-    AppendBuffer<CutEntry> shared;
-    AppendBuffer<CutEntry> currentOnly;
-    AppendBuffer<CutEntry> idealOnly;
+    AppendBuffer<FrontierEntry> shared;
+    AppendBuffer<FrontierEntry> currentOnly;
+    AppendBuffer<FrontierEntry> idealOnly;
 
     void clear()
     {
@@ -228,7 +228,7 @@ struct CutBuffers
         idealOnly.clear();
     }
 
-    CutView view() const
+    FrontierResultView view() const
     {
         return {{shared.data(), shared.size()},
                 {currentOnly.data(), currentOnly.size()},
@@ -238,20 +238,20 @@ struct CutBuffers
 
 } // namespace detail
 
-// Explicit owning snapshot for callers that need to retain a cut across the
-// next selection. The normal API returns CutView and keeps ownership in View;
+// Explicit owning result for callers that need to retain a frontier across the
+// next selection. The normal API returns FrontierResultView and keeps ownership in SpatialQuery;
 // this storage type exposes only spans, not its container.
-class CutResults : public CutView
+class FrontierResult : public FrontierResultView
 {
 public:
-    CutResults() = default;
-    CutResults(const CutResults& other) : buffers_(other.buffers_) { sync(); }
-    CutResults(CutResults&& other) noexcept : buffers_(std::move(other.buffers_))
+    FrontierResult() = default;
+    FrontierResult(const FrontierResult& other) : buffers_(other.buffers_) { sync(); }
+    FrontierResult(FrontierResult&& other) noexcept : buffers_(std::move(other.buffers_))
     {
         sync();
         other.sync();
     }
-    CutResults& operator=(const CutResults& other)
+    FrontierResult& operator=(const FrontierResult& other)
     {
         if (this != &other)
         {
@@ -260,7 +260,7 @@ public:
         }
         return *this;
     }
-    CutResults& operator=(CutResults&& other) noexcept
+    FrontierResult& operator=(FrontierResult&& other) noexcept
     {
         if (this != &other)
         {
@@ -272,15 +272,15 @@ public:
     }
 
 private:
-    friend class View;
-    friend class World;
+    friend class SpatialQuery;
+    friend class SpatialDatabase;
 
-    void sync() { static_cast<CutView&>(*this) = buffers_.view(); }
+    void sync() { static_cast<FrontierResultView&>(*this) = buffers_.view(); }
 
-    detail::CutBuffers buffers_;
+    detail::FrontierBuffers buffers_;
 };
 
-struct CutParams
+struct SelectionParams
 {
     float threshold = 4.0f;   // refine when screen error exceeds this (px)
     float minPix    = 0.0f;   // contribution culling at the top level; 0 = off
@@ -300,7 +300,7 @@ struct InstanceDesc
 // ---------------------------------------------------------------------------
 // Output sinks
 //
-// selectCut writes through a Sink so the same out-of-line traversal can fill
+// selectFrontier writes through a Sink so the same out-of-line traversal can fill
 // either retained internal storage or fixed caller memory that reports what
 // did not fit. Engines that write straight into a draw list or mapped instance
 // buffer use the public span constructor.
@@ -315,7 +315,7 @@ public:
     // Fixed: writes into caller memory, counting (not writing) the overflow.
     explicit Sink(std::span<T> storage) : data_(storage.data())
     {
-        HLOD_CHECK(storage.size() <= UINT32_MAX,
+        FRONTIER_CHECK(storage.size() <= UINT32_MAX,
                    "Sink capacity exceeds 32-bit result count");
         capacity_ = uint32_t(storage.size());
     }
@@ -334,7 +334,7 @@ public:
     }
 
     // Append n contiguous values. Same result as n pushes, one bulk copy: this
-    // is how a View hands back an instance's recorded cut.
+    // is how a SpatialQuery hands back an instance's recorded frontier.
     void pushRange(const T* p, uint32_t n)
     {
         if (n == 0) return;
@@ -355,8 +355,8 @@ public:
     bool     overflowed() const { return dropped_ != 0; }
 
 private:
-    friend class View;
-    friend class World;
+    friend class SpatialQuery;
+    friend class SpatialDatabase;
 
     // Internal growable sink. Public callers see only fixed spans.
     explicit Sink(AppendBuffer<T>& v) : vec_(&v) { v.clear(); }
@@ -368,22 +368,22 @@ private:
     uint32_t        dropped_ = 0;
 };
 
-struct CutResultSink
+struct FrontierResultSink
 {
-    Sink<CutEntry> shared;
-    Sink<CutEntry> currentOnly;
-    Sink<CutEntry> idealOnly;
+    Sink<FrontierEntry> shared;
+    Sink<FrontierEntry> currentOnly;
+    Sink<FrontierEntry> idealOnly;
 
-    CutResultSink() = default;
-    CutResultSink(Sink<CutEntry> sharedSink,
-                  Sink<CutEntry> currentOnlySink,
-                  Sink<CutEntry> idealOnlySink)
+    FrontierResultSink() = default;
+    FrontierResultSink(Sink<FrontierEntry> sharedSink,
+                  Sink<FrontierEntry> currentOnlySink,
+                  Sink<FrontierEntry> idealOnlySink)
         : shared(sharedSink), currentOnly(currentOnlySink), idealOnly(idealOnlySink)
     {}
 };
 
-// Traversal counters, filled only when the library is built with HLOD_STATS.
-struct CutStats
+// Traversal counters, filled only when the library is built with FRONTIER_STATS.
+struct SelectionStats
 {
     uint64_t instancesVisited = 0;
     uint64_t pagesVisited = 0;
@@ -392,14 +392,14 @@ struct CutStats
     uint64_t lanesSurvived = 0;
 };
 
-// Optional per-camera page-use feedback. Passing one to selectCut records the
+// Optional per-camera page-use feedback. Passing one to selectFrontier records the
 // pages that camera needed; omitting it makes selection pay no page-use
-// recording cost. The World consumes feedback only when collect() is called,
+// recording cost. The SpatialDatabase consumes feedback only when collect() is called,
 // so callers choose which cameras influence page retention (for example, the
 // primary camera but not shadow cascades).
 //
 // A context may accumulate observations across many update epochs. Like
-// View, it belongs to one view and must not be used concurrently
+// SpatialQuery, it belongs to one query and must not be used concurrently
 // by two calls; distinct contexts are independent.
 class PageUsageContext
 {
@@ -414,7 +414,7 @@ public:
     size_t bytes() const;
 
 private:
-    friend class World;
+    friend class SpatialDatabase;
 
     struct Rec
     {
@@ -443,13 +443,13 @@ private:
     };
     static_assert(sizeof(Rec) == 8, "page-use record must stay 8 bytes");
 
-    const World*     world_ = nullptr;
+    const SpatialDatabase*     database_ = nullptr;
     std::vector<Rec> rec_;
     std::vector<uint32_t> dirty_;
 };
 
-// Result of one collection pass. freedPayloads refers to World-owned storage
-// and remains valid until the next collect() call or World destruction.
+// Result of one collection pass. freedPayloads refers to SpatialDatabase-owned storage
+// and remains valid until the next collect() call or SpatialDatabase destruction.
 struct CollectResult
 {
     size_t detachedPages = 0;
@@ -457,31 +457,32 @@ struct CollectResult
 };
 
 // ---------------------------------------------------------------------------
-// View — everything selection remembers about one view
+// SpatialQuery — reusable state for one logical spatial query
 //
-// A world that is mostly static, seen by a camera that moves continuously,
-// produces a cut that is nearly identical frame to frame. This exploits that:
-// an instance whose cut provably cannot have changed is not walked at all, and
+// A database that is mostly static, seen by a camera that moves continuously,
+// produces a frontier that is nearly identical frame to frame. This exploits that:
+// an instance whose frontier provably cannot have changed is not walked at all, and
 // its entries are handed back where they already lie.
 //
-// THE STATE IS ALL HERE, NOT IN THE WORLD. Querying several cameras per frame
-// (main view, shadow cascades, a reflection probe) means several Views, and
-// they cannot interfere: the World stays a pure read during selection.
+// THE STATE IS ALL HERE, NOT IN THE DATABASE. Querying several cameras per
+// frame (main view, shadow cascades, a reflection probe) means several
+// SpatialQuery objects, and they cannot interfere: SpatialDatabase stays a
+// pure read during selection.
 //
 // It also owns the camera damper, and that is not merely tidy. The
 // two are one mechanism read two ways: the damper turns a camera position into
 // a query envelope, and the reuse test below is driven by how far that same
 // envelope has travelled, not by the camera. Held separately, the caller has to
-// pair the right damper with the right View by hand every frame, and pairing
-// the main view's damper with a shadow cascade's cache compiles perfectly well.
-// So selectCut takes the raw Camera and damps it internally, one reset() covers
+// pair the right damper with the right SpatialQuery by hand every frame, and pairing
+// the main camera's damper with a shadow cascade's cache compiles perfectly well.
+// So selectFrontier takes the raw Camera and damps it internally, one reset() covers
 // the discontinuity for both halves, and the pairing cannot be got wrong.
 //
 // It also makes one coupling visible instead of hidden, which is the other
 // reason to keep them together. The damper relaxes projection scale k as well
 // as position. A flip point lies at `geometricError * k / threshold`, so the
-// maximum error observed while recording a cut gives a conservative slope for
-// how far any of its decisions can move per unit k. The View accumulates
+// maximum error observed while recording a frontier gives a conservative slope for
+// how far any of its decisions can move per unit k. The SpatialQuery accumulates
 // absolute k travel and charges that per-record slope against the same validity
 // margin used for camera travel.
 //
@@ -492,7 +493,7 @@ struct CollectResult
 //
 // Damping and reuse are independent. A half-life of 0 makes the arithmetic
 // bit-identical to an undamped query; setReuseEnabled(false) selects the
-// uncached traversal and avoids allocating records. A fully dynamic world may
+// uncached traversal and avoids allocating records. A fully dynamic database may
 // want damping without reuse, while a shadow cascade often wants the reverse.
 //
 // WHY IT IS SOUND, AND WHY IT WINS
@@ -507,13 +508,13 @@ struct CollectResult
 // Frustum decisions would spoil that argument, since rotating a camera moves
 // the planes much further than it moves the eye. So only instances that were
 // ENTIRELY INSIDE the frustum are cached: no plane was tested anywhere inside
-// them, and their cut is therefore a pure function of camera position. An
+// them, and their frontier is therefore a pure function of camera position. An
 // instance straddling the frustum edge is always re-walked, and there are few
 // of those -- they are a shell, not a volume.
 //
 // The margin is large exactly where it needs to be. A distant instance sits
 // far past every flip point, so its margin is roughly its own distance and it
-// stays valid for many frames; a near instance with a deep cut has some node
+// stays valid for many frames; a near instance with a deep frontier has some node
 // sitting right at the threshold, so its margin is tiny and it is re-walked
 // every frame. That is the correct division of labour rather than a
 // limitation: the population is dominated by distant instances, which is where
@@ -522,14 +523,14 @@ struct CollectResult
 //
 // BUCKETED OUTPUT
 // ---------------
-// Cached and uncached modes write the same three CutEntry sequences. Reused
-// entries are copied from View-owned storage into the matching caller bucket;
-// no World-owned mutable query state is involved.
+// Cached and uncached modes write the same three FrontierEntry sequences. Reused
+// entries are copied from SpatialQuery-owned storage into the matching caller bucket;
+// no SpatialDatabase-owned mutable query state is involved.
 //
 // WHAT IS EXACT AND WHAT IS NOT
 // -----------------------------
-// The set of emitted nodes is exactly what an uncached selectCut would emit.
-// The compact error code is recorded with that cut and may therefore be stale
+// The set of emitted nodes is exactly what an uncached selectFrontier would emit.
+// The compact error code is recorded with that frontier and may therefore be stale
 // within the proven margin. It remains useful for coarse prioritisation and
 // threshold classification; do not expect a cached result to reproduce a
 // freshly measured pixel error.
@@ -540,19 +541,19 @@ struct CollectResult
 // simply re-walked.
 // ---------------------------------------------------------------------------
 
-class View
+class SpatialQuery
 {
 public:
-    View();
-    explicit View(float halfLifeFrames);
-    ~View();
+    SpatialQuery();
+    explicit SpatialQuery(float halfLifeFrames);
+    ~SpatialQuery();
 
-    View(View&&) noexcept;
-    View& operator=(View&&) noexcept;
-    View(const View&) = delete;
-    View& operator=(const View&) = delete;
+    SpatialQuery(SpatialQuery&&) noexcept;
+    SpatialQuery& operator=(SpatialQuery&&) noexcept;
+    SpatialQuery(const SpatialQuery&) = delete;
+    SpatialQuery& operator=(const SpatialQuery&) = delete;
 
-    // LOD hysteresis for this view, in frames; 0 disables it exactly. See
+    // LOD hysteresis for this query, in frames; 0 disables it exactly. See
     // CameraDamper in math.h for what the envelope does.
     float halfLife() const { return damper_.halfLife(); }
     void  setHalfLife(float frames) { damper_.setHalfLife(frames); }
@@ -561,39 +562,39 @@ public:
     uint32_t reused() const { return reused_; }
     uint32_t walked() const { return walked_; }
 
-    // Counters from this View's last call. Per-view ownership keeps
-    // concurrent views from racing over a global "last selection" value.
-    const CutStats& lastCutStats() const { return stats_; }
+    // Counters from this SpatialQuery's last call. Per-query ownership keeps
+    // concurrent queries from racing over a global "last selection" value.
+    const SelectionStats& lastSelectionStats() const { return stats_; }
 
-    // Cached selection is the default. Disable it for highly dynamic views
+    // Cached selection is the default. Disable it for highly dynamic queries
     // that prefer the internally parallel uncached traversal. Changing modes
     // resets accumulated damping and reuse state but retains allocations.
     bool reuseEnabled() const { return reuseEnabled_; }
     void setReuseEnabled(bool enabled);
 
-    // Query a World snapshot published by applyUpdates(). The View is mutable
-    // and must not be used concurrently; any number of distinct Views may read
-    // the same const World concurrently. A View binds to the first World it
-    // queries and reset() releases that binding.
-    CutView selectCut(const World& world, const Camera& camera,
-                      const CutParams& params);
-    CutView selectCut(const World& world, const Camera& camera,
-                      const CutParams& params, PageUsageContext& usage);
+    // Query a snapshot published by SpatialDatabase::applyUpdates(). The SpatialQuery
+    // is mutable and must not be used concurrently; any number of distinct queries
+    // may read the same const SpatialDatabase concurrently. A query binds to the
+    // first database it reads, and reset() releases that binding.
+    FrontierResultView selectFrontier(const SpatialDatabase& database, const Camera& camera,
+                            const SelectionParams& params);
+    FrontierResultView selectFrontier(const SpatialDatabase& database, const Camera& camera,
+                            const SelectionParams& params, PageUsageContext& usage);
 
     // Advanced zero-copy path: write directly to fixed caller storage.
-    void selectCut(const World& world, const Camera& camera,
-                   const CutParams& params, CutResultSink& outCut);
-    void selectCut(const World& world, const Camera& camera,
-                   const CutParams& params, PageUsageContext& usage,
-                   CutResultSink& outCut);
+    void selectFrontier(const SpatialDatabase& database, const Camera& camera,
+                   const SelectionParams& params, FrontierResultSink& outResult);
+    void selectFrontier(const SpatialDatabase& database, const Camera& camera,
+                   const SelectionParams& params, PageUsageContext& usage,
+                   FrontierResultSink& outResult);
 
-    // Explicit snapshot path for callers that must retain a cut after the
-    // next selection on this View.
-    void selectCut(const World& world, const Camera& camera,
-                   const CutParams& params, CutResults& outCut);
-    void selectCut(const World& world, const Camera& camera,
-                   const CutParams& params, PageUsageContext& usage,
-                   CutResults& outCut);
+    // Explicit owning-result path for callers that must retain a frontier after the
+    // next selection on this SpatialQuery.
+    void selectFrontier(const SpatialDatabase& database, const Camera& camera,
+                   const SelectionParams& params, FrontierResult& outResult);
+    void selectFrontier(const SpatialDatabase& database, const Camera& camera,
+                   const SelectionParams& params, PageUsageContext& usage,
+                   FrontierResult& outResult);
 
     // Forget everything: the damping window and every record. Call it on a
     // teleport or camera cut. Reuse never *requires* this -- every record
@@ -606,9 +607,9 @@ public:
     size_t bytes() const;
 
 private:
-    friend class World;
+    friend class SpatialDatabase;
 
-    // Pages whose state this instance's cut depended on. Two covers an
+    // Pages whose state this instance's frontier depended on. Two covers an
     // instance root plus one attachment; a walk that touches more is simply
     // not cached, which costs nothing, because an instance that deep is
     // usually still streaming and being re-walked anyway.
@@ -622,7 +623,7 @@ private:
     // is often already cheap because shared page bytes stay hot. Everything
     // here is therefore either a scalar or absent:
     //  - no camera envelope: validity is a single scalar budget against the
-    //    view's accumulated travel (see travel_);
+    //    query's accumulated travel (see travel_);
     //  - no per-record k / threshold copies: threshold changes bump epoch_,
     //    while k motion consumes the scalar slope budget below;
     //  - no page generations: contentVersion is bumped on attach too, so it
@@ -634,7 +635,7 @@ private:
         float    validUntil = 0.0f;
         float    kSlope = 0.0f;      // max world-space flip travel per unit k
         uint32_t epoch = 0;          // cache epoch (threshold generation)
-        uint32_t cutVersion = 0;     // unique instance transform/deform version
+        uint32_t frontierVersion = 0;     // unique instance transform/deform version
         uint32_t begin = 0;          // block in store_
         // Three 10-bit counts for [shared, currentOnly, idealOnly], plus the
         // two-bit dependency count. A record with more than 1023 entries in
@@ -645,7 +646,7 @@ private:
         uint32_t depSlot = 0;
         uint32_t depVersion = 0;
     };
-    static_assert(sizeof(Rec) == 32, "View::Rec hot state must stay 32 bytes");
+    static_assert(sizeof(Rec) == 32, "SpatialQuery::Rec hot state must stay 32 bytes");
 
     // Allocation state is needed only when a record is replaced or the slab
     // is compacted. Keeping it out of Rec prevents every hit from fetching it.
@@ -653,7 +654,7 @@ private:
     {
         uint32_t capacity = 0;
     };
-    static_assert(sizeof(RecCold) == 4, "View cold record must stay 4 bytes");
+    static_assert(sizeof(RecCold) == 4, "SpatialQuery cold record must stay 4 bytes");
 
     struct SecondDep
     {
@@ -664,21 +665,21 @@ private:
 
     void compact();
 
-    // This view's hysteresis. selectCut damps through it, so the odometer
+    // This query's hysteresis. selectFrontier damps through it, so the odometer
     // below measures the envelope it produces.
     CameraDamper damper_;
 
     std::vector<Rec>      rec_;      // hit-path state, by InstanceId
     std::vector<RecCold>  recCold_;  // miss/compaction state, by InstanceId
     // Allocated only after a cacheable walk actually touches two pages. The
-    // common one-page world therefore pays no dense second-dependency array.
+    // common one-page database therefore pays no dense second-dependency array.
     AppendBuffer<SecondDep> secondDep_;
-    AppendBuffer<CutEntry> store_;   // slab of recorded runs
+    AppendBuffer<FrontierEntry> store_;   // slab of recorded runs
     uint32_t              used_ = 0;
     uint32_t              garbage_ = 0;
     uint32_t              instanceLayoutVersion_ = 0;
 
-    // Distance the damped query envelope has travelled since this View was
+    // Distance the damped query envelope has travelled since this SpatialQuery was
     // created, accumulated per call. kTravel_ similarly accumulates absolute
     // projection-scale motion. A record taken with margin m remains valid
     // while positionTravel + kSlope * kTravel stays below its saved budget:
@@ -696,12 +697,12 @@ private:
     float    k_ = 0.0f, bar_ = 0.0f;
     uint32_t reused_ = 0;
     uint32_t walked_ = 0;
-    CutStats stats_{};
-    const World* world_ = nullptr;
+    SelectionStats stats_{};
+    const SpatialDatabase* database_ = nullptr;
     bool reuseEnabled_ = true;
 
     // Uncached selection samples whether enough hierarchical TLAS leaves can
-    // terminate at their BLAS root to repay the vector root test. A view that
+    // terminate at their BLAS root to repay the vector root test. A query that
     // currently sees mostly refined roots runs the original lean query and
     // probes periodically so a coherent move back to distance is discovered.
     bool     rootQueryEnabled_ = true;
@@ -709,7 +710,7 @@ private:
 
     // Mutable query scratch. Opaque so traversal
     // implementation details do not become part of the public API.
-    std::unique_ptr<ViewScratch> scratch_;
+    std::unique_ptr<QueryScratch> scratch_;
 };
 
 // ---------------------------------------------------------------------------
@@ -723,11 +724,11 @@ enum class TlasQuality : uint8_t
     BinnedSAH,  // binned surface-area-heuristic split; best traversal cost
 };
 
-struct WorldConfig
+struct SpatialDatabaseConfig
 {
-    // Allocation and task parallelism. Copied into the World; callback code
+    // Allocation and task parallelism. Copied into the SpatialDatabase; callback code
     // and anything referenced by `user` must remain valid for its lifetime.
-    HlodContext context{};
+    FrontierContext context{};
 
     // Quality tier of the top-level BVH. Initial builds, large population
     // drift, and area-drift repair use this tier. Escape/edit-budget repairs
@@ -760,33 +761,33 @@ struct WorldConfig
     // so this bounds how much of it accumulates.
     float tlasEditFraction = 0.05f;
 
-    // Minimum number of visible instances before an uncached View fans
-    // selection out across context.parallelFor. 0 disables parallel cut
+    // Minimum number of visible instances before an uncached SpatialQuery fans
+    // selection out across context.parallelFor. 0 disables parallel
     // selection entirely. Also requires context.workerCount > 1.
     //
     // There is no correctness caveat attached to this: selection reads the
-    // World and writes only per-worker buffers, which are concatenated in
-    // instance order, so a parallel cut is bit-identical to a serial one.
+    // SpatialDatabase and writes only per-worker buffers, which are concatenated in
+    // instance order, so parallel and serial selection are bit-identical.
     uint32_t parallelInstanceThreshold = 0;
 };
 
-class World
+class SpatialDatabase
 {
 public:
-    explicit World(const WorldConfig& config = WorldConfig{});
-    ~World();
+    explicit SpatialDatabase(const SpatialDatabaseConfig& config = SpatialDatabaseConfig{});
+    ~SpatialDatabase();
 
     // Non-copyable and non-movable: registered owned pages retain allocator
     // context pointers, and instances/mounts refer to each other by slot.
-    World(const World&) = delete;
-    World& operator=(const World&) = delete;
-    World(World&&) = delete;
-    World& operator=(World&&) = delete;
+    SpatialDatabase(const SpatialDatabase&) = delete;
+    SpatialDatabase& operator=(const SpatialDatabase&) = delete;
+    SpatialDatabase(SpatialDatabase&&) = delete;
+    SpatialDatabase& operator=(SpatialDatabase&&) = delete;
 
-    const WorldConfig& config() const { return config_; }
+    const SpatialDatabaseConfig& config() const { return config_; }
 
     // ---- assets ------------------------------------------------------------
-    // Publish a page for sharing. The World allocates ONE runtime state for
+    // Publish a page for sharing. The SpatialDatabase allocates ONE runtime state for
     // it (residency, attachment links) no matter how many instances name it,
     // and its root mount stays alive until releaseAsset().
     //
@@ -796,19 +797,19 @@ public:
     AssetHandle registerAsset(Page&& page);
     AssetHandle registerAsset(PageView borrowedPage);
 
-    // Drops the World's own reference. Contract violation if instances still
+    // Drops the SpatialDatabase's own reference. Contract violation if instances still
     // reference the asset. Detaches its whole page tree.
     void   releaseAsset(AssetHandle asset);
     bool   isAsset(AssetHandle asset) const;
     size_t assetCount() const { return liveAssets_; }
 
     // The asset's shared instance-root mount, for composing node handles
-    // (marking residency, attaching children) without a selectCut round-trip.
+    // (marking residency, attaching children) without a selectFrontier round-trip.
     // Invalid until addInstance has materialized that root. Mounts created by
     // attaching the asset elsewhere are independent and returned by attachPage.
     PageHandle assetRootPage(AssetHandle asset) const;
 
-    // ---- world assembly ----------------------------------------------------
+    // ---- database assembly -------------------------------------------------
     // An instance's root page is pinned: attached forever, roots' payloads
     // implicitly resident, never garbage-collected.
     //
@@ -824,7 +825,7 @@ public:
         bool valid() const { return id != kInvalidInstanceId; }
     };
 
-    // A persistent cohort whose caller-visible order stays fixed while World
+    // A persistent cohort whose caller-visible order stays fixed while SpatialDatabase
     // caches the corresponding physical instance order. This is intended for
     // groups that move together every frame. The cache rebuilds automatically
     // after optimize() or another physical layout change.
@@ -837,7 +838,7 @@ public:
         size_t size() const { return instances_.size(); }
 
     private:
-        friend class World;
+        friend class SpatialDatabase;
         struct Slot
         {
             InstanceId dense;
@@ -864,7 +865,7 @@ public:
     InstanceRef addInstance(AssetHandle asset, float4 pos, float scale = 1.0f);
 
     // Convenience for one-off content: registers the page as an anonymous
-    // asset owned by the World and instances it. The asset is freed when its
+    // asset owned by the SpatialDatabase and instances it. The asset is freed when its
     // last instance goes away. Instancing the same tree more than once should
     // go through registerAsset so the two instances share it.
     InstanceRef addInstance(Page&& page, const InstanceDesc& desc);
@@ -880,12 +881,12 @@ public:
                        float scale = 1.0f);
 
     // ---- topology streaming -------------------------------------------------
-    // An expansion handle comes from a high-error ideal-side CutEntry (or is
+    // An expansion handle comes from a high-error ideal-side FrontierEntry (or is
     // composed via nodeAt from a known packed expansion index).
     // attachPage returns an invalid PageHandle if the
     // expansion handle went stale while the page was being built (its parent
     // page was detached/collected) — drop the page in that case. It fires
-    // HLOD_FATAL only on true contract violations (not an expansion point,
+    // FRONTIER_FATAL only on true contract violations (not an expansion point,
     // already attached, empty page).
     //
     // Attaching under an asset attaches for every instance of it at once —
@@ -908,7 +909,7 @@ public:
     DetailPageRef detailPage(NodeHandle expansionNode) const;
 
     // ---- payload residency --------------------------------------------------
-    // Handles come from ideal-side CutEntry values. Stale handles are ignored
+    // Handles come from ideal-side FrontierEntry values. Stale handles are ignored
     // (the page was collected while the payload was loading); isResident
     // reports false for them. Residency changes incrementally propagate
     // complete-subtree coverage toward the root.
@@ -916,7 +917,7 @@ public:
     void markNonResident(NodeHandle h);
     bool isResident(NodeHandle h) const;
 
-    // Resolve immutable application payload data for a live cut handle. The
+    // Resolve immutable application payload data for a live frontier handle. The
     // false case is the normal async race with page detach/collection.
     bool tryGetPayload(NodeHandle h, UserPayload& outPayload) const;
 
@@ -940,14 +941,14 @@ public:
     //
     // Performance: submission order is preserved. For large batches, group
     // calls by instance and page when practical so consecutive refits reuse
-    // nearby overlay data. Ordering is irrelevant to correctness, and World
+    // nearby overlay data. Ordering is irrelevant to correctness, and SpatialDatabase
     // intentionally does not sort the queue because sorting can cost more
     // than the saved cache misses.
     void setNodeBounds(InstanceRef inst, NodeHandle h, const AABB& localBounds);
 
     // Force pending bounds refits now (conservative grow-only propagation up
     // the tree, across page boundaries, and into the top-level BVH). Only
-    // needed by callers that read bounds between cuts — tools, tests.
+    // needed by callers that read bounds between selections — tools, tests.
     void flushBounds();
 
     // Bounds of one node as this instance sees them: the overlay if it has
@@ -955,17 +956,17 @@ public:
     AABB nodeBounds(InstanceRef inst, NodeHandle h);
 
     // Publish queued changes and prepare a stable read-only selection
-    // snapshot. Call once before a group of selections, even when no world
-    // objects changed; it also advances the epoch used by collection aging.
-    // No World mutation (including collect) may overlap or occur before every
-    // View selection using this snapshot has completed.
+    // snapshot. Call once before a group of selections, even when no database
+    // contents changed; it also advances the epoch used by collection aging.
+    // No SpatialDatabase mutation (including collect) may overlap or occur before every
+    // SpatialQuery selection using this snapshot has completed.
     void applyUpdates();
 
     // Force a full quality TLAS rebuild, compact dead dense slots, and restore
-    // physical instance/View-record order to TLAS traversal order. Public
-    // InstanceRefs and CutEntry::instance() ids remain stable. This is
+    // physical instance/SpatialQuery-record order to TLAS traversal order. Public
+    // InstanceRefs and FrontierEntry::instance() ids remain stable. This is
     // intentionally heavier than applyUpdates(): call it at an occasional
-    // synchronization point after disruptive world changes (level transition,
+    // synchronization point after disruptive database changes (level transition,
     // teleport, loading screen), not as routine per-frame maintenance. It
     // flushes pending bounds edits but does not advance collection age.
     void optimize();
@@ -977,7 +978,7 @@ public:
     // child pages, and not pinned are eligible. Returns the number of pages
     // detached together with a non-owning view of payloads whose resident
     // content became unreachable. Overloads taking page-usage contexts consume
-    // their accumulated feedback before examining the tail; omitted views do
+    // their accumulated feedback before examining the tail; omitted queries do
     // not influence page retention.
     CollectResult collect(size_t maxAttachedPages, uint32_t minAge);
     CollectResult collect(PageUsageContext& usage, size_t maxAttachedPages,
@@ -999,8 +1000,8 @@ public:
 
 private:
     friend struct TestAccess;
-    friend struct ViewScratch;
-    friend class View;
+    friend struct QueryScratch;
+    friend class SpatialQuery;
 
     struct NodeRef
     {
@@ -1044,11 +1045,11 @@ private:
     };
     static_assert(sizeof(AssetRt) == 112, "asset runtime state must stay 112 bytes");
 
-    // The two words queried independently of the rest of a mount. Cached View
+    // The two words queried independently of the rest of a mount. Cached SpatialQuery
     // hits validate a page dependency through contentVersion, while handles
     // and overlays validate through generation. Keeping these stamps in a
     // compact parallel stream avoids fetching a sparse 104-byte PageRt record
-    // for every visible instance in a world with many unique pages.
+    // for every visible instance in a database with many unique pages.
     struct PageStamp
     {
         uint32_t contentVersion = 0;
@@ -1091,7 +1092,7 @@ private:
         // error ceilings without rewriting the page's node data.
         float                 errClamp = FLT_MAX;
         // Two bits per node in one byte: payload residency and whether the
-        // node has a complete resident cut. Keeping them together halves the
+        // node has a complete resident frontier. Keeping them together halves the
         // state bytes and removes one allocation per mounted page.
         static constexpr uint8_t kResident = 1u << 0;
         static constexpr uint8_t kCovered = 1u << 1;
@@ -1109,7 +1110,7 @@ private:
         uint64_t lruLinksAndGeneration =
             uint64_t(NodeHandle::kInvalidSlot) |
             (uint64_t(NodeHandle::kInvalidSlot) << kLruNextShift);
-        uint32_t   lastTouched = 0;           // world frame of last walk touch
+        uint32_t   lastTouched = 0;           // database frame of last walk touch
         static constexpr uint32_t kPinned = 1u << 31;
         uint32_t   attachedChildrenAndPinned = 0;
         NodeRef    owner;                     // expansion node above; invalid for root pages
@@ -1250,7 +1251,7 @@ private:
     static_assert(sizeof(OverlayList) == 24,
                   "cold overlay-list header must stay 24 bytes");
 
-    // The cut walk's common per-instance state. Overlay-list headers live in a
+    // The frontier walk's common per-instance state. Overlay-list headers live in a
     // cold pool allocated only for deformed instances; the high bit in that
     // pool index is the live flag. TLAS-only state remains in InstanceTlas.
     struct Instance
@@ -1280,8 +1281,8 @@ private:
         }
         void setOverlayList(uint32_t index)
         {
-            HLOD_ASSERT(index < kOverlayListMask,
-                        "World: exhausted overlay-list index space");
+            FRONTIER_ASSERT(index < kOverlayListMask,
+                        "SpatialDatabase: exhausted overlay-list index space");
             overlayListAndAlive = (overlayListAndAlive & kAlive) | index;
         }
         void clearOverlayList()
@@ -1290,10 +1291,10 @@ private:
                                   kOverlayListMask;
         }
     };
-    static_assert(sizeof(Instance) == 32, "cut-path Instance must stay 32 bytes");
+    static_assert(sizeof(Instance) == 32, "selection-path Instance must stay 32 bytes");
 
     // State used only while building, editing, or refitting the TLAS. Keeping
-    // it parallel preserves dense indexing without charging the cut loop for
+    // it parallel preserves dense indexing without charging the selection loop for
     // bytes it never reads.
     struct InstanceTlas
     {
@@ -1470,26 +1471,26 @@ private:
         // Backing storage for the parallel path, where each worker collects
         // into its own buffers; the serial path points the sinks straight at
         // the caller's output instead.
-        detail::CutBuffers cutBuf;
+        detail::FrontierBuffers frontierBuffer;
 
-        CutResultSink cut;
+        FrontierResultSink result;
 
-        void emit(const CutEntry& entry, bool current, bool ideal)
+        void emit(const FrontierEntry& entry, bool current, bool ideal)
         {
             if (current && ideal)
-                cut.shared.push(entry);
+                result.shared.push(entry);
             else if (current)
-                cut.currentOnly.push(entry);
+                result.currentOnly.push(entry);
             else
-                cut.idealOnly.push(entry);
+                result.idealOnly.push(entry);
         }
 
         std::vector<uint32_t> touched;      // page dependencies / optional usage
         bool trackTouches = false;
-        bool uniqueTouches = false;         // View dependency list
-        CutStats stats;
+        bool uniqueTouches = false;         // SpatialQuery dependency list
+        SelectionStats stats;
 
-        // Validity-margin tracking for View. Off for every ordinary
+        // Validity-margin tracking for SpatialQuery. Off for every ordinary
         // selection, and the branch is invariant for a whole call.
         bool  trackMargin = false;
         float margin = FLT_MAX;   // min distance to a decision flip so far
@@ -1503,7 +1504,7 @@ private:
     const PageRt* resolve(NodeHandle h) const;
     PageRt*       resolve(NodeHandle h)
     {
-        return const_cast<PageRt*>(static_cast<const World*>(this)->resolve(h));
+        return const_cast<PageRt*>(static_cast<const SpatialDatabase*>(this)->resolve(h));
     }
 
     uint32_t allocAsset();
@@ -1531,11 +1532,11 @@ private:
     void lruTouch(uint32_t slot, uint32_t epoch);
     void consumePageUsage(PageUsageContext& usage);
     void consumePageUsage(std::span<PageUsageContext* const> usage);
-    static CutResultSink makeSink(detail::CutBuffers& buffers)
+    static FrontierResultSink makeSink(detail::FrontierBuffers& buffers)
     {
-        return {Sink<CutEntry>(buffers.shared),
-                Sink<CutEntry>(buffers.currentOnly),
-                Sink<CutEntry>(buffers.idealOnly)};
+        return {Sink<FrontierEntry>(buffers.shared),
+                Sink<FrontierEntry>(buffers.currentOnly),
+                Sink<FrontierEntry>(buffers.idealOnly)};
     }
 
     // ---- copy-on-write bounds ----
@@ -1604,32 +1605,32 @@ private:
                                    bool uniqueTouches = true) const;
     bool pageTreeFullyResident(uint32_t slot) const;
     void propagateFullResidency(uint32_t slot, bool wasFullyResident);
-    void runInstance(uint32_t instIdx, const Camera& view, const CutParams& params,
+    void runInstance(uint32_t instIdx, const Camera& view, const SelectionParams& params,
                      uint8_t mask, bool tryRoot, Worker& w) const;
     void runFlatInstance(uint32_t instIdx, const Camera& view,
                          uint8_t mask, Worker& w) const;
     template<bool FullyResident>
     void runPage(const WorkItem& item, const Instance& inst, const Camera& local,
-                 const CutParams& params, Worker& w) const;
+                 const SelectionParams& params, Worker& w) const;
     template<bool FullyResident, bool SparseOverlay>
     void runPageImpl(const WorkItem& item, const Instance& inst,
-                     const Camera& local, const CutParams& params,
+                     const Camera& local, const SelectionParams& params,
                      Worker& w) const;
     template<bool FullyResident, bool SparseOverlay>
     void wideVisit(const WorkItem& item, const PageView& pg, float errClamp,
                    uint32_t gen, InstanceId instance, uint32_t node, uint8_t mask,
                    uint8_t currentKids, uint8_t idealKids,
                    const Camera& local, Worker& w) const;
-    void selectCutCached(const Camera& camera, const CutParams& params,
-                         View& view, PageUsageContext* usage,
-                         CutResultSink& outCut) const;
-    void selectCutUncached(const Camera& camera, const CutParams& params,
-                           View& view, PageUsageContext* usage,
-                           CutResultSink& outCut) const;
+    void selectFrontierCached(const Camera& camera, const SelectionParams& params,
+                         SpatialQuery& query, PageUsageContext* usage,
+                         FrontierResultSink& outResult) const;
+    void selectFrontierUncached(const Camera& camera, const SelectionParams& params,
+                           SpatialQuery& query, PageUsageContext* usage,
+                           FrontierResultSink& outResult) const;
     void recordPageUsage(PageUsageContext& usage, uint32_t slot) const;
 
     // ---- state ----
-    WorldConfig config_;
+    SpatialDatabaseConfig config_;
 
     std::vector<AssetRt>  assets_;
     std::vector<uint32_t> freeAssets_;
@@ -1648,16 +1649,16 @@ private:
     // Root mount for exact one-node assets, kInvalidIndex otherwise; a cold
     // high bit also records the common zero-error case. Keeping this as a
     // lazily allocated compact stream lets mixed forests bypass the 64-byte
-    // Instance and 256-byte WideBlock records for flat objects. Worlds that
+    // Instance and 256-byte WideBlock records for flat objects. Databases that
     // have never contained a flat instance allocate no stream at all.
     std::vector<uint32_t> instanceFlatSlots_;
     size_t                flatInstanceCount_ = 0;
     // Cache hits need only this stamp, not the 32-byte Instance record. It is
     // parallel to instances_ and bumped for transform or deformation changes.
-    std::vector<uint32_t> instanceCutVersions_;
+    std::vector<uint32_t> instanceFrontierVersions_;
     std::vector<InstanceId> liveInstances_;
     std::vector<uint32_t> freeInstances_;
-    // Public InstanceRef/CutEntry ids remain stable while optimize() or the
+    // Public InstanceRef/FrontierEntry ids remain stable while optimize() or the
     // first non-empty build permutes dense storage into TLAS traversal order.
     std::vector<InstanceId> instanceHandleToDense_;
     std::vector<InstanceId> instanceDenseToHandle_;
@@ -1699,12 +1700,12 @@ private:
     static_assert(sizeof(PendingMove) == 48, "queued bounds edit must stay 48 bytes");
     std::vector<PendingMove> pendingMoves_;
 
-    // Backing storage for CollectResult::freedPayloads. Collection is a World
+    // Backing storage for CollectResult::freedPayloads. Collection is a SpatialDatabase
     // mutation, so one retained buffer has the same synchronization contract
-    // as the rest of World state.
+    // as the rest of SpatialDatabase state.
     AppendBuffer<UserPayload> collectPayloads_;
 
-    // Shared TLAS build scratch. Per-selection scratch lives in View.
+    // Shared TLAS build scratch. Per-selection scratch lives in SpatialQuery.
     struct TlasItem
     {
         uint32_t packed = 0;
@@ -1747,4 +1748,4 @@ private:
     std::vector<uint32_t>                      tlasItemsTmp_;
 };
 
-} // namespace hlod
+} // namespace frontier

@@ -6,31 +6,31 @@
 
 #include "helpers.h"
 
-using namespace hlod;
-using namespace hlodtest;
-using TA = World::TestAccess;
+using namespace frontier;
+using namespace frontiertest;
+using TA = SpatialDatabase::TestAccess;
 
 namespace {
 
-std::map<UserId, uint8_t> cutMap(World& world, const CutView& cut)
+std::map<UserId, uint8_t> frontierMap(SpatialDatabase& world, const FrontierResultView& cut)
 {
     std::map<UserId, uint8_t> m;
-    for (const auto& e : currentCut(cut))
+    for (const auto& e : currentFrontier(cut))
         m.emplace(payloadOf(world, e), e.errorCode());
     return m;
 }
-std::map<UserId, uint8_t> idealMap(World& world, const CutView& cut)
+std::map<UserId, uint8_t> idealMap(SpatialDatabase& world, const FrontierResultView& cut)
 {
     std::map<UserId, uint8_t> m;
-    for (const auto& e : idealCut(cut))
+    for (const auto& e : idealFrontier(cut))
         m.emplace(payloadOf(world, e), e.errorCode());
     return m;
 }
 
-void expectSameCut(World& world, const CutView& got, const CutView& want)
+void expectSameFrontier(SpatialDatabase& world, const FrontierResultView& got, const FrontierResultView& want)
 {
-    const auto g = cutMap(world, got), w = cutMap(world, want);
-    ASSERT_EQ(g.size(), currentCutSize(got)) << "duplicate ids in current cut";
+    const auto g = frontierMap(world, got), w = frontierMap(world, want);
+    ASSERT_EQ(g.size(), currentFrontierSize(got)) << "duplicate ids in current frontier";
     ASSERT_EQ(g.size(), w.size());
     for (const auto& [id, error] : w)
     {
@@ -40,10 +40,10 @@ void expectSameCut(World& world, const CutView& got, const CutView& want)
     }
 }
 
-void expectSameIdeal(World& world, const CutView& got, const CutView& want)
+void expectSameIdeal(SpatialDatabase& world, const FrontierResultView& got, const FrontierResultView& want)
 {
     const auto g = idealMap(world, got), w = idealMap(world, want);
-    ASSERT_EQ(g.size(), idealCutSize(got)) << "duplicate ids in ideal cut";
+    ASSERT_EQ(g.size(), idealFrontierSize(got)) << "duplicate ids in ideal frontier";
     ASSERT_EQ(g.size(), w.size());
     for (const auto& [id, error] : w)
     {
@@ -55,13 +55,13 @@ void expectSameIdeal(World& world, const CutView& got, const CutView& want)
 
 struct Outputs
 {
-    CutResults cut;
+    FrontierResult cut;
 };
 
-Outputs run(World& w, const Camera& v, const CutParams& p)
+Outputs run(SpatialDatabase& w, const Camera& v, const SelectionParams& p)
 {
     Outputs o;
-    selectCutUncached(w, v, p, o.cut);
+    selectFrontierUncached(w, v, p, o.cut);
     return o;
 }
 
@@ -70,9 +70,9 @@ Outputs run(World& w, const Camera& v, const CutParams& p)
 // ---------------------------------------------------------------------------
 // The doc's town example: near building refines to walls, far one draws whole.
 // ---------------------------------------------------------------------------
-TEST(Cut, TownExample)
+TEST(Frontier, TownExample)
 {
-    HLodBuilder b;
+    PageBuilder b;
     const auto town = b.createRoot(1, 64.0f);
     const auto bldA = b.createNode(town, 2, 8.0f);
     b.createNode(bldA, 10, 1.0f, AABB::fromCenterExtent(float4::vec(0, 0, 0), float4::vec(1, 1, 1)));
@@ -82,7 +82,7 @@ TEST(Cut, TownExample)
     Page pg = b.build();
     const auto ids = pageIds(pg);
 
-    World w;
+    SpatialDatabase w;
     w.addInstance(std::move(pg), float4::point(0, 0, 0));
     markAllResident(w, ids);
     w.applyUpdates();
@@ -93,17 +93,17 @@ TEST(Cut, TownExample)
     const auto o = run(w, v, {4.0f, 0.0f});
 
     std::set<UserId> got;
-    for (const auto& e : currentCut(o.cut)) got.insert(payloadOf(w, e));
+    for (const auto& e : currentFrontier(o.cut)) got.insert(payloadOf(w, e));
     EXPECT_EQ(got, (std::set<UserId>{10, 11, 12, 3}));   // walls + far building
 
     // Everything resident: ideal == current.
-    EXPECT_EQ(cutMap(w, o.cut), idealMap(w, o.cut));
+    EXPECT_EQ(frontierMap(w, o.cut), idealMap(w, o.cut));
 }
 
 // ---------------------------------------------------------------------------
 // Distance monotonicity: moving away coarsens the cut down to the root.
 // ---------------------------------------------------------------------------
-TEST(Cut, CoarsensWithDistance)
+TEST(Frontier, CoarsensWithDistance)
 {
     TreeGen gen;
     gen.fanout = 4;
@@ -111,7 +111,7 @@ TEST(Cut, CoarsensWithDistance)
     Page pg = gen.makeRootPage(unitRegion(50.0f), 64.0f, 0);
     const auto ids = pageIds(pg);
 
-    World w;
+    SpatialDatabase w;
     w.addInstance(std::move(pg), float4::point(0, 0, 0));
     markAllResident(w, ids);
     w.applyUpdates();
@@ -122,8 +122,8 @@ TEST(Cut, CoarsensWithDistance)
         const Camera v = makeLookAtCamera(float4::point(0, 0, -d), float4::point(0, 0, 0));
         const auto o = run(w, v, {4.0f, 0.0f});
         ASSERT_FALSE(o.cut.empty()) << "distance " << d;
-        EXPECT_LE(currentCutSize(o.cut), lastSize) << "distance " << d;
-        lastSize = currentCutSize(o.cut);
+        EXPECT_LE(currentFrontierSize(o.cut), lastSize) << "distance " << d;
+        lastSize = currentFrontierSize(o.cut);
     }
     EXPECT_EQ(lastSize, 1u);   // far enough: just the root
 }
@@ -131,7 +131,7 @@ TEST(Cut, CoarsensWithDistance)
 // ---------------------------------------------------------------------------
 // The cut is an antichain: no drawn node is an ancestor of another drawn node.
 // ---------------------------------------------------------------------------
-TEST(Cut, IsAntichain)
+TEST(Frontier, IsAntichain)
 {
     TreeGen gen;
     gen.fanout = 3;
@@ -139,7 +139,7 @@ TEST(Cut, IsAntichain)
     Page root = gen.makeRootPage(unitRegion(60.0f), 64.0f, 1);
     const auto rootIds = pageIds(root);
 
-    World w;
+    SpatialDatabase w;
     w.addInstance(std::move(root), float4::point(0, 0, 0));
     markAllResident(w, rootIds);
 
@@ -160,8 +160,8 @@ TEST(Cut, IsAntichain)
     const auto o = run(w, v, {6.0f, 0.0f});
 
     std::set<UserId> inCut;
-    for (const auto& e : currentCut(o.cut)) inCut.insert(payloadOf(w, e));
-    for (const auto& e : currentCut(o.cut))
+    for (const auto& e : currentFrontier(o.cut)) inCut.insert(payloadOf(w, e));
+    for (const auto& e : currentFrontier(o.cut))
     {
         const UserId id = payloadOf(w, e);
         for (UserId anc : TA::ancestorIds(w, id))
@@ -173,7 +173,7 @@ TEST(Cut, IsAntichain)
 // Brute-force reference equivalence over randomized worlds: random paged
 // trees, random attachments, random residency, random cameras, multi-instance.
 // ---------------------------------------------------------------------------
-TEST(Cut, MatchesBruteForceReference)
+TEST(Frontier, MatchesBruteForceReference)
 {
     DeterministicRng rng(777);
     DeterministicUniformFloat uni(0.0f, 1.0f);
@@ -184,7 +184,7 @@ TEST(Cut, MatchesBruteForceReference)
         gen.fanout = 2 + rng.index(3);
         gen.depth = 1 + rng.index(2);
 
-        World w;
+        SpatialDatabase w;
         std::vector<UserId> allIds;
 
         const int numInstances = 1 + int(rng.index(3));
@@ -225,7 +225,7 @@ TEST(Cut, MatchesBruteForceReference)
 
         w.applyUpdates();
 
-        CutParams p;
+        SelectionParams p;
         p.threshold = 1.0f + uni(rng) * 30.0f;
         p.minPix = (iter % 4 == 0) ? 0.5f : 0.0f;
 
@@ -235,10 +235,10 @@ TEST(Cut, MatchesBruteForceReference)
         const Camera v = makeLookAtCamera(camPos, camTgt);
 
         const auto got = run(w, v, p);
-        const RefResult want = TA::referenceCut(w, v, p);
+        const RefResult want = TA::referenceFrontier(w, v, p);
 
         SCOPED_TRACE("iter " + std::to_string(iter));
-        expectSameCut(w, got.cut, want.cut);
+        expectSameFrontier(w, got.cut, want.cut);
         expectSameIdeal(w, got.cut, want.cut);
     }
 }
@@ -246,7 +246,7 @@ TEST(Cut, MatchesBruteForceReference)
 // A far hierarchical BLAS can terminate at its renderable root directly from
 // the TLAS leaf. Moving the camera closer must still refine normally. This
 // guards both sides of the shortcut against the scalar reference.
-TEST(Cut, TlasRootDecisionMatchesReference)
+TEST(Frontier, TlasRootDecisionMatchesReference)
 {
     TreeGen gen;
     gen.fanout = 4;
@@ -254,17 +254,17 @@ TEST(Cut, TlasRootDecisionMatchesReference)
     Page page = gen.makeRootPage(unitRegion(3.0f), 16.0f, 0);
     const auto ids = pageIds(page);
 
-    World w;
+    SpatialDatabase w;
     w.addInstance(std::move(page), float4::point(0, 0, 0));
     markAllResident(w, ids);
     w.applyUpdates();
 
-    const CutParams params{4.0f, 0.0f};
+    const SelectionParams params{4.0f, 0.0f};
     const Camera far = makeLookAtCamera(float4::point(0, 0, -5000),
                                         float4::point(0, 0, 0));
     const auto farGot = run(w, far, params);
-    const RefResult farWant = TA::referenceCut(w, far, params);
-    expectSameCut(w, farGot.cut, farWant.cut);
+    const RefResult farWant = TA::referenceFrontier(w, far, params);
+    expectSameFrontier(w, farGot.cut, farWant.cut);
     expectSameIdeal(w, farGot.cut, farWant.cut);
     ASSERT_EQ(farGot.cut.shared.size(), 1u);
     EXPECT_EQ(payloadOf(w, farGot.cut.shared.front()), ids.front());
@@ -272,8 +272,8 @@ TEST(Cut, TlasRootDecisionMatchesReference)
     const Camera near = makeLookAtCamera(float4::point(0, 0, -1000),
                                          float4::point(0, 0, 0));
     const auto nearGot = run(w, near, params);
-    const RefResult nearWant = TA::referenceCut(w, near, params);
-    expectSameCut(w, nearGot.cut, nearWant.cut);
+    const RefResult nearWant = TA::referenceFrontier(w, near, params);
+    expectSameFrontier(w, nearGot.cut, nearWant.cut);
     expectSameIdeal(w, nearGot.cut, nearWant.cut);
     EXPECT_GT(nearGot.cut.size(), 1u);
 }
@@ -282,13 +282,13 @@ TEST(Cut, TlasRootDecisionMatchesReference)
 // Temporal coherence: identical frames produce identical cuts (epoch stamps
 // must not leak stale state between frames).
 // ---------------------------------------------------------------------------
-TEST(Cut, StableAcrossFrames)
+TEST(Frontier, StableAcrossFrames)
 {
     TreeGen gen;
     Page pg = gen.makeRootPage(unitRegion(50.0f), 64.0f, 0);
     const auto ids = pageIds(pg);
 
-    World w;
+    SpatialDatabase w;
     w.addInstance(std::move(pg), float4::point(0, 0, 0));
     markAllResident(w, ids);
 
@@ -299,7 +299,7 @@ TEST(Cut, StableAcrossFrames)
     {
         w.applyUpdates();
         const auto o = run(w, v, {5.0f, 0.0f});
-        expectSameCut(w, o.cut, first.cut);
+        expectSameFrontier(w, o.cut, first.cut);
     }
 }
 
@@ -314,12 +314,12 @@ namespace {
 // A tiny tree whose root has geometric error 1, so err(root) = k / dist.
 struct DampFixture
 {
-    World w;
+    SpatialDatabase w;
     float k;
 
     DampFixture()
     {
-        HLodBuilder b;
+        PageBuilder b;
         const auto root = b.createRoot(1, 1.0f);
         b.createNode(root, 2, 0.001f,
                      AABB::fromCenterExtent(float4::vec(-0.01f, 0, 0),
@@ -342,11 +342,11 @@ struct DampFixture
                               float4::point(0, 0, 0));
     }
 
-    bool coarse(const Camera& v, const CutParams& p)
+    bool coarse(const Camera& v, const SelectionParams& p)
     {
         w.applyUpdates();
         const Outputs o = run(w, v, p);
-        const auto current = currentCut(o.cut);
+        const auto current = currentFrontier(o.cut);
         return current.size() == 1 && payloadOf(w, current[0]) == 1;
     }
 };
@@ -356,9 +356,9 @@ struct DampFixture
 // A camera jittering around the threshold is the case hysteresis exists for.
 // Undamped it flips every frame; damped, the envelope covers both positions,
 // so the measured error is the closer one's and the decision never moves.
-TEST(Cut, DampingSurvivesJitter)
+TEST(Frontier, DampingSurvivesJitter)
 {
-    const CutParams p{10.0f, 0.0f};
+    const SelectionParams p{10.0f, 0.0f};
 
     {
         DampFixture f;
@@ -387,9 +387,9 @@ TEST(Cut, DampingSurvivesJitter)
 // Detail must arrive the instant the camera gets close enough, and be given up
 // only reluctantly. The envelope always contains the current position, so
 // approach is undamped by construction; recede is damped by the decay.
-TEST(Cut, DampingIsAsymmetric)
+TEST(Frontier, DampingIsAsymmetric)
 {
-    const CutParams p{10.0f, 0.0f};
+    const SelectionParams p{10.0f, 0.0f};
     DampFixture f;
     CameraDamper damper(4.0f);
 
@@ -410,9 +410,9 @@ TEST(Cut, DampingIsAsymmetric)
 
 // Damping off must be bit-identical to no damping at all, so every existing
 // expectation about undamped selection stays exactly valid.
-TEST(Cut, DampingOffIsExact)
+TEST(Frontier, DampingOffIsExact)
 {
-    const CutParams p{10.0f, 0.0f};
+    const SelectionParams p{10.0f, 0.0f};
     DampFixture f;
     CameraDamper off(0.0f);
 
@@ -432,9 +432,9 @@ TEST(Cut, DampingOffIsExact)
 
 // reset() forgets the window, so a teleport does not stretch the envelope
 // across the discontinuity and over-refine everything in between.
-TEST(Cut, DamperResetForgetsTheWindow)
+TEST(Frontier, DamperResetForgetsTheWindow)
 {
-    const CutParams p{10.0f, 0.0f};
+    const SelectionParams p{10.0f, 0.0f};
     DampFixture f;
     CameraDamper damper(8.0f);
 
@@ -449,7 +449,7 @@ TEST(Cut, DamperResetForgetsTheWindow)
 // Contribution culling: a subpixel instance vanishes entirely; a visible one
 // stays untouched.
 // ---------------------------------------------------------------------------
-TEST(Cut, ContributionCulling)
+TEST(Frontier, ContributionCulling)
 {
     TreeGen gen;
     Page near = gen.makeRootPage(unitRegion(10.0f), 8.0f, 0);
@@ -458,7 +458,7 @@ TEST(Cut, ContributionCulling)
         AABB::fromMinMax(float4::vec(-10, -10, -10), float4::vec(10, 10, 10)), 8.0f, 0);
     const auto farIds = pageIds(far);
 
-    World w;
+    SpatialDatabase w;
     w.addInstance(std::move(near), float4::point(0, 0, 0));
     w.addInstance(std::move(far), float4::point(0, 0, 500000.0f), 0.01f);   // tiny & distant
     markAllResident(w, nearIds);
@@ -471,9 +471,9 @@ TEST(Cut, ContributionCulling)
     const auto with = run(w, v, {4.0f, 0.5f});
 
     std::set<UserId> withoutIds, withIds;
-    for (const auto& e : currentCut(without.cut))
+    for (const auto& e : currentFrontier(without.cut))
         withoutIds.insert(payloadOf(w, e));
-    for (const auto& e : currentCut(with.cut)) withIds.insert(payloadOf(w, e));
+    for (const auto& e : currentFrontier(with.cut)) withIds.insert(payloadOf(w, e));
 
     bool farInWithout = false, farInWith = false;
     for (UserId id : farIds)
@@ -490,13 +490,13 @@ TEST(Cut, ContributionCulling)
 // ---------------------------------------------------------------------------
 // Two views over the same world produce independent, correct cuts.
 // ---------------------------------------------------------------------------
-TEST(Cut, MultiViewIndependence)
+TEST(Frontier, MultipleCameraQueriesAreIndependent)
 {
     TreeGen gen;
     Page pg = gen.makeRootPage(unitRegion(50.0f), 64.0f, 0);
     const auto ids = pageIds(pg);
 
-    World w;
+    SpatialDatabase w;
     w.addInstance(std::move(pg), float4::point(0, 0, 0));
     markAllResident(w, ids);
 
@@ -508,7 +508,7 @@ TEST(Cut, MultiViewIndependence)
         w.applyUpdates();
         const auto oNear = run(w, vNear, {4.0f, 0.0f});
         const auto oFar = run(w, vFar, {4.0f, 0.0f});
-        EXPECT_GT(currentCutSize(oNear.cut), currentCutSize(oFar.cut));
-        EXPECT_EQ(currentCutSize(oFar.cut), 1u);
+        EXPECT_GT(currentFrontierSize(oNear.cut), currentFrontierSize(oFar.cut));
+        EXPECT_EQ(currentFrontierSize(oFar.cut), 1u);
     }
 }

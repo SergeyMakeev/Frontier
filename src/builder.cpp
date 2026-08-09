@@ -1,15 +1,15 @@
-#include "hlod/builder.h"
+#include "frontier/builder.h"
 
 #include <cstring>
 #include <functional>
 #include <utility>
 
-namespace hlod {
+namespace frontier {
 
-HLodBuilder::NodeId HLodBuilder::createRoot(UserPayload payload, float geometricError,
+PageBuilder::NodeId PageBuilder::createRoot(UserPayload payload, float geometricError,
                                             const AABB& bbox)
 {
-    HLOD_CHECK(!built_, "HLodBuilder: builder already consumed");
+    FRONTIER_CHECK(!built_, "PageBuilder: builder already consumed");
     BuildNode n;
     n.bbox = bbox;
     n.geometricError = geometricError;
@@ -20,12 +20,12 @@ HLodBuilder::NodeId HLodBuilder::createRoot(UserPayload payload, float geometric
     return NodeId(nodes_.size() - 1);
 }
 
-HLodBuilder::NodeId HLodBuilder::createNode(NodeId parent, UserPayload payload,
+PageBuilder::NodeId PageBuilder::createNode(NodeId parent, UserPayload payload,
                                             float geometricError, const AABB& bbox)
 {
-    HLOD_CHECK(!built_, "HLodBuilder: builder already consumed");
-    HLOD_CHECK(parent < nodes_.size(), "HLodBuilder: invalid parent");
-    HLOD_CHECK(!nodes_[parent].expansion, "HLodBuilder: expansion point must stay a leaf");
+    FRONTIER_CHECK(!built_, "PageBuilder: builder already consumed");
+    FRONTIER_CHECK(parent < nodes_.size(), "PageBuilder: invalid parent");
+    FRONTIER_CHECK(!nodes_[parent].expansion, "PageBuilder: expansion point must stay a leaf");
     BuildNode n;
     n.bbox = bbox;
     n.geometricError = geometricError;
@@ -34,30 +34,30 @@ HLodBuilder::NodeId HLodBuilder::createNode(NodeId parent, UserPayload payload,
     nodes_.push_back(n);
     const NodeId me = NodeId(nodes_.size() - 1);
     nodes_[parent].children.push_back(me);
-    HLOD_CHECK(nodes_[parent].children.size() <= kMaxChildren,
-               "HLodBuilder: fanout exceeds kMaxChildren");
+    FRONTIER_CHECK(nodes_[parent].children.size() <= kMaxChildren,
+               "PageBuilder: fanout exceeds kMaxChildren");
     return me;
 }
 
-void HLodBuilder::markExpansion(NodeId node, HierarchyPageId detailPage)
+void PageBuilder::markExpansion(NodeId node, HierarchyPageId detailPage)
 {
-    HLOD_CHECK(!built_, "HLodBuilder: builder already consumed");
-    HLOD_CHECK(node < nodes_.size(), "HLodBuilder: invalid node");
-    HLOD_CHECK(nodes_[node].children.empty(),
-               "HLodBuilder: expansion point must stay a leaf");
-    HLOD_CHECK(detailPage == kInvalidHierarchyPage ||
+    FRONTIER_CHECK(!built_, "PageBuilder: builder already consumed");
+    FRONTIER_CHECK(node < nodes_.size(), "PageBuilder: invalid node");
+    FRONTIER_CHECK(nodes_[node].children.empty(),
+               "PageBuilder: expansion point must stay a leaf");
+    FRONTIER_CHECK(detailPage == kInvalidHierarchyPage ||
                    (detailPage > 0 && detailPage <= kMaxWideOffset),
-               "HLodBuilder: detail page id exceeds packed metadata");
+               "PageBuilder: detail page id exceeds packed metadata");
     nodes_[node].expansion = true;
     nodes_[node].detailPage = detailPage;
 }
 
-Page HLodBuilder::build(const HlodContext& ctx)
+Page PageBuilder::build(const FrontierContext& ctx)
 {
-    HLOD_CHECK(!built_, "HLodBuilder: builder already consumed");
+    FRONTIER_CHECK(!built_, "PageBuilder: builder already consumed");
     built_ = true;
-    HLOD_CHECK(!roots_.empty(), "HLodBuilder: page has no roots");
-    HLOD_CHECK(roots_.size() <= kMaxChildren, "HLodBuilder: too many page roots");
+    FRONTIER_CHECK(!roots_.empty(), "PageBuilder: page has no roots");
+    FRONTIER_CHECK(roots_.size() <= kMaxChildren, "PageBuilder: too many page roots");
 
     const uint32_t total = uint32_t(nodes_.size()) + 1;   // +1 sentinel
 
@@ -99,7 +99,7 @@ Page HLodBuilder::build(const HlodContext& ctx)
     // ---- Sentinel at index 0: stand-in for this page's owner ----------------
     // FLT_MAX error means the roots are never clamped here. A page attached
     // under an expansion point is clamped at runtime by the owner's error,
-    // which the World carries as a per-attachment scalar rather than by
+    // which the SpatialDatabase carries as a per-attachment scalar rather than by
     // rewriting the page (that is what lets one page back many attachments).
     emit(0, uint32_t(roots_.size()), false, kInvalidHierarchyPage,
          kSentinelPayload, AABB::empty(), FLT_MAX);
@@ -119,7 +119,7 @@ Page HLodBuilder::build(const HlodContext& ctx)
         for (auto c = n.children.rbegin(); c != n.children.rend(); ++c)
             stack.push_back(*c);
     }
-    HLOD_CHECK(parent.size() == total, "HLodBuilder: internal emission count mismatch");
+    FRONTIER_CHECK(parent.size() == total, "PageBuilder: internal emission count mismatch");
 
     // ---- Pass B: bottom-up fold — subtree sizes and bounds, one reverse sweep
     // Unioning children into the parent ESTABLISHES (C); an author-supplied
@@ -130,7 +130,7 @@ Page HLodBuilder::build(const HlodContext& ctx)
         bbox[parent[i]].expand(bbox[i]);
     }
     for (uint32_t i = 1; i < total; ++i)
-        HLOD_CHECK(!bbox[i].isEmpty(), "HLodBuilder: leaf node without bounds");
+        FRONTIER_CHECK(!bbox[i].isEmpty(), "PageBuilder: leaf node without bounds");
 
     // ---- Pass C: enforce monotone error (D), forward sweep ------------------
     for (uint32_t i = 1; i < total; ++i)
@@ -155,8 +155,8 @@ Page HLodBuilder::build(const HlodContext& ctx)
         }
 
         const uint32_t offset = uint32_t(wide.size());
-        HLOD_CHECK(offset <= kMaxWideOffset,
-                   "HLodBuilder: page too large: wide offset overflow");
+        FRONTIER_CHECK(offset <= kMaxWideOffset,
+                   "PageBuilder: page too large: wide offset overflow");
         meta[i] |= offset << kMetaOffsetShift;
 
         for (uint32_t base = 0; base < cc; base += kWide)
@@ -185,15 +185,15 @@ Page HLodBuilder::build(const HlodContext& ctx)
     // Payloads are opaque user data: no uniqueness or reserved-value checks.
     for (uint32_t i = 1; i < total; ++i)
     {
-        HLOD_CHECK(parent[i] < i, "HLodBuilder: (A) violated");                    // (A)
-        HLOD_CHECK(i + subtreeSize[i] <= total, "HLodBuilder: (B) violated");      // (B)
-        HLOD_CHECK(metaChildCount(meta[i]) == 0 || parent[i + 1] == i,
-                   "HLodBuilder: (B) first child not adjacent");
-        HLOD_CHECK(bbox[parent[i]].contains(bbox[i]), "HLodBuilder: (C) violated"); // (C)
-        HLOD_CHECK(geometricError[i] <= geometricError[parent[i]],
-                   "HLodBuilder: (D) violated");                                    // (D)
-        HLOD_CHECK(metaChildCount(meta[i]) == 0 || !metaIsExpansion(meta[i]),
-                   "HLodBuilder: local XOR paged children");
+        FRONTIER_CHECK(parent[i] < i, "PageBuilder: (A) violated");                    // (A)
+        FRONTIER_CHECK(i + subtreeSize[i] <= total, "PageBuilder: (B) violated");      // (B)
+        FRONTIER_CHECK(metaChildCount(meta[i]) == 0 || parent[i + 1] == i,
+                   "PageBuilder: (B) first child not adjacent");
+        FRONTIER_CHECK(bbox[parent[i]].contains(bbox[i]), "PageBuilder: (C) violated"); // (C)
+        FRONTIER_CHECK(geometricError[i] <= geometricError[parent[i]],
+                   "PageBuilder: (D) violated");                                    // (D)
+        FRONTIER_CHECK(metaChildCount(meta[i]) == 0 || !metaIsExpansion(meta[i]),
+                   "PageBuilder: local XOR paged children");
     }
 
     // ---- Pass F: pack the blob -------------------------------------------------
@@ -201,7 +201,7 @@ Page HLodBuilder::build(const HlodContext& ctx)
     const size_t   bytes = pageBlobBytes(total, wideCount);
 
     void* blob = ctx.alloc(bytes, kPageAlign, ctx.user);
-    HLOD_CHECK(blob != nullptr, "HLodBuilder: page allocation failed");
+    FRONTIER_CHECK(blob != nullptr, "PageBuilder: page allocation failed");
     std::memset(blob, 0, bytes);
 
     auto* base = static_cast<std::byte*>(blob);
@@ -245,23 +245,23 @@ Page HLodBuilder::build(const HlodContext& ctx)
 
 PageView Hierarchy::page(PageId id) const
 {
-    HLOD_CHECK(id < pages_.size(), "Hierarchy::page: invalid page id");
-    HLOD_CHECK(pages_[id].valid(), "Hierarchy::page: page was already taken");
+    FRONTIER_CHECK(id < pages_.size(), "Hierarchy::page: invalid page id");
+    FRONTIER_CHECK(pages_[id].valid(), "Hierarchy::page: page was already taken");
     return static_cast<const PageView&>(pages_[id]);
 }
 
-Page Hierarchy::clonePage(PageId id, const HlodContext& ctx) const
+Page Hierarchy::clonePage(PageId id, const FrontierContext& ctx) const
 {
-    HLOD_CHECK(id < pages_.size(), "Hierarchy::clonePage: invalid page id");
-    HLOD_CHECK(pages_[id].valid(),
+    FRONTIER_CHECK(id < pages_.size(), "Hierarchy::clonePage: invalid page id");
+    FRONTIER_CHECK(pages_[id].valid(),
                "Hierarchy::clonePage: page was already taken");
     return pages_[id].clone(ctx);
 }
 
 Page Hierarchy::takePage(PageId id)
 {
-    HLOD_CHECK(id < pages_.size(), "Hierarchy::takePage: invalid page id");
-    HLOD_CHECK(pages_[id].valid(),
+    FRONTIER_CHECK(id < pages_.size(), "Hierarchy::takePage: invalid page id");
+    FRONTIER_CHECK(pages_[id].valid(),
                "Hierarchy::takePage: page was already taken");
     return std::move(pages_[id]);
 }
@@ -274,8 +274,8 @@ HierarchyBuilder::NodeId HierarchyBuilder::createRoot(UserPayload payload,
                                                        float geometricError,
                                                        const AABB& bbox)
 {
-    HLOD_CHECK(!built_, "HierarchyBuilder: builder already consumed");
-    HLOD_CHECK(root_ == kInvalidIndex,
+    FRONTIER_CHECK(!built_, "HierarchyBuilder: builder already consumed");
+    FRONTIER_CHECK(root_ == kInvalidIndex,
                "HierarchyBuilder: a hierarchy has exactly one root");
     BuildNode node;
     node.bbox = bbox;
@@ -291,8 +291,8 @@ HierarchyBuilder::NodeId HierarchyBuilder::createNode(NodeId parent,
                                                        float geometricError,
                                                        const AABB& bbox)
 {
-    HLOD_CHECK(!built_, "HierarchyBuilder: builder already consumed");
-    HLOD_CHECK(parent < nodes_.size(), "HierarchyBuilder: invalid parent");
+    FRONTIER_CHECK(!built_, "HierarchyBuilder: builder already consumed");
+    FRONTIER_CHECK(parent < nodes_.size(), "HierarchyBuilder: invalid parent");
     BuildNode node;
     node.bbox = bbox;
     node.geometricError = geometricError;
@@ -301,23 +301,23 @@ HierarchyBuilder::NodeId HierarchyBuilder::createNode(NodeId parent,
     nodes_.push_back(node);
     const NodeId id = NodeId(nodes_.size() - 1);
     nodes_[parent].children.push_back(id);
-    HLOD_CHECK(nodes_[parent].children.size() <= kMaxChildren,
+    FRONTIER_CHECK(nodes_[parent].children.size() <= kMaxChildren,
                "HierarchyBuilder: fanout exceeds kMaxChildren");
     return id;
 }
 
 void HierarchyBuilder::splitBelow(NodeId node)
 {
-    HLOD_CHECK(!built_, "HierarchyBuilder: builder already consumed");
-    HLOD_CHECK(node < nodes_.size(), "HierarchyBuilder: invalid node");
+    FRONTIER_CHECK(!built_, "HierarchyBuilder: builder already consumed");
+    FRONTIER_CHECK(node < nodes_.size(), "HierarchyBuilder: invalid node");
     nodes_[node].splitBelow = true;
 }
 
-Hierarchy HierarchyBuilder::build(const HlodContext& ctx)
+Hierarchy HierarchyBuilder::build(const FrontierContext& ctx)
 {
-    HLOD_CHECK(!built_, "HierarchyBuilder: builder already consumed");
+    FRONTIER_CHECK(!built_, "HierarchyBuilder: builder already consumed");
     built_ = true;
-    HLOD_CHECK(root_ != kInvalidIndex, "HierarchyBuilder: hierarchy has no root");
+    FRONTIER_CHECK(root_ != kInvalidIndex, "HierarchyBuilder: hierarchy has no root");
 
     // Establish bounds over the complete logical tree before cutting it into
     // pages. A split node therefore keeps bounds for every descendant even
@@ -327,15 +327,15 @@ Hierarchy HierarchyBuilder::build(const HlodContext& ctx)
         BuildNode& node = nodes_[i];
         for (NodeId child : node.children)
             node.bbox.expand(nodes_[child].bbox);
-        HLOD_CHECK(!node.bbox.isEmpty(),
+        FRONTIER_CHECK(!node.bbox.isEmpty(),
                    "HierarchyBuilder: leaf node without bounds");
-        HLOD_CHECK(!node.splitBelow || !node.children.empty(),
+        FRONTIER_CHECK(!node.splitBelow || !node.children.empty(),
                    "HierarchyBuilder: cannot split below a leaf");
     }
 
     // Parent nodes are always created before their children, so one forward
     // pass establishes the same monotone-error contract across page boundaries
-    // that HLodBuilder establishes inside one physical page.
+    // that PageBuilder establishes inside one physical page.
     for (NodeId i = 0; i < nodes_.size(); ++i)
     {
         const NodeId parent = nodes_[i].parent;
@@ -354,7 +354,7 @@ Hierarchy HierarchyBuilder::build(const HlodContext& ctx)
 
     const auto reservePage = [&]()
     {
-        HLOD_CHECK(hierarchy.pages_.size() <= kMaxWideOffset,
+        FRONTIER_CHECK(hierarchy.pages_.size() <= kMaxWideOffset,
                    "HierarchyBuilder: too many logical pages");
         const Hierarchy::PageId pageId =
             Hierarchy::PageId(hierarchy.pages_.size());
@@ -366,14 +366,14 @@ Hierarchy HierarchyBuilder::build(const HlodContext& ctx)
     buildReservedPage = [&](Hierarchy::PageId pageId, NodeId logicalRoot,
                             bool includeLogicalRoot)
     {
-        HLodBuilder pageBuilder;
+        PageBuilder pageBuilder;
         std::vector<PendingDetail> pending;
 
         const auto emitNode = [&](auto&& self, NodeId source, bool isRoot,
-                                  HLodBuilder::NodeId physicalParent) -> void
+                                  PageBuilder::NodeId physicalParent) -> void
         {
             const BuildNode& sourceNode = nodes_[source];
-            const HLodBuilder::NodeId physical =
+            const PageBuilder::NodeId physical =
                 isRoot ? pageBuilder.createRoot(sourceNode.payload,
                                                 sourceNode.geometricError,
                                                 sourceNode.bbox)
@@ -412,11 +412,11 @@ Hierarchy HierarchyBuilder::build(const HlodContext& ctx)
     };
 
     const Hierarchy::PageId rootPage = reservePage();
-    HLOD_CHECK(rootPage == 0,
+    FRONTIER_CHECK(rootPage == 0,
                "HierarchyBuilder: internal root-page ordering failure");
     buildReservedPage(rootPage, root_, true);
 
     return hierarchy;
 }
 
-} // namespace hlod
+} // namespace frontier

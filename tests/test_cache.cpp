@@ -1,7 +1,7 @@
-// View: temporal reuse must be invisible.
+// SpatialQuery: temporal reuse must be invisible.
 //
 // The whole value of the cache rests on one claim -- that the set of nodes it
-// hands back is exactly the set an uncached selectCut would have produced --
+// hands back is exactly the set an uncached selectFrontier would have produced --
 // so that claim is what these tests attack, frame after frame, while the
 // camera moves and the world churns underneath. The quantized error code is
 // deliberately not compared: it is the recorded value, stale within the
@@ -18,7 +18,7 @@
 
 #include "helpers.h"
 
-using namespace hlodtest;
+using namespace frontiertest;
 
 namespace {
 
@@ -26,13 +26,13 @@ namespace {
 // cached error and emission order are dropped.
 using Keys = std::vector<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t>>;
 
-Keys keysOf(const CutView& cut)
+Keys keysOf(const FrontierResultView& cut)
 {
     Keys k;
     k.reserve(cut.size());
     const auto append = [&](const auto& entries, uint32_t bucket)
     {
-        for (const CutEntry& e : entries)
+        for (const FrontierEntry& e : entries)
             k.push_back({bucket, e.instance(), e.nodeHandle.lo, e.nodeHandle.hi});
     };
     append(cut.shared, 0);
@@ -54,16 +54,16 @@ Camera viewAt(float4 pos)
 struct Scene
 {
     TreeGen                       gen;
-    std::unique_ptr<World>        world;
+    std::unique_ptr<SpatialDatabase>        world;
     AssetHandle                   asset;
-    std::vector<World::InstanceRef> inst;
+    std::vector<SpatialDatabase::InstanceRef> inst;
 
     explicit Scene(uint32_t side = 6, uint32_t depth = 3, uint32_t fanout = 4,
-                   const WorldConfig& config = WorldConfig{})
+                   const SpatialDatabaseConfig& config = SpatialDatabaseConfig{})
     {
         gen.fanout = fanout;
         gen.depth = depth;
-        world = std::make_unique<World>(config);
+        world = std::make_unique<SpatialDatabase>(config);
         Page p = gen.makeRootPage(unitRegion(60.0f), 512.0f, 0);
         const uint32_t nodes = p.nodeCount();
         asset = world->registerAsset(std::move(p));
@@ -88,9 +88,9 @@ struct Scene
 TEST(Cache, MatchesUncachedOnMovingCamera)
 {
     Scene sc;
-    View cache;
-    CutResults cut;
-    CutParams p{6.0f, 0.0f};
+    SpatialQuery cache;
+    FrontierResult cut;
+    SelectionParams p{6.0f, 0.0f};
     uint32_t totalReused = 0;
 
     for (int f = 0; f < 120; ++f)
@@ -98,9 +98,9 @@ TEST(Cache, MatchesUncachedOnMovingCamera)
         // Continuous motion, no teleports: a few units of drift per frame.
         const Camera v = viewAt(float4::vec(float(f) * 1.5f, float(f) * 0.4f,
                                              float(f) * 6.0f));
-        CutResults ref;
-        selectCutUncached(*sc.world, v, p, ref);
-        cache.selectCut(*sc.world, v, p, cut);
+        FrontierResult ref;
+        selectFrontierUncached(*sc.world, v, p, ref);
+        cache.selectFrontier(*sc.world, v, p, cut);
         ASSERT_EQ(keysOf(cut), keysOf(ref)) << "frame " << f;
         ASSERT_EQ(cut.size(), ref.size()) << "frame " << f;
         totalReused += cache.reused();
@@ -113,16 +113,16 @@ TEST(Cache, MatchesUncachedOnMovingCamera)
 TEST(Cache, StationaryCameraReusesAlmostEverything)
 {
     Scene sc;
-    View cache;
-    CutResults cut;
-    CutParams p{6.0f, 0.0f};
+    SpatialQuery cache;
+    FrontierResult cut;
+    SelectionParams p{6.0f, 0.0f};
     const Camera v = viewAt(float4::vec(0, 0, 0));
 
-    cache.selectCut(*sc.world, v, p, cut);          // cold: records everything
+    cache.selectFrontier(*sc.world, v, p, cut);          // cold: records everything
     const uint32_t visible = cache.reused() + cache.walked();
     ASSERT_GT(visible, 10u);
 
-    cache.selectCut(*sc.world, v, p, cut);          // warm: nothing changed at all
+    cache.selectFrontier(*sc.world, v, p, cut);          // warm: nothing changed at all
     EXPECT_EQ(cache.walked(), 0u);
     EXPECT_EQ(cache.reused(), visible);
 }
@@ -131,23 +131,23 @@ TEST(Cache, StationaryCameraReusesAlmostEverything)
 TEST(Cache, InstanceMotionInvalidatesOnlyThatInstance)
 {
     Scene sc;
-    View cache;
-    CutResults cut;
-    CutParams p{6.0f, 0.0f};
+    SpatialQuery cache;
+    FrontierResult cut;
+    SelectionParams p{6.0f, 0.0f};
     const Camera v = viewAt(float4::vec(0, 0, 0));
 
-    cache.selectCut(*sc.world, v, p, cut);
-    cache.selectCut(*sc.world, v, p, cut);
+    cache.selectFrontier(*sc.world, v, p, cut);
+    cache.selectFrontier(*sc.world, v, p, cut);
     ASSERT_EQ(cache.walked(), 0u);
 
     const AABB before = TAX::instanceWorldBox(*sc.world, sc.inst[3]);
     sc.world->moveInstance(sc.inst[3], before.mn + float4::vec(0, 0, 40.0f));
-    cache.selectCut(*sc.world, v, p, cut);
+    cache.selectFrontier(*sc.world, v, p, cut);
     EXPECT_EQ(cache.walked(), 1u);
 
-    CutResults ref;
-    selectCutUncached(*sc.world, v, p, ref);
-    cache.selectCut(*sc.world, v, p, cut);
+    FrontierResult ref;
+    selectFrontierUncached(*sc.world, v, p, ref);
+    cache.selectFrontier(*sc.world, v, p, cut);
     EXPECT_EQ(keysOf(cut), keysOf(ref));
 }
 
@@ -156,13 +156,13 @@ TEST(Cache, InstanceMotionInvalidatesOnlyThatInstance)
 TEST(Cache, DeformInvalidatesOnlyThatInstance)
 {
     Scene sc;
-    View cache;
-    CutResults cut;
-    CutParams p{6.0f, 0.0f};
+    SpatialQuery cache;
+    FrontierResult cut;
+    SelectionParams p{6.0f, 0.0f};
     const Camera v = viewAt(float4::vec(0, 0, 0));
 
-    cache.selectCut(*sc.world, v, p, cut);
-    cache.selectCut(*sc.world, v, p, cut);
+    cache.selectFrontier(*sc.world, v, p, cut);
+    cache.selectFrontier(*sc.world, v, p, cut);
     ASSERT_EQ(cache.walked(), 0u);
 
     const UserPayload leaf = sc.gen.lastIds.back();
@@ -172,12 +172,12 @@ TEST(Cache, DeformInvalidatesOnlyThatInstance)
     sc.world->setNodeBounds(sc.inst[5], h, b);
     sc.world->applyUpdates();
 
-    cache.selectCut(*sc.world, v, p, cut);
+    cache.selectFrontier(*sc.world, v, p, cut);
     EXPECT_EQ(cache.walked(), 1u);
 
-    CutResults ref;
-    selectCutUncached(*sc.world, v, p, ref);
-    cache.selectCut(*sc.world, v, p, cut);
+    FrontierResult ref;
+    selectFrontierUncached(*sc.world, v, p, ref);
+    cache.selectFrontier(*sc.world, v, p, cut);
     EXPECT_EQ(keysOf(cut), keysOf(ref));
 }
 
@@ -186,23 +186,23 @@ TEST(Cache, DeformInvalidatesOnlyThatInstance)
 TEST(Cache, SharedPageChangeInvalidatesEveryInstanceOfIt)
 {
     Scene sc;
-    View cache;
-    CutResults cut;
-    CutParams p{6.0f, 0.0f};
+    SpatialQuery cache;
+    FrontierResult cut;
+    SelectionParams p{6.0f, 0.0f};
     const Camera v = viewAt(float4::vec(0, 0, 0));
 
-    cache.selectCut(*sc.world, v, p, cut);
-    cache.selectCut(*sc.world, v, p, cut);
+    cache.selectFrontier(*sc.world, v, p, cut);
+    cache.selectFrontier(*sc.world, v, p, cut);
     ASSERT_EQ(cache.walked(), 0u);
     const uint32_t visible = cache.reused();
 
     markNonResident(*sc.world, sc.gen.lastIds.back());
-    cache.selectCut(*sc.world, v, p, cut);
+    cache.selectFrontier(*sc.world, v, p, cut);
     EXPECT_EQ(cache.walked(), visible) << "one shared page changed; all of them stale";
 
-    CutResults ref;
-    selectCutUncached(*sc.world, v, p, ref);
-    cache.selectCut(*sc.world, v, p, cut);
+    FrontierResult ref;
+    selectFrontierUncached(*sc.world, v, p, ref);
+    cache.selectFrontier(*sc.world, v, p, cut);
     EXPECT_EQ(keysOf(cut), keysOf(ref));
 }
 
@@ -210,17 +210,17 @@ TEST(Cache, SharedPageChangeInvalidatesEveryInstanceOfIt)
 // odometer has to bound the movement of the whole envelope rather than of the
 // eye. Jitter is the case that would expose a bound that only tracked position.
 //
-// The View damps internally, so the reference arm drives an external
+// The SpatialQuery damps internally, so the reference arm drives an external
 // CameraDamper with the same half-life over the same raw views. Equal node sets
 // therefore assert two things at once: that reuse is invisible, and that the
 // contained damper is the same mechanism the caller could have run by hand.
 TEST(Cache, MatchesUncachedUnderDamping)
 {
     Scene sc;
-    View cache(6.0f);
-    CutResults cut;
+    SpatialQuery cache(6.0f);
+    FrontierResult cut;
     CameraDamper refDamper(6.0f);
-    CutParams p{6.0f, 0.0f};
+    SelectionParams p{6.0f, 0.0f};
     DeterministicRng rng(99);
     DeterministicUniformFloat jit(-2.0f, 2.0f);
 
@@ -235,52 +235,52 @@ TEST(Cache, MatchesUncachedUnderDamping)
         // time as camera and damping-envelope travel.
         raw.k *= 0.75f + 0.2f * std::sin(float(f) * 0.13f);
 
-        CutResults ref;
-        selectCutUncached(*sc.world, refDamper.damp(raw), p, ref);
-        cache.selectCut(*sc.world, raw, p, cut);
+        FrontierResult ref;
+        selectFrontierUncached(*sc.world, refDamper.damp(raw), p, ref);
+        cache.selectFrontier(*sc.world, raw, p, cut);
         ASSERT_EQ(keysOf(cut), keysOf(ref)) << "frame " << f;
     }
 }
 
-// Damping off must stay exactly damping off: a default-constructed View has
+// Damping off must stay exactly damping off: a default-constructed SpatialQuery has
 // to leave the view alone, or every other test in this file is comparing
 // against the wrong reference.
 TEST(Cache, UndampedByDefault)
 {
     Scene sc;
-    View cache;
-    CutResults cut;
-    CutParams p{6.0f, 0.0f};
+    SpatialQuery cache;
+    FrontierResult cut;
+    SelectionParams p{6.0f, 0.0f};
     EXPECT_EQ(cache.halfLife(), 0.0f);
 
     for (int f = 0; f < 8; ++f)
     {
         const Camera raw = viewAt(float4::vec(float(f) * 40.0f, 0.0f, float(f) * 90.0f));
-        CutResults ref;
-        selectCutUncached(*sc.world, raw, p, ref);
-        cache.selectCut(*sc.world, raw, p, cut);
+        FrontierResult ref;
+        selectFrontierUncached(*sc.world, raw, p, ref);
+        cache.selectFrontier(*sc.world, raw, p, cut);
         ASSERT_EQ(keysOf(cut), keysOf(ref)) << "frame " << f;
     }
 }
 
 // reset() has to clear the damping window too, not just the records: that is
 // the half of it that is required rather than merely tidy. After a teleport +
-// reset the envelope must be a point again, which is what an undamped View
+// reset the envelope must be a point again, which is what an undamped SpatialQuery
 // fed the same view produces.
 TEST(Cache, ResetClearsTheDampingWindow)
 {
     Scene sc;
-    View damped(8.0f), fresh;
-    CutResults dampedCut, freshCut;
-    CutParams p{6.0f, 0.0f};
+    SpatialQuery damped(8.0f), fresh;
+    FrontierResult dampedCut, freshCut;
+    SelectionParams p{6.0f, 0.0f};
 
     for (int f = 0; f < 12; ++f)
-        damped.selectCut(*sc.world, viewAt(float4::vec(0.0f, 0.0f, float(f) * -120.0f)), p, dampedCut);
+        damped.selectFrontier(*sc.world, viewAt(float4::vec(0.0f, 0.0f, float(f) * -120.0f)), p, dampedCut);
 
     const Camera jumped = viewAt(float4::vec(0, 0, 2600.0f));
     damped.reset();
-    damped.selectCut(*sc.world, jumped, p, dampedCut);
-    fresh.selectCut(*sc.world, jumped, p, freshCut);
+    damped.selectFrontier(*sc.world, jumped, p, dampedCut);
+    fresh.selectFrontier(*sc.world, jumped, p, freshCut);
 
     // A stale envelope would still reach back down the flight path and refine
     // nodes the point query does not.
@@ -296,18 +296,18 @@ TEST(Cache, ResetClearsTheDampingWindow)
 TEST(Cache, TeleportRewalksAndStaysCorrect)
 {
     Scene sc;
-    View cache;
-    CutResults cut;
-    CutParams p{6.0f, 0.0f};
+    SpatialQuery cache;
+    FrontierResult cut;
+    SelectionParams p{6.0f, 0.0f};
 
-    cache.selectCut(*sc.world, viewAt(float4::vec(0, 0, 0)), p, cut);
-    cache.selectCut(*sc.world, viewAt(float4::vec(0, 0, 0)), p, cut);
+    cache.selectFrontier(*sc.world, viewAt(float4::vec(0, 0, 0)), p, cut);
+    cache.selectFrontier(*sc.world, viewAt(float4::vec(0, 0, 0)), p, cut);
     ASSERT_EQ(cache.walked(), 0u);
 
     const Camera jumped = viewAt(float4::vec(0, 0, 2400.0f));
-    CutResults ref;
-    selectCutUncached(*sc.world, jumped, p, ref);
-    cache.selectCut(*sc.world, jumped, p, cut);
+    FrontierResult ref;
+    selectFrontierUncached(*sc.world, jumped, p, ref);
+    cache.selectFrontier(*sc.world, jumped, p, cut);
     EXPECT_GT(cache.walked(), cache.reused());
     EXPECT_EQ(keysOf(cut), keysOf(ref));
 }
@@ -315,23 +315,23 @@ TEST(Cache, TeleportRewalksAndStaysCorrect)
 // Two cameras, two caches, on the same world in the same frame: neither may
 // see the other's state, and each must match its own uncached answer. This is
 // the reason the cache is a separate object.
-TEST(Cache, MultipleViewsDoNotInterfere)
+TEST(Cache, MultipleSpatialQueriesDoNotInterfere)
 {
     Scene sc;
-    View main, shadow;
-    CutResults mainCut, shadowCut;
-    CutParams pm{6.0f, 0.0f}, ps{24.0f, 0.0f};
+    SpatialQuery main, shadow;
+    FrontierResult mainCut, shadowCut;
+    SelectionParams pm{6.0f, 0.0f}, ps{24.0f, 0.0f};
 
     for (int f = 0; f < 40; ++f)
     {
         const Camera vm = viewAt(float4::vec(float(f) * 2.0f, 0, float(f) * 5.0f));
         const Camera vs = viewAt(float4::vec(-float(f) * 3.0f, 120.0f, float(f) * 2.0f));
 
-        CutResults rm, rs;
-        selectCutUncached(*sc.world, vm, pm, rm);
-        selectCutUncached(*sc.world, vs, ps, rs);
-        main.selectCut(*sc.world, vm, pm, mainCut);
-        shadow.selectCut(*sc.world, vs, ps, shadowCut);
+        FrontierResult rm, rs;
+        selectFrontierUncached(*sc.world, vm, pm, rm);
+        selectFrontierUncached(*sc.world, vs, ps, rs);
+        main.selectFrontier(*sc.world, vm, pm, mainCut);
+        shadow.selectFrontier(*sc.world, vs, ps, shadowCut);
 
         ASSERT_EQ(keysOf(mainCut), keysOf(rm)) << "main, frame " << f;
         ASSERT_EQ(keysOf(shadowCut), keysOf(rs)) << "shadow, frame " << f;
@@ -343,20 +343,20 @@ TEST(Cache, MultipleViewsDoNotInterfere)
 TEST(Cache, ThresholdChangesInvalidate)
 {
     Scene sc;
-    View cache;
-    CutResults cut;
+    SpatialQuery cache;
+    FrontierResult cut;
     const Camera v = viewAt(float4::vec(0, 0, 0));
 
-    cache.selectCut(*sc.world, v, CutParams{6.0f, 0.0f}, cut);
-    cache.selectCut(*sc.world, v, CutParams{6.0f, 0.0f}, cut);
+    cache.selectFrontier(*sc.world, v, SelectionParams{6.0f, 0.0f}, cut);
+    cache.selectFrontier(*sc.world, v, SelectionParams{6.0f, 0.0f}, cut);
     ASSERT_EQ(cache.walked(), 0u);
 
-    cache.selectCut(*sc.world, v, CutParams{3.0f, 0.0f}, cut);
+    cache.selectFrontier(*sc.world, v, SelectionParams{3.0f, 0.0f}, cut);
     EXPECT_EQ(cache.reused(), 0u);
 
-    CutResults ref;
-    selectCutUncached(*sc.world, v, CutParams{3.0f, 0.0f}, ref);
-    cache.selectCut(*sc.world, v, CutParams{3.0f, 0.0f}, cut);
+    FrontierResult ref;
+    selectFrontierUncached(*sc.world, v, SelectionParams{3.0f, 0.0f}, ref);
+    cache.selectFrontier(*sc.world, v, SelectionParams{3.0f, 0.0f}, cut);
     EXPECT_EQ(keysOf(cut), keysOf(ref));
 }
 
@@ -368,36 +368,36 @@ TEST(Cache, SurvivesStreamingAndInstanceChurn)
     TreeGen gen;
     gen.fanout = 4;
     gen.depth = 2;
-    World world;
+    SpatialDatabase world;
     Page root = gen.makeRootPage(unitRegion(80.0f), 400.0f, 1);
     std::vector<UserId> rootIds = gen.lastIds;
     const AssetHandle asset = world.registerAsset(std::move(root));
 
-    std::vector<World::InstanceRef> inst;
+    std::vector<SpatialDatabase::InstanceRef> inst;
     for (uint32_t i = 0; i < 24; ++i)
         inst.push_back(world.addInstance(
             asset, float4::vec(float(i % 6) * 250.0f - 750.0f,
                                float(i / 6) * 250.0f - 400.0f, 1800.0f)));
     markAllResident(world, rootIds);
 
-    View cache;
-    CutResults cut;
-    CutParams p{5.0f, 0.0f};
+    SpatialQuery cache;
+    FrontierResult cut;
+    SelectionParams p{5.0f, 0.0f};
     uint32_t reused = 0, attached = 0;
 
     for (int f = 0; f < 60; ++f)
     {
         const Camera v = viewAt(float4::vec(float(f) * 2.0f, float(f), float(f) * 8.0f));
 
-        CutResults ref;
-        selectCutUncached(world, v, p, ref);
+        FrontierResult ref;
+        selectFrontierUncached(world, v, p, ref);
 
-        cache.selectCut(world, v, p, cut);
+        cache.selectFrontier(world, v, p, cut);
         ASSERT_EQ(keysOf(cut), keysOf(ref)) << "frame " << f;
         reused += cache.reused();
 
         // Act on streaming the way a real frame would.
-        for (const CutEntry& entry : idealCut(cut))
+        for (const FrontierEntry& entry : idealFrontier(cut))
         {
             const UserId id = payloadOf(world, entry);
             const bool expandable = entry.overThreshold() &&
@@ -407,7 +407,7 @@ TEST(Cache, SurvivesStreamingAndInstanceChurn)
                 world.markResident(entry.nodeHandle);
         }
         if (f % 4 == 0)
-            for (const CutEntry& e : idealCut(cut))
+            for (const FrontierEntry& e : idealFrontier(cut))
                 if (e.overThreshold() && attached < 8)
                 {
                     const UserId id = payloadOf(world, e);
@@ -440,29 +440,29 @@ TEST(Cache, SurvivesStreamingAndInstanceChurn)
 
 TEST(Cache, SurvivesFullTlasRebuild)
 {
-    WorldConfig config;
+    SpatialDatabaseConfig config;
     config.tlasEscapeFraction = 0.0f;
     Scene sc(8, 3, 4, config);
-    View cache;
-    CutResults cut;
+    SpatialQuery cache;
+    FrontierResult cut;
     const Camera v = viewAt(float4::vec(0, 0, 0));
-    const CutParams p{6.0f, 0.0f};
+    const SelectionParams p{6.0f, 0.0f};
 
-    cache.selectCut(*sc.world, v, p, cut);
-    cache.selectCut(*sc.world, v, p, cut);
+    cache.selectFrontier(*sc.world, v, p, cut);
+    cache.selectFrontier(*sc.world, v, p, cut);
     ASSERT_GT(cache.reused(), 0u);
     const uint32_t initialLayout = TAX::instanceLayoutVersion(*sc.world);
 
     // Escaping the exact lane with a zero budget forces a Morton rebuild. A
-    // routine rebuild must leave dense positions and warm View records alone.
+    // routine rebuild must leave dense positions and warm SpatialQuery records alone.
     const uint32_t center = 4u * 8u + 4u;
     sc.world->moveInstance(sc.inst[center], float4::point(10.0f, 0.0f, 3300.0f));
     sc.world->applyUpdates();
     EXPECT_EQ(TAX::instanceLayoutVersion(*sc.world), initialLayout);
 
-    CutResults ref;
-    selectCutUncached(*sc.world, v, p, ref);
-    cache.selectCut(*sc.world, v, p, cut);
+    FrontierResult ref;
+    selectFrontierUncached(*sc.world, v, p, ref);
+    cache.selectFrontier(*sc.world, v, p, cut);
     EXPECT_EQ(keysOf(cut), keysOf(ref));
     EXPECT_GT(cache.reused(), 0u);
 
@@ -471,50 +471,50 @@ TEST(Cache, SurvivesFullTlasRebuild)
     // record indexing while public InstanceRefs remain usable.
     sc.world->optimize();
     EXPECT_NE(TAX::instanceLayoutVersion(*sc.world), initialLayout);
-    selectCutUncached(*sc.world, v, p, ref);
-    cache.selectCut(*sc.world, v, p, cut);
+    selectFrontierUncached(*sc.world, v, p, ref);
+    cache.selectFrontier(*sc.world, v, p, cut);
     EXPECT_EQ(keysOf(cut), keysOf(ref));
     EXPECT_EQ(cache.reused(), 0u);
 
-    cache.selectCut(*sc.world, v, p, cut);
+    cache.selectFrontier(*sc.world, v, p, cut);
     EXPECT_GT(cache.reused(), 0u);
 
     const uint32_t optimizedLayout = TAX::instanceLayoutVersion(*sc.world);
     sc.world->moveInstance(sc.inst[center], float4::point(20.0f, 0.0f, 3300.0f));
     sc.world->applyUpdates();
     EXPECT_EQ(TAX::instanceLayoutVersion(*sc.world), optimizedLayout);
-    selectCutUncached(*sc.world, v, p, ref);
-    cache.selectCut(*sc.world, v, p, cut);
+    selectFrontierUncached(*sc.world, v, p, ref);
+    cache.selectFrontier(*sc.world, v, p, cut);
     EXPECT_EQ(keysOf(cut), keysOf(ref));
 }
 
 // Residency feedback is optional: a view that does not influence collection
-// pays no PageUsageContext storage and still gets normal cut reuse.
+// pays no PageUsageContext storage and still gets normal frontier reuse.
 TEST(Cache, ReuseDoesNotRequirePageUsage)
 {
     Scene sc;
-    View cache;
-    CutResults cut;
-    CutParams p{6.0f, 0.0f};
+    SpatialQuery cache;
+    FrontierResult cut;
+    SelectionParams p{6.0f, 0.0f};
     const Camera v = viewAt(float4::vec(0, 0, 0));
 
-    cache.selectCut(*sc.world, v, p, cut);
+    cache.selectFrontier(*sc.world, v, p, cut);
     sc.world->applyUpdates();
-    cache.selectCut(*sc.world, v, p, cut);
+    cache.selectFrontier(*sc.world, v, p, cut);
     ASSERT_EQ(cache.walked(), 0u);
 }
 
-TEST(Cache, SixViewsSelectConcurrentlyFromOnePublishedWorld)
+TEST(Cache, SixQueriesSelectConcurrentlyFromOnePublishedDatabase)
 {
     constexpr size_t kViews = 6;
     Scene sc(20);
-    const World& published = *sc.world;
-    const CutParams params{6.0f, 0.0f};
+    const SpatialDatabase& published = *sc.world;
+    const SelectionParams params{6.0f, 0.0f};
 
-    std::array<View, kViews> serialCtx;
-    std::array<View, kViews> parallelCtx;
-    std::array<CutResults, kViews> serialCut;
-    std::array<CutResults, kViews> parallelCut;
+    std::array<SpatialQuery, kViews> serialCtx;
+    std::array<SpatialQuery, kViews> parallelCtx;
+    std::array<FrontierResult, kViews> serialCut;
+    std::array<FrontierResult, kViews> parallelCut;
 
     for (int frame = 0; frame < 12; ++frame)
     {
@@ -531,7 +531,7 @@ TEST(Cache, SixViewsSelectConcurrentlyFromOnePublishedWorld)
                                           float(v) * 8.0f, float(frame) * 4.0f));
 
         for (size_t v = 0; v < kViews; ++v)
-            serialCtx[v].selectCut(published, views[v], params, serialCut[v]);
+            serialCtx[v].selectFrontier(published, views[v], params, serialCut[v]);
 
         std::barrier<> start(static_cast<std::ptrdiff_t>(kViews + 1));
         std::array<std::exception_ptr, kViews> errors{};
@@ -542,7 +542,7 @@ TEST(Cache, SixViewsSelectConcurrentlyFromOnePublishedWorld)
                 start.arrive_and_wait();
                 try
                 {
-                    parallelCtx[v].selectCut(published, views[v], params,
+                    parallelCtx[v].selectFrontier(published, views[v], params,
                                         parallelCut[v]);
                 }
                 catch (...)
@@ -564,7 +564,7 @@ TEST(Cache, SixViewsSelectConcurrentlyFromOnePublishedWorld)
     }
 }
 
-TEST(Cache, ConcurrentViewsClassifyBucketedCutsIndependently)
+TEST(Cache, ConcurrentQueriesClassifyBucketedFrontiersIndependently)
 {
     constexpr size_t kViews = 6;
     TreeGen gen;
@@ -572,30 +572,30 @@ TEST(Cache, ConcurrentViewsClassifyBucketedCutsIndependently)
     gen.depth = 3;
     Page page = gen.makeRootPage(unitRegion(40.0f), 128.0f, 0);
 
-    World world;
+    SpatialDatabase world;
     const AssetHandle asset = world.registerAsset(std::move(page));
     for (uint32_t i = 0; i < 256; ++i)
         world.addInstance(asset,
                           float4::point(float(i % 16) * 20.0f - 150.0f, 0.0f,
                                         float(i / 16) * 20.0f + 1000.0f));
     world.applyUpdates();
-    const World& published = world;
+    const SpatialDatabase& published = world;
 
-    const CutParams params{0.25f, 0.0f};
+    const SelectionParams params{0.25f, 0.0f};
     std::array<Camera, kViews> views;
-    std::array<CutResults, kViews> serialCut, parallelCut;
-    std::array<View, kViews> contexts;
+    std::array<FrontierResult, kViews> serialCut, parallelCut;
+    std::array<SpatialQuery, kViews> contexts;
     for (size_t v = 0; v < kViews; ++v)
     {
         views[v] = viewAt(float4::vec((float(v) - 2.5f) * 10.0f, 0.0f, 0.0f));
-        selectCutUncached(world, views[v], params, serialCut[v]);
+        selectFrontierUncached(world, views[v], params, serialCut[v]);
     }
 
     std::array<std::thread, kViews> threads;
     for (size_t v = 0; v < kViews; ++v)
         threads[v] = std::thread([&, v]
         {
-            contexts[v].selectCut(published, views[v], params, parallelCut[v]);
+            contexts[v].selectFrontier(published, views[v], params, parallelCut[v]);
         });
     for (std::thread& thread : threads) thread.join();
 
@@ -608,13 +608,13 @@ TEST(Cache, ConcurrentViewsClassifyBucketedCutsIndependently)
 TEST(Cache, ResetForgetsEverythingAndStaysCorrect)
 {
     Scene sc;
-    View cache;
-    CutResults cut;
-    CutParams p{6.0f, 0.0f};
+    SpatialQuery cache;
+    FrontierResult cut;
+    SelectionParams p{6.0f, 0.0f};
     const Camera v = viewAt(float4::vec(0, 0, 0));
 
-    cache.selectCut(*sc.world, v, p, cut);
-    cache.selectCut(*sc.world, v, p, cut);
+    cache.selectFrontier(*sc.world, v, p, cut);
+    cache.selectFrontier(*sc.world, v, p, cut);
     ASSERT_EQ(cache.walked(), 0u);
 
     const size_t allocated = cache.bytes();
@@ -623,11 +623,11 @@ TEST(Cache, ResetForgetsEverythingAndStaysCorrect)
     EXPECT_EQ(cache.bytes(), allocated);   // forget state, retain reusable storage
     EXPECT_EQ(cache.reused(), 0u);
     EXPECT_EQ(cache.walked(), 0u);
-    EXPECT_EQ(cache.lastCutStats().instancesVisited, 0u);
+    EXPECT_EQ(cache.lastSelectionStats().instancesVisited, 0u);
 
-    CutResults ref;
-    selectCutUncached(*sc.world, v, p, ref);
-    cache.selectCut(*sc.world, v, p, cut);
+    FrontierResult ref;
+    selectFrontierUncached(*sc.world, v, p, ref);
+    cache.selectFrontier(*sc.world, v, p, cut);
     EXPECT_EQ(cache.reused(), 0u);
     EXPECT_EQ(keysOf(cut), keysOf(ref));
 }

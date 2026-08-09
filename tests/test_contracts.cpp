@@ -12,41 +12,41 @@
 // determinism, multi-view damper isolation, instance-slot reuse (ABA),
 // geometric edge cases, and memory budgets.
 
-using namespace hlod;
-using namespace hlodtest;
-using TA = World::TestAccess;
+using namespace frontier;
+using namespace frontiertest;
+using TA = SpatialDatabase::TestAccess;
 
 namespace {
 
 struct Outputs
 {
-    CutResults cut;
+    FrontierResult cut;
 };
 
-Outputs run(World& w, const Camera& v, const CutParams& p)
+Outputs run(SpatialDatabase& w, const Camera& v, const SelectionParams& p)
 {
     Outputs o;
-    selectCutUncached(w, v, p, o.cut);
+    selectFrontierUncached(w, v, p, o.cut);
     return o;
 }
 
-std::set<UserId> cutIds(World& world, const CutView& cut)
+std::set<UserId> frontierIds(SpatialDatabase& world, const FrontierResultView& cut)
 {
     std::set<UserId> s;
-    for (const auto& e : currentCut(cut)) s.insert(payloadOf(world, e));
+    for (const auto& e : currentFrontier(cut)) s.insert(payloadOf(world, e));
     return s;
 }
 
 using ResultKey = std::tuple<uint32_t, UserPayload, uint8_t, InstanceId,
                              uint32_t, uint32_t>;
 
-std::vector<ResultKey> resultKeys(World& world, const CutView& cut)
+std::vector<ResultKey> resultKeys(SpatialDatabase& world, const FrontierResultView& cut)
 {
     std::vector<ResultKey> keys;
     keys.reserve(cut.size());
     const auto append = [&](const auto& entries, uint32_t bucket)
     {
-        for (const CutEntry& e : entries)
+        for (const FrontierEntry& e : entries)
             keys.emplace_back(bucket, payloadOf(world, e), e.errorCode(),
                               e.instance(), e.nodeHandle.lo, e.nodeHandle.hi);
     };
@@ -58,10 +58,10 @@ std::vector<ResultKey> resultKeys(World& world, const CutView& cut)
 
 // Deterministic random world: several instances of a paged tree, a couple of
 // rounds of expansion attaches, partial residency. Given the same seed it
-// reproduces the exact same World (same slots, same pages, same residency).
+// reproduces the exact same SpatialDatabase (same slots, same pages, same residency).
 struct RandomWorld
 {
-    World w;
+    SpatialDatabase w;
     std::vector<UserId> allIds;
 
     explicit RandomWorld(uint32_t seed)
@@ -122,12 +122,12 @@ Camera randomView(DeterministicRng& rng)
 
 // ---------------------------------------------------------------------------
 // Structural invariants that must hold for ANY world and ANY camera:
-//   - the current cut is an antichain (no entry is an ancestor of another)
+//   - the current frontier is an antichain (no entry is an ancestor of another)
 //     and every entry is resident;
-//   - the ideal cut is an antichain;
+//   - the ideal frontier is an antichain;
 //   - every entry carries a live compact node handle in the correct bucket.
 // ---------------------------------------------------------------------------
-TEST(Contracts, CutInvariantsHoldOnRandomWorlds)
+TEST(Contracts, FrontierInvariantsHoldOnRandomDatabases)
 {
     DeterministicRng rng(2024);
     DeterministicUniformFloat uni(0.0f, 1.0f);
@@ -135,9 +135,9 @@ TEST(Contracts, CutInvariantsHoldOnRandomWorlds)
     for (int iter = 0; iter < 15; ++iter)
     {
         RandomWorld rw(1000 + uint32_t(iter));
-        World& w = rw.w;
+        SpatialDatabase& w = rw.w;
 
-        CutParams p;
+        SelectionParams p;
         p.threshold = 1.0f + uni(rng) * 30.0f;
 
         for (int frame = 0; frame < 3; ++frame)
@@ -145,10 +145,10 @@ TEST(Contracts, CutInvariantsHoldOnRandomWorlds)
             const Camera v = randomView(rng);
             const Outputs o = run(w, v, p);
 
-            const std::set<UserId> cut = cutIds(w, o.cut);
-            ASSERT_EQ(cut.size(), currentCutSize(o.cut))
-                << "duplicate payloads in current cut";
-            for (const auto& e : currentCut(o.cut))
+            const std::set<UserId> cut = frontierIds(w, o.cut);
+            ASSERT_EQ(cut.size(), currentFrontierSize(o.cut))
+                << "duplicate payloads in current frontier";
+            for (const auto& e : currentFrontier(o.cut))
             {
                 const UserId id = payloadOf(w, e);
                 EXPECT_TRUE(w.isResident(e.nodeHandle))
@@ -159,10 +159,10 @@ TEST(Contracts, CutInvariantsHoldOnRandomWorlds)
             }
 
             std::set<UserId> ideal;
-            for (const auto& e : idealCut(o.cut)) ideal.insert(payloadOf(w, e));
-            ASSERT_EQ(ideal.size(), idealCutSize(o.cut))
+            for (const auto& e : idealFrontier(o.cut)) ideal.insert(payloadOf(w, e));
+            ASSERT_EQ(ideal.size(), idealFrontierSize(o.cut))
                 << "duplicate payloads in ideal";
-            for (const auto& e : idealCut(o.cut))
+            for (const auto& e : idealFrontier(o.cut))
             {
                 const UserId id = payloadOf(w, e);
                 for (UserId anc : TA::ancestorIds(w, id))
@@ -182,7 +182,7 @@ TEST(Contracts, CutInvariantsHoldOnRandomWorlds)
 // with bit-equal errors. (No unordered containers or pointers may leak into
 // the traversal order.)
 // ---------------------------------------------------------------------------
-TEST(Contracts, DeterministicAcrossIdenticalWorlds)
+TEST(Contracts, DeterministicAcrossIdenticalDatabases)
 {
     for (uint32_t seed : {7u, 42u, 314u})
     {
@@ -190,7 +190,7 @@ TEST(Contracts, DeterministicAcrossIdenticalWorlds)
         // Damping on: the camera envelope history must match too.
         CameraDamper da(4.0f), db(4.0f);
         DeterministicRng rngA(seed * 3), rngB(seed * 3);
-        const CutParams p{6.0f, 0.5f};
+        const SelectionParams p{6.0f, 0.5f};
 
         for (int frame = 0; frame < 6; ++frame)
         {
@@ -208,23 +208,23 @@ TEST(Contracts, DeterministicAcrossIdenticalWorlds)
 }
 
 // Parallel workers preserve the exact per-bucket order and classifications.
-TEST(Contracts, ParallelSelectionMatchesSerialBucketedCut)
+TEST(Contracts, ParallelSelectionMatchesSerialBucketedFrontier)
 {
     TreeGen gen;
     gen.fanout = 4;
     gen.depth = 2;
     const Page proto = gen.makeRootPage(unitRegion(20.0f), 64.0f, 0);
-    HLodBuilder flatBuilder;
+    PageBuilder flatBuilder;
     flatBuilder.createRoot(
         9000, 0.0f,
         AABB::fromCenterExtent(float4::point(0, 0, 0), float4::vec(1, 1, 1)));
     const Page flatProto = flatBuilder.build();
 
-    World serial;
-    WorldConfig config;
+    SpatialDatabase serial;
+    SpatialDatabaseConfig config;
     config.context.workerCount = 4;
     config.parallelInstanceThreshold = 1;
-    World parallel(config);
+    SpatialDatabase parallel(config);
 
     const AssetHandle serialAsset = serial.registerAsset(proto.clone());
     const AssetHandle parallelAsset = parallel.registerAsset(proto.clone());
@@ -242,7 +242,7 @@ TEST(Contracts, ParallelSelectionMatchesSerialBucketedCut)
     parallel.applyUpdates();
     const Camera view = makeLookAtCamera(float4::point(3, 8, -40),
                                          float4::point(3, 0, 3));
-    const CutParams params{0.25f, 0.0f};
+    const SelectionParams params{0.25f, 0.0f};
     const Outputs a = run(serial, view, params);
     const Outputs b = run(parallel, view, params);
 
@@ -250,46 +250,46 @@ TEST(Contracts, ParallelSelectionMatchesSerialBucketedCut)
     EXPECT_EQ(resultKeys(parallel, b.cut), resultKeys(serial, a.cut));
 }
 
-TEST(Contracts, ViewBindsToOneWorldUntilReset)
+TEST(Contracts, SpatialQueryBindsToOneDatabaseUntilReset)
 {
-    World first, second;
+    SpatialDatabase first, second;
     first.applyUpdates();
     second.applyUpdates();
 
-    const World& publishedFirst = first;
-    const World& publishedSecond = second;
+    const SpatialDatabase& publishedFirst = first;
+    const SpatialDatabase& publishedSecond = second;
     const Camera camera = makeLookAtCamera(float4::point(0, 0, -10),
                                            float4::point(0, 0, 0));
-    const CutParams params{4.0f, 0.0f};
-    CutResults cut;
-    View view;
+    const SelectionParams params{4.0f, 0.0f};
+    FrontierResult cut;
+    SpatialQuery query;
 
-    EXPECT_NO_THROW(view.selectCut(publishedFirst, camera, params, cut));
-    EXPECT_THROW(view.selectCut(publishedSecond, camera, params, cut),
+    EXPECT_NO_THROW(query.selectFrontier(publishedFirst, camera, params, cut));
+    EXPECT_THROW(query.selectFrontier(publishedSecond, camera, params, cut),
                  std::logic_error);
 
-    view.reset();
-    EXPECT_NO_THROW(view.selectCut(publishedSecond, camera, params, cut));
+    query.reset();
+    EXPECT_NO_THROW(query.selectFrontier(publishedSecond, camera, params, cut));
 }
 
-TEST(Contracts, ViewRequiresPublishedWorld)
+TEST(Contracts, SpatialQueryRequiresPublishedDatabase)
 {
-    World world;
-    View view;
+    SpatialDatabase world;
+    SpatialQuery query;
     const Camera camera = makeLookAtCamera(float4::point(0, 0, -10),
                                            float4::point(0, 0, 0));
-    const CutParams params{4.0f, 0.0f};
-    CutResults cut;
+    const SelectionParams params{4.0f, 0.0f};
+    FrontierResult cut;
 
-    EXPECT_THROW(view.selectCut(world, camera, params, cut), std::logic_error);
+    EXPECT_THROW(query.selectFrontier(world, camera, params, cut), std::logic_error);
     world.applyUpdates();
-    EXPECT_NO_THROW(view.selectCut(world, camera, params, cut));
+    EXPECT_NO_THROW(query.selectFrontier(world, camera, params, cut));
 }
 
 // ---------------------------------------------------------------------------
 // Multiple damped views share the world but not each other's history: each
-// view's memory lives entirely in its own CameraDamper, and selectCut is a pure
-// read of the World. Interleaving view B must not change view A's outputs vs
+// view's memory lives entirely in its own CameraDamper, and selectFrontier is a pure
+// read of the SpatialDatabase. Interleaving view B must not change view A's outputs vs
 // running A alone on an identical world (and vice versa). This is the
 // regression test for moving hysteresis off the nodes onto the camera.
 // ---------------------------------------------------------------------------
@@ -307,7 +307,7 @@ TEST(Contracts, MultiCameraDamperIsolation)
 
     // Heavy damping: the envelope history matters.
     CameraDamper dA(8.0f), dB(8.0f), dAlone(8.0f), dBlone(8.0f);
-    const CutParams p{6.0f, 0.0f};
+    const SelectionParams p{6.0f, 0.0f};
 
     for (int frame = 0; frame < 8; ++frame)
     {
@@ -321,11 +321,11 @@ TEST(Contracts, MultiCameraDamperIsolation)
         const Camera vB = makeLookAtCamera(
             float4::point(-std::sin(t) * 90, 25, std::cos(t) * 90), float4::point(30, 0, -20));
 
-        CutResults cutA, cutB, cutAlone, cutBlone;
-        selectCutUncached(both.w, dA.damp(vA), p, cutA);
-        selectCutUncached(both.w, dB.damp(vB), p, cutB);   // interleaved with A every frame
-        selectCutUncached(onlyA.w, dAlone.damp(vA), p, cutAlone);
-        selectCutUncached(onlyB.w, dBlone.damp(vB), p, cutBlone);
+        FrontierResult cutA, cutB, cutAlone, cutBlone;
+        selectFrontierUncached(both.w, dA.damp(vA), p, cutA);
+        selectFrontierUncached(both.w, dB.damp(vB), p, cutB);   // interleaved with A every frame
+        selectFrontierUncached(onlyA.w, dAlone.damp(vA), p, cutAlone);
+        selectFrontierUncached(onlyB.w, dBlone.damp(vB), p, cutBlone);
 
         EXPECT_EQ(resultKeys(both.w, cutA), resultKeys(onlyA.w, cutAlone))
             << "frame " << frame;
@@ -343,7 +343,7 @@ TEST(Contracts, MultiCameraDamperIsolation)
 TEST(Contracts, StaleInstanceRefIsIgnored)
 {
     TreeGen gen;
-    World w;
+    SpatialDatabase w;
 
     Page pgA = gen.makeRootPage(unitRegion(5.0f), 16.0f, 0);
     const auto refA = w.addInstance(std::move(pgA), float4::point(0, 0, 0));
@@ -358,23 +358,23 @@ TEST(Contracts, StaleInstanceRefIsIgnored)
 
     w.applyUpdates();
     const Camera v = makeLookAtCamera(float4::point(0, 0, -30), float4::point(0, 0, 0));
-    CutResults cut;
-    selectCutUncached(w, v, {4, 0}, cut);
+    FrontierResult cut;
+    selectFrontierUncached(w, v, {4, 0}, cut);
     ASSERT_FALSE(cut.empty());
 
     // Stale move: B must not teleport.
     w.moveInstance(refA, float4::point(50000, 0, 0));
-    selectCutUncached(w, v, {4, 0}, cut);
+    selectFrontierUncached(w, v, {4, 0}, cut);
     EXPECT_FALSE(cut.empty()) << "stale moveInstance displaced the new instance";
 
     // Stale remove: B must survive.
     w.removeInstance(refA);
-    selectCutUncached(w, v, {4, 0}, cut);
+    selectFrontierUncached(w, v, {4, 0}, cut);
     EXPECT_FALSE(cut.empty()) << "stale removeInstance killed the new instance";
 
     // The live ref still works.
     w.removeInstance(refB);
-    selectCutUncached(w, v, {4, 0}, cut);
+    selectFrontierUncached(w, v, {4, 0}, cut);
     EXPECT_TRUE(cut.empty());
 }
 
@@ -386,7 +386,7 @@ TEST(Contracts, StaleInstanceRefIsIgnored)
 // must handle degenerate boxes; the cut matches the scalar reference.
 TEST(Contracts, PointLeavesMatchReference)
 {
-    HLodBuilder b;
+    PageBuilder b;
     const auto root = b.createRoot(1, 64.0f, AABB::empty());
     for (int i = 0; i < 12; ++i)
     {
@@ -396,19 +396,19 @@ TEST(Contracts, PointLeavesMatchReference)
     Page pg = b.build();
     const auto ids = pageIds(pg);
 
-    World w;
+    SpatialDatabase w;
     w.addInstance(std::move(pg), float4::point(0, 0, 0));
     markAllResident(w, ids);
     w.applyUpdates();
 
     const Camera v = makeLookAtCamera(float4::point(0, 20, -60), float4::point(0, 0, 0));
-    const CutParams p{4.0f, 0.0f};
+    const SelectionParams p{4.0f, 0.0f};
     const Outputs o = run(w, v, p);
-    const RefResult want = TA::referenceCut(w, v, p);
+    const RefResult want = TA::referenceFrontier(w, v, p);
 
     std::set<UserId> wantIds;
-    for (const auto& e : currentCut(want.cut)) wantIds.insert(payloadOf(w, e));
-    EXPECT_EQ(cutIds(w, o.cut), wantIds);
+    for (const auto& e : currentFrontier(want.cut)) wantIds.insert(payloadOf(w, e));
+    EXPECT_EQ(frontierIds(w, o.cut), wantIds);
     EXPECT_FALSE(o.cut.empty());
 }
 
@@ -422,24 +422,24 @@ TEST(Contracts, CameraInsideTreeMatchesReference)
     Page pg = gen.makeRootPage(unitRegion(50.0f), 64.0f, 0);
     const auto ids = pageIds(pg);
 
-    World w;
+    SpatialDatabase w;
     w.addInstance(std::move(pg), float4::point(0, 0, 0));
     markAllResident(w, ids);
     w.applyUpdates();
 
     const Camera v = makeLookAtCamera(float4::point(1, 2, 3), float4::point(40, 0, 40));
-    const CutParams p{4.0f, 0.0f};
+    const SelectionParams p{4.0f, 0.0f};
     const Outputs o = run(w, v, p);
-    const RefResult want = TA::referenceCut(w, v, p);
+    const RefResult want = TA::referenceFrontier(w, v, p);
 
     ASSERT_FALSE(o.cut.empty());
-    for (const auto& e : currentCut(o.cut))
+    for (const auto& e : currentFrontier(o.cut))
         EXPECT_TRUE(std::isfinite(e.approximateError(p.threshold)))
             << payloadOf(w, e);
 
     std::set<UserId> wantIds;
-    for (const auto& e : currentCut(want.cut)) wantIds.insert(payloadOf(w, e));
-    EXPECT_EQ(cutIds(w, o.cut), wantIds);
+    for (const auto& e : currentFrontier(want.cut)) wantIds.insert(payloadOf(w, e));
+    EXPECT_EQ(frontierIds(w, o.cut), wantIds);
 }
 
 // A world far from the origin (1e6 units out): absolute-coordinate math must
@@ -451,19 +451,19 @@ TEST(Contracts, FarFromOriginMatchesReference)
     const auto ids = pageIds(pg);
 
     const float4 farPos = float4::point(1.0e6f, 0, 1.0e6f);
-    World w;
+    SpatialDatabase w;
     w.addInstance(std::move(pg), farPos);
     markAllResident(w, ids);
     w.applyUpdates();
 
     const Camera v = makeLookAtCamera(farPos + float4::vec(0, 30, -80), farPos);
-    const CutParams p{4.0f, 0.0f};
+    const SelectionParams p{4.0f, 0.0f};
     const Outputs o = run(w, v, p);
-    const RefResult want = TA::referenceCut(w, v, p);
+    const RefResult want = TA::referenceFrontier(w, v, p);
 
     std::set<UserId> wantIds;
-    for (const auto& e : currentCut(want.cut)) wantIds.insert(payloadOf(w, e));
-    EXPECT_EQ(cutIds(w, o.cut), wantIds);
+    for (const auto& e : currentFrontier(want.cut)) wantIds.insert(payloadOf(w, e));
+    EXPECT_EQ(frontierIds(w, o.cut), wantIds);
     EXPECT_FALSE(o.cut.empty());
 }
 
@@ -477,20 +477,20 @@ TEST(Contracts, ScaledInstanceMatchesReference)
         Page pg = gen.makeRootPage(unitRegion(10.0f), 32.0f, 0);
         const auto ids = pageIds(pg);
 
-        World w;
+        SpatialDatabase w;
         w.addInstance(std::move(pg), float4::point(0, 0, 0), scale);
         markAllResident(w, ids);
         w.applyUpdates();
 
         const Camera v = makeLookAtCamera(float4::point(0, 10 * scale, -40 * scale),
                                           float4::point(0, 0, 0));
-        const CutParams p{4.0f, 0.0f};
+        const SelectionParams p{4.0f, 0.0f};
         const Outputs o = run(w, v, p);
-        const RefResult want = TA::referenceCut(w, v, p);
+        const RefResult want = TA::referenceFrontier(w, v, p);
 
         std::set<UserId> wantIds;
-        for (const auto& e : currentCut(want.cut)) wantIds.insert(payloadOf(w, e));
-        EXPECT_EQ(cutIds(w, o.cut), wantIds) << "scale " << scale;
+        for (const auto& e : currentFrontier(want.cut)) wantIds.insert(payloadOf(w, e));
+        EXPECT_EQ(frontierIds(w, o.cut), wantIds) << "scale " << scale;
         EXPECT_FALSE(o.cut.empty()) << "scale " << scale;
     }
 }
@@ -501,7 +501,7 @@ TEST(Contracts, NonFiniteBoundsRejected)
 {
     TreeGen gen;
     Page pg = gen.makeRootPage(unitRegion(5.0f), 16.0f, 0);
-    World w;
+    SpatialDatabase w;
     const auto inst = w.addInstance(std::move(pg), float4::point(0, 0, 0));
     const NodeHandle leaf = nodeAt(inst.rootPage, 2);
 
@@ -527,10 +527,10 @@ TEST(Contracts, NonFiniteBoundsRejected)
 // survive refactors but tight enough to flag a new hot-array or a hash map
 // sneaking back in.
 // ---------------------------------------------------------------------------
-TEST(Contracts, CompactCutRepresentation)
+TEST(Contracts, CompactFrontierRepresentation)
 {
     EXPECT_EQ(sizeof(NodeHandle), 8u);
-    EXPECT_EQ(sizeof(CutEntry), 12u);
+    EXPECT_EQ(sizeof(FrontierEntry), 12u);
 
     const NodeHandle handle{NodeHandle::kInvalidSlot - 1,
                             NodeHandle::kIndexMask,
@@ -541,34 +541,34 @@ TEST(Contracts, CompactCutRepresentation)
     EXPECT_EQ(handle.generation(), NodeHandle::kGenerationMask);
 
     constexpr float threshold = 4.0f;
-    EXPECT_LT(encodeCutError(threshold, threshold), kCutErrorThreshold);
-    EXPECT_LT(encodeCutError(std::nextafter(threshold, 0.0f), threshold),
-              kCutErrorThreshold);
-    EXPECT_GE(encodeCutError(std::nextafter(
+    EXPECT_LT(encodeFrontierError(threshold, threshold), kFrontierErrorThreshold);
+    EXPECT_LT(encodeFrontierError(std::nextafter(threshold, 0.0f), threshold),
+              kFrontierErrorThreshold);
+    EXPECT_GE(encodeFrontierError(std::nextafter(
                   threshold, std::numeric_limits<float>::infinity()), threshold),
-              kCutErrorThreshold);
+              kFrontierErrorThreshold);
 
     uint8_t previous = 0;
     for (float error : {0.0f, 0.01f, 0.25f, 1.0f, 3.99f, 4.0f,
                         4.01f, 8.0f, 64.0f, 1.0e20f})
     {
-        const uint8_t code = encodeCutError(error, threshold);
+        const uint8_t code = encodeFrontierError(error, threshold);
         EXPECT_GE(code, previous);
         previous = code;
     }
 
-    const CutEntry entry{handle, 8.0f, threshold, kInvalidInstanceId - 1};
+    const FrontierEntry entry{handle, 8.0f, threshold, kInvalidInstanceId - 1};
     EXPECT_EQ(entry.nodeHandle, handle);
     EXPECT_EQ(entry.instance(), kInvalidInstanceId - 1);
     EXPECT_TRUE(entry.overThreshold());
     EXPECT_TRUE(std::isfinite(entry.approximateError(threshold)));
 
-    CutEntry sharedStorage[1];
-    CutEntry currentStorage[1];
-    CutEntry idealStorage[1];
-    CutResultSink sink{Sink<CutEntry>{std::span{sharedStorage}},
-                       Sink<CutEntry>{std::span{currentStorage}},
-                       Sink<CutEntry>{std::span{idealStorage}}};
+    FrontierEntry sharedStorage[1];
+    FrontierEntry currentStorage[1];
+    FrontierEntry idealStorage[1];
+    FrontierResultSink sink{Sink<FrontierEntry>{std::span{sharedStorage}},
+                       Sink<FrontierEntry>{std::span{currentStorage}},
+                       Sink<FrontierEntry>{std::span{idealStorage}}};
     sink.shared.push(entry);
     sink.shared.push(entry);
     sink.currentOnly.push(entry);
@@ -579,7 +579,7 @@ TEST(Contracts, CompactCutRepresentation)
     EXPECT_EQ(sink.idealOnly.count(), 1u);
 }
 
-TEST(Contracts, ViewReturnsSpansBackedByRetainedStorage)
+TEST(Contracts, FrontierResultViewUsesRetainedQueryStorage)
 {
     TreeGen gen;
     gen.fanout = 4;
@@ -587,7 +587,7 @@ TEST(Contracts, ViewReturnsSpansBackedByRetainedStorage)
     Page page = gen.makeRootPage(unitRegion(20.0f), 64.0f, 0);
     const uint32_t nodes = page.nodeCount();
 
-    World world;
+    SpatialDatabase world;
     const auto instance =
         world.addInstance(std::move(page), float4::point(0, 0, 0));
     markAllResident(world, instance.rootPage, nodes);
@@ -595,30 +595,30 @@ TEST(Contracts, ViewReturnsSpansBackedByRetainedStorage)
 
     const Camera camera = makeLookAtCamera(float4::point(0, 10, -40),
                                             float4::point(0, 0, 0));
-    const CutParams params{4.0f, 0.0f};
-    View view;
-    view.setReuseEnabled(false);
+    const SelectionParams params{4.0f, 0.0f};
+    SpatialQuery query;
+    query.setReuseEnabled(false);
 
-    const CutView first = view.selectCut(world, camera, params);
+    const FrontierResultView first = query.selectFrontier(world, camera, params);
     ASSERT_FALSE(first.empty());
-    const CutEntry* firstData = !first.shared.empty()
+    const FrontierEntry* firstData = !first.shared.empty()
                                     ? first.shared.data()
                                     : (!first.currentOnly.empty()
                                            ? first.currentOnly.data()
                                            : first.idealOnly.data());
 
-    const CutView second = view.selectCut(world, camera, params);
-    const CutEntry* secondData = !second.shared.empty()
+    const FrontierResultView second = query.selectFrontier(world, camera, params);
+    const FrontierEntry* secondData = !second.shared.empty()
                                      ? second.shared.data()
                                      : (!second.currentOnly.empty()
                                             ? second.currentOnly.data()
                                             : second.idealOnly.data());
-    EXPECT_EQ(secondData, firstData) << "View should retain result capacity";
+    EXPECT_EQ(secondData, firstData) << "SpatialQuery should retain result capacity";
 
-    View snapshotView;
-    snapshotView.setReuseEnabled(false);
-    CutResults snapshot;
-    snapshotView.selectCut(world, camera, params, snapshot);
+    SpatialQuery snapshotQuery;
+    snapshotQuery.setReuseEnabled(false);
+    FrontierResult snapshot;
+    snapshotQuery.selectFrontier(world, camera, params, snapshot);
     EXPECT_EQ(resultKeys(world, second), resultKeys(world, snapshot));
 }
 

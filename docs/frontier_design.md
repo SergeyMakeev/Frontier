@@ -1,6 +1,6 @@
-# HLodTree design and runtime contract
+# Frontier design and runtime contract
 
-This is the current design implemented by `include/hlod` and `src`. Start with
+This is the current design implemented by `include/frontier` and `src`. Start with
 the [README](../README.md) for the general overview, a compilable minimal example,
 and representative performance numbers. See [API.md](API.md) for detailed
 integration guidance and [ARCHITECTURE.md](ARCHITECTURE.md) for the current
@@ -20,7 +20,7 @@ asset, or one flat vehicle or character. Every real node carries a renderable
 `UserPayload`, so selection can stop anywhere in the hierarchy. The dynamic
 TLAS spatially indexes placements of these independent BLAS roots. TLAS
 internal nodes are acceleration data rather than renderable representations;
-they do not appear in the cut. Consequently the world needs no common
+they do not appear in the frontier. Consequently the database needs no common
 whole-map hierarchy and can freely mix BLASes of very different scopes.
 
 A selection is a ragged antichain through that tree:
@@ -33,26 +33,27 @@ A selection is a ragged antichain through that tree:
           wall wall wall                 <- draw nearby walls
 ```
 
-No selected node is an ancestor of another selected node. Refinement is
-replace-only: either a node draws, or its children replace it. This makes a cut
-hole-free without parent/child overdraw.
+No selected node is an ancestor of another selected node. This antichain is the
+hierarchical **frontier** (also called a cut). Refinement is replace-only:
+either a node draws, or its children replace it, so the frontier is hole-free
+without parent/child overdraw.
 
 The library is deliberately external to rendering. A node stores an opaque
 `uint64_t UserPayload`; selection carries a compact node handle and the caller
-may resolve that payload with `World::tryGetPayload` only when needed. A
+may resolve that payload with `SpatialDatabase::tryGetPayload` only when needed. A
 payload can be a mesh-table index, entity key, pointer-sized token, or any
 other value. Duplicate payloads are legal. Every node must nevertheless have a
-renderable representation because any node can become part of the current cut.
+renderable representation because any node can become part of the current frontier.
 
 The projected error test is conceptually:
 
 ```text
 screenErrorPx = geometricError * projectionScale / distance(camera, bounds)
-refine when screenErrorPx > CutParams::threshold
+refine when screenErrorPx > SelectionParams::threshold
 ```
 
 Distance is measured to the node box, not its center. The camera constructors
-compute `projectionScale` from vertical FOV and viewport height. A `View` uses
+compute `projectionScale` from vertical FOV and viewport height. A `SpatialQuery` uses
 its internal `CameraDamper` to replace the camera point with a decaying camera
 envelope, providing LOD hysteresis without sticky state on every node.
 
@@ -61,13 +62,13 @@ envelope, providing LOD hysteresis without sticky state on every node.
 The runtime has four distinct concepts:
 
 - A `Page` or `PageView` is an immutable, packed BLAS fragment.
-- An `AssetHandle` names page bytes registered with a `World` for reuse. Here
+- An `AssetHandle` names page bytes registered with a `SpatialDatabase` for reuse. Here
   *asset* is an API/storage term and does not mean that the BLAS represents one
   object.
 - A page mount places an asset at an instance root or below an expansion point;
   a `PageHandle` names that mount.
 - An instance applies a translation and positive uniform scale to one
-  independent BLAS root. `World::InstanceRef` also contains a generation and
+  independent BLAS root. `SpatialDatabase::InstanceRef` also contains a generation and
   its root page handle.
 
 `NodeHandle{slot, index, generation}` names a node in a mounted page and packs
@@ -78,8 +79,8 @@ index. Generations prevent ABA bugs when page or instance slots are recycled.
 An asynchronous completion using a handle whose page was collected is an
 expected race: mutating calls ignore it and queries report it absent.
 
-The `World` keeps no payload-to-node index and no hash map. Persistent systems
-should retain handles from `CutEntry`, `InstanceRef::rootPage`, or
+The `SpatialDatabase` keeps no payload-to-node index and no hash map. Persistent systems
+should retain handles from `FrontierEntry`, `InstanceRef::rootPage`, or
 `attachPage`. Generated expansion nodes embed their `HierarchyPageId`; only a
 low-level custom partitioner needs to own additional page-index metadata.
 
@@ -88,14 +89,14 @@ low-level custom partitioner needs to own additional page-index metadata.
 - `pos` and positive uniform `scale`;
 - `mask`, ANDed with `Camera::viewMask` for cheap layer filtering.
 
-`World::addInstance` returns the generation-stamped owner reference. Selection
-packs its stable 24-bit public `InstanceId` into each `CutEntry`; callers
+`SpatialDatabase::addInstance` returns the generation-stamped owner reference. Selection
+packs its stable 24-bit public `InstanceId` into each `FrontierEntry`; callers
 normally use that id to index the same placement/transform table that stores
 the returned `InstanceRef`.
 
 Rotation and non-uniform scale are not represented by `InstanceDesc`. Bake
 them into authored bounds/proxies or place such objects in an integration layer
-that presents translation plus uniform scale to HLodTree.
+that presents translation plus uniform scale to Frontier.
 
 ### Typical runtime flow
 
@@ -103,64 +104,64 @@ The following uses the actual API. Page loading is application-specific and is
 shown as placeholders:
 
 ```cpp
-void renderEntry(const World& world, const CutEntry& entry)
+void renderEntry(const SpatialDatabase& database, const FrontierEntry& entry)
 {
     UserPayload payload;
-    if (world.tryGetPayload(entry.nodeHandle, payload))
+    if (database.tryGetPayload(entry.nodeHandle, payload))
         submit(payload, transforms[entry.instance()]);
 }
 
-void updateStreaming(World& world, const CutEntry& entry)
+void updateStreaming(SpatialDatabase& database, const FrontierEntry& entry)
 {
     UserPayload payload;
-    if (!world.tryGetPayload(entry.nodeHandle, payload))
+    if (!database.tryGetPayload(entry.nodeHandle, payload))
         return;
 
-    const DetailPageRef detail = world.detailPage(entry.nodeHandle);
+    const DetailPageRef detail = database.detailPage(entry.nodeHandle);
     if (entry.overThreshold() && detail.valid() &&
-        !world.isAttached(entry.nodeHandle))
-        world.attachPage(entry.nodeHandle, loadHierarchyPage(detail));
+        !database.isAttached(entry.nodeHandle))
+        database.attachPage(entry.nodeHandle, loadHierarchyPage(detail));
 
-    if (!world.isResident(entry.nodeHandle) && payloadFinishedLoading(payload))
-        world.markResident(entry.nodeHandle);
+    if (!database.isResident(entry.nodeHandle) && payloadFinishedLoading(payload))
+        database.markResident(entry.nodeHandle);
 }
 
-World world;
-AssetHandle tree = world.registerAsset(loadRootPage());
+SpatialDatabase database;
+AssetHandle tree = database.registerAsset(loadRootPage());
 
 InstanceDesc desc;
 desc.pos = float4::point(100, 0, 20);
 desc.scale = 1.0f;
-World::InstanceRef instance = world.addInstance(tree, desc);
+SpatialDatabase::InstanceRef instance = database.addInstance(tree, desc);
 
 Camera camera = makeLookAtCamera(eye, target);
-View view;                         // owns cache, scratch, and cut storage
-PageUsageContext primaryUsage;    // only retention-relevant views need one
+SpatialQuery query;                // owns cache, scratch, and result storage
+PageUsageContext primaryUsage;     // only retention-relevant queries need one
 
-world.applyUpdates();              // apply changes and publish the read-only world
-const World& published = world;
-const CutView cut = view.selectCut(
-    published, camera, CutParams{4.0f, 0.0f}, primaryUsage);
+database.applyUpdates();              // apply changes and publish the read-only database
+const SpatialDatabase& publishedDatabase = database;
+const FrontierResultView result = query.selectFrontier(
+    publishedDatabase, camera, SelectionParams{4.0f, 0.0f}, primaryUsage);
 
-for (const CutEntry& entry : cut.shared)
-    renderEntry(published, entry);
-for (const CutEntry& entry : cut.currentOnly)
-    renderEntry(published, entry);
+for (const FrontierEntry& entry : result.shared)
+    renderEntry(publishedDatabase, entry);
+for (const FrontierEntry& entry : result.currentOnly)
+    renderEntry(publishedDatabase, entry);
 
-// After all view queries join, streaming and World mutation are serial again.
-for (const CutEntry& entry : cut.shared)
-    updateStreaming(world, entry);
-for (const CutEntry& entry : cut.idealOnly)
-    updateStreaming(world, entry);
+// After all spatial queries join, streaming and SpatialDatabase mutation are serial again.
+for (const FrontierEntry& entry : result.shared)
+    updateStreaming(database, entry);
+for (const FrontierEntry& entry : result.idealOnly)
+    updateStreaming(database, entry);
 
 const CollectResult collected =
-    world.collect(primaryUsage, pageBudget, minPageAge);
+    database.collect(primaryUsage, pageBudget, minPageAge);
 for (UserPayload payload : collected.freedPayloads) releasePayload(payload);
 ```
 
 In a real asynchronous streamer, completions normally arrive in later frames.
 It normally deduplicates content identities and applies IO/page budgets before
-scheduling work; `World` deliberately does neither. The loop above shows the
+scheduling work; `SpatialDatabase` deliberately does neither. The loop above shows the
 state transitions, not a production scheduler. Generated expansion metadata
 distinguishes a high-error terminal leaf from one with a detail page.
 
@@ -184,12 +185,12 @@ index zero acts as their common continuation sentinel. Users author and stream
 the single logical root, not this packed multi-root representation.
 
 The generated local detail-page id is stored in otherwise unused expansion
-metadata. `World::detailPage(NodeHandle)` scopes it with the hierarchy's root
+metadata. `SpatialDatabase::detailPage(NodeHandle)` scopes it with the hierarchy's root
 asset and can therefore resolve an unambiguous streaming request without a
 payload lookup or a map for every mounted page. Payloads remain non-unique
 opaque application data.
 
-`HLodBuilder` is the low-level escape hatch for a content pipeline that already
+`PageBuilder` is the low-level escape hatch for a content pipeline that already
 owns physical partitioning. It emits one packed blob and may explicitly mark a
 leaf with `markExpansion(node, detailPageId)`.
 
@@ -217,7 +218,7 @@ Both builders establish these packed-page invariants:
 | A | `parent[i] < i` | Preorder parent lookup and bottom-up refit |
 | B | A subtree occupies `[i, i + subtreeSize[i])` | Constant-time subtree range |
 | C | Parent bounds conservatively contain descendants | Sound frustum and distance tests |
-| D | Effective geometric error never increases downward | Both cuts remain antichains |
+| D | Effective geometric error never increases downward | Both frontiers remain antichains |
 | E | An expansion point has no local children | One unambiguous refinement source |
 
 `HierarchyBuilder` derives bounds and clamps errors over the complete logical
@@ -247,7 +248,7 @@ execute lane loops, so page blobs do not vary by CPU backend.
 
 ## 4. Assets, mounts, and sharing
 
-`registerAsset(Page&&)` transfers ownership of a blob to the `World`.
+`registerAsset(Page&&)` transfers ownership of a blob to the `SpatialDatabase`.
 `registerAsset(PageView)` borrows one. Instancing a registered root asset reuses
 one root mount, including its residency and attached child-page graph. Ten
 thousand identical trees can therefore share one hierarchy rather than clone
@@ -263,7 +264,7 @@ The convenience `addInstance(Page&&, ...)` creates an anonymous asset. It is
 appropriate for one-off content; repeated content should be registered once
 and instanced by `AssetHandle`.
 
-`releaseAsset` drops the world's registered ownership. It is a contract error
+`releaseAsset` drops the database's registered ownership. It is a contract error
 while live instances still reference the asset. Anonymous assets disappear
 when their last mount and instance reference disappear.
 
@@ -280,14 +281,14 @@ Each mounted page has compact runtime arrays parallel to its nodes:
 
 Each mount also has two compact 8-byte records outside the 104-byte `PageRt`.
 `PageStamp` holds the content version plus the generation/live stamp used by
-handles and cached-view dependency checks. The residency summary holds a
+handles and cached-query dependency checks. The residency summary holds a
 resident node count and a count of recursively incomplete attached child
 mounts. It changes only with residency or topology and propagates upward only
 when a mount tree crosses the fully-resident boundary. Selection uses that
 proof to take a shared-only traversal that skips residency checks and
 current/ideal branching for the common fully-resident case.
 
-Residency changes propagate coverage toward the root. A current-cut node may
+Residency changes propagate coverage toward the root. A current-frontier node may
 refine whenever more detailed resident nodes completely cover the region
 selection needs. The intermediate proxy itself need not be resident: if a
 parent `P` and leaf descendants `L` are resident while an intermediate `C` is
@@ -300,25 +301,25 @@ frustum needs full structural coverage; a node crossing a frustum plane may
 ignore missing branches that are outside the view, so selection recursively
 checks only surviving uncovered branches. Those pages count as used for
 optional `PageUsageContext` feedback. Instances touching a frustum plane are
-re-walked rather than cached by `View`.
+re-walked rather than cached by `SpatialQuery`.
 
 An expansion point is a renderable collapsed proxy whose children live in a
-different page. If its error is acceptable it remains a normal ideal-cut entry.
+different page. If its error is acceptable it remains a normal ideal-frontier entry.
 If it is too coarse and no child page is attached, it appears as a high-error
 ideal-side leaf. Attaching a child page makes traversal able to cross the
-boundary on the next cut. No per-entry expansion tag is needed:
-`World::detailPage()` reports whether a generated detail page exists, while
+boundary on the next selection. No per-entry expansion tag is needed:
+`SpatialDatabase::detailPage()` reports whether a generated detail page exists, while
 the quantized error says whether loading it is currently useful.
 
 Instance-root payloads are pinned resident. This is the base case for the
 runtime invariant:
 
-> Every node drawn by the current cut is resident, and every region refined
+> Every node drawn by the current frontier is resident, and every region refined
 > through has a complete resident descendant cover.
 
 Payload residency, page attachment, instance updates, and collection are
 single-writer operations. Finish them before `applyUpdates`, then treat the
-published World as read-only until every view selection has joined.
+published SpatialDatabase as read-only until every spatial query has joined.
 
 ### Streamer policy
 
@@ -342,16 +343,16 @@ error across the whole view.
 
 ## 6. Selection outputs and traversal
 
-`selectCut` returns a `CutView` with three spans:
+`selectFrontier` returns a `FrontierResultView` with three spans:
 
-- `shared` belongs to both the current and ideal cuts;
-- `currentOnly` is a resident fallback needed only by the current cut; and
-- `idealOnly` belongs only to the fully-resident ideal cut.
+- `shared` belongs to both the current and ideal frontiers;
+- `currentOnly` is a resident fallback needed only by the current frontier; and
+- `idealOnly` belongs only to the fully-resident ideal frontier.
 
-Thus `shared + currentOnly` is the hole-free render cut, while
+Thus `shared + currentOnly` is the hole-free render frontier, while
 `shared + idealOnly` is the frontier known topology would choose if every
 payload were resident. Keeping membership in the container rather than every
-entry avoids two per-entry tags and makes each `CutEntry` exactly 12 bytes:
+entry avoids two per-entry tags and makes each `FrontierEntry` exactly 12 bytes:
 
 - an 8-byte `NodeHandle`;
 - a stable 24-bit public `InstanceId`; and
@@ -364,12 +365,12 @@ Magnitude is logarithmically quantized at roughly eight steps per octave and
 are not repeated in the output; use `tryGetPayload(nodeHandle, payload)` or the
 caller's external graph when needed.
 
-The spans point into retained storage owned by the `View` and remain valid
-until its next selection or reset. `CutResults` is an explicit owning snapshot
-for the less common case that a cut must survive another query. There is no
+The spans point into retained storage owned by the `SpatialQuery` and remain valid
+until its next selection or reset. `FrontierResult` is an explicit owning result
+for the less common case that a frontier must survive another query. There is no
 request output. The caller inspects ideal-side entries, tests
 residency, deduplicates whatever it considers the same content, and applies its
-own IO priorities and budgets. Each member of `CutResultSink` targets fixed
+own IO priorities and budgets. Each member of `FrontierResultSink` targets fixed
 caller memory and reports dropped entries, so the caller can grow its capacity
 without an allocation inside the traversal.
 
@@ -381,15 +382,15 @@ build or repair. Selection then proceeds against that stable snapshot:
 2. A TLAS leaf compactly marks a hierarchical BLAS whose root page has one
    renderable root. When a vector error test says that root may satisfy the
    threshold, retest its precise world box and error and emit the pinned root
-   directly into `shared`. Uncached views enable this query work adaptively;
-   cached views do the exact root test only for cache misses.
+   directly into `shared`. Uncached queries enable this work adaptively;
+   cached queries do the exact root test only for cache misses.
 3. For an exact one-node BLAS, retest its precise world box and emit its pinned
    root directly into `shared`. A compact per-instance marker identifies this
    case without fetching the normal instance/page traversal state.
 4. For hierarchical BLASes that did not terminate at the root, transform the
    view into each surviving instance's local space.
 5. Walk attached pages with an explicit DFS stack, carrying current- and
-   ideal-cut liveness together. Propagated coverage answers most current-cut
+   ideal-frontier liveness together. Propagated coverage answers most current-frontier
    descent decisions in O(1); only partially visible uncovered regions need a
    recursive visible-coverage probe. A recursively fully-resident mount tree
    instead takes a specialized path in which every emitted entry is `shared`.
@@ -400,31 +401,31 @@ build or repair. Selection then proceeds against that stable snapshot:
    expansion nodes carry error, plane mask, and both membership paths on the
    DFS stack. Shared nodes are emitted once.
 
-There is no required per-node per-view scratch and no per-frame clear over all
-materialized nodes. Work is bounded by the visible current/ideal cut region
+There is no required per-node per-query scratch and no per-frame clear over all
+materialized nodes. Work is bounded by the visible current/ideal frontier region
 rather than the full authored hierarchy:
 
 ```text
-O(TLAS query + visible instances + visible cut region + output size)
+O(TLAS query + visible instances + visible frontier region + output size)
 ```
 
-The more compact shorthand `O(log R + hits + cut region)` assumes a
+The more compact shorthand `O(log R + hits + frontier region)` assumes a
 reasonably separating TLAS. In the adversarial case where all R instances
 overlap, the TLAS must report all R and the query is necessarily O(R). No
 algorithm can cost less than the output it must emit.
 
-## 7. View state and damping
+## 7. SpatialQuery state and damping
 
-Every logical camera, shadow cascade, or reflection probe owns a `View`.
-`View::selectCut` accepts the frame's raw `Camera`, damps it internally, and
-queries a published `const World`. Keeping the damper, reuse records, traversal
+Every logical camera, shadow cascade, or reflection probe owns a `SpatialQuery`.
+`SpatialQuery::selectFrontier` accepts the frame's raw `Camera`, damps it internally, and
+queries a published `const SpatialDatabase`. Keeping the damper, reuse records, traversal
 scratch, and statistics together prevents state from one camera being paired
 with another by mistake.
 
 For a fully-frustum-inside instance, every LOD decision changes only when the
-camera envelope or projection scale crosses a recorded flip point. The view
+camera envelope or projection scale crosses a recorded flip point. The query
 records a conservative margin, transform/content versions, up to two page
-dependencies, and the emitted cut. A later call copies that cut without walking
+dependencies, and the emitted frontier. A later call copies that frontier without walking
 the instance only while every proof condition still holds.
 
 Important limits are explicit:
@@ -437,39 +438,39 @@ Important limits are explicit:
 - The emitted node set matches uncached selection exactly. `errorCode()` on a
   reused entry is the recorded quantized value and can be stale within the
   proven margin; use its magnitude for prioritization or dithering, not
-  bit-exact comparison with a freshly walked view.
-- A cached call walks its camera serially, but different views can run
-  concurrently because all mutable query state is view-owned.
+  bit-exact comparison with a fresh traversal.
+- A cached call walks its camera serially, but different queries can run
+  concurrently because all mutable query state is query-owned.
 
 Each per-instance cache record is split into 32 hot bytes and 4 cold bytes,
 plus an optional 8-byte second-page dependency allocated only after a
 cacheable walk actually touches two pages. The common hit reads the hot record
 and a parallel 4-byte instance-version stream; it does not fetch the 32-byte
-instance record. Recorded cut entries remain separate slab storage.
+instance record. Recorded frontier entries remain separate slab storage.
 `reset()` clears logical state and its damping window but retains capacity,
 which is appropriate for camera cuts and teleports. `setHalfLife(0)` disables
-damping exactly. `setReuseEnabled(false)` disables temporal cut reuse while
+damping exactly. `setReuseEnabled(false)` disables temporal frontier reuse while
 retaining the same API and ownership model.
 
 ## 8. Parallel selection and threading
 
 There are two independent forms of parallelism.
 
-For multiple views, call `applyUpdates()` once, then invoke `View::selectCut`
-concurrently on the published `const World`. Every in-flight call
-must own a distinct `View`, optional `PageUsageContext`, and output
+For multiple queries, call `applyUpdates()` once, then invoke `SpatialQuery::selectFrontier`
+concurrently on the published `const SpatialDatabase`. Every in-flight call
+must own a distinct `SpatialQuery`, optional `PageUsageContext`, and output
 buffers. Those objects are deliberately unsynchronized; sharing one between
 threads is a caller error. Selection mutates only those caller-owned objects.
 
-After all view tasks join, the caller may resume World mutation and call
+After all query tasks join, the caller may resume SpatialDatabase mutation and call
 `collect`. Passing only important cameras' `PageUsageContext` objects lets a
-primary view influence page retention without giving the same weight to shadow
-or probe views.
+primary camera influence page retention without giving the same weight to shadow
+or probe queries.
 
-For one uncached view, `HlodContext` supplies aligned allocation and an
-optional blocking `parallelFor`. Call `view.setReuseEnabled(false)`, set
+For one uncached query, `FrontierContext` supplies aligned allocation and an
+optional blocking `parallelFor`. Call `query.setReuseEnabled(false)`, set
 `workerCount > 1`, and set
-`WorldConfig::parallelInstanceThreshold > 0` to fan that call out once the
+`SpatialDatabaseConfig::parallelInstanceThreshold > 0` to fan that call out once the
 visible instance count reaches the threshold.
 
 The runtime gives each worker a contiguous visible-instance range and private
@@ -477,9 +478,9 @@ output buffers, then concatenates each bucket in serial order. Serial and
 parallel results match entry-for-entry for the same backend and input.
 
 `parallelFor` may run task indices in any order but must return only after all
-tasks finish. Its scratch and aggregate statistics live in the `View`, so
-distinct uncached views have the same external concurrency contract as cached
-ones. No selection may overlap a World mutation, another `applyUpdates`, or
+tasks finish. Its scratch and aggregate statistics live in the `SpatialQuery`, so
+distinct uncached queries have the same external concurrency contract as cached
+ones. No selection may overlap a SpatialDatabase mutation, another `applyUpdates`, or
 `collect`.
 
 ## 9. TLAS lifecycle
@@ -487,7 +488,7 @@ ones. No selection may overlap a World mutation, another `applyUpdates`, or
 The top level is an 8-wide dynamic BVH over live placements of independent
 BLAS roots, including one-node BLASes. It stores world bounds, maximum
 effective error, layer masks, and parent/lane back-pointers in maintenance
-arrays separate from the cut-path instance record. TLAS nodes have no
+arrays separate from the selection-path instance record. TLAS nodes have no
 renderable payload and are never selected; after coarse culling, a surviving
 leaf identifies the BLAS instance whose renderable hierarchy is evaluated.
 
@@ -499,7 +500,7 @@ the selection snapshot:
 - `TlasQuality::Morton` is the cheapest, loosest quality choice.
 
 That first non-empty build also compacts and spatially orders the physical
-instance streams. Public `InstanceRef` values and `CutEntry::instance()` ids
+instance streams. Public `InstanceRef` values and `FrontierEntry::instance()` ids
 are mapped separately and remain stable.
 
 After the tree exists, individual adds and removes are applied incrementally in
@@ -515,11 +516,11 @@ bounded cohort consume the budget repeatedly. Sufficient aggregate area growth
 can promote a later rebuild to restore quality. These thresholds are exposed as
 `tlasEscapeFraction` and `tlasAreaDrift`.
 
-Routine repairs preserve physical instance order. `World::optimize()` is the
+Routine repairs preserve physical instance order. `SpatialDatabase::optimize()` is the
 explicit synchronization-point operation that flushes pending bounds, compacts
 dead dense slots, performs a quality rebuild, and restores TLAS traversal order
-to the physical instance and view-record streams. Call it after disruptive
-world changes at a menu, loading screen, teleport, or level transition rather
+to the physical instance and query-record streams. Call it after disruptive
+database changes at a menu, loading screen, teleport, or level transition rather
 than as per-frame maintenance.
 
 Morton builds quantize each centroid to 21 bits per axis for a 63-bit key.
@@ -529,7 +530,7 @@ live-instance list makes rebuild enumeration proportional to the current
 population rather than the allocated-slot high-water mark.
 
 Quality builds can be a visible level-load cost at hundreds of thousands of
-instances. Build the initial world before an interactive frame and keep the
+instances. Build the initial database before an interactive frame and keep the
 incremental edit path active for steady churn.
 
 ## 10. Motion and copy-on-write bounds
@@ -538,7 +539,7 @@ incremental edit path active for steady churn.
 For a persistent fixed-order cohort, `MotionGroup` retains the caller's order
 and caches the corresponding physical instance order for `moveInstances`.
 Stale references are skipped, duplicate references use the last supplied
-position, and the physical-order cache refreshes after a world layout change.
+position, and the physical-order cache refreshes after a database layout change.
 
 `setNodeBounds(instance, node, localBounds)` deforms one node for one instance.
 The instance argument is essential: immutable topology and payload data remain
@@ -574,13 +575,13 @@ caller-generated dynamic proxies.
 
 ## 11. Garbage collection
 
-Non-pinned attached pages participate in an intrusive world LRU, but selection
+Non-pinned attached pages participate in an intrusive database LRU, but selection
 never mutates it. `applyUpdates` advances the age epoch. A
-`PageUsageContext` records the latest epoch in which its view needed each page
+`PageUsageContext` records the latest epoch in which its query needed each page
 and accumulates that feedback until collection.
 
 `collect(usageContexts, maxAttachedPages, minAge)` first consumes
-only the supplied views' accumulated feedback, then detaches cold leaf mounts
+only the supplied queries' accumulated feedback, then detaches cold leaf mounts
 until `streamedPageCount()` is no larger than the requested budget. The
 single-`PageUsageContext` and no-feedback overloads are conveniences. Pinned root mounts
 do not count because they cannot be collected. A candidate must:
@@ -589,17 +590,17 @@ do not count because they cannot be collected. A candidate must:
 - have no attached child pages; and
 - have been untouched for at least `minAge` frames.
 
-`CollectResult::freedPayloads` is a span over World-owned resident payload
+`CollectResult::freedPayloads` is a span over SpatialDatabase-owned resident payload
 values that became unreachable. It remains valid until the next collection.
 Collection works from the cold tail and is proportional to feedback consumed,
-candidates examined, and pages detached; it does not scan the entire world.
+candidates examined, and pages detached; it does not scan the entire database.
 
 ## 12. Complexity and current limits
 
 | Operation | Expected cost |
 |---|---|
-| Uncached `View::selectCut` | TLAS query + visible current/ideal cut region + outputs |
-| View reuse hit | TLAS query + record validation + copied cut entries |
+| Uncached `SpatialQuery::selectFrontier` | TLAS query + visible current/ideal frontier region + outputs |
+| SpatialQuery reuse hit | TLAS query + record validation + copied frontier entries |
 | `markResident` / `markNonResident` | O(changed coverage path to the mount root), with early-out |
 | `attachPage` | O(page nodes) runtime-state initialization |
 | `detachPage` | O(detached mount state); child mounts must be detached first |
@@ -614,11 +615,11 @@ Current integration limits and tuning decisions are:
 - page size is content-dependent; hundreds to low thousands of nodes is the
   intended starting range, but boundary frequency and streaming granularity
   should be profiled;
-- compact identifiers cap a world at 1,048,575 simultaneously mounted page
+- compact identifiers cap a database at 1,048,575 simultaneously mounted page
   slots, a page at 1,048,576 entries including its sentinel, and the dense
   instance table at 16,777,215 live slots; a mount generation wraps only after
   that same slot has been recycled more than 16 million times;
-- cached views parallelize across calls; one cached call does not fan out
+- cached queries parallelize across calls; one cached call does not fan out
   internally;
 - translation plus uniform scale is the built-in instance transform;
 - internal deformation needs caller-maintained proxy fidelity and has no

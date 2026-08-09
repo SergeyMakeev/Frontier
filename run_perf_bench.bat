@@ -37,18 +37,18 @@ if not exist "%BUILD_DIR%\CMakeCache.txt" (
 echo Configuring Release AVX2 performance build...
 cmake -S "%ROOT%" -B "%BUILD_DIR%" !GENERATOR_ARGS! ^
     -DCMAKE_BUILD_TYPE=Release ^
-    -DHLOD_BUILD_TESTS=OFF ^
-    -DHLOD_BUILD_BENCH=ON ^
-    -DHLOD_AVX2=ON ^
-    -DHLOD_FORCE_SCALAR=OFF
+    -DFRONTIER_BUILD_TESTS=OFF ^
+    -DFRONTIER_BUILD_BENCH=ON ^
+    -DFRONTIER_AVX2=ON ^
+    -DFRONTIER_FORCE_SCALAR=OFF
 if errorlevel 1 exit /b 1
 
-echo Building hlod_bench...
-cmake --build "%BUILD_DIR%" --config Release --target hlod_bench --parallel
+echo Building frontier_bench...
+cmake --build "%BUILD_DIR%" --config Release --target frontier_bench --parallel
 if errorlevel 1 exit /b 1
 
-set "BENCH_EXE=%BUILD_DIR%\bench\Release\hlod_bench.exe"
-if not exist "%BENCH_EXE%" set "BENCH_EXE=%BUILD_DIR%\bench\hlod_bench.exe"
+set "BENCH_EXE=%BUILD_DIR%\bench\Release\frontier_bench.exe"
+if not exist "%BENCH_EXE%" set "BENCH_EXE=%BUILD_DIR%\bench\frontier_bench.exe"
 if not exist "%BENCH_EXE%" (
     echo ERROR: Built benchmark executable was not found under "%BUILD_DIR%\bench".
     exit /b 1
@@ -60,7 +60,7 @@ echo Running the documented performance suite with five repetitions...
 echo Pass Google Benchmark arguments to this script to override the default suite.
 echo Writing %ROOT%\real_world_perf.json
 "%BENCH_EXE%" ^
-    --benchmark_filter="BM_(View_Breakdown|View_MultiView|FlatForest100k|MixedForest100k|RootDecisionForest100k)" ^
+    --benchmark_filter="BM_(SpatialQuery_Breakdown|SpatialQuery_MultiQuery|FlatForest100k|MixedForest100k|RootDecisionForest100k)" ^
     --benchmark_repetitions=5 ^
     --benchmark_report_aggregates_only=true ^
     --benchmark_out="%ROOT%\real_world_perf.json" ^
@@ -68,7 +68,7 @@ echo Writing %ROOT%\real_world_perf.json
 goto done
 
 :custom_args
-echo Running hlod_bench with caller-supplied arguments...
+echo Running frontier_bench with caller-supplied arguments...
 "%BENCH_EXE%" %*
 
 :done

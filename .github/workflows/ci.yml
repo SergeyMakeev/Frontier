@@ -18,22 +18,22 @@ jobs:
           # ---- Linux x86-64: GCC and Clang, AVX2 / SSE2 / scalar ----------
           - name: linux-x64-gcc-avx2
             os: ubuntu-latest
-            cmake_args: -DCMAKE_CXX_COMPILER=g++ -DHLOD_AVX2=ON
+            cmake_args: -DCMAKE_CXX_COMPILER=g++ -DFRONTIER_AVX2=ON
           - name: linux-x64-gcc-sse2
             os: ubuntu-latest
-            cmake_args: -DCMAKE_CXX_COMPILER=g++ -DHLOD_AVX2=OFF
+            cmake_args: -DCMAKE_CXX_COMPILER=g++ -DFRONTIER_AVX2=OFF
           - name: linux-x64-gcc-scalar
             os: ubuntu-latest
-            cmake_args: -DCMAKE_CXX_COMPILER=g++ -DHLOD_AVX2=OFF -DHLOD_FORCE_SCALAR=ON
+            cmake_args: -DCMAKE_CXX_COMPILER=g++ -DFRONTIER_AVX2=OFF -DFRONTIER_FORCE_SCALAR=ON
           - name: linux-x64-clang-avx2
             os: ubuntu-latest
-            cmake_args: -DCMAKE_CXX_COMPILER=clang++ -DHLOD_AVX2=ON
+            cmake_args: -DCMAKE_CXX_COMPILER=clang++ -DFRONTIER_AVX2=ON
           - name: linux-x64-clang-sse2
             os: ubuntu-latest
-            cmake_args: -DCMAKE_CXX_COMPILER=clang++ -DHLOD_AVX2=OFF
+            cmake_args: -DCMAKE_CXX_COMPILER=clang++ -DFRONTIER_AVX2=OFF
           - name: linux-x64-clang-scalar
             os: ubuntu-latest
-            cmake_args: -DCMAKE_CXX_COMPILER=clang++ -DHLOD_AVX2=OFF -DHLOD_FORCE_SCALAR=ON
+            cmake_args: -DCMAKE_CXX_COMPILER=clang++ -DFRONTIER_AVX2=OFF -DFRONTIER_FORCE_SCALAR=ON
 
           # ---- Linux ARM64: GCC and Clang, NEON / scalar -------------------
           - name: linux-arm64-gcc-neon
@@ -41,30 +41,30 @@ jobs:
             cmake_args: -DCMAKE_CXX_COMPILER=g++
           - name: linux-arm64-gcc-scalar
             os: ubuntu-24.04-arm
-            cmake_args: -DCMAKE_CXX_COMPILER=g++ -DHLOD_FORCE_SCALAR=ON
+            cmake_args: -DCMAKE_CXX_COMPILER=g++ -DFRONTIER_FORCE_SCALAR=ON
           - name: linux-arm64-clang-neon
             os: ubuntu-24.04-arm
             cmake_args: -DCMAKE_CXX_COMPILER=clang++
           - name: linux-arm64-clang-scalar
             os: ubuntu-24.04-arm
-            cmake_args: -DCMAKE_CXX_COMPILER=clang++ -DHLOD_FORCE_SCALAR=ON
+            cmake_args: -DCMAKE_CXX_COMPILER=clang++ -DFRONTIER_FORCE_SCALAR=ON
 
           # ---- Windows x86-64: MSVC (AVX2 / SSE2 / scalar) and clang-cl ----
           - name: windows-x64-msvc-avx2
             os: windows-latest
-            cmake_args: -DHLOD_AVX2=ON
+            cmake_args: -DFRONTIER_AVX2=ON
           - name: windows-x64-msvc-sse2
             os: windows-latest
-            cmake_args: -DHLOD_AVX2=OFF
+            cmake_args: -DFRONTIER_AVX2=OFF
           - name: windows-x64-msvc-scalar
             os: windows-latest
-            cmake_args: -DHLOD_AVX2=OFF -DHLOD_FORCE_SCALAR=ON
+            cmake_args: -DFRONTIER_AVX2=OFF -DFRONTIER_FORCE_SCALAR=ON
           - name: windows-x64-clangcl-avx2
             os: windows-latest
-            cmake_args: -T ClangCL -DHLOD_AVX2=ON
+            cmake_args: -T ClangCL -DFRONTIER_AVX2=ON
           - name: windows-x64-clangcl-sse2
             os: windows-latest
-            cmake_args: -T ClangCL -DHLOD_AVX2=OFF
+            cmake_args: -T ClangCL -DFRONTIER_AVX2=OFF
 
           # ---- Windows ARM64: MSVC, NEON / scalar --------------------------
           - name: windows-arm64-msvc-neon
@@ -72,7 +72,7 @@ jobs:
             cmake_args: ""
           - name: windows-arm64-msvc-scalar
             os: windows-11-arm
-            cmake_args: -DHLOD_FORCE_SCALAR=ON
+            cmake_args: -DFRONTIER_FORCE_SCALAR=ON
 
           # ---- macOS Apple Silicon: AppleClang, NEON / scalar --------------
           - name: macos-arm64-clang-neon
@@ -80,18 +80,18 @@ jobs:
             cmake_args: ""
           - name: macos-arm64-clang-scalar
             os: macos-latest
-            cmake_args: -DHLOD_FORCE_SCALAR=ON
+            cmake_args: -DFRONTIER_FORCE_SCALAR=ON
 
           # ---- macOS Intel: AppleClang, AVX2 / SSE2 / scalar ---------------
           - name: macos-x64-clang-avx2
             os: macos-15-intel
-            cmake_args: -DHLOD_AVX2=ON
+            cmake_args: -DFRONTIER_AVX2=ON
           - name: macos-x64-clang-sse2
             os: macos-15-intel
-            cmake_args: -DHLOD_AVX2=OFF
+            cmake_args: -DFRONTIER_AVX2=OFF
           - name: macos-x64-clang-scalar
             os: macos-15-intel
-            cmake_args: -DHLOD_AVX2=OFF -DHLOD_FORCE_SCALAR=ON
+            cmake_args: -DFRONTIER_AVX2=OFF -DFRONTIER_FORCE_SCALAR=ON
 
     steps:
       - uses: actions/checkout@v4
@@ -108,10 +108,10 @@ jobs:
       - name: Performance tests
         shell: bash
         run: |
-          if [ -x build/bench/hlod_bench ]; then
-            BENCH=build/bench/hlod_bench
+          if [ -x build/bench/frontier_bench ]; then
+            BENCH=build/bench/frontier_bench
           else
-            BENCH=build/bench/Release/hlod_bench.exe
+            BENCH=build/bench/Release/frontier_bench.exe
           fi
           "$BENCH" --benchmark_min_time=0.1s \
                    --benchmark_out=bench-${{ matrix.name }}.json \

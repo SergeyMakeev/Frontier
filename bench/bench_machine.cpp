@@ -1,4 +1,4 @@
-// Machine characterization for interpreting HLodTree results, plus a small
+// Machine characterization for interpreting Frontier results, plus a small
 // group of production-kernel probes. This is a separate executable so adding
 // diagnostics cannot perturb the end-to-end benchmark's code layout.
 
@@ -16,44 +16,44 @@
 #include <string>
 #include <vector>
 
-#include "hlod/math.h"
-#include "hlod/world.h"
+#include "frontier/math.h"
+#include "frontier/spatial_database.h"
 #include "deterministic_rng.h"
 
 #if defined(__aarch64__) || defined(_M_ARM64) || defined(_M_ARM64EC)
 #include <arm_neon.h>
-#define HLOD_MACHINE_NEON 1
+#define FRONTIER_MACHINE_NEON 1
 #elif defined(__SSE2__) || defined(_M_X64) || \
       (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
 #include <immintrin.h>
-#define HLOD_MACHINE_SSE2 1
+#define FRONTIER_MACHINE_SSE2 1
 #endif
 
 #if defined(_MSC_VER)
-#define HLOD_MACHINE_NOINLINE __declspec(noinline)
+#define FRONTIER_MACHINE_NOINLINE __declspec(noinline)
 #else
-#define HLOD_MACHINE_NOINLINE __attribute__((noinline))
+#define FRONTIER_MACHINE_NOINLINE __attribute__((noinline))
 #endif
 
-#define HLOD_STRINGIZE_DETAIL(x) #x
-#define HLOD_STRINGIZE(x) HLOD_STRINGIZE_DETAIL(x)
+#define FRONTIER_STRINGIZE_DETAIL(x) #x
+#define FRONTIER_STRINGIZE(x) FRONTIER_STRINGIZE_DETAIL(x)
 
 namespace {
 
 constexpr int64_t kKiB = 1024;
 constexpr int64_t kMiB = 1024 * kKiB;
 
-#if HLOD_SIMD_AVX2
+#if FRONTIER_SIMD_AVX2
 constexpr const char* kKernelBackend = "AVX2 256-bit";
-#elif HLOD_SIMD_NEON
+#elif FRONTIER_SIMD_NEON
 constexpr const char* kKernelBackend = "NEON 128-bit x2";
-#elif HLOD_SIMD_SSE2
+#elif FRONTIER_SIMD_SSE2
 constexpr const char* kKernelBackend = "SSE2 128-bit x2";
 #else
 constexpr const char* kKernelBackend = "portable scalar x8";
 #endif
 
-#if HLOD_MACHINE_NEON
+#if FRONTIER_MACHINE_NEON
 using Vec4 = float32x4_t;
 constexpr const char* kVectorBackend = "NEON 128-bit";
 inline Vec4 vset(float x) { return vdupq_n_f32(x); }
@@ -70,7 +70,7 @@ inline uint32_t compareMask(Vec4 a, Vec4 b)
     const uint32x4_t bits = vshrq_n_u32(vcltq_f32(a, b), 31);
     return vaddvq_u32(vmulq_u32(bits, vld1q_u32(kWeights)));
 }
-#elif HLOD_MACHINE_SSE2
+#elif FRONTIER_MACHINE_SSE2
 using Vec4 = __m128;
 constexpr const char* kVectorBackend = "SSE2 128-bit";
 inline Vec4 vset(float x) { return _mm_set1_ps(x); }
@@ -125,9 +125,9 @@ inline uint32_t compareMask(Vec4 a, Vec4 b)
 constexpr const char* kCompiler = "Clang " __clang_version__;
 #elif defined(__GNUC__)
 constexpr const char* kCompiler =
-    "GCC " HLOD_STRINGIZE(__GNUC__) "." HLOD_STRINGIZE(__GNUC_MINOR__);
+    "GCC " FRONTIER_STRINGIZE(__GNUC__) "." FRONTIER_STRINGIZE(__GNUC_MINOR__);
 #elif defined(_MSC_VER)
-constexpr const char* kCompiler = "MSVC " HLOD_STRINGIZE(_MSC_VER);
+constexpr const char* kCompiler = "MSVC " FRONTIER_STRINGIZE(_MSC_VER);
 #else
 constexpr const char* kCompiler = "unknown";
 #endif
@@ -346,7 +346,7 @@ static void BM_VectorCompareMask128(benchmark::State& state)
 {
     constexpr size_t kLanes = 4096;
     std::vector<float> a(kLanes), b(kLanes);
-    hlodtest::DeterministicRng rng(0x12345678u);
+    frontiertest::DeterministicRng rng(0x12345678u);
     for (size_t i = 0; i < kLanes; ++i)
     {
         a[i] = float(int32_t(rng.next())) * (1.0f / 2147483648.0f);
@@ -366,19 +366,19 @@ BENCHMARK(BM_VectorCompareMask128);
 
 // ---- production traversal kernels ----------------------------------------
 
-inline uint32_t wideAabbProduction(const hlod::WideBounds& b,
-                                   const hlod::Frustum& fr,
+inline uint32_t wideAabbProduction(const frontier::WideBounds& b,
+                                   const frontier::Frustum& fr,
                                    uint8_t inMask, uint8_t* outMasks)
 {
-    return hlod::testWideAabb(b, fr, inMask, outMasks);
+    return frontier::testWideAabb(b, fr, inMask, outMasks);
 }
 
 struct WideAabbFixture
 {
     static constexpr size_t kCases = 128;
-    std::array<hlod::WideBounds, kCases> bounds{};
-    std::array<hlod::float8, kCases> geometricError{};
-    hlod::Frustum frustum{};
+    std::array<frontier::WideBounds, kCases> bounds{};
+    std::array<frontier::float8, kCases> geometricError{};
+    frontier::Frustum frustum{};
 };
 
 WideAabbFixture makeWideAabbFixture()
@@ -391,12 +391,12 @@ WideAabbFixture makeWideAabbFixture()
     f.frustum.plane[4] = { 0.00000f,  0.00000f,  1.00000f,  5.0f};
     f.frustum.plane[5] = { 0.00000f,  0.00000f, -1.00000f, 80.0f};
 
-    hlodtest::DeterministicRng rng(0x6d2b79f5u);
+    frontiertest::DeterministicRng rng(0x6d2b79f5u);
     const auto random = [&rng](float lo, float hi) { return rng.uniform(lo, hi); };
     for (size_t i = 0; i < f.bounds.size(); ++i)
     {
-        hlod::WideBounds& wide = f.bounds[i];
-        for (uint32_t lane = 0; lane < hlod::kWide; ++lane)
+        frontier::WideBounds& wide = f.bounds[i];
+        for (uint32_t lane = 0; lane < frontier::kWide; ++lane)
         {
             const float cx = random(-60.0f, 60.0f);
             const float cy = random(-50.0f, 50.0f);
@@ -404,7 +404,7 @@ WideAabbFixture makeWideAabbFixture()
             const float ex = random(0.05f, 8.0f);
             const float ey = random(0.05f, 8.0f);
             const float ez = random(0.05f, 8.0f);
-            wide.setLane(lane, hlod::AABB::fromMinMax(
+            wide.setLane(lane, frontier::AABB::fromMinMax(
                 {cx - ex, cy - ey, cz - ez, 0.0f},
                 {cx + ex, cy + ey, cz + ez, 0.0f}));
             f.geometricError[i].v[lane] = random(0.1f, 50.0f);
@@ -425,7 +425,7 @@ static void BM_KernelWideAabb(benchmark::State& state)
     {
         for (int i = 0; i < kCalls; ++i)
         {
-            uint8_t masks[hlod::kWide];
+            uint8_t masks[frontier::kWide];
             const uint32_t alive = wideAabbProduction(
                 fixture.bounds[size_t(i) & (WideAabbFixture::kCases - 1)],
                 fixture.frustum, inMask, masks);
@@ -435,7 +435,7 @@ static void BM_KernelWideAabb(benchmark::State& state)
         }
         benchmark::DoNotOptimize(checksum);
     }
-    state.SetItemsProcessed(state.iterations() * kCalls * hlod::kWide);
+    state.SetItemsProcessed(state.iterations() * kCalls * frontier::kWide);
 }
 BENCHMARK(BM_KernelWideAabb)
     ->Args({1})->Args({3})->Args({6})->ArgName("active_planes");
@@ -444,24 +444,24 @@ static void BM_KernelDistanceErrorCurrent(benchmark::State& state)
 {
     constexpr int kCalls = 4096;
     const WideAabbFixture fixture = makeWideAabbFixture();
-    const hlod::float4 queryMin = hlod::float4::point(-1.0f, -1.0f, -1.0f);
-    const hlod::float4 queryMax = hlod::float4::point(1.0f, 1.0f, 1.0f);
-    std::array<hlod::float8, WideAabbFixture::kCases> output{};
+    const frontier::float4 queryMin = frontier::float4::point(-1.0f, -1.0f, -1.0f);
+    const frontier::float4 queryMax = frontier::float4::point(1.0f, 1.0f, 1.0f);
+    std::array<frontier::float8, WideAabbFixture::kCases> output{};
 
     for (auto _ : state)
     {
         for (int i = 0; i < kCalls; ++i)
         {
             const size_t index = size_t(i) & (WideAabbFixture::kCases - 1);
-            const hlod::float8 d2 = hlod::distanceToBoxesSq(
+            const frontier::float8 d2 = frontier::distanceToBoxesSq(
                 fixture.bounds[index], queryMin, queryMax);
-            output[index] = hlod::screenErrorFromSq8(
+            output[index] = frontier::screenErrorFromSq8(
                 fixture.geometricError[index], 935.0f, d2);
         }
         benchmark::ClobberMemory();
     }
     benchmark::DoNotOptimize(output.data());
-    state.SetItemsProcessed(state.iterations() * kCalls * hlod::kWide);
+    state.SetItemsProcessed(state.iterations() * kCalls * frontier::kWide);
 }
 BENCHMARK(BM_KernelDistanceErrorCurrent);
 
@@ -470,7 +470,7 @@ struct alignas(32) CacheHitRecord
     float validUntil;
     float kSlope;
     uint32_t epoch;
-    uint32_t cutVersion;
+    uint32_t frontierVersion;
     uint32_t begin;
     uint32_t counts;
     uint32_t depSlot;
@@ -494,7 +494,7 @@ static void runCacheHitValidation(benchmark::State& state)
     constexpr uint32_t kStampCount = 64;
     std::vector<uint32_t> visible(kRecords);
     std::vector<CacheHitRecord> records(kRecords);
-    std::vector<uint32_t> cutVersions(kRecords, 11u);
+    std::vector<uint32_t> frontierVersions(kRecords, 11u);
     std::array<CacheHitStamp, kStampCount> stamps{};
 
     for (CacheHitStamp& stamp : stamps) stamp = {7u, 1u};
@@ -530,21 +530,21 @@ static void runCacheHitValidation(benchmark::State& state)
                 hit = mask == 0;
                 hit &= 1.0f + r.kSlope * 0.5f < r.validUntil;
                 hit &= r.epoch == 5u;
-                hit &= r.cutVersion == cutVersions[instance];
+                hit &= r.frontierVersion == frontierVersions[instance];
             }
             else if constexpr (Mode == 2)
             {
                 hit = mask == 0 &&
                       1.0f < r.validUntil &&
                       r.epoch == 5u &&
-                      r.cutVersion == cutVersions[instance];
+                      r.frontierVersion == frontierVersions[instance];
             }
             else
             {
                 hit = mask == 0 &&
                       1.0f + r.kSlope * 0.5f < r.validUntil &&
                       r.epoch == 5u &&
-                      r.cutVersion == cutVersions[instance];
+                      r.frontierVersion == frontierVersions[instance];
             }
             if (hit && depCount != 0)
             {
@@ -588,22 +588,22 @@ static void BM_OutputAppendBuffer(benchmark::State& state)
     constexpr uint32_t kRanges = 25'000;
     const uint32_t entriesPerRange = uint32_t(state.range(0));
     const size_t entryCount = size_t(kRanges) * entriesPerRange;
-    std::vector<hlod::CutEntry> input(entryCount);
+    std::vector<frontier::FrontierEntry> input(entryCount);
     for (size_t i = 0; i < entryCount; ++i)
     {
-        input[i] = hlod::CutEntry(
-            hlod::NodeHandle{uint32_t(i) & 0xffffu, uint32_t(i) & 0xffu, 1u},
-            uint8_t(i), uint32_t(i) & hlod::kInstanceIdMask);
+        input[i] = frontier::FrontierEntry(
+            frontier::NodeHandle{uint32_t(i) & 0xffffu, uint32_t(i) & 0xffu, 1u},
+            uint8_t(i), uint32_t(i) & frontier::kInstanceIdMask);
     }
 
-    hlod::AppendBuffer<hlod::CutEntry> output;
+    frontier::AppendBuffer<frontier::FrontierEntry> output;
     output.reserve(entryCount);
     for (auto _ : state)
     {
         output.clear();
         for (uint32_t range = 0; range < kRanges; ++range)
         {
-            const hlod::CutEntry* p =
+            const frontier::FrontierEntry* p =
                 input.data() + size_t(range) * entriesPerRange;
             output.append(p, entriesPerRange);
         }
@@ -612,7 +612,7 @@ static void BM_OutputAppendBuffer(benchmark::State& state)
     }
     state.SetItemsProcessed(state.iterations() * int64_t(entryCount));
     state.SetBytesProcessed(
-        state.iterations() * int64_t(entryCount * sizeof(hlod::CutEntry)));
+        state.iterations() * int64_t(entryCount * sizeof(frontier::FrontierEntry)));
 }
 BENCHMARK(BM_OutputAppendBuffer)
     ->Arg(1)
@@ -812,12 +812,12 @@ BENCHMARK(BM_IndexedRecordRead)
 
 // ---- control flow and mask handling ---------------------------------------
 
-HLOD_MACHINE_NOINLINE uint32_t branchArmA(uint32_t x)
+FRONTIER_MACHINE_NOINLINE uint32_t branchArmA(uint32_t x)
 {
     return (x * 1664525u + 1013904223u) ^ 0x9e3779b9u;
 }
 
-HLOD_MACHINE_NOINLINE uint32_t branchArmB(uint32_t x)
+FRONTIER_MACHINE_NOINLINE uint32_t branchArmB(uint32_t x)
 {
     return std::rotl(x ^ 0x85ebca6bu, 13) + 0xc2b2ae35u;
 }
@@ -827,7 +827,7 @@ static void BM_BranchDispatch(benchmark::State& state)
     constexpr size_t kCount = 16384;
     const int pattern = int(state.range(0)); // 0 constant, 1 alternating, 2 random
     std::vector<uint8_t> choices(kCount);
-    hlodtest::DeterministicRng rng(0x31415926u);
+    frontiertest::DeterministicRng rng(0x31415926u);
     for (size_t i = 0; i < kCount; ++i)
     {
         choices[i] = pattern == 0 ? 0 : pattern == 1 ? uint8_t(i & 1)
@@ -880,7 +880,7 @@ int main(int argc, char** argv)
     benchmark::MaybeReenterWithoutASLR(argc, argv);
     benchmark::Initialize(&argc, argv);
     benchmark::AddCustomContext("machine_vector_backend", kVectorBackend);
-    benchmark::AddCustomContext("hlod_kernel_backend", kKernelBackend);
+    benchmark::AddCustomContext("frontier_kernel_backend", kKernelBackend);
     benchmark::AddCustomContext("machine_compiler", kCompiler);
     if (benchmark::ReportUnrecognizedArguments(argc, argv)) return 1;
     benchmark::RunSpecifiedBenchmarks();

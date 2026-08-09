@@ -13,7 +13,7 @@
 #include <iterator>
 #include <type_traits>
 
-namespace hlodtest {
+namespace frontiertest {
 
 class DeterministicRng
 {
@@ -101,4 +101,4 @@ void deterministicShuffle(RandomIt first, RandomIt last, DeterministicRng& rng)
     }
 }
 
-} // namespace hlodtest
+} // namespace frontiertest

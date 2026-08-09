@@ -1,8 +1,8 @@
 #pragma once
 // Immutable flat page: preorder SoA arrays + BVH8-style wide child blocks,
 // laid out as ONE contiguous blob. Produced by HierarchyBuilder::build() or
-// the low-level HLodBuilder::build();
-// see docs/hlod_design.md §3.
+// the low-level PageBuilder::build();
+// see docs/frontier_design.md §3.
 //
 // The in-memory layout IS the on-disk format. A streamed page can be read into
 // one aligned buffer and validated in place, with no unpacking, fixups, or
@@ -11,7 +11,7 @@
 // thousands of instances can share a single asset blob.
 //
 //   PageView — borrows a blob somebody else owns (mmap, a bundle file, an
-//              asset the World already holds). Trivially copyable, 88 bytes.
+//              asset the SpatialDatabase already holds). Trivially copyable, 88 bytes.
 //   Page     — owns its blob and frees it through the context it came from.
 //              Move-only; copies must be spelled out with clone().
 
@@ -21,12 +21,12 @@
 #include "config.h"
 #include "math.h"
 
-namespace hlod {
+namespace frontier {
 
-class World;
+class SpatialDatabase;
 
 // Opaque 64-bit user payload carried per node: an id, a pointer, an index —
-// the World never interprets it, only echoes it back in selectCut outputs.
+// the SpatialDatabase never interprets it, only echoes it back in selectFrontier outputs.
 // Duplicates are the caller's business.
 using UserPayload = uint64_t;
 inline constexpr UserPayload kSentinelPayload = ~0ull;   // page sentinel [0] only
@@ -141,6 +141,7 @@ struct MutWideBoundsRef
 // Blob format
 // ---------------------------------------------------------------------------
 
+// Existing page blobs retain their original four-byte format signature.
 inline constexpr uint32_t kPageMagic   = 0x444F4C48u;   // 'HLOD', little-endian
 // Readers require an exact format-version match.
 inline constexpr uint16_t kPageVersion = 2;
@@ -200,11 +201,11 @@ public:
     PageView() = default;
 
     // Wrap a blob, validating magic, version and every offset/extent against
-    // `bytes`. HLOD_FATAL on a malformed or truncated blob — this is the
+    // `bytes`. FRONTIER_FATAL on a malformed or truncated blob — this is the
     // trust boundary for data coming off disk.
     static PageView fromBytes(const void* blob, size_t bytes);
 
-    // Wrap a blob that has already been validated (one the World is holding).
+    // Wrap a blob that has already been validated (one the SpatialDatabase is holding).
     // No checks; do not point this at untrusted bytes.
     static PageView fromValidatedBytes(const void* blob);
 
@@ -285,28 +286,28 @@ public:
     Page& operator=(const Page&) = delete;
 
     // Take ownership of a blob that was allocated through `ctx`.
-    static Page adopt(void* blob, size_t bytes, const HlodContext& ctx);
+    static Page adopt(void* blob, size_t bytes, const FrontierContext& ctx);
 
     // Validate and copy an external blob (one just read from a file).
     static Page fromBytes(const void* blob, size_t bytes,
-                          const HlodContext& ctx = defaultContext());
+                          const FrontierContext& ctx = defaultContext());
 
-    Page clone(const HlodContext& ctx = defaultContext()) const;
+    Page clone(const FrontierContext& ctx = defaultContext()) const;
 
 private:
-    friend class World;
+    friend class SpatialDatabase;
 
     // Wrap already-validated external storage without taking ownership. The
-    // World uses this so AssetRt needs one Page object for both owned and
+    // SpatialDatabase uses this so AssetRt needs one Page object for both owned and
     // borrowed assets instead of storing a duplicate PageView beside it.
     static Page borrow(PageView view);
 
     void release();
     void moveFrom(Page& o) noexcept;
 
-    const HlodContext* ctx_ = nullptr;
+    const FrontierContext* ctx_ = nullptr;
 };
 static_assert(sizeof(void*) != 8 || sizeof(Page) == 96,
               "Page must stay an 88-byte view plus ownership pointer");
 
-} // namespace hlod
+} // namespace frontier

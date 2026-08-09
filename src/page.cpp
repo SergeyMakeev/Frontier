@@ -1,8 +1,8 @@
-#include "hlod/page.h"
+#include "frontier/page.h"
 
 #include <cstring>
 
-namespace hlod {
+namespace frontier {
 
 namespace {
 
@@ -100,24 +100,24 @@ PageView PageView::fromValidatedBytes(const void* blob)
 
 PageView PageView::fromBytes(const void* blob, size_t bytes)
 {
-    HLOD_CHECK(blob != nullptr, "PageView::fromBytes: null blob");
-    HLOD_CHECK(bytes >= sizeof(PageHeader), "PageView::fromBytes: truncated header");
-    HLOD_CHECK((reinterpret_cast<uintptr_t>(blob) & (alignof(WideBlock) - 1)) == 0,
+    FRONTIER_CHECK(blob != nullptr, "PageView::fromBytes: null blob");
+    FRONTIER_CHECK(bytes >= sizeof(PageHeader), "PageView::fromBytes: truncated header");
+    FRONTIER_CHECK((reinterpret_cast<uintptr_t>(blob) & (alignof(WideBlock) - 1)) == 0,
                "PageView::fromBytes: blob is not sufficiently aligned");
 
     const auto* h = static_cast<const PageHeader*>(blob);
-    HLOD_CHECK(h->magic == kPageMagic,
-               "PageView::fromBytes: bad magic (not an hlod page, or byte-swapped)");
-    HLOD_CHECK(h->version == kPageVersion, "PageView::fromBytes: page version mismatch");
-    HLOD_CHECK(h->headerBytes == sizeof(PageHeader),
+    FRONTIER_CHECK(h->magic == kPageMagic,
+               "PageView::fromBytes: bad magic (not a Frontier page, or byte-swapped)");
+    FRONTIER_CHECK(h->version == kPageVersion, "PageView::fromBytes: page version mismatch");
+    FRONTIER_CHECK(h->headerBytes == sizeof(PageHeader),
                "PageView::fromBytes: header size mismatch");
-    HLOD_CHECK(h->nodeCount >= 1, "PageView::fromBytes: empty page");
-    HLOD_CHECK(h->totalBytes <= bytes, "PageView::fromBytes: truncated blob");
+    FRONTIER_CHECK(h->nodeCount >= 1, "PageView::fromBytes: empty page");
+    FRONTIER_CHECK(h->totalBytes <= bytes, "PageView::fromBytes: truncated blob");
 
     // Every offset is a function of the shape, so one comparison against the
     // recomputed layout covers all of them.
     const Layout L = computeLayout(h->nodeCount, h->wideCount);
-    HLOD_CHECK(L.totalBytes == h->totalBytes && L.wide == h->wideOffset &&
+    FRONTIER_CHECK(L.totalBytes == h->totalBytes && L.wide == h->wideOffset &&
                    L.mask == h->maskOffset && L.bbox == h->bboxOffset &&
                    L.payload == h->payloadOffset && L.parent == h->parentOffset &&
                    L.subtree == h->subtreeOffset && L.meta == h->metaOffset &&
@@ -126,7 +126,7 @@ PageView PageView::fromBytes(const void* blob, size_t bytes)
 
     PageView v;
     v.bind(blob, h->totalBytes);
-    HLOD_CHECK(v.payload[0] == kSentinelPayload,
+    FRONTIER_CHECK(v.payload[0] == kSentinelPayload,
                "PageView::fromBytes: missing page sentinel");
     return v;
 }
@@ -135,7 +135,7 @@ PageView PageView::fromBytes(const void* blob, size_t bytes)
 // Page
 // ---------------------------------------------------------------------------
 
-Page Page::adopt(void* blob, size_t bytes, const HlodContext& ctx)
+Page Page::adopt(void* blob, size_t bytes, const FrontierContext& ctx)
 {
     Page p;
     static_cast<PageView&>(p) = PageView::fromBytes(blob, bytes);
@@ -150,20 +150,20 @@ Page Page::borrow(PageView view)
     return p;
 }
 
-Page Page::fromBytes(const void* blob, size_t bytes, const HlodContext& ctx)
+Page Page::fromBytes(const void* blob, size_t bytes, const FrontierContext& ctx)
 {
     const PageView v = PageView::fromBytes(blob, bytes);
     void* copy = ctx.alloc(v.byteSize(), kPageAlign, ctx.user);
-    HLOD_CHECK(copy != nullptr, "Page::fromBytes: allocation failed");
+    FRONTIER_CHECK(copy != nullptr, "Page::fromBytes: allocation failed");
     std::memcpy(copy, v.data(), v.byteSize());
     return adopt(copy, v.byteSize(), ctx);
 }
 
-Page Page::clone(const HlodContext& ctx) const
+Page Page::clone(const FrontierContext& ctx) const
 {
     if (!valid()) return Page{};
     void* copy = ctx.alloc(byteSize_, kPageAlign, ctx.user);
-    HLOD_CHECK(copy != nullptr, "Page::clone: allocation failed");
+    FRONTIER_CHECK(copy != nullptr, "Page::clone: allocation failed");
     std::memcpy(copy, base_, byteSize_);
     Page p;
     static_cast<PageView&>(p) = PageView::fromValidatedBytes(copy);
@@ -186,4 +186,4 @@ void Page::moveFrom(Page& o) noexcept
     o.ctx_ = nullptr;
 }
 
-} // namespace hlod
+} // namespace frontier

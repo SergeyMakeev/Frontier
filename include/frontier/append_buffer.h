@@ -11,7 +11,7 @@
 #include <type_traits>
 #include <utility>
 
-namespace hlod {
+namespace frontier {
 
 // Retained-capacity, append-only storage for trivially copyable hot-path
 // output. It deliberately omits middle insertion, erasure, and shrinking.
@@ -197,4 +197,4 @@ private:
     uint32_t capacity_ = 0;
 };
 
-} // namespace hlod
+} // namespace frontier

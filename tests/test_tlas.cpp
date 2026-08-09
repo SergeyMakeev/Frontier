@@ -19,15 +19,15 @@
 
 #include "helpers.h"
 
-namespace hlodtest {
+namespace frontiertest {
 namespace {
 
-// Cut output carries the World's compact dense InstanceId. Generation remains
+// Cut output carries the SpatialDatabase's compact dense InstanceId. Generation remains
 // on InstanceRef for mutation safety, while render-side entity identity is a
 // caller table indexed by this id.
 struct Placed
 {
-    World::InstanceRef ref;
+    SpatialDatabase::InstanceRef ref;
     InstanceId         id;
 };
 
@@ -40,11 +40,11 @@ struct Placed
 // in-place editing silently measures a rebuild instead.
 struct Field
 {
-    World       w;
+    SpatialDatabase       w;
     AssetHandle asset{};
     TreeGen     gen;
 
-    explicit Field(const WorldConfig& cfg = WorldConfig{}) : w(cfg)
+    explicit Field(const SpatialDatabaseConfig& cfg = SpatialDatabaseConfig{}) : w(cfg)
     {
         gen.fanout = 4;
         gen.depth = 1;
@@ -52,7 +52,7 @@ struct Field
         const uint32_t nodes = proto.nodeCount();
         asset = w.registerAsset(std::move(proto));
         // The root mount only exists once an instance references the asset.
-        const World::InstanceRef seed = w.addInstance(asset, float4::point(0, 0, 0));
+        const SpatialDatabase::InstanceRef seed = w.addInstance(asset, float4::point(0, 0, 0));
         markAllResident(w, w.assetRootPage(asset), nodes);
         w.removeInstance(seed);
     }
@@ -62,7 +62,7 @@ struct Field
         InstanceDesc d;
         d.pos = float4::point(x, 0, z);
         d.mask = mask;
-        const World::InstanceRef ref = w.addInstance(asset, d);
+        const SpatialDatabase::InstanceRef ref = w.addInstance(asset, d);
         return {ref, ref.id};
     }
 };
@@ -81,29 +81,29 @@ Camera viewFrom(float x, float z, float halfExtent, uint32_t mask = ~0u)
 }
 
 // Isolates one trigger by putting the others out of reach.
-WorldConfig onlyEditBudget()
+SpatialDatabaseConfig onlyEditBudget()
 {
-    WorldConfig c;
+    SpatialDatabaseConfig c;
     c.tlasAreaDrift = 1.0e9f;
     c.tlasCountDrift = 1.0e9f;
     return c;
 }
-WorldConfig neverRebuild()
+SpatialDatabaseConfig neverRebuild()
 {
-    WorldConfig c = onlyEditBudget();
+    SpatialDatabaseConfig c = onlyEditBudget();
     c.tlasEditFraction = 1.0e9f;
     c.tlasEscapeFraction = 1.0e9f;
     return c;
 }
 
-std::multiset<InstanceId> instanceIdsOf(const CutView& cut)
+std::multiset<InstanceId> instanceIdsOf(const FrontierResultView& cut)
 {
     std::multiset<uint32_t> out;
-    for (const CutEntry& e : currentCut(cut)) out.insert(e.instance());
+    for (const FrontierEntry& e : currentFrontier(cut)) out.insert(e.instance());
     return out;
 }
 
-const CutParams kParams{8.0f, 0.0f};
+const SelectionParams kParams{8.0f, 0.0f};
 
 }   // namespace
 
@@ -118,16 +118,16 @@ TEST(Tlas, SpawnIsVisibleWithoutRebuilding)
         f.add(float(i % 20) * 4.0f - 40.0f, float(i / 20) * 4.0f - 20.0f);
 
     const Camera v = viewFrom(0, 0, 60.0f);
-    CutResults before;
-    selectCutUncached(f.w, v, kParams, before);
+    FrontierResult before;
+    selectFrontierUncached(f.w, v, kParams, before);
     ASSERT_FALSE(TAX::tlasDirty(f.w));
 
     const Placed fresh = f.add(2.0f, 2.0f);
     EXPECT_FALSE(TAX::tlasDirty(f.w)) << "a single spawn must not dirty the tree";
     EXPECT_EQ(TAX::tlasValidate(f.w), "");
 
-    CutResults after;
-    selectCutUncached(f.w, v, kParams, after);
+    FrontierResult after;
+    selectFrontierUncached(f.w, v, kParams, after);
     EXPECT_GT(after.size(), before.size());
     EXPECT_TRUE(instanceIdsOf(after).count(fresh.id)) << "the spawned instance is missing";
 }
@@ -140,8 +140,8 @@ TEST(Tlas, RemoveVanishesWithoutRebuilding)
         refs.push_back(f.add(float(i % 20) * 4.0f - 40.0f, float(i / 20) * 4.0f - 20.0f));
 
     const Camera v = viewFrom(0, 0, 60.0f);
-    CutResults cut;
-    selectCutUncached(f.w, v, kParams, cut);
+    FrontierResult cut;
+    selectFrontierUncached(f.w, v, kParams, cut);
     const InstanceId victim = refs[97].id;
     ASSERT_TRUE(instanceIdsOf(cut).count(victim));
 
@@ -149,7 +149,7 @@ TEST(Tlas, RemoveVanishesWithoutRebuilding)
     EXPECT_FALSE(TAX::tlasDirty(f.w)) << "a single removal must not dirty the tree";
     EXPECT_EQ(TAX::tlasValidate(f.w), "");
 
-    selectCutUncached(f.w, v, kParams, cut);
+    selectFrontierUncached(f.w, v, kParams, cut);
     EXPECT_EQ(instanceIdsOf(cut).count(victim), 0u) << "a removed instance is still emitted";
 }
 
@@ -185,12 +185,12 @@ TEST(Tlas, IncrementalEditsMatchARebuiltTree)
         ASSERT_EQ(TAX::tlasValidate(f.w), "") << "round " << round;
 
         const Camera v = viewFrom(uni(rng) * 0.3f, uni(rng) * 0.3f, 90.0f);
-        CutResults incremental;
-        selectCutUncached(f.w, v, kParams, incremental);
+        FrontierResult incremental;
+        selectFrontierUncached(f.w, v, kParams, incremental);
 
         TAX::forceTlasRebuild(f.w);
-        CutResults rebuilt;
-        selectCutUncached(f.w, v, kParams, rebuilt);
+        FrontierResult rebuilt;
+        selectFrontierUncached(f.w, v, kParams, rebuilt);
 
         EXPECT_EQ(instanceIdsOf(incremental), instanceIdsOf(rebuilt)) << "round " << round;
     }
@@ -209,9 +209,9 @@ TEST(Tlas, SplittingFullLeavesKeepsEveryInstanceReachable)
     Field f(neverRebuild());
     for (int i = 0; i < 64; ++i) f.add(float(i % 8) * 8.0f, float(i / 8) * 8.0f);
 
-    CutResults cut;
+    FrontierResult cut;
     const Camera v = viewFrom(28.0f, 28.0f, 40.0f);
-    selectCutUncached(f.w, v, kParams, cut);
+    selectFrontierUncached(f.w, v, kParams, cut);
     ASSERT_FALSE(TAX::tlasDirty(f.w));
     const size_t nodesBefore = TAX::tlasNodeCount(f.w);
 
@@ -226,7 +226,7 @@ TEST(Tlas, SplittingFullLeavesKeepsEveryInstanceReachable)
     }
     EXPECT_GT(TAX::tlasNodeCount(f.w), nodesBefore) << "no split ever happened";
 
-    selectCutUncached(f.w, v, kParams, cut);
+    selectFrontierUncached(f.w, v, kParams, cut);
     const std::multiset<InstanceId> ids = instanceIdsOf(cut);
     for (const Placed& r : added)
         EXPECT_TRUE(ids.count(r.id)) << "instance " << r.id << " lost by a split";
@@ -242,8 +242,8 @@ TEST(Tlas, InsertionPropagatesLayerMasksUpTheTree)
     for (int i = 0; i < 200; ++i)
         f.add(float(i % 20) * 4.0f - 40.0f, float(i / 20) * 4.0f - 20.0f, 0x1u);
 
-    CutResults cut;
-    selectCutUncached(f.w, viewFrom(0, 0, 60.0f), kParams, cut);
+    FrontierResult cut;
+    selectFrontierUncached(f.w, viewFrom(0, 0, 60.0f), kParams, cut);
     ASSERT_FALSE(TAX::tlasDirty(f.w));
 
     // A spawn on a layer no existing instance uses: every ancestor lane mask on
@@ -252,14 +252,14 @@ TEST(Tlas, InsertionPropagatesLayerMasksUpTheTree)
     ASSERT_FALSE(TAX::tlasDirty(f.w));
     EXPECT_EQ(TAX::tlasValidate(f.w), "");
 
-    CutParams filteredParams = kParams;
+    SelectionParams filteredParams = kParams;
     filteredParams.minPix = 0.5f;   // layer mask + contribution-culling path
-    selectCutUncached(f.w, viewFrom(0, 0, 60.0f, 0x4u), filteredParams, cut);
+    selectFrontierUncached(f.w, viewFrom(0, 0, 60.0f, 0x4u), filteredParams, cut);
     EXPECT_TRUE(instanceIdsOf(cut).count(odd.id))
         << "the layer filter culled a freshly inserted instance";
 
     // And a view on the layer it is not on must not pick it up.
-    selectCutUncached(f.w, viewFrom(0, 0, 60.0f, 0x1u), filteredParams, cut);
+    selectFrontierUncached(f.w, viewFrom(0, 0, 60.0f, 0x1u), filteredParams, cut);
     EXPECT_EQ(instanceIdsOf(cut).count(odd.id), 0u);
 }
 
@@ -272,15 +272,15 @@ TEST(Tlas, InsertionOutsideTheRootExtentGrowsThePath)
     Field f(neverRebuild());
     for (int i = 0; i < 200; ++i)
         f.add(float(i % 20) * 2.0f - 20.0f, float(i / 20) * 2.0f - 10.0f);
-    CutResults cut;
-    selectCutUncached(f.w, viewFrom(0, 0, 40.0f), kParams, cut);
+    FrontierResult cut;
+    selectFrontierUncached(f.w, viewFrom(0, 0, 40.0f), kParams, cut);
     ASSERT_FALSE(TAX::tlasDirty(f.w));
 
     const Placed out = f.add(900.0f, 900.0f);
     ASSERT_FALSE(TAX::tlasDirty(f.w));
     EXPECT_EQ(TAX::tlasValidate(f.w), "");
 
-    selectCutUncached(f.w, viewFrom(900.0f, 900.0f, 20.0f), kParams, cut);
+    selectFrontierUncached(f.w, viewFrom(900.0f, 900.0f, 20.0f), kParams, cut);
     EXPECT_TRUE(instanceIdsOf(cut).count(out.id)) << "an out-of-extent spawn is unreachable";
 }
 
@@ -294,15 +294,15 @@ TEST(Tlas, ADistantSpawnTripsTheAreaBudget)
     Field f;
     for (int i = 0; i < 200; ++i)
         f.add(float(i % 20) * 2.0f - 20.0f, float(i / 20) * 2.0f - 10.0f);
-    CutResults cut;
-    selectCutUncached(f.w, viewFrom(0, 0, 40.0f), kParams, cut);
+    FrontierResult cut;
+    selectFrontierUncached(f.w, viewFrom(0, 0, 40.0f), kParams, cut);
     ASSERT_FALSE(TAX::tlasDirty(f.w));
 
     const Placed out = f.add(9000.0f, 9000.0f);
     EXPECT_TRUE(TAX::tlasDirty(f.w));
 
     // Still correct, just by the slower route.
-    selectCutUncached(f.w, viewFrom(9000.0f, 9000.0f, 20.0f), kParams, cut);
+    selectFrontierUncached(f.w, viewFrom(9000.0f, 9000.0f, 20.0f), kParams, cut);
     EXPECT_EQ(TAX::tlasValidate(f.w), "");
     EXPECT_TRUE(instanceIdsOf(cut).count(out.id));
 }
@@ -319,9 +319,9 @@ TEST(Tlas, EmptyingAndRefillingReusesNodesSafely)
     for (int i = 0; i < 128; ++i)
         refs.push_back(f.add(float(i % 16) * 4.0f + 1.0f, float(i / 16) * 4.0f + 1.0f));
 
-    CutResults cut;
+    FrontierResult cut;
     const Camera v = viewFrom(30.0f, 14.0f, 50.0f);
-    selectCutUncached(f.w, v, kParams, cut);
+    selectFrontierUncached(f.w, v, kParams, cut);
     ASSERT_FALSE(TAX::tlasDirty(f.w));
     ASSERT_EQ(TAX::tlasValidate(f.w), "");
 
@@ -344,7 +344,7 @@ TEST(Tlas, EmptyingAndRefillingReusesNodesSafely)
     EXPECT_EQ(TAX::tlasNodeCount(f.w), nodesAfterRemoval)
         << "respawning grew the node array instead of reusing emptied nodes";
 
-    selectCutUncached(f.w, v, kParams, cut);
+    selectFrontierUncached(f.w, v, kParams, cut);
     const std::multiset<InstanceId> ids = instanceIdsOf(cut);
     for (const Placed& r : again)
         EXPECT_TRUE(ids.count(r.id)) << "respawned instance " << r.id << " is missing";
@@ -352,13 +352,13 @@ TEST(Tlas, EmptyingAndRefillingReusesNodesSafely)
     // Dense ids are intentionally recycled. The old generation-stamped refs
     // must nevertheless be unable to remove the new occupants of those ids.
     for (const Placed& r : refs) f.w.removeInstance(r.ref);
-    selectCutUncached(f.w, v, kParams, cut);
+    selectFrontierUncached(f.w, v, kParams, cut);
     const std::multiset<InstanceId> afterStaleRemoves = instanceIdsOf(cut);
     for (const Placed& r : again)
         EXPECT_TRUE(afterStaleRemoves.count(r.id));
 }
 
-TEST(Tlas, RemovingEveryInstanceLeavesAQueryableEmptyWorld)
+TEST(Tlas, RemovingEveryInstanceLeavesAQueryableEmptyDatabase)
 {
     Field f;
     std::vector<Placed> refs;
@@ -366,14 +366,14 @@ TEST(Tlas, RemovingEveryInstanceLeavesAQueryableEmptyWorld)
     for (const Placed& r : refs) f.w.removeInstance(r.ref);
     EXPECT_EQ(TAX::tlasValidate(f.w), "");
 
-    CutResults cut;
+    FrontierResult cut;
     const Camera v = viewFrom(70.0f, 0, 120.0f);
-    selectCutUncached(f.w, v, kParams, cut);
+    selectFrontierUncached(f.w, v, kParams, cut);
     EXPECT_TRUE(cut.empty());
 
     // And the world still works afterwards.
     const Placed fresh = f.add(70.0f, 0.0f);
-    selectCutUncached(f.w, v, kParams, cut);
+    selectFrontierUncached(f.w, v, kParams, cut);
     EXPECT_TRUE(instanceIdsOf(cut).count(fresh.id));
 }
 
@@ -384,9 +384,9 @@ TEST(Tlas, OptimizeCompactsDenseSlotsAndKeepsPublicRefsStable)
     for (int i = 0; i < 100; ++i)
         refs.push_back(f.add(float(i % 10) * 5.0f, float(i / 10) * 5.0f));
 
-    CutResults cut;
+    FrontierResult cut;
     const Camera v = viewFrom(22.5f, 22.5f, 80.0f);
-    selectCutUncached(f.w, v, kParams, cut);
+    selectFrontierUncached(f.w, v, kParams, cut);
     ASSERT_EQ(TAX::instanceSlotCount(f.w), 100u);
 
     for (size_t i = 50; i < refs.size(); ++i) f.w.removeInstance(refs[i].ref);
@@ -401,7 +401,7 @@ TEST(Tlas, OptimizeCompactsDenseSlotsAndKeepsPublicRefsStable)
                          float4::point(float(i % 10) * 5.0f + 1.0f, 0.0f,
                                        float(i / 10) * 5.0f));
     f.w.applyUpdates();
-    selectCutUncached(f.w, v, kParams, cut);
+    selectFrontierUncached(f.w, v, kParams, cut);
     const std::multiset<InstanceId> ids = instanceIdsOf(cut);
     for (size_t i = 0; i < 50; ++i)
         EXPECT_TRUE(ids.count(refs[i].id)) << "instance " << refs[i].id;
@@ -417,9 +417,9 @@ TEST(Tlas, SustainedChurnEventuallyForcesARebuild)
     std::vector<Placed> refs;
     for (int i = 0; i < 200; ++i) refs.push_back(f.add(uni(rng), uni(rng)));
 
-    CutResults cut;
+    FrontierResult cut;
     const Camera v = viewFrom(0, 0, 90.0f);
-    selectCutUncached(f.w, v, kParams, cut);
+    selectFrontierUncached(f.w, v, kParams, cut);
     ASSERT_FALSE(TAX::tlasDirty(f.w));
 
     // tlasEditFraction defaults to 0.05, so ~10 edits against 200 instances.
@@ -435,7 +435,7 @@ TEST(Tlas, SustainedChurnEventuallyForcesARebuild)
     }
     EXPECT_TRUE(rebuilt) << "the edit budget never triggered a rebuild";
 
-    selectCutUncached(f.w, v, kParams, cut);
+    selectFrontierUncached(f.w, v, kParams, cut);
     EXPECT_FALSE(TAX::tlasDirty(f.w));
     EXPECT_EQ(TAX::tlasValidate(f.w), "");
 }
@@ -446,15 +446,15 @@ TEST(Tlas, SustainedChurnEventuallyForcesARebuild)
 // many frames. Distinct escaped instances still consume the budget normally.
 TEST(Tlas, EscapeBudgetCountsDistinctInstances)
 {
-    WorldConfig config = neverRebuild();
+    SpatialDatabaseConfig config = neverRebuild();
     config.tlasEscapeFraction = 0.25f;
     Field f(config);
     std::vector<Placed> refs;
     for (int i = 0; i < 200; ++i)
         refs.push_back(f.add(float(i % 20) * 4.0f, float(i / 20) * 4.0f));
 
-    CutResults cut;
-    selectCutUncached(f.w, viewFrom(40.0f, 20.0f, 80.0f), kParams, cut);
+    FrontierResult cut;
+    selectFrontierUncached(f.w, viewFrom(40.0f, 20.0f, 80.0f), kParams, cut);
     ASSERT_FALSE(TAX::tlasDirty(f.w));
 
     for (int frame = 0; frame < 100; ++frame)
@@ -477,16 +477,16 @@ TEST(Tlas, MassDespawnStillForcesAQualityRebuild)
     std::vector<Placed> refs;
     for (int i = 0; i < 200; ++i)
         refs.push_back(f.add(float(i % 20) * 4.0f, float(i / 20) * 4.0f));
-    CutResults cut;
+    FrontierResult cut;
     const Camera v = viewFrom(40.0f, 20.0f, 60.0f);
-    selectCutUncached(f.w, v, kParams, cut);
+    selectFrontierUncached(f.w, v, kParams, cut);
     ASSERT_FALSE(TAX::tlasDirty(f.w));
 
     // tlasCountDrift defaults to 0.2: half the population is well past it.
     for (int i = 0; i < 100; ++i) f.w.removeInstance(refs[size_t(i)].ref);
     EXPECT_TRUE(TAX::tlasDirty(f.w));
 
-    selectCutUncached(f.w, v, kParams, cut);
+    selectFrontierUncached(f.w, v, kParams, cut);
     EXPECT_EQ(TAX::tlasValidate(f.w), "");
     const std::multiset<InstanceId> ids = instanceIdsOf(cut);
     for (int i = 0; i < 100; ++i) EXPECT_EQ(ids.count(refs[size_t(i)].id), 0u);
@@ -499,8 +499,8 @@ TEST(Tlas, MovingAnIncrementallyInsertedInstanceRefitsCorrectly)
 {
     Field f(neverRebuild());
     for (int i = 0; i < 64; ++i) f.add(float(i % 8) * 8.0f, float(i / 8) * 8.0f);
-    CutResults cut;
-    selectCutUncached(f.w, viewFrom(28.0f, 28.0f, 40.0f), kParams, cut);
+    FrontierResult cut;
+    selectFrontierUncached(f.w, viewFrom(28.0f, 28.0f, 40.0f), kParams, cut);
     ASSERT_FALSE(TAX::tlasDirty(f.w));
 
     const Placed r = f.add(9.0f, 9.0f);
@@ -508,7 +508,7 @@ TEST(Tlas, MovingAnIncrementallyInsertedInstanceRefitsCorrectly)
     f.w.moveInstance(r.ref, float4::point(300.0f, 0, 300.0f));
     EXPECT_EQ(TAX::tlasValidate(f.w), "");
 
-    selectCutUncached(f.w, viewFrom(300.0f, 300.0f, 20.0f), kParams, cut);
+    selectFrontierUncached(f.w, viewFrom(300.0f, 300.0f, 20.0f), kParams, cut);
     EXPECT_TRUE(instanceIdsOf(cut).count(r.id)) << "moved after insertion and lost";
 }
 
@@ -517,31 +517,31 @@ TEST(Tlas, MovingAnIncrementallyInsertedInstanceRefitsCorrectly)
 // box or it would emit the object in both its old and new locations.
 TEST(Tlas, FlatInstanceRetestsExactBoundsAfterMotion)
 {
-    World w(neverRebuild());
-    HLodBuilder builder;
+    SpatialDatabase w(neverRebuild());
+    PageBuilder builder;
     builder.createRoot(
         77, 6.0f,
         AABB::fromCenterExtent(float4::point(0, 0, 0), float4::vec(1, 1, 1)));
     const AssetHandle asset = w.registerAsset(builder.build());
-    const World::InstanceRef instance =
+    const SpatialDatabase::InstanceRef instance =
         w.addInstance(asset, float4::point(0, 0, 0));
     w.applyUpdates();
 
     const Camera oldView = viewFrom(0.0f, 0.0f, 12.0f);
-    CutResults cut;
-    selectCutUncached(w, oldView, kParams, cut);
-    ASSERT_EQ(currentCut(cut).size(), 1u);
-    const RefResult reference = TAX::referenceCut(w, oldView, kParams);
-    ASSERT_EQ(currentCut(reference.cut).size(), 1u);
-    EXPECT_EQ(currentCut(cut)[0].errorCode(),
-              currentCut(reference.cut)[0].errorCode());
+    FrontierResult cut;
+    selectFrontierUncached(w, oldView, kParams, cut);
+    ASSERT_EQ(currentFrontier(cut).size(), 1u);
+    const RefResult reference = TAX::referenceFrontier(w, oldView, kParams);
+    ASSERT_EQ(currentFrontier(reference.cut).size(), 1u);
+    EXPECT_EQ(currentFrontier(cut)[0].errorCode(),
+              currentFrontier(reference.cut)[0].errorCode());
 
     w.moveInstance(instance, float4::point(300.0f, 0, 0));
     w.applyUpdates();
     ASSERT_FALSE(TAX::tlasDirty(w));
     EXPECT_EQ(TAX::tlasValidate(w), "");
 
-    selectCutUncached(w, oldView, kParams, cut);
+    selectFrontierUncached(w, oldView, kParams, cut);
     EXPECT_TRUE(cut.empty());
 }
 
@@ -550,7 +550,7 @@ TEST(Tlas, FlatInstanceRetestsExactBoundsAfterMotion)
 // deterministic without needing a comparison sort inside the equal-key run.
 TEST(Tlas, MortonRebuildHandlesCoincidentCentroids)
 {
-    WorldConfig config = onlyEditBudget();
+    SpatialDatabaseConfig config = onlyEditBudget();
     config.tlasEscapeFraction = 0.0f;
     Field f(config);
 
@@ -559,15 +559,15 @@ TEST(Tlas, MortonRebuildHandlesCoincidentCentroids)
     for (int i = 0; i < 1100; ++i) refs.push_back(f.add(0.0f, 0.0f));
 
     const Camera view = viewFrom(0.0f, 0.0f, 400.0f);
-    CutResults cut;
-    selectCutUncached(f.w, view, kParams, cut);   // initial quality build
+    FrontierResult cut;
+    selectFrontierUncached(f.w, view, kParams, cut);   // initial quality build
 
     f.w.moveInstance(refs[0].ref, float4::point(300.0f, 0.0f, 300.0f));
-    selectCutUncached(f.w, view, kParams, cut);   // forced Morton rebuild
+    selectFrontierUncached(f.w, view, kParams, cut);   // forced Morton rebuild
 
     EXPECT_EQ(TAX::tlasValidate(f.w), "");
     EXPECT_EQ(instanceIdsOf(cut),
-              instanceIdsOf(TAX::referenceCut(f.w, view, kParams).cut));
+              instanceIdsOf(TAX::referenceFrontier(f.w, view, kParams).cut));
 }
 
-}   // namespace hlodtest
+}   // namespace frontiertest

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BUILD_DIR="${HLOD_MACHINE_BUILD_DIR:-${ROOT_DIR}/build-machine-perf}"
+BUILD_DIR="${FRONTIER_MACHINE_BUILD_DIR:-${ROOT_DIR}/build-machine-perf}"
 
 if ! command -v cmake >/dev/null 2>&1; then
     echo "ERROR: CMake was not found in PATH." >&2
@@ -38,9 +38,9 @@ configure_args=(
     -S "${ROOT_DIR}"
     -B "${BUILD_DIR}"
     -DCMAKE_BUILD_TYPE=Release
-    -DHLOD_BUILD_TESTS=OFF
-    -DHLOD_BUILD_BENCH=ON
-    -DHLOD_AVX2="${avx2}"
+    -DFRONTIER_BUILD_TESTS=OFF
+    -DFRONTIER_BUILD_BENCH=ON
+    -DFRONTIER_AVX2="${avx2}"
 )
 if [[ -n "${generator}" ]]; then
     configure_args+=(-G "${generator}")
@@ -51,7 +51,7 @@ fi
 
 cmake "${configure_args[@]}"
 cmake --build "${BUILD_DIR}" --config Release \
-    --target hlod_machine_bench --parallel
+    --target frontier_machine_bench --parallel
 
 cache_file="${BUILD_DIR}/CMakeCache.txt"
 if grep -Eq '^CMAKE_CONFIGURATION_TYPES:[^=]*=.+$' "${cache_file}"; then
@@ -65,7 +65,7 @@ else
     bench_dir="${BUILD_DIR}/bench"
 fi
 
-bench_exe="${bench_dir}/hlod_machine_bench"
+bench_exe="${bench_dir}/frontier_machine_bench"
 if [[ ! -x "${bench_exe}" ]]; then
     echo "ERROR: Benchmark executable was not found at ${bench_exe}." >&2
     exit 1

@@ -6,31 +6,31 @@
 
 #include "helpers.h"
 
-using namespace hlod;
-using namespace hlodtest;
-using TA = World::TestAccess;
+using namespace frontier;
+using namespace frontiertest;
+using TA = SpatialDatabase::TestAccess;
 
 namespace {
 
 struct Outputs
 {
-    World* world = nullptr;
-    CutResults cut;
+    SpatialDatabase* world = nullptr;
+    FrontierResult cut;
 };
 
-Outputs frame(World& w, const Camera& v, const CutParams& p)
+Outputs frame(SpatialDatabase& w, const Camera& v, const SelectionParams& p)
 {
     w.applyUpdates();
     Outputs o;
     o.world = &w;
-    selectCutUncached(w, v, p, o.cut);
+    selectFrontierUncached(w, v, p, o.cut);
     return o;
 }
 
-std::set<UserId> cutIds(const Outputs& o)
+std::set<UserId> frontierIds(const Outputs& o)
 {
     std::set<UserId> ids;
-    for (const auto& e : currentCut(o.cut)) ids.insert(payloadOf(*o.world, e));
+    for (const auto& e : currentFrontier(o.cut)) ids.insert(payloadOf(*o.world, e));
     return ids;
 }
 
@@ -38,26 +38,26 @@ std::set<UserId> cutIds(const Outputs& o)
 
 TEST(Streaming, BorrowedAssetKeepsExternalOwnership)
 {
-    HLodBuilder builder;
+    PageBuilder builder;
     builder.createRoot(
         42, 0.0f,
         AABB::fromCenterExtent(float4::point(0, 0, 0), float4::vec(1, 1, 1)));
     Page backing = builder.build();
     const void* const originalData = backing.data();
 
-    World world;
+    SpatialDatabase world;
     const AssetHandle asset =
         world.registerAsset(static_cast<const PageView&>(backing));
-    const World::InstanceRef instance =
+    const SpatialDatabase::InstanceRef instance =
         world.addInstance(asset, float4::point(0, 0, 0));
 
-    CutResults cut;
-    selectCutUncached(
+    FrontierResult cut;
+    selectFrontierUncached(
         world,
         makeLookAtCamera(float4::point(0, 0, -8), float4::point(0, 0, 0)),
-        CutParams{4.0f, 0.0f}, cut);
+        SelectionParams{4.0f, 0.0f}, cut);
     ASSERT_EQ(cut.currentSize(), 1u);
-    EXPECT_EQ(payloadOf(world, currentCut(cut).front()), 42u);
+    EXPECT_EQ(payloadOf(world, currentFrontier(cut).front()), 42u);
 
     world.removeInstance(instance);
     world.releaseAsset(asset);
@@ -71,30 +71,30 @@ TEST(Streaming, BorrowedAssetKeepsExternalOwnership)
 // ---------------------------------------------------------------------------
 TEST(Streaming, AllOrNothingRefinement)
 {
-    HLodBuilder b;
+    PageBuilder b;
     const auto root = b.createRoot(1, 32.0f);
     b.createNode(root, 10, 1.0f, AABB::fromCenterExtent(float4::vec(-2, 0, 0), float4::vec(1, 1, 1)));
     b.createNode(root, 11, 1.0f, AABB::fromCenterExtent(float4::vec(0, 0, 0), float4::vec(1, 1, 1)));
     b.createNode(root, 12, 1.0f, AABB::fromCenterExtent(float4::vec(2, 0, 0), float4::vec(1, 1, 1)));
     Page pg = b.build();
 
-    World w;
+    SpatialDatabase w;
     w.addInstance(std::move(pg), float4::point(0, 0, 0));
     // Root is pinned-resident automatically. Children start non-resident.
 
     const Camera v = makeLookAtCamera(float4::point(0, 0, -20), float4::point(0, 0, 0));
-    const CutParams p{4.0f, 0.0f};
+    const SelectionParams p{4.0f, 0.0f};
 
     auto o = frame(w, v, p);
-    EXPECT_EQ(cutIds(o), std::set<UserId>{1});                    // parent draws
+    EXPECT_EQ(frontierIds(o), std::set<UserId>{1});                    // parent draws
     EXPECT_EQ(o.cut.idealOnly.size(), 3u);
 
     markResident(w, 10);
     markResident(w, 11);
     o = frame(w, v, p);
-    EXPECT_EQ(cutIds(o), std::set<UserId>{1});                    // still all-or-nothing
+    EXPECT_EQ(frontierIds(o), std::set<UserId>{1});                    // still all-or-nothing
     auto missing = std::find_if(o.cut.idealOnly.begin(), o.cut.idealOnly.end(),
-                                [&](const CutEntry& e) {
+                                [&](const FrontierEntry& e) {
         return !w.isResident(e.nodeHandle);
     });
     ASSERT_NE(missing, o.cut.idealOnly.end());
@@ -104,18 +104,18 @@ TEST(Streaming, AllOrNothingRefinement)
     // the load through its node handle.
     w.markResident(missing->nodeHandle);
     o = frame(w, v, p);
-    EXPECT_EQ(cutIds(o), (std::set<UserId>{10, 11, 12}));         // refined
+    EXPECT_EQ(frontierIds(o), (std::set<UserId>{10, 11, 12}));         // refined
 
     // Invariant F: everything drawn is resident.
-    for (const auto& e : currentCut(o.cut))
+    for (const auto& e : currentFrontier(o.cut))
         EXPECT_TRUE(w.isResident(e.nodeHandle));
 
     // Eviction: parent falls back next frame, no holes.
     markNonResident(w, 11);
     o = frame(w, v, p);
-    EXPECT_EQ(cutIds(o), std::set<UserId>{1});
+    EXPECT_EQ(frontierIds(o), std::set<UserId>{1});
     missing = std::find_if(o.cut.idealOnly.begin(), o.cut.idealOnly.end(),
-                           [&](const CutEntry& e) {
+                           [&](const FrontierEntry& e) {
         return !w.isResident(e.nodeHandle);
     });
     ASSERT_NE(missing, o.cut.idealOnly.end());
@@ -124,12 +124,12 @@ TEST(Streaming, AllOrNothingRefinement)
 
 using ResultKey = std::tuple<uint32_t, UserPayload, uint8_t>;
 
-std::vector<ResultKey> resultKeys(World& world, const CutView& cut)
+std::vector<ResultKey> resultKeys(SpatialDatabase& world, const FrontierResultView& cut)
 {
     std::vector<ResultKey> keys;
     const auto append = [&](const auto& entries, uint32_t bucket)
     {
-        for (const CutEntry& e : entries)
+        for (const FrontierEntry& e : entries)
             keys.emplace_back(bucket, payloadOf(world, e), e.errorCode());
     };
     append(cut.shared, 0);
@@ -141,7 +141,7 @@ std::vector<ResultKey> resultKeys(World& world, const CutView& cut)
 
 TEST(Streaming, ResidentDescendantsBypassMissingIntermediateProxies)
 {
-    HLodBuilder builder;
+    PageBuilder builder;
     const auto root = builder.createRoot(
         1, 64.0f,
         AABB::fromCenterExtent(float4::point(0, 0, 0), float4::vec(8, 8, 8)));
@@ -152,7 +152,7 @@ TEST(Streaming, ResidentDescendantsBypassMissingIntermediateProxies)
         intermediate, 3, 0.0f,
         AABB::fromCenterExtent(float4::point(0, 0, 0), float4::vec(1, 1, 1)));
 
-    World world;
+    SpatialDatabase world;
     world.addInstance(builder.build(), float4::point(0, 0, 0));
     markResident(world, 3);   // payload 2 deliberately remains non-resident
 
@@ -161,7 +161,7 @@ TEST(Streaming, ResidentDescendantsBypassMissingIntermediateProxies)
     const Outputs output = frame(world, view, {4.0f, 0.0f});
 
     EXPECT_FALSE(isResident(world, 2));
-    EXPECT_EQ(cutIds(output), std::set<UserId>{3});
+    EXPECT_EQ(frontierIds(output), std::set<UserId>{3});
     ASSERT_EQ(output.cut.shared.size(), 1u);
     EXPECT_TRUE(output.cut.currentOnly.empty());
     EXPECT_TRUE(output.cut.idealOnly.empty());
@@ -169,7 +169,7 @@ TEST(Streaming, ResidentDescendantsBypassMissingIntermediateProxies)
 
 TEST(Streaming, InvisibleMissingBranchDoesNotBlockResidentCover)
 {
-    HLodBuilder builder;
+    PageBuilder builder;
     const auto root = builder.createRoot(1, 128.0f);
     const auto visible = builder.createNode(
         root, 2, 32.0f,
@@ -184,7 +184,7 @@ TEST(Streaming, InvisibleMissingBranchDoesNotBlockResidentCover)
         hidden, 5, 0.0f,
         AABB::fromCenterExtent(float4::point(100, 0, 0), float4::vec(1, 1, 1)));
 
-    World world;
+    SpatialDatabase world;
     world.addInstance(builder.build(), float4::point(0, 0, 0));
     markResident(world, 3);   // the off-screen branch remains entirely missing
 
@@ -192,17 +192,17 @@ TEST(Streaming, InvisibleMissingBranchDoesNotBlockResidentCover)
         makeLookAtCamera(float4::point(0, 0, -20), float4::point(0, 0, 0));
     const Outputs output = frame(world, view, {4.0f, 0.0f});
 
-    EXPECT_EQ(cutIds(output), std::set<UserId>{3});
+    EXPECT_EQ(frontierIds(output), std::set<UserId>{3});
     ASSERT_EQ(output.cut.shared.size(), 1u);
     EXPECT_TRUE(output.cut.currentOnly.empty());
     EXPECT_TRUE(output.cut.idealOnly.empty());
 }
 
 // ---------------------------------------------------------------------------
-// The ideal cut: nodes below the current cut appear on its ideal-only side;
+// The ideal frontier: nodes below the current frontier appear on its ideal-only side;
 // the difference between the cuts is the prefetch target.
 // ---------------------------------------------------------------------------
-TEST(Streaming, IdealCutLeadsCurrentCut)
+TEST(Streaming, IdealFrontierLeadsCurrentFrontier)
 {
     TreeGen gen;
     gen.fanout = 2;
@@ -210,7 +210,7 @@ TEST(Streaming, IdealCutLeadsCurrentCut)
     Page pg = gen.makeRootPage(unitRegion(30.0f), 64.0f, 0);
     const auto ids = pageIds(pg);
 
-    World w;
+    SpatialDatabase w;
     w.addInstance(std::move(pg), float4::point(0, 0, 0));
     // Nothing resident except the pinned root.
 
@@ -218,10 +218,10 @@ TEST(Streaming, IdealCutLeadsCurrentCut)
     const auto o = frame(w, v, {4.0f, 0.0f});
 
     // Current cut: the root proxy only. Ideal cut: the deeper frontier.
-    EXPECT_EQ(cutIds(o), std::set<UserId>{ids.front()});
-    EXPECT_GT(idealCutSize(o.cut), 1u);
-    for (const auto& e : idealCut(o.cut))
-        EXPECT_NE(payloadOf(w, e), ids.front()); // the root refines in the ideal cut
+    EXPECT_EQ(frontierIds(o), std::set<UserId>{ids.front()});
+    EXPECT_GT(idealFrontierSize(o.cut), 1u);
+    for (const auto& e : idealFrontier(o.cut))
+        EXPECT_NE(payloadOf(w, e), ids.front()); // the root refines in the ideal frontier
 }
 
 // ---------------------------------------------------------------------------
@@ -236,19 +236,19 @@ TEST(Streaming, ExpansionLifeCycle)
     Page root = gen.makeRootPage(unitRegion(20.0f), 64.0f, 1);
     const auto rootIds = pageIds(root);
 
-    World w;
+    SpatialDatabase w;
     w.addInstance(std::move(root), float4::point(0, 0, 0));
     markAllResident(w, rootIds);
 
     ASSERT_FALSE(gen.recipes.empty());
 
-    const CutParams p{4.0f, 0.0f};
+    const SelectionParams p{4.0f, 0.0f};
 
     // Far away: collapsed expansion points draw their proxies; steady state.
     {
         const Camera far = makeLookAtCamera(float4::point(0, 0, -100000), float4::point(0, 0, 0));
         const auto o = frame(w, far, p);
-        for (const auto& e : idealCut(o.cut)) EXPECT_FALSE(e.overThreshold());
+        for (const auto& e : idealFrontier(o.cut)) EXPECT_FALSE(e.overThreshold());
     }
 
     // Close: the expansion points are too coarse. Error plus the external
@@ -257,17 +257,17 @@ TEST(Streaming, ExpansionLifeCycle)
     std::vector<UserId> needed;
     {
         const auto o = frame(w, near, p);
-        for (const auto& e : idealCut(o.cut))
+        for (const auto& e : idealFrontier(o.cut))
             if (e.overThreshold() && gen.recipes.count(payloadOf(w, e)))
                 needed.push_back(payloadOf(w, e));
         ASSERT_FALSE(needed.empty());
         // Collapsed nodes still draw (they are leaves for now).
-        const auto ids = cutIds(o);
+        const auto ids = frontierIds(o);
         for (UserId id : needed)
         {
             EXPECT_TRUE(ids.count(id));
             EXPECT_NE(std::find_if(o.cut.shared.begin(), o.cut.shared.end(),
-                                   [&](const CutEntry& e) {
+                                   [&](const FrontierEntry& e) {
                                        return payloadOf(w, e) == id;
                                    }),
                       o.cut.shared.end());
@@ -285,7 +285,7 @@ TEST(Streaming, ExpansionLifeCycle)
     {
         const auto o = frame(w, near, p);
         bool loaded = false;
-        for (const CutEntry& entry : idealCut(o.cut))
+        for (const FrontierEntry& entry : idealFrontier(o.cut))
             if (!w.isResident(entry.nodeHandle))
             {
                 w.markResident(entry.nodeHandle);
@@ -295,7 +295,7 @@ TEST(Streaming, ExpansionLifeCycle)
     }
     {
         const auto o = frame(w, near, p);
-        const auto ids = cutIds(o);
+        const auto ids = frontierIds(o);
         for (UserId id : needed) EXPECT_FALSE(ids.count(id));   // refined through
     }
 
@@ -304,13 +304,13 @@ TEST(Streaming, ExpansionLifeCycle)
     EXPECT_FALSE(isAttached(w, needed[0]));
     {
         const auto o = frame(w, near, p);
-        EXPECT_TRUE(cutIds(o).count(needed[0]));
+        EXPECT_TRUE(frontierIds(o).count(needed[0]));
     }
 }
 
 TEST(Streaming, FullyResidentSummaryTracksAttachedMountTree)
 {
-    HLodBuilder rootBuilder;
+    PageBuilder rootBuilder;
     const auto root = rootBuilder.createRoot(1, 64.0f);
     const auto expansion = rootBuilder.createNode(
         root, 2, 32.0f,
@@ -319,12 +319,12 @@ TEST(Streaming, FullyResidentSummaryTracksAttachedMountTree)
     Page rootPage = rootBuilder.build();
     const auto rootIds = pageIds(rootPage);
 
-    World world;
+    SpatialDatabase world;
     world.addInstance(std::move(rootPage), float4::point(0, 0, 0));
     markAllResident(world, rootIds);
     EXPECT_TRUE(TA::fullyResidentTree(world, 1));
 
-    HLodBuilder childBuilder;
+    PageBuilder childBuilder;
     childBuilder.createRoot(
         10, 0.0f,
         AABB::fromCenterExtent(float4::point(0, 0, 0), float4::vec(1, 1, 1)));
@@ -342,7 +342,7 @@ TEST(Streaming, FullyResidentSummaryTracksAttachedMountTree)
     const Outputs output = frame(world, view, {4.0f, 0.0f});
     EXPECT_TRUE(output.cut.currentOnly.empty());
     EXPECT_TRUE(output.cut.idealOnly.empty());
-    EXPECT_EQ(cutIds(output), std::set<UserId>{10});
+    EXPECT_EQ(frontierIds(output), std::set<UserId>{10});
 
     world.markNonResident(nodeAt(child, 1));
     EXPECT_FALSE(TA::fullyResidentTree(world, 1));
@@ -362,7 +362,7 @@ TEST(Streaming, FullyResidentSummaryTracksAttachedMountTree)
 TEST(Streaming, AttachClampsChildErrors)
 {
     auto makeRoot = [] {
-        HLodBuilder rb;
+        PageBuilder rb;
         const auto r = rb.createRoot(1, 8.0f);
         const auto e = rb.createNode(r, 2, 0.5f,   // deliberately small error
                                      AABB::fromCenterExtent(float4::vec(0, 0, 0),
@@ -371,12 +371,12 @@ TEST(Streaming, AttachClampsChildErrors)
         return rb.build();
     };
     auto makeChild = [](float rootErr) {
-        HLodBuilder cb;
+        PageBuilder cb;
         cb.createRoot(10, rootErr,
                       AABB::fromCenterExtent(float4::vec(0, 0, 0), float4::vec(1, 1, 1)));
         return cb.build();
     };
-    auto cutOf = [](World& w) {
+    auto cutOf = [](SpatialDatabase& w) {
         markResident(w, 2);
         markResident(w, 10);
         // Close enough that the expansion node (err 0.5, box within 2 units)
@@ -385,7 +385,7 @@ TEST(Streaming, AttachClampsChildErrors)
         return frame(w, v, {4.0f, 0.0f});
     };
 
-    World w;
+    SpatialDatabase w;
     w.addInstance(makeRoot(), float4::point(0, 0, 0));
     attachPage(w, 2, makeChild(100.0f));   // way larger than the expansion node's 0.5
 
@@ -396,14 +396,14 @@ TEST(Streaming, AttachClampsChildErrors)
 
     // Behaviorally the over-erroneous child is indistinguishable from one
     // authored at the clamp: same cut, same reported errors.
-    World wRef;
+    SpatialDatabase wRef;
     wRef.addInstance(makeRoot(), float4::point(0, 0, 0));
     attachPage(wRef, 2, makeChild(0.5f));
 
     const Outputs got = cutOf(w), want = cutOf(wRef);
     ASSERT_FALSE(got.cut.empty());
     EXPECT_EQ(resultKeys(w, got.cut), resultKeys(wRef, want.cut));
-    EXPECT_TRUE(cutIds(got).count(10));   // the walk did reach the child
+    EXPECT_TRUE(frontierIds(got).count(10));   // the walk did reach the child
 }
 
 // ---------------------------------------------------------------------------
@@ -418,7 +418,7 @@ TEST(Streaming, GarbageCollection)
     Page root = gen.makeRootPage(unitRegion(400.0f), 512.0f, 2);
     const auto rootIds = pageIds(root);
 
-    World w;
+    SpatialDatabase w;
     w.addInstance(std::move(root), float4::point(0, 0, 0));
     markAllResident(w, rootIds);
 
@@ -461,19 +461,19 @@ TEST(Streaming, GarbageCollection)
     const float4 c1 = region1.center();
     const Camera shadow = makeLookAtCamera(c1 + float4::vec(60, 0, 0),
                                            c1 - float4::vec(150, 0, 0));
-    CutResults cut;
-    CutResults shadowCut;
-    View selection;
-    View shadowView;
-    shadowView.setReuseEnabled(false);
+    FrontierResult cut;
+    FrontierResult shadowCut;
+    SpatialQuery selection;
+    SpatialQuery shadowQuery;
+    shadowQuery.setReuseEnabled(false);
     PageUsageContext usage;
     for (int f = 0; f < 10; ++f)
     {
         w.applyUpdates();
-        selection.selectCut(w, v, {0.5f, 0.0f}, usage, cut);
-        shadowView.selectCut(w, shadow, {0.5f, 0.0f}, shadowCut);
+        selection.selectFrontier(w, v, {0.5f, 0.0f}, usage, cut);
+        shadowQuery.selectFrontier(w, shadow, {0.5f, 0.0f}, shadowCut);
     }
-    // Selection only accumulates feedback. The World LRU is updated when the
+    // Selection only accumulates feedback. The SpatialDatabase LRU is updated when the
     // caller explicitly chooses this camera at collect time.
     EXPECT_LT(TA::lastTouched(w, pageProbe[0]), w.frame());
     PageUsageContext* usageList[] = {&usage};
@@ -499,7 +499,7 @@ TEST(Streaming, GarbageCollection)
     for (int f = 0; f < 10; ++f)
     {
         w.applyUpdates();
-        selection.selectCut(w, v, {0.5f, 0.0f}, usage, cut);
+        selection.selectFrontier(w, v, {0.5f, 0.0f}, usage, cut);
         w.collect(usage, 0, 3);
     }
     EXPECT_TRUE(isAttached(w, level1[0]));
@@ -521,7 +521,7 @@ TEST(Streaming, CollectMinAgeBoundaryAndExactFreedPayloads)
     Page root = gen.makeRootPage(unitRegion(100.0f), 256.0f, 1);
     const auto rootIds = pageIds(root);
 
-    World w;
+    SpatialDatabase w;
     w.addInstance(std::move(root), float4::point(0, 0, 0));
     markAllResident(w, rootIds);
 
@@ -586,12 +586,12 @@ TEST(Streaming, GcChurnStress)
     Page root = gen.makeRootPage(unitRegion(500.0f), 4096.0f, 3);
     const auto rootIds = pageIds(root);
 
-    World w;
+    SpatialDatabase w;
     w.addInstance(std::move(root), float4::point(0, 0, 0));
     markAllResident(w, rootIds);
 
-    const CutParams p{4.0f, 0.0f};
-    CutResults cut;
+    const SelectionParams p{4.0f, 0.0f};
+    FrontierResult cut;
     PageUsageContext usage;
 
     size_t attaches = 0, collected = 0;
@@ -604,17 +604,17 @@ TEST(Streaming, GcChurnStress)
             float4::vec(0, 1, 0), 1.0f, 16.0f / 9.0f, 1080.0f, 0.1f, 1.0e9f);
 
         w.applyUpdates();
-        selectCutUncached(w, v, p, usage, cut);
+        selectFrontierUncached(w, v, p, usage, cut);
 
         if (f % 7 == 0)   // spot-check equivalence on the exact same state
         {
-            const RefResult want = TA::referenceCut(w, v, p);
+            const RefResult want = TA::referenceFrontier(w, v, p);
             EXPECT_EQ(resultKeys(w, cut), resultKeys(w, want.cut))
                 << "frame " << f;
         }
 
         int budget = 8;
-        for (const auto& e : idealCut(cut))
+        for (const auto& e : idealFrontier(cut))
         {
             if (budget <= 0 || !e.overThreshold()) continue;
             const UserId id = payloadOf(w, e);
@@ -628,7 +628,7 @@ TEST(Streaming, GcChurnStress)
             --budget;
             ++attaches;
         }
-        for (const CutEntry& entry : idealCut(cut))
+        for (const FrontierEntry& entry : idealFrontier(cut))
         {
             const UserId id = payloadOf(w, entry);
             const bool expandable = entry.overThreshold() &&
@@ -649,28 +649,28 @@ TEST(Streaming, GcChurnStress)
 }
 
 // ---------------------------------------------------------------------------
-// Streaming loop toward the ideal cut: consuming ideal entries frame by frame
-// converges, and the ideal cut equals the current cut at the fixed point.
+// Streaming loop toward the ideal frontier: consuming ideal entries frame by frame
+// converges, and the ideal frontier equals the current frontier at the fixed point.
 // ---------------------------------------------------------------------------
-TEST(Streaming, ConvergesToIdealCut)
+TEST(Streaming, ConvergesToIdealFrontier)
 {
     TreeGen gen;
     gen.fanout = 3;
     gen.depth = 2;
     Page root = gen.makeRootPage(unitRegion(50.0f), 64.0f, 1);
 
-    World w;
+    SpatialDatabase w;
     w.addInstance(std::move(root), float4::point(0, 0, 0));
 
     const Camera v = makeLookAtCamera(float4::point(0, 10, -80), float4::point(0, 0, 0));
-    const CutParams p{4.0f, 0.0f};
+    const SelectionParams p{4.0f, 0.0f};
 
     Outputs o;
     for (int f = 0; f < 64; ++f)
     {
         o = frame(w, v, p);
         bool progress = false;
-        for (const CutEntry& entry : idealCut(o.cut))
+        for (const FrontierEntry& entry : idealFrontier(o.cut))
         {
             const UserId id = payloadOf(w, entry);
             if (entry.overThreshold() && gen.recipes.count(id) &&
@@ -690,8 +690,8 @@ TEST(Streaming, ConvergesToIdealCut)
     }
 
     // Fixed point: no missing ideal payloads or unattached pages; ideal == current.
-    std::set<UserId> ideal, current = cutIds(o);
-    for (const auto& e : idealCut(o.cut))
+    std::set<UserId> ideal, current = frontierIds(o);
+    for (const auto& e : idealFrontier(o.cut))
     {
         EXPECT_TRUE(w.isResident(e.nodeHandle));
         ideal.insert(payloadOf(w, e));
@@ -708,7 +708,7 @@ TEST(Streaming, ApiContracts)
     Page root = gen.makeRootPage(unitRegion(10.0f), 16.0f, 1);
     const auto rootIds = pageIds(root);
 
-    World w;
+    SpatialDatabase w;
     w.addInstance(std::move(root), float4::point(0, 0, 0));
 
     // Contract violations on LIVE handles throw.

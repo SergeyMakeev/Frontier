@@ -1,6 +1,6 @@
 #pragma once
-// Shared test utilities: World internals access, a brute-force scalar
-// reference implementation of selectCut, and deterministic tree generators.
+// Shared test utilities: SpatialDatabase internals access, a brute-force scalar
+// reference implementation of selectFrontier, and deterministic tree generators.
 
 #include <algorithm>
 #include <cstdint>
@@ -9,16 +9,16 @@
 #include <unordered_map>
 #include <vector>
 
-#include "hlod/builder.h"
-#include "hlod/world.h"
+#include "frontier/builder.h"
+#include "frontier/spatial_database.h"
 #include "deterministic_rng.h"
 
-namespace hlod {
+namespace frontier {
 
 struct RefResult
 {
-    detail::CutBuffers buffers;
-    CutView cut;
+    detail::FrontierBuffers buffers;
+    FrontierResultView cut;
 
     RefResult() { sync(); }
     RefResult(const RefResult& other) : buffers(other.buffers) { sync(); }
@@ -44,39 +44,39 @@ struct RefResult
     void sync() { cut = buffers.view(); }
 };
 
-// Exercise the uncached public path without carrying a View between calls.
+// Exercise the uncached public path without carrying a SpatialQuery between calls.
 // Most correctness tests want a fresh reference query; tests for reuse own a
-// persistent View explicitly.
-inline void selectCutUncached(World& world, const Camera& camera,
-                              const CutParams& params,
-                              CutResults& outCut)
+// persistent SpatialQuery explicitly.
+inline void selectFrontierUncached(SpatialDatabase& world, const Camera& camera,
+                              const SelectionParams& params,
+                              FrontierResult& outResult)
 {
     world.applyUpdates();
-    View view;
-    view.setReuseEnabled(false);
-    view.selectCut(world, camera, params, outCut);
+    SpatialQuery query;
+    query.setReuseEnabled(false);
+    query.selectFrontier(world, camera, params, outResult);
 }
 
-inline void selectCutUncached(World& world, const Camera& camera,
-                              const CutParams& params, PageUsageContext& usage,
-                              CutResults& outCut)
+inline void selectFrontierUncached(SpatialDatabase& world, const Camera& camera,
+                              const SelectionParams& params, PageUsageContext& usage,
+                              FrontierResult& outResult)
 {
     world.applyUpdates();
-    View view;
-    view.setReuseEnabled(false);
-    view.selectCut(world, camera, params, usage, outCut);
+    SpatialQuery query;
+    query.setReuseEnabled(false);
+    query.selectFrontier(world, camera, params, usage, outResult);
 }
 
-// Full access to World internals plus a straightforward recursive scalar
-// reference for selectCut (no wide tests, no masks, no epoch stamps, no
+// Full access to SpatialDatabase internals plus a straightforward recursive scalar
+// reference for selectFrontier (no wide tests, no masks, no epoch stamps, no
 // pruning shortcuts beyond the algorithm's own semantics). It reads the
 // camera envelope the same way the production path does, so it stays valid
 // under LOD damping — there is no per-frame state on either side to diverge.
 //
-// The production API is handle-only; the World keeps no payload index. For
+// The production API is handle-only; the SpatialDatabase keeps no payload index. For
 // test readability everything here resolves payloads by brute-force scan
 // over the attached pages (findByScan) — deliberately slow, tests only.
-struct World::TestAccess
+struct SpatialDatabase::TestAccess
 {
     struct TlasQueryScratch
     {
@@ -84,14 +84,14 @@ struct World::TestAccess
         std::vector<TlasItem> stack;
     };
 
-    static size_t queryTlas(World& w, const Camera& camera, float minPix,
+    static size_t queryTlas(SpatialDatabase& w, const Camera& camera, float minPix,
                             TlasQueryScratch& scratch)
     {
         w.tlasQuery(camera, minPix, -1.0f, scratch.visible, scratch.stack);
         return scratch.visible.size();
     }
 
-    static NodeHandle findByScan(World& w, UserPayload payload)
+    static NodeHandle findByScan(SpatialDatabase& w, UserPayload payload)
     {
         for (uint32_t s = 0; s < uint32_t(w.slots_.size()); ++s)
         {
@@ -104,29 +104,29 @@ struct World::TestAccess
         }
         return NodeHandle{};
     }
-    static NodeHandle requireByScan(World& w, UserPayload payload)
+    static NodeHandle requireByScan(SpatialDatabase& w, UserPayload payload)
     {
         const NodeHandle h = findByScan(w, payload);
         if (!h.valid()) throw std::logic_error("TestAccess: unknown payload");
         return h;
     }
-    static const PageView& pageOf(World& w, UserPayload anyNodeInPage)
+    static const PageView& pageOf(SpatialDatabase& w, UserPayload anyNodeInPage)
     {
         return w.pageView(w.slots_[requireByScan(w, anyNodeInPage).slot()]);
     }
-    static uint32_t lastTouched(World& w, UserPayload anyNodeInPage)
+    static uint32_t lastTouched(SpatialDatabase& w, UserPayload anyNodeInPage)
     {
         return w.slots_[requireByScan(w, anyNodeInPage).slot()].lastTouched;
     }
-    static void forceTlasRebuild(World& w) { w.tlasDirty_ = true; }
+    static void forceTlasRebuild(SpatialDatabase& w) { w.tlasDirty_ = true; }
     // False means the next query will use the tree as it stands. This is how a
     // test asserts that an edit was applied INCREMENTALLY rather than by
     // deferring a full rebuild, which is invisible in the cut either way.
-    static bool tlasDirty(World& w) { return w.tlasDirty_; }
-    static uint32_t tlasEscapes(World& w) { return w.tlasEscapes_; }
-    static size_t tlasNodeCount(World& w) { return w.tlasNodes_.size(); }
-    static size_t instanceSlotCount(World& w) { return w.instances_.size(); }
-    static uint32_t instanceLayoutVersion(World& w)
+    static bool tlasDirty(SpatialDatabase& w) { return w.tlasDirty_; }
+    static uint32_t tlasEscapes(SpatialDatabase& w) { return w.tlasEscapes_; }
+    static size_t tlasNodeCount(SpatialDatabase& w) { return w.tlasNodes_.size(); }
+    static size_t instanceSlotCount(SpatialDatabase& w) { return w.instances_.size(); }
+    static uint32_t instanceLayoutVersion(SpatialDatabase& w)
     {
         return w.instanceLayoutVersion_;
     }
@@ -144,21 +144,21 @@ struct World::TestAccess
     static size_t pendingMoveBytes() { return sizeof(PendingMove); }
     static size_t tlasItemBytes() { return sizeof(TlasItem); }
     static size_t mortonItemBytes() { return sizeof(MortonItem); }
-    static bool fullyResidentTree(World& w, UserPayload anyNodeInPage)
+    static bool fullyResidentTree(SpatialDatabase& w, UserPayload anyNodeInPage)
     {
         return w.pageTreeFullyResident(requireByScan(w, anyNodeInPage).slot());
     }
 
     // Invariant (D) across a page boundary is a per-mount scalar now, not a
     // rewrite of the child page's error array (page bytes are immutable).
-    static float errClampOf(World& w, UserPayload anyNodeInPage)
+    static float errClampOf(SpatialDatabase& w, UserPayload anyNodeInPage)
     {
         return w.slots_[requireByScan(w, anyNodeInPage).slot()].errClamp;
     }
 
     // How many mounts this instance has taken a private copy of the bounds
     // for. Zero unless the instance has been deformed.
-    static size_t overlaysOf(World& w, World::InstanceRef ref)
+    static size_t overlaysOf(SpatialDatabase& w, SpatialDatabase::InstanceRef ref)
     {
         const Instance* inst = w.resolveInstance(ref);
         return inst && inst->hasOverlayList()
@@ -166,7 +166,7 @@ struct World::TestAccess
                    : 0;
     }
 
-    static bool overlayIsSparse(World& w, World::InstanceRef ref, uint32_t slot)
+    static bool overlayIsSparse(SpatialDatabase& w, SpatialDatabase::InstanceRef ref, uint32_t slot)
     {
         const Instance* inst = w.resolveInstance(ref);
         const Overlay* ov = inst ? w.findOverlay(*inst, slot) : nullptr;
@@ -176,12 +176,12 @@ struct World::TestAccess
     // Bounds AS THIS INSTANCE SEES THEM. Refit no longer writes into the page
     // (it is shared and immutable), so a test that wants to observe motion has
     // to read through the instance, not through the page.
-    static const AABB* bboxOf(World& w, World::InstanceRef ref, uint32_t slot)
+    static const AABB* bboxOf(SpatialDatabase& w, SpatialDatabase::InstanceRef ref, uint32_t slot)
     {
         Instance* inst = w.resolveInstance(ref);
         return inst ? w.boundsFor(*inst, slot, w.slots_[slot]) : nullptr;
     }
-    static WideBoundsRef wideOf(World& w, World::InstanceRef ref, uint32_t slot)
+    static WideBoundsRef wideOf(SpatialDatabase& w, SpatialDatabase::InstanceRef ref, uint32_t slot)
     {
         Instance* inst = w.resolveInstance(ref);
         if (!inst) return WideBoundsRef{};
@@ -196,7 +196,7 @@ struct World::TestAccess
         uint32_t sparse = kInvalidIndex;
         return w.wideBoundsFor(*inst, slot, w.slots_[slot], &sparse);
     }
-    static AABB instanceWorldBox(World& w, World::InstanceRef ref)
+    static AABB instanceWorldBox(SpatialDatabase& w, SpatialDatabase::InstanceRef ref)
     {
         w.flushBounds();
         const Instance* inst = w.resolveInstance(ref);
@@ -205,21 +205,21 @@ struct World::TestAccess
     }
     // The runtime state a mount holds, which every instance of the asset
     // shares: used to assert that deforming one instance does not fork it.
-    static const void* mountStateOf(World& w, UserPayload anyNodeInPage)
+    static const void* mountStateOf(SpatialDatabase& w, UserPayload anyNodeInPage)
     {
         return &w.slots_[requireByScan(w, anyNodeInPage).slot()];
     }
 
-    static std::vector<std::pair<uint32_t, uint8_t>> tlasQuery(World& w,
+    static std::vector<std::pair<uint32_t, uint8_t>> tlasQuery(SpatialDatabase& w,
                                                                const Camera& v,
                                                                float minPix)
     {
         std::vector<std::pair<uint32_t, uint8_t>> out;
-        std::vector<World::VisibleItem> packed;
-        std::vector<World::TlasItem> stack;
+        std::vector<SpatialDatabase::VisibleItem> packed;
+        std::vector<SpatialDatabase::TlasItem> stack;
         w.tlasQuery(v, minPix, -1.0f, packed, stack);
         out.reserve(packed.size());
-        for (const World::VisibleItem item : packed)
+        for (const SpatialDatabase::VisibleItem item : packed)
         {
             const uint32_t instance = w.publicInstanceId(item.instance());
             out.emplace_back(instance, item.mask());
@@ -232,12 +232,12 @@ struct World::TestAccess
     // tree in place, so every one of these is a way for a spawn to make an
     // instance invisible or a stale one visible -- exactly the failures a cut
     // comparison can miss when the camera happens not to look there.
-    static std::string tlasValidate(World& w)
+    static std::string tlasValidate(SpatialDatabase& w)
     {
         if (w.tlasDirty_) return "";   // a rebuild is pending; nothing to audit
         std::vector<uint32_t> seen(w.instances_.size(), 0);
         size_t alive = 0;
-        for (const World::Instance& i : w.instances_)
+        for (const SpatialDatabase::Instance& i : w.instances_)
             if (i.alive()) ++alive;
         if (w.instanceTlas_.size() != w.instances_.size() ||
             (!w.instanceFlatSlots_.empty() &&
@@ -275,7 +275,7 @@ struct World::TestAccess
             stack.pop_back();
             if (visited[size_t(ni)]) return "node reachable twice";
             visited[size_t(ni)] = 1;
-            const World::TlasNode& n = w.tlasNodes_[size_t(ni)];
+            const SpatialDatabase::TlasNode& n = w.tlasNodes_[size_t(ni)];
             if (n.validLanes() == 0) return "reachable node with no valid lane";
             for (uint32_t l = 0; l < kWide; ++l)
             {
@@ -285,8 +285,8 @@ struct World::TestAccess
                 {
                     const uint32_t id = uint32_t(~n.child[l]);
                     if (id >= w.instances_.size()) return "lane names no instance";
-                    const World::Instance& inst = w.instances_[id];
-                    const World::InstanceTlas& spatial = w.instanceTlas_[id];
+                    const SpatialDatabase::Instance& inst = w.instances_[id];
+                    const SpatialDatabase::InstanceTlas& spatial = w.instanceTlas_[id];
                     if (!inst.alive()) return "dead instance still in the tree";
                     if (seen[id]++) return "instance in the tree twice";
                     if (spatial.tlasNode() != uint32_t(ni) || spatial.tlasLane() != l)
@@ -305,7 +305,7 @@ struct World::TestAccess
                 {
                     if (n.singleRoot(l))
                         return "inner lane carries a leaf single-root flag";
-                    const World::TlasNode& c = w.tlasNodes_[size_t(n.child[l])];
+                    const SpatialDatabase::TlasNode& c = w.tlasNodes_[size_t(n.child[l])];
                     if (c.parent != ni) return "child's parent link is wrong";
                     float childErr = 0.0f;
                     uint32_t childMask = 0;
@@ -326,7 +326,7 @@ struct World::TestAccess
 
     // Ancestor chain of a node as payloads, walking parent links inside pages
     // and owner links across pages, up to (excluding) the instance sentinel.
-    static std::vector<UserPayload> ancestorIds(World& w, UserPayload payload)
+    static std::vector<UserPayload> ancestorIds(SpatialDatabase& w, UserPayload payload)
     {
         std::vector<UserPayload> out;
         const NodeHandle h = requireByScan(w, payload);
@@ -347,7 +347,7 @@ struct World::TestAccess
         }
     }
 
-    static RefResult referenceCut(World& w, const Camera& view, const CutParams& p)
+    static RefResult referenceFrontier(SpatialDatabase& w, const Camera& view, const SelectionParams& p)
     {
         w.flushBounds();
         RefResult out;
@@ -374,11 +374,11 @@ struct World::TestAccess
     }
 
 private:
-    static void refChildren(World& w, const Instance& inst, InstanceId instance,
+    static void refChildren(SpatialDatabase& w, const Instance& inst, InstanceId instance,
                             uint32_t slot,
                             uint32_t node, bool current, bool ideal,
                             const Camera& local,
-                            const CutParams& p, RefResult& out)
+                            const SelectionParams& p, RefResult& out)
     {
         const PageView& pg = w.pageView(w.slots_[slot]);
         uint32_t c = node + 1;
@@ -389,10 +389,10 @@ private:
         }
     }
 
-    static void refNode(World& w, const Instance& inst, InstanceId instance,
+    static void refNode(SpatialDatabase& w, const Instance& inst, InstanceId instance,
                         uint32_t slot, uint32_t i,
                         bool current, bool ideal, const Camera& local,
-                        const CutParams& p,
+                        const SelectionParams& p,
                         RefResult& out)
     {
         const PageRt& rt = w.slots_[slot];
@@ -432,7 +432,7 @@ private:
             (exp && !rt.expSlot.empty()) ? rt.expSlot[i] : kInvalidIndex;
         if (ideal && wants && exp && childSlot == kInvalidIndex)
         {
-            const CutEntry entry{here, err, p.threshold, instance};
+            const FrontierEntry entry{here, err, p.threshold, instance};
             (current ? out.buffers.shared : out.buffers.idealOnly).push_back(entry);
             return;
         }
@@ -460,42 +460,42 @@ private:
     }
 };
 
-} // namespace hlod
+} // namespace frontier
 
-namespace hlodtest {
+namespace frontiertest {
 
-using namespace hlod;
-using TAX = World::TestAccess;
+using namespace frontier;
+using TAX = SpatialDatabase::TestAccess;
 
 // Tests key their content by numeric ids; those ids travel as the opaque
 // payload. The alias keeps test code reading naturally.
 using UserId = UserPayload;
 
-inline std::vector<CutEntry> currentCut(const CutView& cut)
+inline std::vector<FrontierEntry> currentFrontier(const FrontierResultView& cut)
 {
-    std::vector<CutEntry> out(cut.shared.begin(), cut.shared.end());
+    std::vector<FrontierEntry> out(cut.shared.begin(), cut.shared.end());
     out.insert(out.end(), cut.currentOnly.begin(), cut.currentOnly.end());
     return out;
 }
 
-inline std::vector<CutEntry> idealCut(const CutView& cut)
+inline std::vector<FrontierEntry> idealFrontier(const FrontierResultView& cut)
 {
-    std::vector<CutEntry> out(cut.shared.begin(), cut.shared.end());
+    std::vector<FrontierEntry> out(cut.shared.begin(), cut.shared.end());
     out.insert(out.end(), cut.idealOnly.begin(), cut.idealOnly.end());
     return out;
 }
 
-inline size_t currentCutSize(const CutView& cut)
+inline size_t currentFrontierSize(const FrontierResultView& cut)
 {
     return cut.currentSize();
 }
 
-inline size_t idealCutSize(const CutView& cut)
+inline size_t idealFrontierSize(const FrontierResultView& cut)
 {
     return cut.idealSize();
 }
 
-inline UserPayload payloadOf(const World& w, const CutEntry& entry)
+inline UserPayload payloadOf(const SpatialDatabase& w, const FrontierEntry& entry)
 {
     UserPayload payload = 0;
     if (!w.tryGetPayload(entry.nodeHandle, payload))
@@ -513,35 +513,35 @@ inline std::vector<UserPayload> pageIds(const PageView& pg)
 // ---------------------------------------------------------------------------
 // Payload-keyed wrappers over the handle-only production API. Each one is a
 // brute-force scan (TestAccess::findByScan) — fine for tests, never for
-// production code, which composes handles from attach results and selectCut
+// production code, which composes handles from attach results and selectFrontier
 // outputs instead.
 // ---------------------------------------------------------------------------
-inline NodeHandle handleOf(World& w, UserPayload p) { return TAX::requireByScan(w, p); }
+inline NodeHandle handleOf(SpatialDatabase& w, UserPayload p) { return TAX::requireByScan(w, p); }
 
-inline void markResident(World& w, UserPayload p) { w.markResident(handleOf(w, p)); }
-inline void markNonResident(World& w, UserPayload p) { w.markNonResident(handleOf(w, p)); }
-inline bool isResident(World& w, UserPayload p) { return w.isResident(handleOf(w, p)); }
-inline bool contains(World& w, UserPayload p) { return TAX::findByScan(w, p).valid(); }
+inline void markResident(SpatialDatabase& w, UserPayload p) { w.markResident(handleOf(w, p)); }
+inline void markNonResident(SpatialDatabase& w, UserPayload p) { w.markNonResident(handleOf(w, p)); }
+inline bool isResident(SpatialDatabase& w, UserPayload p) { return w.isResident(handleOf(w, p)); }
+inline bool contains(SpatialDatabase& w, UserPayload p) { return TAX::findByScan(w, p).valid(); }
 
-inline PageHandle attachPage(World& w, UserPayload expansion, Page page)
+inline PageHandle attachPage(SpatialDatabase& w, UserPayload expansion, Page page)
 {
     return w.attachPage(handleOf(w, expansion), std::move(page));
 }
-inline void detachPage(World& w, UserPayload expansion)
+inline void detachPage(SpatialDatabase& w, UserPayload expansion)
 {
     w.detachPage(handleOf(w, expansion));
 }
-inline bool isAttached(World& w, UserPayload expansion)
+inline bool isAttached(SpatialDatabase& w, UserPayload expansion)
 {
     const NodeHandle h = TAX::findByScan(w, expansion);
     return h.valid() && w.isAttached(h);
 }
-inline void setNodeBounds(World& w, World::InstanceRef inst, UserPayload p,
+inline void setNodeBounds(SpatialDatabase& w, SpatialDatabase::InstanceRef inst, UserPayload p,
                           const AABB& b)
 {
     w.setNodeBounds(inst, handleOf(w, p), b);
 }
-inline AABB nodeBounds(World& w, World::InstanceRef inst, UserPayload p)
+inline AABB nodeBounds(SpatialDatabase& w, SpatialDatabase::InstanceRef inst, UserPayload p)
 {
     return w.nodeBounds(inst, handleOf(w, p));
 }
@@ -581,7 +581,7 @@ struct TreeGen
 
     Page makeRootPage(const AABB& region, float rootErr, uint32_t pageLevels)
     {
-        HLodBuilder b;
+        PageBuilder b;
         lastIds.clear();
         addSubtree(b, 0, true, region, rootErr, 0, pageLevels);
         return b.build();
@@ -590,7 +590,7 @@ struct TreeGen
     Page makeChildPage(UserId expansionId)
     {
         const Recipe r = recipes.at(expansionId);
-        HLodBuilder b;
+        PageBuilder b;
         lastIds.clear();
         for (uint32_t f = 0; f < fanout; ++f)
             addSubtree(b, 0, true, slab(r.region, f, fanout), r.rootErr, 0, r.pageLevels);
@@ -598,13 +598,13 @@ struct TreeGen
     }
 
 private:
-    void addSubtree(HLodBuilder& b, HLodBuilder::NodeId parent, bool isRoot,
+    void addSubtree(PageBuilder& b, PageBuilder::NodeId parent, bool isRoot,
                     const AABB& region, float err, uint32_t level, uint32_t pageLevels)
     {
         const UserId id = nextId++;
         lastIds.push_back(id);
         const bool pageLeaf = (level == depth);
-        const HLodBuilder::NodeId n =
+        const PageBuilder::NodeId n =
             isRoot ? b.createRoot(id, err, pageLeaf ? region : AABB::empty())
                    : b.createNode(parent, id, err, pageLeaf ? region : AABB::empty());
         if (pageLeaf)
@@ -622,14 +622,14 @@ private:
     }
 };
 
-inline void markAllResident(World& w, const std::vector<UserPayload>& ids)
+inline void markAllResident(SpatialDatabase& w, const std::vector<UserPayload>& ids)
 {
     for (UserPayload id : ids) markResident(w, id);
 }
 
 // Fast path for benchmarks: mark a whole freshly attached page resident by
 // composing handles from the PageHandle — no scans.
-inline void markAllResident(World& w, PageHandle page, uint32_t nodeCount)
+inline void markAllResident(SpatialDatabase& w, PageHandle page, uint32_t nodeCount)
 {
     for (uint32_t i = 1; i < nodeCount; ++i) w.markResident(nodeAt(page, i));
 }
@@ -640,4 +640,4 @@ inline AABB unitRegion(float halfSize = 100.0f)
                             float4::vec(halfSize, halfSize, halfSize));
 }
 
-} // namespace hlodtest
+} // namespace frontiertest

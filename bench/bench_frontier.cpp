@@ -1,4 +1,4 @@
-// Performance tests for the HLodTree corner cases:
+// Performance tests for Frontier corner cases:
 //   - one very deep tree, static camera and fly-through
 //   - deep paged tree with live streaming (attach/resident/collect loop)
 //   - many shallow trees (forests), with and without contribution culling
@@ -6,7 +6,7 @@
 //   - moving leaf nodes (bounds refit)
 //   - payload residency churn
 //   - dynamic instance churn (spawn/despawn every frame)
-//   - HLodBuilder page composition (runtime tree creation)
+//   - PageBuilder page composition (runtime tree creation)
 //   - output-sensitivity scaling (cost vs cut size at fixed world size)
 //   - camera teleport (cold-frame latency spike)
 //   - multi-view frames (marginal cost of extra views)
@@ -15,7 +15,7 @@
 //   - 100k flat forests: TLAS-only vs cached/uncached result materialization
 //   - adversarial shapes (stacked instances, max-width node, deep page chain)
 //
-// All setup happens outside the timed loop; iterations time selectCut plus
+// All setup happens outside the timed loop; iterations time selectFrontier plus
 // whatever per-frame work the scenario prescribes.
 
 #include <benchmark/benchmark.h>
@@ -35,23 +35,23 @@
 
 #include "helpers.h"   // TreeGen etc. (shared with the unit tests)
 
-using namespace hlod;
-using namespace hlodtest;
+using namespace frontier;
+using namespace frontiertest;
 
 namespace {
 
-struct UncachedView : View
+struct UncachedSpatialQuery : SpatialQuery
 {
-    UncachedView() { setReuseEnabled(false); }
+    UncachedSpatialQuery() { setReuseEnabled(false); }
 };
 
 struct Outputs
 {
-    UncachedView view;
-    CutResults cut;
+    UncachedSpatialQuery query;
+    FrontierResult cut;
 };
 
-void consumeCut(const CutView& cut)
+void consumeFrontier(const FrontierResultView& cut)
 {
     benchmark::DoNotOptimize(cut.shared.data());
     benchmark::DoNotOptimize(cut.currentOnly.data());
@@ -72,14 +72,14 @@ constexpr uint32_t kDynamicWorkloadSeed = 0x9e3779b9u;
 // streaming policy must prioritize by err — picking "the first N" makes the
 // attach set depend on walk order and over-refines wherever the walk went
 // deep first (measurably worse: the hot set churns instead of converging).
-size_t attachTopByPriority(World& w, TreeGen& gen,
-                           const CutView& cut, size_t budget)
+size_t attachTopByPriority(SpatialDatabase& w, TreeGen& gen,
+                           const FrontierResultView& cut, size_t budget)
 {
-    static std::vector<const CutEntry*> candidates;
+    static std::vector<const FrontierEntry*> candidates;
     candidates.clear();
     const auto gather = [&](const auto& entries)
     {
-        for (const CutEntry& entry : entries)
+        for (const FrontierEntry& entry : entries)
         {
             const UserId id = payloadOf(w, entry);
             if (entry.overThreshold() && gen.recipes.count(id) &&
@@ -92,13 +92,13 @@ size_t attachTopByPriority(World& w, TreeGen& gen,
     const size_t take = candidates.size() < budget ? candidates.size() : budget;
     std::partial_sort(candidates.begin(), candidates.begin() + ptrdiff_t(take),
                       candidates.end(),
-                      [](const CutEntry* a, const CutEntry* b) {
+                      [](const FrontierEntry* a, const FrontierEntry* b) {
                           return a->errorCode() > b->errorCode();
                       });
     for (size_t j = 0; j < take; ++j)
     {
         // Production flow: content is keyed by payload, attach by handle.
-        const CutEntry& e = *candidates[j];
+        const FrontierEntry& e = *candidates[j];
         Page child = gen.makeChildPage(payloadOf(w, e));
         const uint32_t n = child.nodeCount();
         const PageHandle ph = w.attachPage(e.nodeHandle, std::move(child));
@@ -110,11 +110,11 @@ size_t attachTopByPriority(World& w, TreeGen& gen,
 // Example streaming policy: make every ideal-cut payload resident.
 // A production streamer would normally deduplicate shared payload ids, apply
 // priorities/budgets, and complete these calls asynchronously.
-size_t makeIdealResident(World& w, const CutView& cut)
+size_t makeIdealResident(SpatialDatabase& w, const FrontierResultView& cut)
 {
     const auto mark = [&](const auto& entries)
     {
-        for (const CutEntry& e : entries)
+        for (const FrontierEntry& e : entries)
             if (!w.isResident(e.nodeHandle)) w.markResident(e.nodeHandle);
     };
     mark(cut.shared);
@@ -124,7 +124,7 @@ size_t makeIdealResident(World& w, const CutView& cut)
 
 // Add a root page and mark every node resident (handles composed from the
 // attach result — no lookups anywhere).
-World::InstanceRef addResidentInstance(World& w, Page pg, float4 pos, float scale = 1.0f)
+SpatialDatabase::InstanceRef addResidentInstance(SpatialDatabase& w, Page pg, float4 pos, float scale = 1.0f)
 {
     const uint32_t n = pg.nodeCount();
     const auto inst = w.addInstance(std::move(pg), pos, scale);
@@ -133,16 +133,16 @@ World::InstanceRef addResidentInstance(World& w, Page pg, float4 pos, float scal
 }
 
 // One fully resident deep tree. depth 6 / fanout 8 is ~300k nodes.
-// (unique_ptr because World is neither copyable nor movable: mounts and
+// (unique_ptr because SpatialDatabase is neither copyable nor movable: mounts and
 // instances refer to each other by slot, and owned pages point into the
-// World's context.)
-std::unique_ptr<World> makeDeepWorld(uint32_t fanout, uint32_t depth,
+// SpatialDatabase's context.)
+std::unique_ptr<SpatialDatabase> makeDeepWorld(uint32_t fanout, uint32_t depth,
                                      TreeGen* genOut = nullptr)
 {
     TreeGen gen;
     gen.fanout = fanout;
     gen.depth = depth;
-    auto w = std::make_unique<World>();
+    auto w = std::make_unique<SpatialDatabase>();
     addResidentInstance(*w, gen.makeRootPage(unitRegion(1000.0f), 4096.0f, 0),
                         float4::point(0, 0, 0));
     if (genOut) *genOut = std::move(gen);
@@ -157,41 +157,41 @@ std::unique_ptr<World> makeDeepWorld(uint32_t fanout, uint32_t depth,
 static void BM_DeepTree_StaticCamera(benchmark::State& state)
 {
     const auto wp = makeDeepWorld(8, uint32_t(state.range(0)));
-    World& w = *wp;
+    SpatialDatabase& w = *wp;
     Outputs o;
     const Camera v = orbitView(0.7f, 2500.0f);
-    const CutParams p{4.0f, 0.0f};
+    const SelectionParams p{4.0f, 0.0f};
 
     for (auto _ : state)
     {
         w.applyUpdates();
-        o.view.selectCut(w, v, p, o.cut);
-        consumeCut(o.cut);
+        o.query.selectFrontier(w, v, p, o.cut);
+        consumeFrontier(o.cut);
     }
-    state.counters["cut"] = double(o.cut.size());
+    state.counters["frontier"] = double(o.cut.size());
 }
 BENCHMARK(BM_DeepTree_StaticCamera)->Arg(4)->Arg(5)->Arg(6)->Unit(benchmark::kMicrosecond);
 
 // Same scene through an explicit owning snapshot. The fully resident result is
 // entirely Shared.
-static void BM_DeepTree_CutOnly(benchmark::State& state)
+static void BM_DeepTree_FrontierOnly(benchmark::State& state)
 {
-    UncachedView selection;
+    UncachedSpatialQuery selection;
     const auto wp = makeDeepWorld(8, uint32_t(state.range(0)));
-    World& w = *wp;
-    CutResults cut;
+    SpatialDatabase& w = *wp;
+    FrontierResult cut;
     const Camera v = orbitView(0.7f, 2500.0f);
-    const CutParams p{4.0f, 0.0f};
+    const SelectionParams p{4.0f, 0.0f};
 
     for (auto _ : state)
     {
         w.applyUpdates();
-        selection.selectCut(w, v, p, cut);
-        consumeCut(cut);
+        selection.selectFrontier(w, v, p, cut);
+        consumeFrontier(cut);
     }
-    state.counters["cut"] = double(cut.size());
+    state.counters["frontier"] = double(cut.size());
 }
-BENCHMARK(BM_DeepTree_CutOnly)->Arg(6)->Unit(benchmark::kMicrosecond);
+BENCHMARK(BM_DeepTree_FrontierOnly)->Arg(6)->Unit(benchmark::kMicrosecond);
 
 // ---------------------------------------------------------------------------
 // Deep tree, flying camera: refinement churn, epoch reuse.
@@ -199,12 +199,12 @@ BENCHMARK(BM_DeepTree_CutOnly)->Arg(6)->Unit(benchmark::kMicrosecond);
 static void BM_DeepTree_FlyThrough(benchmark::State& state)
 {
     const auto wp = makeDeepWorld(8, uint32_t(state.range(0)));
-    World& w = *wp;
+    SpatialDatabase& w = *wp;
     Outputs o;
-    const CutParams p{4.0f, 0.0f};
+    const SelectionParams p{4.0f, 0.0f};
 
     float t = 0.0f;
-    size_t cutTotal = 0, frames = 0;
+    size_t frontierTotal = 0, frames = 0;
     for (auto _ : state)
     {
         t += 0.02f;
@@ -212,12 +212,12 @@ static void BM_DeepTree_FlyThrough(benchmark::State& state)
         const float dist = 1800.0f + 1500.0f * std::sin(t * 3.1f);
         const Camera v = orbitView(t, dist);
         w.applyUpdates();
-        o.view.selectCut(w, v, p, o.cut);
-        consumeCut(o.cut);
-        cutTotal += o.cut.size();
+        o.query.selectFrontier(w, v, p, o.cut);
+        consumeFrontier(o.cut);
+        frontierTotal += o.cut.size();
         ++frames;
     }
-    state.counters["avg_cut"] = double(cutTotal) / double(frames ? frames : 1);
+    state.counters["avg_frontier"] = double(frontierTotal) / double(frames ? frames : 1);
 }
 BENCHMARK(BM_DeepTree_FlyThrough)->Arg(5)->Arg(6)->Unit(benchmark::kMicrosecond);
 
@@ -225,38 +225,38 @@ BENCHMARK(BM_DeepTree_FlyThrough)->Arg(5)->Arg(6)->Unit(benchmark::kMicrosecond)
 // LOD damping cost: the camera envelope is conservative, so a damped cut is
 // larger than an undamped one — that growth is the honest price of damping
 // (the cut is output-bound). arg0 = depth, arg1 = damper half-life in frames
-// (0 = envelope collapsed, i.e. off). Compare avg_cut across arg1; time per
+// (0 = envelope collapsed, i.e. off). Compare avg_frontier across arg1; time per
 // emitted entry should not move (the damped and undamped walks execute the
 // same instruction sequence).
 // The flight swoops through 30k–90k units, where the refinement boundary of
 // the mid tree levels actually lives (leaf refine distance for this world is
 // ~63k units at 4 px) — the close-in FlyThrough orbit leaves the whole
 // visible tree fully refined, and then damping has nothing to damp.
-// Iterations are FIXED so every variant flies the identical path — avg_cut
+// Iterations are FIXED so every variant flies the identical path — avg_frontier
 // would otherwise depend on how many iterations the harness happens to pick.
 // ---------------------------------------------------------------------------
 static void BM_DeepTree_FlyThroughDamped(benchmark::State& state)
 {
     const auto wp = makeDeepWorld(8, uint32_t(state.range(0)));
-    World& w = *wp;
+    SpatialDatabase& w = *wp;
     Outputs o;
-    const CutParams p{4.0f, 0.0f};
+    const SelectionParams p{4.0f, 0.0f};
     CameraDamper damper(float(state.range(1)));
 
     float t = 0.0f;
-    size_t cutTotal = 0, frames = 0;
+    size_t frontierTotal = 0, frames = 0;
     for (auto _ : state)
     {
         t += 0.02f;
         const float dist = 60000.0f + 30000.0f * std::sin(t * 3.1f);
         const Camera v = damper.damp(orbitView(t, dist));
         w.applyUpdates();
-        o.view.selectCut(w, v, p, o.cut);
-        consumeCut(o.cut);
-        cutTotal += o.cut.size();
+        o.query.selectFrontier(w, v, p, o.cut);
+        consumeFrontier(o.cut);
+        frontierTotal += o.cut.size();
         ++frames;
     }
-    state.counters["avg_cut"] = double(cutTotal) / double(frames ? frames : 1);
+    state.counters["avg_frontier"] = double(frontierTotal) / double(frames ? frames : 1);
 }
 BENCHMARK(BM_DeepTree_FlyThroughDamped)
     ->Args({6, 0})->Args({6, 4})->Args({6, 16})
@@ -272,13 +272,13 @@ static void BM_PagedPlanet_StreamingFly(benchmark::State& state)
     TreeGen gen;
     gen.fanout = 4;
     gen.depth = 2;
-    World w;
+    SpatialDatabase w;
     addResidentInstance(w, gen.makeRootPage(unitRegion(100000.0f), 1u << 20, 4),
                         float4::point(0, 0, 0));
 
     Outputs o;
     PageUsageContext usage;
-    const CutParams p{8.0f, 0.0f};
+    const SelectionParams p{8.0f, 0.0f};
     const size_t pageBudget = size_t(state.range(0));
 
     float t = 0.0f;
@@ -290,12 +290,12 @@ static void BM_PagedPlanet_StreamingFly(benchmark::State& state)
         const Camera v = orbitView(t * 0.2f, 20000.0f + dist);
 
         w.applyUpdates();
-        o.view.selectCut(w, v, p, usage, o.cut);
+        o.query.selectFrontier(w, v, p, usage, o.cut);
 
         attaches += attachTopByPriority(w, gen, o.cut, 8);
         makeIdealResident(w, o.cut);
         w.collect(usage, pageBudget, 16);
-        consumeCut(o.cut);
+        consumeFrontier(o.cut);
     }
     state.counters["attached"] = double(w.attachedPageCount());
     state.counters["attaches"] = double(attaches);
@@ -314,20 +314,20 @@ static void BM_GcStress_FastFlythrough(benchmark::State& state)
     TreeGen gen;
     gen.fanout = 4;
     gen.depth = 2;
-    World w;
+    SpatialDatabase w;
     const float half = 100000.0f;
     addResidentInstance(w, gen.makeRootPage(unitRegion(half), float(1u << 20), 4),
                         float4::point(0, 0, 0));
 
     Outputs o;
     PageUsageContext usage;
-    const CutParams p{8.0f, 1.0f};
+    const SelectionParams p{8.0f, 1.0f};
     const size_t pageBudget = size_t(state.range(0));
     const uint32_t minAge = 8;
     const float speed = half / 250.0f;   // crosses the whole world in ~500 frames
 
     float x = -half;
-    size_t attaches = 0, collected = 0, frames = 0, cutTotal = 0;
+    size_t attaches = 0, collected = 0, frames = 0, frontierTotal = 0;
     for (auto _ : state)
     {
         x += speed;
@@ -337,20 +337,20 @@ static void BM_GcStress_FastFlythrough(benchmark::State& state)
             float4::vec(0, 1, 0), 1.0f, 16.0f / 9.0f, 1080.0f, 0.1f, 1.0e9f);
 
         w.applyUpdates();
-        o.view.selectCut(w, v, p, usage, o.cut);
+        o.query.selectFrontier(w, v, p, usage, o.cut);
 
         attaches += attachTopByPriority(w, gen, o.cut, 16);
         const size_t currentCount = makeIdealResident(w, o.cut);
         collected += w.collect(usage, pageBudget, minAge).detachedPages;
 
-        cutTotal += currentCount;
+        frontierTotal += currentCount;
         ++frames;
-        consumeCut(o.cut);
+        consumeFrontier(o.cut);
     }
     state.counters["attached"] = double(w.attachedPageCount());
     state.counters["attach_pf"] = double(attaches) / double(frames ? frames : 1);
     state.counters["collect_pf"] = double(collected) / double(frames ? frames : 1);
-    state.counters["avg_cut"] = double(cutTotal) / double(frames ? frames : 1);
+    state.counters["avg_frontier"] = double(frontierTotal) / double(frames ? frames : 1);
 }
 BENCHMARK(BM_GcStress_FastFlythrough)->Arg(96)->Arg(768)->Unit(benchmark::kMicrosecond);
 
@@ -367,13 +367,13 @@ static void BM_ManyShallowTrees(benchmark::State& state)
     TreeGen gen;
     gen.fanout = 4;
     gen.depth = 1;
-    World w;
+    SpatialDatabase w;
     for (int i = 0; i < count; ++i)
         addResidentInstance(w, gen.makeRootPage(unitRegion(4.0f), 8.0f, 0),
                             float4::point(uni(rng), 0, uni(rng)));
 
     Outputs o;
-    const CutParams p{4.0f, state.range(1) ? 1.0f : 0.0f};
+    const SelectionParams p{4.0f, state.range(1) ? 1.0f : 0.0f};
 
     float t = 0.0f;
     for (auto _ : state)
@@ -381,10 +381,10 @@ static void BM_ManyShallowTrees(benchmark::State& state)
         t += 0.01f;
         const Camera v = orbitView(t, area * 0.4f);
         w.applyUpdates();
-        o.view.selectCut(w, v, p, o.cut);
-        consumeCut(o.cut);
+        o.query.selectFrontier(w, v, p, o.cut);
+        consumeFrontier(o.cut);
     }
-    state.counters["cut"] = double(o.cut.size());
+    state.counters["frontier"] = double(o.cut.size());
 }
 BENCHMARK(BM_ManyShallowTrees)
     ->Args({1000, 0})->Args({10000, 0})->Args({50000, 0})
@@ -406,14 +406,14 @@ static void BM_MovingInstances(benchmark::State& state)
     TreeGen gen;
     gen.fanout = 4;
     gen.depth = 1;
-    World w;
-    std::vector<World::InstanceRef> insts;
+    SpatialDatabase w;
+    std::vector<SpatialDatabase::InstanceRef> insts;
     for (int i = 0; i < count; ++i)
         insts.push_back(addResidentInstance(w, gen.makeRootPage(unitRegion(4.0f), 8.0f, 0),
                                             float4::point(uni(rng), 0, uni(rng))));
 
     Outputs o;
-    const CutParams p{4.0f, 0.0f};
+    const SelectionParams p{4.0f, 0.0f};
     DeterministicRng fast(kDynamicWorkloadSeed);
 
     float t = 0.0f;
@@ -429,8 +429,8 @@ static void BM_MovingInstances(benchmark::State& state)
         }
         const Camera v = orbitView(t, area * 0.4f);
         w.applyUpdates();
-        o.view.selectCut(w, v, p, o.cut);
-        consumeCut(o.cut);
+        o.query.selectFrontier(w, v, p, o.cut);
+        consumeFrontier(o.cut);
     }
 }
 BENCHMARK(BM_MovingInstances)
@@ -440,18 +440,18 @@ BENCHMARK(BM_MovingInstances)
 // ---------------------------------------------------------------------------
 // Movable/resizable leaf stress: ~250k leaves in one wide tree. The refit-only
 // benches time setNodeBounds + flushBounds (the bbox hierarchy + wide-lane
-// update) in isolation; the WithCut variant adds selectCut on top.
+// update) in isolation; the WithCut variant adds selectFrontier on top.
 // ---------------------------------------------------------------------------
 struct MoverWorld
 {
-    World world;
-    World::InstanceRef      inst;     // setNodeBounds is per instance now
+    SpatialDatabase world;
+    SpatialDatabase::InstanceRef      inst;     // setNodeBounds is per instance now
     std::vector<NodeHandle> leaves;   // composed from the attach result
     std::vector<float4>     home;     // original leaf centers
     float half = 2000.0f;
 };
 
-// unique_ptr: World (and so MoverWorld) is neither copyable nor movable.
+// unique_ptr: SpatialDatabase (and so MoverWorld) is neither copyable nor movable.
 std::unique_ptr<MoverWorld> makeMoverWorld()
 {
     auto mw = std::make_unique<MoverWorld>();
@@ -566,17 +566,17 @@ BENCHMARK(BM_LeafRefit_RepeatedMoves)
 // Full frame under teleport chaos: refit + cut selection with a moving
 // camera. Note the ancestor boxes degrade toward the whole region (grow-only,
 // shrink is lazy), so this also measures the cut under worst-case bounds.
-static void BM_LeafMotion_TeleportWithCut(benchmark::State& state)
+static void BM_LeafMotion_TeleportWithFrontier(benchmark::State& state)
 {
     const auto mwp = makeMoverWorld();
     MoverWorld& mw = *mwp;
     const int movers = int(state.range(0));
     DeterministicRng rng(kDynamicWorkloadSeed);
     Outputs o;
-    const CutParams p{16.0f, 0.0f};
+    const SelectionParams p{16.0f, 0.0f};
 
     float t = 0.0f;
-    size_t cursor = 0, cutTotal = 0, frames = 0;
+    size_t cursor = 0, frontierTotal = 0, frames = 0;
     for (auto _ : state)
     {
         t += 0.02f;
@@ -591,28 +591,28 @@ static void BM_LeafMotion_TeleportWithCut(benchmark::State& state)
         }
         const Camera v = orbitView(t, mw.half * 2.0f);
         mw.world.applyUpdates();
-        o.view.selectCut(mw.world, v, p, o.cut);
-        consumeCut(o.cut);
-        cutTotal += o.cut.size();
+        o.query.selectFrontier(mw.world, v, p, o.cut);
+        consumeFrontier(o.cut);
+        frontierTotal += o.cut.size();
         ++frames;
     }
     state.SetItemsProcessed(int64_t(state.iterations()) * movers);
-    state.counters["avg_cut"] = double(cutTotal) / double(frames ? frames : 1);
+    state.counters["avg_frontier"] = double(frontierTotal) / double(frames ? frames : 1);
 }
-BENCHMARK(BM_LeafMotion_TeleportWithCut)->Arg(10000)->Arg(100000)
+BENCHMARK(BM_LeafMotion_TeleportWithFrontier)->Arg(10000)->Arg(100000)
     ->Unit(benchmark::kMicrosecond);
 
 // ---------------------------------------------------------------------------
 // In-tree motion: leaf nodes of a deep tree change bounds every frame; the
-// lazy refit + wide-lane patching runs inside selectCut.
+// lazy refit + wide-lane patching runs inside selectFrontier.
 // ---------------------------------------------------------------------------
 static void BM_MovingLeafNodes(benchmark::State& state)
 {
     TreeGen gen;
     gen.fanout = 8;
     gen.depth = 5;
-    World w;
-    World::InstanceRef inst;
+    SpatialDatabase w;
+    SpatialDatabase::InstanceRef inst;
     std::vector<NodeHandle> leaves;
     {
         Page pg = gen.makeRootPage(unitRegion(1000.0f), 4096.0f, 0);
@@ -627,7 +627,7 @@ static void BM_MovingLeafNodes(benchmark::State& state)
     const int movers = int(state.range(0));
 
     Outputs o;
-    const CutParams p{4.0f, 0.0f};
+    const SelectionParams p{4.0f, 0.0f};
 
     float t = 0.0f;
     size_t cursor = 0;
@@ -645,8 +645,8 @@ static void BM_MovingLeafNodes(benchmark::State& state)
         }
         const Camera v = orbitView(t, 2500.0f);
         w.applyUpdates();
-        o.view.selectCut(w, v, p, o.cut);
-        consumeCut(o.cut);
+        o.query.selectFrontier(w, v, p, o.cut);
+        consumeFrontier(o.cut);
     }
 }
 BENCHMARK(BM_MovingLeafNodes)->Arg(100)->Arg(1000)->Arg(10000)
@@ -660,7 +660,7 @@ static void BM_ResidencyChurn(benchmark::State& state)
     TreeGen gen;
     gen.fanout = 8;
     gen.depth = 5;
-    World w;
+    SpatialDatabase w;
     Page pg = gen.makeRootPage(unitRegion(1000.0f), 4096.0f, 0);
     const uint32_t nodeCount = pg.nodeCount();
     const auto inst = w.addInstance(std::move(pg), float4::point(0, 0, 0));
@@ -674,7 +674,7 @@ static void BM_ResidencyChurn(benchmark::State& state)
     const int churn = int(state.range(0));
 
     Outputs o;
-    const CutParams p{4.0f, 0.0f};
+    const SelectionParams p{4.0f, 0.0f};
 
     float t = 0.0f;
     size_t cursor = 0;
@@ -689,8 +689,8 @@ static void BM_ResidencyChurn(benchmark::State& state)
         }
         const Camera v = orbitView(t, 2500.0f);
         w.applyUpdates();
-        o.view.selectCut(w, v, p, o.cut);
-        consumeCut(o.cut);
+        o.query.selectFrontier(w, v, p, o.cut);
+        consumeFrontier(o.cut);
     }
 }
 BENCHMARK(BM_ResidencyChurn)->Arg(100)->Arg(10000)->Unit(benchmark::kMicrosecond);
@@ -702,7 +702,7 @@ BENCHMARK(BM_ResidencyChurn)->Arg(100)->Arg(10000)->Unit(benchmark::kMicrosecond
 //   - a deep tree whose leaves jitter, 2000 refits per frame
 //   - payload residency streamed with one frame of latency
 // This is the "real game" shape: nothing is isolated, every subsystem's
-// bookkeeping has to coexist with the others in the same selectCut.
+// bookkeeping has to coexist with the others in the same selectFrontier.
 // ---------------------------------------------------------------------------
 static void BM_Combined_KitchenSink(benchmark::State& state)
 {
@@ -711,7 +711,7 @@ static void BM_Combined_KitchenSink(benchmark::State& state)
     planetGen.fanout = 4;
     planetGen.depth = 2;
 
-    World w;
+    SpatialDatabase w;
     addResidentInstance(w, planetGen.makeRootPage(unitRegion(half), float(1u << 19), 3),
                         float4::point(0, 0, 0));
 
@@ -722,7 +722,7 @@ static void BM_Combined_KitchenSink(benchmark::State& state)
     propGen.nextId = 1u << 20;   // avoid id collisions with the planet
     DeterministicRng rng(4242);
     DeterministicUniformFloat uni(-half, half);
-    std::vector<World::InstanceRef> props;
+    std::vector<SpatialDatabase::InstanceRef> props;
     std::vector<float4> propHome;
     for (int i = 0; i < 20000; ++i)
     {
@@ -736,7 +736,7 @@ static void BM_Combined_KitchenSink(benchmark::State& state)
     moverGen.fanout = 10;
     moverGen.depth = 4;   // 10^4 = 10k leaves
     moverGen.nextId = 1u << 24;
-    World::InstanceRef moverInst;
+    SpatialDatabase::InstanceRef moverInst;
     std::vector<NodeHandle> moverLeaves;
     std::vector<float4> moverHome;
     {
@@ -754,11 +754,11 @@ static void BM_Combined_KitchenSink(benchmark::State& state)
 
     Outputs o;
     PageUsageContext usage;
-    const CutParams p{8.0f, 0.5f};
+    const SelectionParams p{8.0f, 0.5f};
     DeterministicRng fast(kDynamicWorkloadSeed);
 
     float x = -half;
-    size_t frames = 0, cutTotal = 0, attaches = 0, collected = 0;
+    size_t frames = 0, frontierTotal = 0, attaches = 0, collected = 0;
     size_t propCursor = 0, leafCursor = 0;
     for (auto _ : state)
     {
@@ -792,17 +792,17 @@ static void BM_Combined_KitchenSink(benchmark::State& state)
             float4::vec(0, 1, 0), 1.0f, 16.0f / 9.0f, 1080.0f, 0.1f, 1.0e9f);
 
         w.applyUpdates();
-        o.view.selectCut(w, v, p, usage, o.cut);
+        o.query.selectFrontier(w, v, p, usage, o.cut);
 
         attaches += attachTopByPriority(w, planetGen, o.cut, 12);
         const size_t currentCount = makeIdealResident(w, o.cut);
         collected += w.collect(usage, 300, 8).detachedPages;
 
-        cutTotal += currentCount;
+        frontierTotal += currentCount;
         ++frames;
-        consumeCut(o.cut);
+        consumeFrontier(o.cut);
     }
-    state.counters["avg_cut"] = double(cutTotal) / double(frames ? frames : 1);
+    state.counters["avg_frontier"] = double(frontierTotal) / double(frames ? frames : 1);
     state.counters["attach_pf"] = double(attaches) / double(frames ? frames : 1);
     state.counters["collect_pf"] = double(collected) / double(frames ? frames : 1);
     state.counters["attached"] = double(w.attachedPageCount());
@@ -815,17 +815,17 @@ BENCHMARK(BM_Combined_KitchenSink)->Unit(benchmark::kMicrosecond);
 //     leaves) and 20% deep (fanout 4, depth 3 -> 64 leaves)
 //   - 10% of ALL leaves sway slowly (small local drift) every frame
 //   - camera at eye height runs through the forest (~5 m/s at 60 fps)
-//   - fully resident, no streaming: cut-only selectCut
+//   - fully resident, no streaming: cut-only selectFrontier
 // Movers are addressed by NodeHandle, composed at setup from the attach
 // result plus the authored leaf indices — the production pattern.
 // Phase times are reported as counters, in microseconds per frame:
 //   move_us  = setNodeBounds submission (handle check + queue push)
 //   refit_us = flushBounds (coalesce + bbox hierarchy + wide-lane patching)
-//   cut_us   = TLAS query + per-instance walks + emission
+//   frontier_us   = TLAS query + per-instance walks + emission
 // ---------------------------------------------------------------------------
 static void BM_TypicalForest_Breakdown(benchmark::State& state)
 {
-    UncachedView selection;
+    UncachedSpatialQuery selection;
     using clock = std::chrono::steady_clock;
     const int count = int(state.range(0));
     // ~20 m spacing: 10k trees live on a ~2x2 km map.
@@ -834,9 +834,9 @@ static void BM_TypicalForest_Breakdown(benchmark::State& state)
     DeterministicUniformFloat uni(-half, half);
 
     TreeGen gen;
-    World w;
+    SpatialDatabase w;
     std::vector<NodeHandle> leaves;   // all leaf handles
-    std::vector<World::InstanceRef> leafInst;   // owning instance per leaf
+    std::vector<SpatialDatabase::InstanceRef> leafInst;   // owning instance per leaf
     std::vector<float4>     home;     // leaf home centers, local space
     std::vector<uint32_t>   leafIdx;
     for (int i = 0; i < count; ++i)
@@ -866,12 +866,12 @@ static void BM_TypicalForest_Breakdown(benchmark::State& state)
     std::vector<uint32_t> movers;
     for (uint32_t i = 0; i < leaves.size(); i += 10) movers.push_back(i);
 
-    CutResults cut;
-    const CutParams p{4.0f, 1.0f};
+    FrontierResult cut;
+    const SelectionParams p{4.0f, 1.0f};
     DeterministicRng fast(kDynamicWorkloadSeed);
 
-    double moveNs = 0, refitNs = 0, cutNs = 0;
-    size_t frames = 0, cutTotal = 0;
+    double moveNs = 0, refitNs = 0, frontierNs = 0;
+    size_t frames = 0, frontierTotal = 0;
     float x = -half * 0.7f;
     for (auto _ : state)
     {
@@ -893,23 +893,23 @@ static void BM_TypicalForest_Breakdown(benchmark::State& state)
         const Camera v = makePerspectiveCamera(
             float4::point(x, 1.7f, 0), float4::vec(1.0f, 0.0f, 0.05f),
             float4::vec(0, 1, 0), 1.0f, 16.0f / 9.0f, 1080.0f, 0.1f, 1.0e9f);
-        selection.selectCut(w, v, p, cut);
+        selection.selectFrontier(w, v, p, cut);
         const auto t3 = clock::now();
 
         moveNs += std::chrono::duration<double, std::nano>(t1 - t0).count();
         refitNs += std::chrono::duration<double, std::nano>(t2 - t1).count();
-        cutNs += std::chrono::duration<double, std::nano>(t3 - t2).count();
-        cutTotal += cut.size();
+        frontierNs += std::chrono::duration<double, std::nano>(t3 - t2).count();
+        frontierTotal += cut.size();
         ++frames;
-        consumeCut(cut);
+        consumeFrontier(cut);
     }
     const double f = double(frames ? frames : 1);
     state.counters["move_us"] = moveNs / f / 1000.0;
     state.counters["refit_us"] = refitNs / f / 1000.0;
-    state.counters["cut_us"] = cutNs / f / 1000.0;
+    state.counters["frontier_us"] = frontierNs / f / 1000.0;
     state.counters["movers"] = double(movers.size());
     state.counters["leaves"] = double(leaves.size());
-    state.counters["avg_cut"] = double(cutTotal) / f;
+    state.counters["avg_frontier"] = double(frontierTotal) / f;
 }
 BENCHMARK(BM_TypicalForest_Breakdown)->Arg(10000)->Arg(50000)
     ->Unit(benchmark::kMicrosecond);
@@ -925,11 +925,11 @@ BENCHMARK(BM_TypicalForest_Breakdown)->Arg(10000)->Arg(50000)
 //   churn_us = removeInstance + page copy + addInstance + residency
 //   move_us  = setNodeBounds submissions
 //   refit_us = flushBounds
-//   cut_us   = selectCut (includes any TLAS rebuild the churn forced)
+//   frontier_us   = selectFrontier (includes any TLAS rebuild the churn forced)
 // ---------------------------------------------------------------------------
 static void BM_TypicalForest_Churn(benchmark::State& state)
 {
-    UncachedView selection;
+    UncachedSpatialQuery selection;
     using clock = std::chrono::steady_clock;
     const int count = int(state.range(0));
     const int churnPct = int(state.range(1));
@@ -963,10 +963,10 @@ static void BM_TypicalForest_Churn(benchmark::State& state)
     };
     const Proto protos[2] = {makeProto(protoShallow), makeProto(protoDeep)};
 
-    World w;
+    SpatialDatabase w;
     struct Tree
     {
-        World::InstanceRef ref;
+        SpatialDatabase::InstanceRef ref;
         PageHandle  page;
         const Proto* proto;
     };
@@ -981,13 +981,13 @@ static void BM_TypicalForest_Churn(benchmark::State& state)
     for (int i = 0; i < count; ++i)
         addTree((i % 5) == 0, float4::point(uni(rng), 0, uni(rng)));
 
-    CutResults cut;
-    const CutParams p{4.0f, 1.0f};
+    FrontierResult cut;
+    const SelectionParams p{4.0f, 1.0f};
     DeterministicRng fast(kDynamicWorkloadSeed);
     const size_t churnN = size_t(count) * size_t(churnPct) / 100;
 
-    double churnNs = 0, moveNs = 0, refitNs = 0, cutNs = 0;
-    size_t frames = 0, cutTotal = 0;
+    double churnNs = 0, moveNs = 0, refitNs = 0, frontierNs = 0;
+    size_t frames = 0, frontierTotal = 0;
     float x = -half * 0.7f;
     for (auto _ : state)
     {
@@ -1027,31 +1027,31 @@ static void BM_TypicalForest_Churn(benchmark::State& state)
         const Camera v = makePerspectiveCamera(
             float4::point(x, 1.7f, 0), float4::vec(1.0f, 0.0f, 0.05f),
             float4::vec(0, 1, 0), 1.0f, 16.0f / 9.0f, 1080.0f, 0.1f, 1.0e9f);
-        selection.selectCut(w, v, p, cut);
+        selection.selectFrontier(w, v, p, cut);
         const auto t4 = clock::now();
 
         churnNs += std::chrono::duration<double, std::nano>(t1 - t0).count();
         moveNs += std::chrono::duration<double, std::nano>(t2 - t1).count();
         refitNs += std::chrono::duration<double, std::nano>(t3 - t2).count();
-        cutNs += std::chrono::duration<double, std::nano>(t4 - t3).count();
-        cutTotal += cut.size();
+        frontierNs += std::chrono::duration<double, std::nano>(t4 - t3).count();
+        frontierTotal += cut.size();
         ++frames;
-        consumeCut(cut);
+        consumeFrontier(cut);
     }
     const double f = double(frames ? frames : 1);
     state.counters["churn_us"] = churnNs / f / 1000.0;
     state.counters["move_us"] = moveNs / f / 1000.0;
     state.counters["refit_us"] = refitNs / f / 1000.0;
-    state.counters["cut_us"] = cutNs / f / 1000.0;
+    state.counters["frontier_us"] = frontierNs / f / 1000.0;
     state.counters["churn_pf"] = double(churnN) * 2.0;
-    state.counters["avg_cut"] = double(cutTotal) / f;
+    state.counters["avg_frontier"] = double(frontierTotal) / f;
 }
 BENCHMARK(BM_TypicalForest_Churn)
     ->Args({10000, 5})->Args({50000, 5})
     ->Unit(benchmark::kMicrosecond);
 
 // ---------------------------------------------------------------------------
-// HLodBuilder cost: composing a page at runtime (spawned structures,
+// PageBuilder cost: composing a page at runtime (spawned structures,
 // procedural content). Builds a complete fanout^depth tree — createRoot +
 // createNode per node + build() (preorder layout, wide-block packing,
 // invariant checks) — per iteration.
@@ -1067,13 +1067,13 @@ static void BM_Builder_BuildPage(benchmark::State& state)
     uint64_t nodes = 0;
     for (auto _ : state)
     {
-        HLodBuilder b;
+        PageBuilder b;
         uint64_t payload = 1;
         const auto root = b.createRoot(payload++, float(1u << (2 * depth)),
                                        AABB::fromCenterExtent(float4::vec(0, 0, 0),
                                                               float4::vec(100, 100, 100)));
         // Iterative BFS expansion; children boxes subdivide the parent's.
-        struct Item { HLodBuilder::NodeId node; AABB box; uint32_t level; };
+        struct Item { PageBuilder::NodeId node; AABB box; uint32_t level; };
         std::vector<Item> queue;
         queue.push_back({root, AABB::fromCenterExtent(float4::vec(0, 0, 0),
                                                       float4::vec(100, 100, 100)), 0});
@@ -1111,28 +1111,28 @@ BENCHMARK(BM_Builder_BuildPage)
 // thresholds. Cost must track the OUTPUT size (ns_per_entry roughly flat),
 // not the world size — that is the core complexity claim.
 // ---------------------------------------------------------------------------
-static void BM_CutScaling_OutputSensitivity(benchmark::State& state)
+static void BM_FrontierScaling_OutputSensitivity(benchmark::State& state)
 {
-    UncachedView selection;
+    UncachedSpatialQuery selection;
     const auto wp = makeDeepWorld(8, 6);
-    World& w = *wp;
-    CutResults cut;
+    SpatialDatabase& w = *wp;
+    FrontierResult cut;
     const Camera v = orbitView(0.7f, 2500.0f);
-    const CutParams p{float(state.range(0)), 0.0f};
+    const SelectionParams p{float(state.range(0)), 0.0f};
 
     for (auto _ : state)
     {
         w.applyUpdates();
-        selection.selectCut(w, v, p, cut);
-        consumeCut(cut);
+        selection.selectFrontier(w, v, p, cut);
+        consumeFrontier(cut);
     }
-    state.counters["cut"] = double(cut.size());
-    // Inverted iteration-invariant rate: seconds per cut entry (SI-suffixed).
+    state.counters["frontier"] = double(cut.size());
+    // Inverted iteration-invariant rate: seconds per frontier entry (SI-suffixed).
     state.counters["per_entry"] = benchmark::Counter(
         double(cut.size()),
         benchmark::Counter::kIsIterationInvariantRate | benchmark::Counter::kInvert);
 }
-BENCHMARK(BM_CutScaling_OutputSensitivity)
+BENCHMARK(BM_FrontierScaling_OutputSensitivity)
     ->Arg(64)->Arg(16)->Arg(4)->Arg(1)
     ->Unit(benchmark::kMicrosecond);
 
@@ -1144,7 +1144,7 @@ BENCHMARK(BM_CutScaling_OutputSensitivity)
 // ---------------------------------------------------------------------------
 static void BM_CameraTeleport_ColdFrame(benchmark::State& state)
 {
-    UncachedView selection;
+    UncachedSpatialQuery selection;
     using clock = std::chrono::steady_clock;
     DeterministicRng rng(777);
     const float half = 6000.0f;
@@ -1153,7 +1153,7 @@ static void BM_CameraTeleport_ColdFrame(benchmark::State& state)
     TreeGen propGen;
     propGen.fanout = 4;
     propGen.depth = 1;
-    World w;
+    SpatialDatabase w;
     for (int i = 0; i < 20000; ++i)
         addResidentInstance(w, propGen.makeRootPage(unitRegion(6.0f), 24.0f, 0),
                             float4::point(uni(rng), 0, uni(rng)));
@@ -1164,8 +1164,8 @@ static void BM_CameraTeleport_ColdFrame(benchmark::State& state)
     addResidentInstance(w, deepGen.makeRootPage(unitRegion(800.0f), 2048.0f, 0),
                         float4::point(0, 300.0f, 0));
 
-    CutResults cut;
-    const CutParams p{4.0f, 1.0f};
+    FrontierResult cut;
+    const SelectionParams p{4.0f, 1.0f};
     DeterministicRng fast(kDynamicWorkloadSeed);
 
     double steadyNs = 0, teleportNs = 0;
@@ -1182,9 +1182,9 @@ static void BM_CameraTeleport_ColdFrame(benchmark::State& state)
 
         const auto t0 = clock::now();
         w.applyUpdates();
-        selection.selectCut(w, v, p, cut);
+        selection.selectFrontier(w, v, p, cut);
         const auto t1 = clock::now();
-        consumeCut(cut);
+        consumeFrontier(cut);
 
         const double ns = std::chrono::duration<double, std::nano>(t1 - t0).count();
         if (jump) { teleportNs += ns; ++teleportFrames; }
@@ -1203,7 +1203,7 @@ BENCHMARK(BM_CameraTeleport_ColdFrame)->Unit(benchmark::kMicrosecond);
 // ---------------------------------------------------------------------------
 static void BM_MultiView(benchmark::State& state)
 {
-    UncachedView selection;
+    UncachedSpatialQuery selection;
     using clock = std::chrono::steady_clock;
     DeterministicRng rng(4321);
     const float half = 4000.0f;
@@ -1212,7 +1212,7 @@ static void BM_MultiView(benchmark::State& state)
     TreeGen propGen;
     propGen.fanout = 4;
     propGen.depth = 1;
-    World w;
+    SpatialDatabase w;
     for (int i = 0; i < 10000; ++i)
         addResidentInstance(w, propGen.makeRootPage(unitRegion(6.0f), 24.0f, 0),
                             float4::point(uni(rng), 0, uni(rng)));
@@ -1223,8 +1223,8 @@ static void BM_MultiView(benchmark::State& state)
     addResidentInstance(w, deepGen.makeRootPage(unitRegion(600.0f), 2048.0f, 0),
                         float4::point(0, 250.0f, 0));
 
-    CutResults cut[4];
-    const CutParams p{4.0f, 1.0f};
+    FrontierResult cut[4];
+    const SelectionParams p{4.0f, 1.0f};
 
     double mainNs = 0, extraNs = 0;
     size_t frames = 0;
@@ -1236,15 +1236,15 @@ static void BM_MultiView(benchmark::State& state)
         const float4 eye = float4::vec(std::cos(t) * 900.0f, 300.0f, std::sin(t) * 900.0f);
 
         const auto t0 = clock::now();
-        selection.selectCut(w, makeLookAtCamera(eye, float4::point(0, 0, 0)), p, cut[0]);
+        selection.selectFrontier(w, makeLookAtCamera(eye, float4::point(0, 0, 0)), p, cut[0]);
         const auto t1 = clock::now();
         // Extra views: same eye, different directions (cascade-style).
-        selection.selectCut(w, makeLookAtCamera(eye, float4::point(2000, 0, 0)), p, cut[1]);
-        selection.selectCut(w, makeLookAtCamera(eye, float4::point(-1000, 0, 1500)), p, cut[2]);
-        selection.selectCut(w, makeLookAtCamera(eye + float4::vec(0, 1200, 0), eye), p, cut[3]);
+        selection.selectFrontier(w, makeLookAtCamera(eye, float4::point(2000, 0, 0)), p, cut[1]);
+        selection.selectFrontier(w, makeLookAtCamera(eye, float4::point(-1000, 0, 1500)), p, cut[2]);
+        selection.selectFrontier(w, makeLookAtCamera(eye + float4::vec(0, 1200, 0), eye), p, cut[3]);
         const auto t2 = clock::now();
 
-        for (auto& c : cut) consumeCut(c);
+        for (auto& c : cut) consumeFrontier(c);
         mainNs += std::chrono::duration<double, std::nano>(t1 - t0).count();
         extraNs += std::chrono::duration<double, std::nano>(t2 - t1).count();
         ++frames;
@@ -1291,8 +1291,8 @@ BENCHMARK(BM_MultiView)->Unit(benchmark::kMicrosecond);
 namespace {
 
 // One frame of the predictive policy, entirely content-side (the streamer
-// owns the page data and the recipes; the World only sees attachPage).
-void predictiveAttachFrame(World& w, TreeGen& gen, const CutView& cut,
+// owns the page data and the recipes; the SpatialDatabase only sees attachPage).
+void predictiveAttachFrame(SpatialDatabase& w, TreeGen& gen, const FrontierResultView& cut,
                            const Camera& view, float threshold, size_t budget)
 {
     struct Cand
@@ -1307,7 +1307,7 @@ void predictiveAttachFrame(World& w, TreeGen& gen, const CutView& cut,
 
     const auto gather = [&](const auto& entries)
     {
-        for (const CutEntry& e : entries)
+        for (const FrontierEntry& e : entries)
         {
             const UserPayload payload = payloadOf(w, e);
             if (e.overThreshold() && gen.recipes.count(payload) &&
@@ -1363,13 +1363,13 @@ static void BM_StreamingConvergence(benchmark::State& state)
     TreeGen gen;
     gen.fanout = 4;
     gen.depth = 2;
-    World w;
+    SpatialDatabase w;
     addResidentInstance(w, gen.makeRootPage(unitRegion(4000.0f), float(1u << 17), 3),
                         float4::point(0, 0, 0));
 
     Outputs o;
     PageUsageContext usage;
-    const CutParams p{4.0f, 0.0f};
+    const SelectionParams p{4.0f, 0.0f};
     DeterministicRng fast(kDynamicWorkloadSeed);
 
     constexpr int kPeriod = 33;                          // teleport every 33 frames
@@ -1391,7 +1391,7 @@ static void BM_StreamingConvergence(benchmark::State& state)
 
         const Camera v = makeLookAtCamera(eye, eye + float4::vec(1, -0.15f, 0.3f));
         w.applyUpdates();
-        o.view.selectCut(w, v, p, usage, o.cut);
+        o.query.selectFrontier(w, v, p, usage, o.cut);
 
         // Residual: worst screen error still waiting on an expansion.
         // Clamped: the camera inside a collapsed box saturates err toward
@@ -1400,7 +1400,7 @@ static void BM_StreamingConvergence(benchmark::State& state)
         float worst = 0.0f;
         const auto measureResidual = [&](const auto& entries)
         {
-            for (const CutEntry& e : entries)
+            for (const FrontierEntry& e : entries)
             {
                 const UserPayload payload = payloadOf(w, e);
                 if (e.overThreshold() && gen.recipes.count(payload))
@@ -1423,7 +1423,7 @@ static void BM_StreamingConvergence(benchmark::State& state)
             attachTopByPriority(w, gen, o.cut, attachBudget);
         makeIdealResident(w, o.cut);
         w.collect(usage, 20000, 30);
-        consumeCut(o.cut);
+        consumeFrontier(o.cut);
     }
     state.counters["px_f1"] = resSum[0] / double(resCnt[0] ? resCnt[0] : 1);
     state.counters["px_f2"] = resSum[1] / double(resCnt[1] ? resCnt[1] : 1);
@@ -1439,12 +1439,12 @@ BENCHMARK(BM_StreamingConvergence)
 
 // ---------------------------------------------------------------------------
 // TLAS at scale: hundreds of thousands of instances. Steady cost is the
-// output-sensitive TLAS query + visible-instance walks; firstcut_ms is the
+// output-sensitive TLAS query + visible-instance walks; first_frontier_ms is the
 // level-load burst (quality TLAS build + first full query) paid once.
 // ---------------------------------------------------------------------------
 static void BM_TlasScale(benchmark::State& state)
 {
-    UncachedView selection;
+    UncachedSpatialQuery selection;
     using clock = std::chrono::steady_clock;
     const int count = int(state.range(0));
     const float half = 40.0f * std::sqrt(float(count));
@@ -1456,17 +1456,17 @@ static void BM_TlasScale(benchmark::State& state)
     gen.depth = 1;
     const Page proto = gen.makeRootPage(unitRegion(5.0f), 16.0f, 0);
 
-    World w;
+    SpatialDatabase w;
     for (int i = 0; i < count; ++i)
         addResidentInstance(w, proto.clone(), float4::point(uni(rng), 0, uni(rng)));
 
-    CutResults cut;
-    const CutParams p{4.0f, 1.0f};
+    FrontierResult cut;
+    const SelectionParams p{4.0f, 1.0f};
 
     // Level-load burst: the first cut pays the quality TLAS build.
     const auto b0 = clock::now();
     w.applyUpdates();
-    selection.selectCut(w, orbitView(0.0f, half * 0.25f), p, cut);
+    selection.selectFrontier(w, orbitView(0.0f, half * 0.25f), p, cut);
     const auto b1 = clock::now();
     const double firstMs = std::chrono::duration<double, std::milli>(b1 - b0).count();
 
@@ -1475,11 +1475,11 @@ static void BM_TlasScale(benchmark::State& state)
     {
         t += 0.01f;
         w.applyUpdates();
-        selection.selectCut(w, orbitView(t, half * 0.25f), p, cut);
-        consumeCut(cut);
+        selection.selectFrontier(w, orbitView(t, half * 0.25f), p, cut);
+        consumeFrontier(cut);
     }
-    state.counters["cut"] = double(cut.size());
-    state.counters["firstcut_ms"] = firstMs;
+    state.counters["frontier"] = double(cut.size());
+    state.counters["first_frontier_ms"] = firstMs;
 }
 BENCHMARK(BM_TlasScale)
     ->Arg(200000)->Arg(500000)
@@ -1491,7 +1491,7 @@ BENCHMARK(BM_TlasScale)
 //
 // arg0 = 1: one shared flat asset, 0: one anonymous flat asset per instance
 // arg1 = target visible population percentage (25 or 100)
-// arg2 = 0: TLAS query only, 1: uncached selectCut, 2: cached selectCut
+// arg2 = 0: TLAS query only, 1: uncached selectFrontier, 2: cached selectFrontier
 static void BM_FlatForest100k(benchmark::State& state)
 {
     constexpr uint32_t kInstances = 100000;
@@ -1500,13 +1500,13 @@ static void BM_FlatForest100k(benchmark::State& state)
         kInstances * uint32_t(state.range(1)) / 100u;
     const int mode = int(state.range(2));
 
-    HLodBuilder builder;
+    PageBuilder builder;
     builder.createRoot(
         1, 0.0f,
         AABB::fromCenterExtent(float4::point(0, 0, 0), float4::vec(1, 1, 1)));
     Page prototype = builder.build();
 
-    World world;
+    SpatialDatabase world;
     AssetHandle shared;
     if (sharedAsset) shared = world.registerAsset(prototype.clone());
 
@@ -1539,56 +1539,56 @@ static void BM_FlatForest100k(benchmark::State& state)
     const Camera camera = makePerspectiveCamera(
         float4::point(0, 100, -2000), float4::vec(0, -0.05f, 1),
         float4::vec(0, 1, 0), 1.2f, 16.0f / 9.0f, 1080.0f, 0.1f, 5000.0f);
-    const CutParams params{4.0f, 0.0f};
+    const SelectionParams params{4.0f, 0.0f};
 
     const auto build0 = std::chrono::steady_clock::now();
     world.applyUpdates();
     const auto build1 = std::chrono::steady_clock::now();
     const double buildMs =
         std::chrono::duration<double, std::milli>(build1 - build0).count();
-    World::TestAccess::TlasQueryScratch tlasScratch;
-    View view;
-    view.setReuseEnabled(mode == 2);
-    CutView cut;
+    SpatialDatabase::TestAccess::TlasQueryScratch tlasScratch;
+    SpatialQuery query;
+    query.setReuseEnabled(mode == 2);
+    FrontierResultView cut;
 
     size_t visible = 0;
     if (mode == 0)
-        visible = World::TestAccess::queryTlas(world, camera, params.minPix,
+        visible = SpatialDatabase::TestAccess::queryTlas(world, camera, params.minPix,
                                                tlasScratch);
     else
     {
-        // Warm output and View capacities; the benchmark measures steady
+        // Warm output and SpatialQuery capacities; the benchmark measures steady
         // culling/materialization rather than first-use allocation.
-        cut = view.selectCut(world, camera, params);
-        visible = view.reused() + view.walked();
+        cut = query.selectFrontier(world, camera, params);
+        visible = query.reused() + query.walked();
     }
 
     for (auto _ : state)
     {
         if (mode == 0)
         {
-            visible = World::TestAccess::queryTlas(world, camera, params.minPix,
+            visible = SpatialDatabase::TestAccess::queryTlas(world, camera, params.minPix,
                                                    tlasScratch);
             benchmark::DoNotOptimize(tlasScratch.visible.data());
         }
         else
         {
-            cut = view.selectCut(world, camera, params);
-            visible = view.reused() + view.walked();
-            consumeCut(cut);
+            cut = query.selectFrontier(world, camera, params);
+            visible = query.reused() + query.walked();
+            consumeFrontier(cut);
         }
     }
 
     state.SetItemsProcessed(state.iterations() * int64_t(visible));
     state.counters["visible"] = double(visible);
     state.counters["visible%"] = 100.0 * double(visible) / double(kInstances);
-    state.counters["cut"] = mode == 0 ? 0.0 : double(cut.size());
-    state.counters["view_MB"] =
-        mode == 2 ? double(view.bytes()) / (1024.0 * 1024.0) : 0.0;
+    state.counters["frontier"] = mode == 0 ? 0.0 : double(cut.size());
+    state.counters["query_MB"] =
+        mode == 2 ? double(query.bytes()) / (1024.0 * 1024.0) : 0.0;
     state.counters["build_ms"] = buildMs;
     state.counters["pages"] = double(world.attachedPageCount());
     state.counters["tlas_nodes"] =
-        double(World::TestAccess::tlasNodeCount(world));
+        double(SpatialDatabase::TestAccess::tlasNodeCount(world));
 }
 BENCHMARK(BM_FlatForest100k)
     ->Args({1, 25, 0})->Args({1, 25, 1})->Args({1, 25, 2})
@@ -1604,7 +1604,7 @@ BENCHMARK(BM_FlatForest100k)
 // spatial distribution.
 //
 // arg0 = percentage of instances using the single-node asset
-// arg1 = 0: uncached View, 1: warm cached View
+// arg1 = 0: uncached SpatialQuery, 1: warm cached SpatialQuery
 static void BM_MixedForest100k(benchmark::State& state)
 {
     constexpr uint32_t kInstances = 100000;
@@ -1612,7 +1612,7 @@ static void BM_MixedForest100k(benchmark::State& state)
     const uint32_t flatPercent = uint32_t(state.range(0));
     const bool cached = state.range(1) != 0;
 
-    HLodBuilder flatBuilder;
+    PageBuilder flatBuilder;
     flatBuilder.createRoot(
         1, 0.0f,
         AABB::fromCenterExtent(float4::point(0, 0, 0), float4::vec(1, 1, 1)));
@@ -1623,7 +1623,7 @@ static void BM_MixedForest100k(benchmark::State& state)
     Page hierarchy = treeGen.makeRootPage(unitRegion(3.0f), 16.0f, 0);
     const uint32_t hierarchyNodes = hierarchy.nodeCount();
 
-    World world;
+    SpatialDatabase world;
     const AssetHandle flatAsset = world.registerAsset(flatBuilder.build());
     const AssetHandle hierarchyAsset = world.registerAsset(std::move(hierarchy));
 
@@ -1655,7 +1655,7 @@ static void BM_MixedForest100k(benchmark::State& state)
     const Camera camera = makePerspectiveCamera(
         float4::point(0, 100, -2000), float4::vec(0, -0.05f, 1),
         float4::vec(0, 1, 0), 1.2f, 16.0f / 9.0f, 1080.0f, 0.1f, 5000.0f);
-    const CutParams params{4.0f, 0.0f};
+    const SelectionParams params{4.0f, 0.0f};
 
     const auto build0 = std::chrono::steady_clock::now();
     world.applyUpdates();
@@ -1663,26 +1663,26 @@ static void BM_MixedForest100k(benchmark::State& state)
     const double buildMs =
         std::chrono::duration<double, std::milli>(build1 - build0).count();
 
-    View view;
-    view.setReuseEnabled(cached);
-    CutView cut = view.selectCut(world, camera, params);
-    size_t visible = view.reused() + view.walked();
+    SpatialQuery query;
+    query.setReuseEnabled(cached);
+    FrontierResultView cut = query.selectFrontier(world, camera, params);
+    size_t visible = query.reused() + query.walked();
 
     for (auto _ : state)
     {
-        cut = view.selectCut(world, camera, params);
-        visible = view.reused() + view.walked();
-        consumeCut(cut);
+        cut = query.selectFrontier(world, camera, params);
+        visible = query.reused() + query.walked();
+        consumeFrontier(cut);
     }
 
     state.SetItemsProcessed(state.iterations() * int64_t(visible));
     state.counters["visible"] = double(visible);
     state.counters["flat_visible"] = double(visibleFlat);
-    state.counters["cut"] = double(cut.size());
+    state.counters["frontier"] = double(cut.size());
     state.counters["entries/visible"] =
         visible != 0 ? double(cut.size()) / double(visible) : 0.0;
-    state.counters["view_MB"] =
-        cached ? double(view.bytes()) / (1024.0 * 1024.0) : 0.0;
+    state.counters["query_MB"] =
+        cached ? double(query.bytes()) / (1024.0 * 1024.0) : 0.0;
     state.counters["build_ms"] = buildMs;
 }
 BENCHMARK(BM_MixedForest100k)
@@ -1698,10 +1698,10 @@ BENCHMARK(BM_MixedForest100k)
 // hierarchical arm above. The near camera refines every visible root to four
 // entries; the far camera accepts the one renderable BLAS root. This separates
 // a TLAS-leaf root decision from the ordinary page walk while keeping output
-// size and View behavior explicit.
+// size and SpatialQuery behavior explicit.
 //
 // arg0 = 0: near/refined roots, 1: far/accepted roots
-// arg1 = 0: uncached View, 1: warm cached View
+// arg1 = 0: uncached SpatialQuery, 1: warm cached SpatialQuery
 static void BM_RootDecisionForest100k(benchmark::State& state)
 {
     constexpr uint32_t kInstances = 100000;
@@ -1715,7 +1715,7 @@ static void BM_RootDecisionForest100k(benchmark::State& state)
     Page hierarchy = treeGen.makeRootPage(unitRegion(3.0f), 16.0f, 0);
     const uint32_t hierarchyNodes = hierarchy.nodeCount();
 
-    World world;
+    SpatialDatabase world;
     const AssetHandle hierarchyAsset = world.registerAsset(std::move(hierarchy));
     const auto gridPosition = [](uint32_t index, uint32_t count, float zBase)
     {
@@ -1742,28 +1742,28 @@ static void BM_RootDecisionForest100k(benchmark::State& state)
         float4::point(0, 100, far ? -4000.0f : -2000.0f),
         float4::vec(0, -0.05f, 1), float4::vec(0, 1, 0), 1.2f,
         16.0f / 9.0f, 1080.0f, 0.1f, 6000.0f);
-    const CutParams params{4.0f, 0.0f};
+    const SelectionParams params{4.0f, 0.0f};
 
     world.applyUpdates();
-    View view;
-    view.setReuseEnabled(cached);
-    CutView cut = view.selectCut(world, camera, params);
-    size_t visible = view.reused() + view.walked();
+    SpatialQuery query;
+    query.setReuseEnabled(cached);
+    FrontierResultView cut = query.selectFrontier(world, camera, params);
+    size_t visible = query.reused() + query.walked();
 
     for (auto _ : state)
     {
-        cut = view.selectCut(world, camera, params);
-        visible = view.reused() + view.walked();
-        consumeCut(cut);
+        cut = query.selectFrontier(world, camera, params);
+        visible = query.reused() + query.walked();
+        consumeFrontier(cut);
     }
 
     state.SetItemsProcessed(state.iterations() * int64_t(visible));
     state.counters["visible"] = double(visible);
-    state.counters["cut"] = double(cut.size());
+    state.counters["frontier"] = double(cut.size());
     state.counters["entries/visible"] =
         visible != 0 ? double(cut.size()) / double(visible) : 0.0;
-    state.counters["view_MB"] =
-        cached ? double(view.bytes()) / (1024.0 * 1024.0) : 0.0;
+    state.counters["query_MB"] =
+        cached ? double(query.bytes()) / (1024.0 * 1024.0) : 0.0;
 }
 BENCHMARK(BM_RootDecisionForest100k)
     ->Args({0, 0})->Args({0, 1})
@@ -1777,15 +1777,15 @@ BENCHMARK(BM_RootDecisionForest100k)
 // so it cannot promote that rebuild back to the quality tier.
 static void BM_TlasMortonRebuild(benchmark::State& state)
 {
-    UncachedView selection;
+    UncachedSpatialQuery selection;
     const int count = int(state.range(0));
     const bool stacked = state.range(1) != 0;
     const float half = 40.0f * std::sqrt(float(count));
 
-    WorldConfig config;
+    SpatialDatabaseConfig config;
     config.tlasEscapeFraction = 0.0f;
     config.tlasAreaDrift = std::numeric_limits<float>::max();
-    World w(config);
+    SpatialDatabase w(config);
 
     TreeGen gen;
     gen.fanout = 4;
@@ -1796,7 +1796,7 @@ static void BM_TlasMortonRebuild(benchmark::State& state)
 
     DeterministicRng rng(1919);
     DeterministicUniformFloat uni(-half, half);
-    std::vector<World::InstanceRef> refs;
+    std::vector<SpatialDatabase::InstanceRef> refs;
     refs.reserve(count);
     for (int i = 0; i < count; ++i)
     {
@@ -1806,11 +1806,11 @@ static void BM_TlasMortonRebuild(benchmark::State& state)
     }
     markAllResident(w, w.assetRootPage(asset), nodes);
 
-    CutResults cut;
-    const CutParams params{4.0f, 1.0f};
+    FrontierResult cut;
+    const SelectionParams params{4.0f, 1.0f};
     const Camera view = orbitView(0.0f, half * 0.25f);
     w.applyUpdates();
-    selection.selectCut(w, view, params, cut);   // establish the quality tree
+    selection.selectFrontier(w, view, params, cut);   // establish the quality tree
 
     bool high = false;
     for (auto _ : state)
@@ -1819,10 +1819,10 @@ static void BM_TlasMortonRebuild(benchmark::State& state)
         const float corner = high ? half * 0.95f : -half * 0.95f;
         w.moveInstance(refs[0], float4::point(corner, 0, corner));
         w.applyUpdates();
-        selection.selectCut(w, view, params, cut);
-        consumeCut(cut);
+        selection.selectFrontier(w, view, params, cut);
+        consumeFrontier(cut);
     }
-    state.counters["cut"] = double(cut.size());
+    state.counters["frontier"] = double(cut.size());
     state.counters["instances"] = double(count);
     state.counters["stacked"] = double(stacked);
 }
@@ -1839,7 +1839,7 @@ static void BM_TlasOptimize(benchmark::State& state)
     const int count = int(state.range(0));
     const float half = 40.0f * std::sqrt(float(count));
 
-    World w;
+    SpatialDatabase w;
     TreeGen gen;
     gen.fanout = 4;
     gen.depth = 1;
@@ -1855,14 +1855,14 @@ static void BM_TlasOptimize(benchmark::State& state)
     for (auto _ : state)
     {
         w.optimize();
-        benchmark::DoNotOptimize(World::TestAccess::tlasNodeCount(w));
+        benchmark::DoNotOptimize(SpatialDatabase::TestAccess::tlasNodeCount(w));
     }
     state.counters["instances"] = double(count);
 }
 BENCHMARK(BM_TlasOptimize)->Arg(100000)->Unit(benchmark::kMillisecond);
 
 // Selection after disruptive motion has randomized the relationship between
-// dense storage and TLAS traversal. The optimized arm pays World::optimize()
+// dense storage and TLAS traversal. The optimized arm pays SpatialDatabase::optimize()
 // outside the timed loop, so the delta measures the locality it recovers.
 static void BM_LayoutRecovery100k(benchmark::State& state)
 {
@@ -1870,12 +1870,12 @@ static void BM_LayoutRecovery100k(benchmark::State& state)
     constexpr uint32_t kVisible = kInstances / 4;
     const bool optimized = state.range(0) != 0;
 
-    WorldConfig config;
+    SpatialDatabaseConfig config;
     config.tlasEscapeFraction = 0.0f;
     config.tlasAreaDrift = std::numeric_limits<float>::max();
-    World world(config);
+    SpatialDatabase world(config);
 
-    HLodBuilder builder;
+    PageBuilder builder;
     builder.createRoot(
         1, 0.0f,
         AABB::fromCenterExtent(float4::point(0, 0, 0), float4::vec(1, 1, 1)));
@@ -1891,7 +1891,7 @@ static void BM_LayoutRecovery100k(benchmark::State& state)
         return float4::point(x, 0.0f, zBase + float(row) * 6.0f);
     };
 
-    std::vector<World::InstanceRef> refs;
+    std::vector<SpatialDatabase::InstanceRef> refs;
     std::vector<float4> positions;
     refs.reserve(kInstances);
     positions.reserve(kInstances);
@@ -1925,18 +1925,18 @@ static void BM_LayoutRecovery100k(benchmark::State& state)
     const Camera camera = makePerspectiveCamera(
         float4::point(0, 100, -2000), float4::vec(0, -0.05f, 1),
         float4::vec(0, 1, 0), 1.2f, 16.0f / 9.0f, 1080.0f, 0.1f, 5000.0f);
-    const CutParams params{4.0f, 0.0f};
-    View view;
-    CutView cut;
-    cut = view.selectCut(world, camera, params);
+    const SelectionParams params{4.0f, 0.0f};
+    SpatialQuery query;
+    FrontierResultView cut;
+    cut = query.selectFrontier(world, camera, params);
 
     for (auto _ : state)
     {
-        cut = view.selectCut(world, camera, params);
-        consumeCut(cut);
+        cut = query.selectFrontier(world, camera, params);
+        consumeFrontier(cut);
     }
     state.SetItemsProcessed(state.iterations() * int64_t(kVisible));
-    state.counters["cut"] = double(cut.size());
+    state.counters["frontier"] = double(cut.size());
     state.counters["optimize_ms"] = optimizeMs;
     state.counters["optimized"] = optimized ? 1.0 : 0.0;
 }
@@ -1951,14 +1951,14 @@ BENCHMARK(BM_LayoutRecovery100k)
 // scale with the 10% that remain.
 static void BM_TlasSparseRebuild(benchmark::State& state)
 {
-    UncachedView selection;
+    UncachedSpatialQuery selection;
     using clock = std::chrono::steady_clock;
     const int peak = int(state.range(0));
     const int live = peak / 10;
 
-    WorldConfig config;
+    SpatialDatabaseConfig config;
     config.tlasCountDrift = 2.0f;   // let edit budget request a Morton rebuild
-    World w(config);
+    SpatialDatabase w(config);
 
     TreeGen gen;
     gen.fanout = 4;
@@ -1970,22 +1970,22 @@ static void BM_TlasSparseRebuild(benchmark::State& state)
     const float half = 40.0f * std::sqrt(float(peak));
     DeterministicRng rng(1717);
     DeterministicUniformFloat uni(-half, half);
-    std::vector<World::InstanceRef> refs;
+    std::vector<SpatialDatabase::InstanceRef> refs;
     refs.reserve(peak);
     for (int i = 0; i < peak; ++i)
         refs.push_back(w.addInstance(asset, float4::point(uni(rng), 0, uni(rng))));
     markAllResident(w, w.assetRootPage(asset), nodes);
 
-    CutResults cut;
-    const CutParams params{4.0f, 1.0f};
+    FrontierResult cut;
+    const SelectionParams params{4.0f, 1.0f};
     const Camera view = orbitView(0.0f, half * 0.25f);
     w.applyUpdates();
-    selection.selectCut(w, view, params, cut);   // establish the peak-quality tree
+    selection.selectFrontier(w, view, params, cut);   // establish the peak-quality tree
     for (int i = live; i < peak; ++i) w.removeInstance(refs[i]);
 
     const auto t0 = clock::now();
     w.applyUpdates();
-    selection.selectCut(w, view, params, cut);   // sparse Morton rebuild
+    selection.selectFrontier(w, view, params, cut);   // sparse Morton rebuild
     const auto t1 = clock::now();
     const double rebuildMs =
         std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -1993,10 +1993,10 @@ static void BM_TlasSparseRebuild(benchmark::State& state)
     for (auto _ : state)
     {
         w.applyUpdates();
-        selection.selectCut(w, view, params, cut);
-        consumeCut(cut);
+        selection.selectFrontier(w, view, params, cut);
+        consumeFrontier(cut);
     }
-    state.counters["cut"] = double(cut.size());
+    state.counters["frontier"] = double(cut.size());
     state.counters["live"] = double(live);
     state.counters["peak"] = double(peak);
     state.counters["rebuild_ms"] = rebuildMs;
@@ -2015,9 +2015,9 @@ BENCHMARK(BM_TlasSparseRebuild)->Arg(100000)->Unit(benchmark::kMicrosecond);
 // bench here builds a unique page per instance (or proto.clone()s one), so
 // they all model the unshared case.
 // ---------------------------------------------------------------------------
-static void BM_AssetSharing_CutCost(benchmark::State& state)
+static void BM_AssetSharing_FrontierCost(benchmark::State& state)
 {
-    UncachedView selection;
+    UncachedSpatialQuery selection;
     const bool shared = state.range(0) != 0;
     const int  count  = int(state.range(1));
 
@@ -2035,7 +2035,7 @@ static void BM_AssetSharing_CutCost(benchmark::State& state)
                              float(i / side - side / 2) * pitch);
     };
 
-    World w;
+    SpatialDatabase w;
     AssetHandle asset{};
     if (shared)
     {
@@ -2048,8 +2048,8 @@ static void BM_AssetSharing_CutCost(benchmark::State& state)
         for (int i = 0; i < count; ++i) addResidentInstance(w, proto.clone(), at(i));
     }
 
-    CutResults cut;
-    const CutParams p{4.0f, 0.0f};
+    FrontierResult cut;
+    const SelectionParams p{4.0f, 0.0f};
     const float span = float(side) * pitch;
     const Camera v = makeLookAtCamera(float4::point(0, span * 0.8f, -span * 0.8f),
                                       float4::point(0, 0, 0));
@@ -2057,16 +2057,16 @@ static void BM_AssetSharing_CutCost(benchmark::State& state)
     for (auto _ : state)
     {
         w.applyUpdates();
-        selection.selectCut(w, v, p, cut);
-        consumeCut(cut);
+        selection.selectFrontier(w, v, p, cut);
+        consumeFrontier(cut);
     }
-    state.counters["cut"] = double(cut.size());
+    state.counters["frontier"] = double(cut.size());
     state.counters["mounts"] = double(w.attachedPageCount());
     state.counters["page_KB"] = double(pageBytes) / 1024.0;
     state.counters["pages_MB"] =
         double(pageBytes) * (shared ? 1.0 : double(count)) / (1024.0 * 1024.0);
 }
-BENCHMARK(BM_AssetSharing_CutCost)
+BENCHMARK(BM_AssetSharing_FrontierCost)
     ->Args({0, 100})->Args({1, 100})       // cloned set ~5 MB: fits in L3
     ->Args({0, 300})->Args({1, 300})       // ~16 MB: half of L3
     ->Args({0, 600})->Args({1, 600})       // ~32 MB: at L3
@@ -2086,12 +2086,12 @@ BENCHMARK(BM_AssetSharing_CutCost)
 //
 // Bounds are 192 of a WideBlock's 256 bytes, so a deformed instance stops
 // sharing about two thirds of the hot block and its walk splits into two
-// streams. BM_AssetSharing_CutCost showed that sharing is worth up to 2.6x;
+// streams. BM_AssetSharing_FrontierCost showed that sharing is worth up to 2.6x;
 // this asks how much of that a deformed instance gives back.
 // ---------------------------------------------------------------------------
-static void BM_DeformedCutCost(benchmark::State& state)
+static void BM_DeformedFrontierCost(benchmark::State& state)
 {
-    UncachedView selection;
+    UncachedSpatialQuery selection;
     const int count = int(state.range(0));
     const int pct   = int(state.range(1));
 
@@ -2108,9 +2108,9 @@ static void BM_DeformedCutCost(benchmark::State& state)
     const int   side  = int(std::ceil(std::sqrt(double(count))));
     const float pitch = 14.0f;
 
-    World w;
+    SpatialDatabase w;
     const AssetHandle asset = w.registerAsset(proto.clone());
-    std::vector<World::InstanceRef> insts;
+    std::vector<SpatialDatabase::InstanceRef> insts;
     insts.reserve(size_t(count));
     for (int i = 0; i < count; ++i)
         insts.push_back(w.addInstance(
@@ -2127,8 +2127,8 @@ static void BM_DeformedCutCost(benchmark::State& state)
     }
     w.flushBounds();
 
-    CutResults cut;
-    const CutParams p{4.0f, 0.0f};
+    FrontierResult cut;
+    const SelectionParams p{4.0f, 0.0f};
     const float span = float(side) * pitch;
     const Camera v = makeLookAtCamera(float4::point(0, span * 0.8f, -span * 0.8f),
                                       float4::point(0, 0, 0));
@@ -2136,14 +2136,14 @@ static void BM_DeformedCutCost(benchmark::State& state)
     for (auto _ : state)
     {
         w.applyUpdates();
-        selection.selectCut(w, v, p, cut);
-        consumeCut(cut);
+        selection.selectFrontier(w, v, p, cut);
+        consumeFrontier(cut);
     }
-    state.counters["cut"] = double(cut.size());
+    state.counters["frontier"] = double(cut.size());
     state.counters["overlays"] = double(w.overlayCount());
     state.counters["ov_MB"] = double(w.overlayBytes()) / (1024.0 * 1024.0);
 }
-BENCHMARK(BM_DeformedCutCost)
+BENCHMARK(BM_DeformedFrontierCost)
     ->Args({1000, 0})->Args({1000, 1})->Args({1000, 10})
     ->Args({1000, 50})->Args({1000, 100})
     ->Args({4000, 0})->Args({4000, 10})->Args({4000, 100})
@@ -2166,9 +2166,9 @@ static void BM_DeformationSubmissionOrder(benchmark::State& state)
     while (leaf < proto.nodeCount() && proto.childCount(leaf) != 0) ++leaf;
     const AABB leafBox = proto.bbox[leaf];
 
-    World w;
+    SpatialDatabase w;
     const AssetHandle asset = w.registerAsset(proto.clone());
-    std::vector<World::InstanceRef> insts;
+    std::vector<SpatialDatabase::InstanceRef> insts;
     insts.reserve(size_t(count));
     for (int i = 0; i < count; ++i)
         insts.push_back(w.addInstance(asset, float4::point(float(i) * 5.0f, 0, 0)));
@@ -2212,7 +2212,7 @@ BENCHMARK(BM_DeformationSubmissionOrder)
     ->Unit(benchmark::kMicrosecond);
 
 // ---------------------------------------------------------------------------
-// View: what temporal reuse is worth on the workload it targets.
+// SpatialQuery: what temporal reuse is worth on the workload it targets.
 //
 // A large instanced world seen by a camera that moves continuously and never
 // teleports, with a configurable slice of the instances moving every frame.
@@ -2229,7 +2229,7 @@ BENCHMARK(BM_DeformationSubmissionOrder)
 // population the margin actually covered, and it is the mechanism's own
 // report on whether this world suits it.
 // ---------------------------------------------------------------------------
-static void BM_View_FlyThrough(benchmark::State& state)
+static void BM_SpatialQuery_FlyThrough(benchmark::State& state)
 {
     const int count = int(state.range(0));
     const bool cached = state.range(1) != 0;
@@ -2243,12 +2243,12 @@ static void BM_View_FlyThrough(benchmark::State& state)
     Page proto = gen.makeRootPage(unitRegion(3.0f), 2.0f, 0);
     const uint32_t nodes = proto.nodeCount();
 
-    World w;
+    SpatialDatabase w;
     const AssetHandle asset = w.registerAsset(std::move(proto));
     const float half = 12.0f * std::sqrt(float(count));
     DeterministicRng rng(4242);
     DeterministicUniformFloat uni(-half, half);
-    std::vector<World::InstanceRef> insts;
+    std::vector<SpatialDatabase::InstanceRef> insts;
     std::vector<float4>             home;
     insts.reserve(count);
     home.reserve(count);
@@ -2261,14 +2261,14 @@ static void BM_View_FlyThrough(benchmark::State& state)
 
     const int movers = count * movePct / 100;
 
-    CutView cut;
-    View cache;
+    FrontierResultView cut;
+    SpatialQuery cache;
     cache.setReuseEnabled(cached);
-    const CutParams p{4.0f, 0.0f};
+    const SelectionParams p{4.0f, 0.0f};
     DeterministicRng fast(kDynamicWorkloadSeed);
     std::vector<float4> movingPositions(static_cast<size_t>(movers));
-    World::MotionGroup movingGroup(
-        std::span<const World::InstanceRef>(insts.data(), size_t(movers)));
+    SpatialDatabase::MotionGroup movingGroup(
+        std::span<const SpatialDatabase::InstanceRef>(insts.data(), size_t(movers)));
 
     // Fixed iteration count, and the camera's path is a function of the frame
     // index: both arms therefore fly exactly the same route past exactly the
@@ -2276,7 +2276,7 @@ static void BM_View_FlyThrough(benchmark::State& state)
     // Google Benchmark choose the count would let the faster arm sweep a
     // different part of the map and quietly change what it is averaging.
     using clock = std::chrono::steady_clock;
-    double cutNs = 0, reuse = 0, entries = 0, visible = 0;
+    double frontierNs = 0, reuse = 0, entries = 0, visible = 0;
     size_t frames = 0;
     for (auto _ : state)
     {
@@ -2295,9 +2295,9 @@ static void BM_View_FlyThrough(benchmark::State& state)
         w.applyUpdates();
 
         const auto t0 = clock::now();
-        cut = cache.selectCut(w, v, p);
+        cut = cache.selectFrontier(w, v, p);
         const auto t1 = clock::now();
-        cutNs += std::chrono::duration<double, std::nano>(t1 - t0).count();
+        frontierNs += std::chrono::duration<double, std::nano>(t1 - t0).count();
 
         if (cached)
         {
@@ -2305,26 +2305,26 @@ static void BM_View_FlyThrough(benchmark::State& state)
             reuse += n > 0 ? 100.0 * double(cache.reused()) / n : 0.0;
             entries += double(cut.size());
             visible += n;
-        consumeCut(cut);
+        consumeFrontier(cut);
         }
         else
         {
             entries += double(cut.size());
-        consumeCut(cut);
+        consumeFrontier(cut);
         }
         ++frames;
     }
     const double f = double(frames ? frames : 1);
-    state.counters["cut_us"] = cutNs / f / 1000.0;
+    state.counters["frontier_us"] = frontierNs / f / 1000.0;
     state.counters["reuse%"] = reuse / f;
-    state.counters["avg_cut"] = entries / f;
+    state.counters["avg_frontier"] = entries / f;
     state.counters["cache_MB"] = double(cache.bytes()) / (1024.0 * 1024.0);
     // Entries per visible instance: how shallow a per-instance cut really is.
     // At ~1 this is what killed the span-per-instance output -- the descriptor
     // array came out the same size as the data it described.
     state.counters["ent_inst"] = visible > 0 ? entries / visible : 0.0;
 }
-BENCHMARK(BM_View_FlyThrough)
+BENCHMARK(BM_SpatialQuery_FlyThrough)
     ->Args({20000, 0, 0})->Args({20000, 1, 0})
     ->Args({20000, 0, 5})->Args({20000, 1, 5})
     ->Args({20000, 0, 100})->Args({20000, 1, 100})
@@ -2333,14 +2333,14 @@ BENCHMARK(BM_View_FlyThrough)
     ->Unit(benchmark::kMicrosecond);
 
 // Operation-level breakdown for the representative README workloads. This is
-// deliberately View-only: three arms at each scale separate object
+// deliberately SpatialQuery-only: three arms at each scale separate object
 // motion from camera motion while keeping the view and 600-frame route fixed.
 //
 // arg0 = instance count
 // arg1 = separately registered assets shared by those instances
 // arg2 = instances moved per frame
 // arg3 = 0 fixed camera / 1 continuous fly-through
-static void BM_View_Breakdown(benchmark::State& state)
+static void BM_SpatialQuery_Breakdown(benchmark::State& state)
 {
     using clock = std::chrono::steady_clock;
 
@@ -2354,7 +2354,7 @@ static void BM_View_Breakdown(benchmark::State& state)
     gen.fanout = 4;
     gen.depth = 3;
 
-    World w;
+    SpatialDatabase w;
     std::vector<AssetHandle> assets;
     assets.reserve(size_t(assetCount));
     uint32_t nodes = 0;
@@ -2367,7 +2367,7 @@ static void BM_View_Breakdown(benchmark::State& state)
     const float half = 12.0f * std::sqrt(float(count));
     DeterministicRng rng(4242);
     DeterministicUniformFloat uni(-half, half);
-    std::vector<World::InstanceRef> insts;
+    std::vector<SpatialDatabase::InstanceRef> insts;
     std::vector<float4> home;
     insts.reserve(count);
     home.reserve(count);
@@ -2389,25 +2389,25 @@ static void BM_View_Breakdown(benchmark::State& state)
             float4::vec(0, 1, 0), 1.0f, 16.0f / 9.0f, 1080.0f, 0.1f, 1.0e9f);
     };
 
-    View viewState;
-    CutView cut;
-    const CutParams params{4.0f, 0.0f};
+    SpatialQuery query;
+    FrontierResultView cut;
+    const SelectionParams params{4.0f, 0.0f};
 
     // The first published selection cycle builds the initial TLAS and
-    // populates the View. Steady-frame counters start from a warm state.
+    // populates the SpatialQuery. Steady-frame counters start from a warm state.
     const auto cold0 = clock::now();
     w.applyUpdates();
     const Camera coldView = viewAt(0);
-    cut = viewState.selectCut(w, coldView, params);
+    cut = query.selectFrontier(w, coldView, params);
     const auto cold1 = clock::now();
 
     DeterministicRng fast(kDynamicWorkloadSeed);
     std::vector<float4> movingPositions(static_cast<size_t>(movers));
-    World::MotionGroup movingGroup(
-        std::span<const World::InstanceRef>(insts.data(), size_t(movers)));
+    SpatialDatabase::MotionGroup movingGroup(
+        std::span<const SpatialDatabase::InstanceRef>(insts.data(), size_t(movers)));
     double moveNs = 0.0;
     double maintenanceNs = 0.0;
-    double cutNs = 0.0;
+    double frontierNs = 0.0;
     double totalNs = 0.0;
     double reuse = 0.0;
     double entries = 0.0;
@@ -2430,20 +2430,20 @@ static void BM_View_Breakdown(benchmark::State& state)
         w.applyUpdates();
         const auto maintenance1 = clock::now();
 
-        cut = viewState.selectCut(w, view, params);
+        cut = query.selectFrontier(w, view, params);
         const auto cut1 = clock::now();
 
         moveNs += std::chrono::duration<double, std::nano>(move1 - move0).count();
         maintenanceNs +=
             std::chrono::duration<double, std::nano>(maintenance1 - move1).count();
-        cutNs += std::chrono::duration<double, std::nano>(cut1 - maintenance1).count();
+        frontierNs += std::chrono::duration<double, std::nano>(cut1 - maintenance1).count();
         totalNs += std::chrono::duration<double, std::nano>(cut1 - frame0).count();
 
-        const double n = double(viewState.reused() + viewState.walked());
-        reuse += n > 0.0 ? 100.0 * double(viewState.reused()) / n : 0.0;
+        const double n = double(query.reused() + query.walked());
+        reuse += n > 0.0 ? 100.0 * double(query.reused()) / n : 0.0;
         entries += double(cut.size());
         visible += n;
-        consumeCut(cut);
+        consumeFrontier(cut);
         ++frames;
     }
 
@@ -2454,14 +2454,14 @@ static void BM_View_Breakdown(benchmark::State& state)
         std::chrono::duration<double, std::milli>(cold1 - cold0).count();
     state.counters["move_us"] = moveNs / f / 1000.0;
     state.counters["maint_us"] = maintenanceNs / f / 1000.0;
-    state.counters["cut_us"] = cutNs / f / 1000.0;
+    state.counters["frontier_us"] = frontierNs / f / 1000.0;
     state.counters["total_us"] = totalNs / f / 1000.0;
     state.counters["reuse%"] = reuse / f;
     state.counters["visible"] = visible / f;
-    state.counters["avg_cut"] = entries / f;
-    state.counters["cache_MB"] = double(viewState.bytes()) / (1024.0 * 1024.0);
+    state.counters["avg_frontier"] = entries / f;
+    state.counters["cache_MB"] = double(query.bytes()) / (1024.0 * 1024.0);
 }
-BENCHMARK(BM_View_Breakdown)
+BENCHMARK(BM_SpatialQuery_Breakdown)
     ->Args({80000, 1, 4000, 1})    // large: moving camera and objects
     ->Args({80000, 1, 4000, 0})    // large: static camera, moving objects
     ->Args({80000, 1, 0, 1})       // large: moving camera, static objects
@@ -2473,7 +2473,7 @@ BENCHMARK(BM_View_Breakdown)
     ->Unit(benchmark::kMicrosecond);
 
 // Multi-view scaling for the same representative world. Object updates happen
-// once per frame; each nearby view owns its own View and output.
+// once per frame; each nearby view owns its own SpatialQuery and output.
 // `select_us` is wall time for all six views. The MT arms use six persistent
 // worker threads, so the measurement excludes thread creation and directly
 // compares serial and concurrent selection of the same published snapshot.
@@ -2481,7 +2481,7 @@ BENCHMARK(BM_View_Breakdown)
 // arg0 = percent of instances moved per frame
 // arg1 = number of views
 // arg2 = 0 serial views / 1 concurrent views on persistent worker threads
-static void BM_View_MultiView(benchmark::State& state)
+static void BM_SpatialQuery_MultiQuery(benchmark::State& state)
 {
     using clock = std::chrono::steady_clock;
 
@@ -2496,12 +2496,12 @@ static void BM_View_MultiView(benchmark::State& state)
     Page proto = gen.makeRootPage(unitRegion(3.0f), 2.0f, 0);
     const uint32_t nodes = proto.nodeCount();
 
-    World w;
+    SpatialDatabase w;
     const AssetHandle asset = w.registerAsset(std::move(proto));
     const float half = 12.0f * std::sqrt(float(count));
     DeterministicRng rng(4242);
     DeterministicUniformFloat uni(-half, half);
-    std::vector<World::InstanceRef> insts;
+    std::vector<SpatialDatabase::InstanceRef> insts;
     std::vector<float4> home;
     insts.reserve(count);
     home.reserve(count);
@@ -2522,13 +2522,13 @@ static void BM_View_MultiView(benchmark::State& state)
             float4::vec(0, 1, 0), 1.0f, 16.0f / 9.0f, 1080.0f, 0.1f, 1.0e9f);
     };
 
-    std::vector<View> contexts(static_cast<size_t>(viewCount));
-    std::vector<CutView> cuts(static_cast<size_t>(viewCount));
-    const CutParams params{4.0f, 0.0f};
+    std::vector<SpatialQuery> contexts(static_cast<size_t>(viewCount));
+    std::vector<FrontierResultView> cuts(static_cast<size_t>(viewCount));
+    const SelectionParams params{4.0f, 0.0f};
 
     w.applyUpdates();
     for (int v = 0; v < viewCount; ++v)
-        cuts[size_t(v)] = contexts[size_t(v)].selectCut(w, viewAt(0, v), params);
+        cuts[size_t(v)] = contexts[size_t(v)].selectFrontier(w, viewAt(0, v), params);
 
     std::vector<Camera> currentViews(static_cast<size_t>(viewCount));
     std::atomic<bool> stop{false};
@@ -2545,8 +2545,8 @@ static void BM_View_MultiView(benchmark::State& state)
                 {
                     start.arrive_and_wait();
                     if (stop.load(std::memory_order_relaxed)) return;
-                    cuts[size_t(v)] = contexts[size_t(v)].selectCut(
-                        static_cast<const World&>(w), currentViews[size_t(v)], params);
+                    cuts[size_t(v)] = contexts[size_t(v)].selectFrontier(
+                        static_cast<const SpatialDatabase&>(w), currentViews[size_t(v)], params);
                     done.arrive_and_wait();
                 }
             });
@@ -2555,8 +2555,8 @@ static void BM_View_MultiView(benchmark::State& state)
     const int movers = count * movePct / 100;
     DeterministicRng fast(kDynamicWorkloadSeed);
     std::vector<float4> movingPositions(static_cast<size_t>(movers));
-    World::MotionGroup movingGroup(
-        std::span<const World::InstanceRef>(insts.data(), size_t(movers)));
+    SpatialDatabase::MotionGroup movingGroup(
+        std::span<const SpatialDatabase::InstanceRef>(insts.data(), size_t(movers)));
     double selectNs = 0.0;
     double entries = 0.0;
     double reuse = 0.0;
@@ -2587,7 +2587,7 @@ static void BM_View_MultiView(benchmark::State& state)
             const auto select0 = clock::now();
             for (int v = 0; v < viewCount; ++v)
                 cuts[size_t(v)] =
-                    contexts[size_t(v)].selectCut(w, viewAt(frames, v), params);
+                    contexts[size_t(v)].selectFrontier(w, viewAt(frames, v), params);
             const auto select1 = clock::now();
             selectNs +=
                 std::chrono::duration<double, std::nano>(select1 - select0).count();
@@ -2599,7 +2599,7 @@ static void BM_View_MultiView(benchmark::State& state)
                                     contexts[size_t(v)].walked());
             reuse += n > 0.0 ? 100.0 * double(contexts[size_t(v)].reused()) / n : 0.0;
             entries += double(cuts[size_t(v)].size());
-            consumeCut(cuts[size_t(v)]);
+            consumeFrontier(cuts[size_t(v)]);
         }
         ++frames;
     }
@@ -2618,9 +2618,9 @@ static void BM_View_MultiView(benchmark::State& state)
     state.counters["per_view"] = selectUs / double(viewCount);
     state.counters["view_mt"] = concurrent ? 1.0 : 0.0;
     state.counters["reuse%"] = reuse / calls;
-    state.counters["avg_cut"] = entries / calls;
+    state.counters["avg_frontier"] = entries / calls;
 }
-BENCHMARK(BM_View_MultiView)
+BENCHMARK(BM_SpatialQuery_MultiQuery)
     ->Args({0, 6, 0})
     ->Args({0, 6, 1})
     ->Args({5, 6, 0})
@@ -2648,7 +2648,7 @@ BENCHMARK(BM_View_MultiView)
 // that has nothing to do with the cache. Compare within a period, across
 // half-lives: /0/120 against /8/120.
 // ---------------------------------------------------------------------------
-static void BM_View_Zoom(benchmark::State& state)
+static void BM_SpatialQuery_Zoom(benchmark::State& state)
 {
     const float halfLife = float(state.range(0));
     const int   zoomEvery = int(state.range(1));
@@ -2660,7 +2660,7 @@ static void BM_View_Zoom(benchmark::State& state)
     Page proto = gen.makeRootPage(unitRegion(3.0f), 2.0f, 0);
     const uint32_t nodes = proto.nodeCount();
 
-    World w;
+    SpatialDatabase w;
     const AssetHandle asset = w.registerAsset(std::move(proto));
     const float half = 12.0f * std::sqrt(float(count));
     DeterministicRng rng(4242);
@@ -2669,12 +2669,12 @@ static void BM_View_Zoom(benchmark::State& state)
         w.addInstance(asset, float4::point(uni(rng), 0, uni(rng)));
     markAllResident(w, w.assetRootPage(asset), nodes);
 
-    View ctx(halfLife);
-    CutResults cut;
-    const CutParams p{4.0f, 0.0f};
+    SpatialQuery ctx(halfLife);
+    FrontierResult cut;
+    const SelectionParams p{4.0f, 0.0f};
 
     using clock = std::chrono::steady_clock;
-    double cutNs = 0, reuse = 0;
+    double frontierNs = 0, reuse = 0;
     size_t frames = 0, stalls = 0;
     for (auto _ : state)
     {
@@ -2691,22 +2691,22 @@ static void BM_View_Zoom(benchmark::State& state)
         w.applyUpdates();
 
         const auto t0 = clock::now();
-        ctx.selectCut(w, v, p, cut);
+        ctx.selectFrontier(w, v, p, cut);
         const auto t1 = clock::now();
-        cutNs += std::chrono::duration<double, std::nano>(t1 - t0).count();
+        frontierNs += std::chrono::duration<double, std::nano>(t1 - t0).count();
 
         const double n = double(ctx.reused() + ctx.walked());
         reuse += n > 0 ? 100.0 * double(ctx.reused()) / n : 0.0;
         if (ctx.reused() == 0 && ctx.walked() > 0) ++stalls;
-        consumeCut(cut);
+        consumeFrontier(cut);
         ++frames;
     }
     const double f = double(frames ? frames : 1);
-    state.counters["cut_us"] = cutNs / f / 1000.0;
+    state.counters["frontier_us"] = frontierNs / f / 1000.0;
     state.counters["reuse%"] = reuse / f;
     state.counters["stall_f"] = double(stalls);
 }
-BENCHMARK(BM_View_Zoom)
+BENCHMARK(BM_SpatialQuery_Zoom)
     ->Args({0, 0})->Args({0, 120})
     ->Args({8, 0})->Args({8, 120})
     // 300 isolates the direction: with this period the run contains exactly one
@@ -2717,9 +2717,9 @@ BENCHMARK(BM_View_Zoom)
     ->Unit(benchmark::kMicrosecond);
 
 // Camera-cut/reset latency. A reset forgets reuse and damping state, but the
-// the same View immediately starts filling its records again; retaining its
+// the same SpatialQuery immediately starts filling its records again; retaining its
 // buffers avoids turning that normal cycle into allocator traffic.
-static void BM_View_Reset(benchmark::State& state)
+static void BM_SpatialQuery_Reset(benchmark::State& state)
 {
     const int count = int(state.range(0));
     TreeGen gen;
@@ -2728,7 +2728,7 @@ static void BM_View_Reset(benchmark::State& state)
     Page proto = gen.makeRootPage(unitRegion(3.0f), 2.0f, 0);
     const uint32_t nodes = proto.nodeCount();
 
-    World w;
+    SpatialDatabase w;
     const AssetHandle asset = w.registerAsset(std::move(proto));
     const float half = 12.0f * std::sqrt(float(count));
     DeterministicRng rng(4242);
@@ -2737,9 +2737,9 @@ static void BM_View_Reset(benchmark::State& state)
         w.addInstance(asset, float4::point(uni(rng), 0, uni(rng)));
     markAllResident(w, w.assetRootPage(asset), nodes);
 
-    View ctx(6.0f);
-    CutResults cut;
-    const CutParams params{4.0f, 0.0f};
+    SpatialQuery ctx(6.0f);
+    FrontierResult cut;
+    const SelectionParams params{4.0f, 0.0f};
     const Camera view = makePerspectiveCamera(
         float4::point(0, 2.0f, 0), float4::vec(0, 0, 1), float4::vec(0, 1, 0),
         1.0f, 16.0f / 9.0f, 1080.0f, 0.1f, 1.0e9f);
@@ -2747,18 +2747,18 @@ static void BM_View_Reset(benchmark::State& state)
     // Allocate once before timing. The benchmark measures whether reset keeps
     // or discards that reusable storage.
     w.applyUpdates();
-    ctx.selectCut(w, view, params, cut);
+    ctx.selectFrontier(w, view, params, cut);
     for (auto _ : state)
     {
         ctx.reset();
         w.applyUpdates();
-        ctx.selectCut(w, view, params, cut);
-        consumeCut(cut);
+        ctx.selectFrontier(w, view, params, cut);
+        consumeFrontier(cut);
     }
-    state.counters["cut"] = double(cut.size());
+    state.counters["frontier"] = double(cut.size());
     state.counters["ctx_MB"] = double(ctx.bytes()) / (1024.0 * 1024.0);
 }
-BENCHMARK(BM_View_Reset)->Arg(20000)->Unit(benchmark::kMicrosecond);
+BENCHMARK(BM_SpatialQuery_Reset)->Arg(20000)->Unit(benchmark::kMicrosecond);
 
 // ---------------------------------------------------------------------------
 // What does ONE spawn cost?
@@ -2769,7 +2769,7 @@ BENCHMARK(BM_View_Reset)->Arg(20000)->Unit(benchmark::kMicrosecond);
 // marginal cost of a spawn from the bulk cost of thousands of them.
 //
 // arg0 = population, arg1 = spawns AND removes per frame, as an absolute count.
-// arg1 = 0 is the control: no structural change at all. Read cut_us across the
+// arg1 = 0 is the control: no structural change at all. Read frontier_us across the
 // arg1 series -- if one spawn costs what five hundred cost, the cost is not the
 // spawn.
 //
@@ -2783,7 +2783,7 @@ BENCHMARK(BM_View_Reset)->Arg(20000)->Unit(benchmark::kMicrosecond);
 // ---------------------------------------------------------------------------
 static void BM_Spawn_MarginalCost(benchmark::State& state)
 {
-    UncachedView selection;
+    UncachedSpatialQuery selection;
     using clock = std::chrono::steady_clock;
     const int count = int(state.range(0));
     const int churn = int(state.range(1));
@@ -2795,24 +2795,24 @@ static void BM_Spawn_MarginalCost(benchmark::State& state)
     Page proto = gen.makeRootPage(unitRegion(3.0f), 2.0f, 0);
     const uint32_t nodes = proto.nodeCount();
 
-    WorldConfig cfg;
+    SpatialDatabaseConfig cfg;
     if (editPerMille > 0) cfg.tlasEditFraction = float(editPerMille) / 1000.0f;
-    World w(cfg);
+    SpatialDatabase w(cfg);
     const AssetHandle asset = w.registerAsset(std::move(proto));
     const float half = 12.0f * std::sqrt(float(count));
     DeterministicRng rng(4242);
     DeterministicUniformFloat uni(-half, half);
-    std::vector<World::InstanceRef> insts;
+    std::vector<SpatialDatabase::InstanceRef> insts;
     insts.reserve(size_t(count) + size_t(churn) + 1);
     for (int i = 0; i < count; ++i)
         insts.push_back(w.addInstance(asset, float4::point(uni(rng), 0, uni(rng))));
     markAllResident(w, w.assetRootPage(asset), nodes);
 
-    CutResults cut;
-    const CutParams p{6.0f, 0.0f};
+    FrontierResult cut;
+    const SelectionParams p{6.0f, 0.0f};
     DeterministicRng fast(kDynamicWorkloadSeed);
-    double churnNs = 0, cutNs = 0;
-    size_t frames = 0, cutTotal = 0;
+    double churnNs = 0, frontierNs = 0;
+    size_t frames = 0, frontierTotal = 0;
 
     for (auto _ : state)
     {
@@ -2836,19 +2836,19 @@ static void BM_Spawn_MarginalCost(benchmark::State& state)
         }
         const auto t1 = clock::now();
         w.applyUpdates();
-        selection.selectCut(w, v, p, cut);
+        selection.selectFrontier(w, v, p, cut);
         const auto t2 = clock::now();
 
         churnNs += std::chrono::duration<double, std::nano>(t1 - t0).count();
-        cutNs += std::chrono::duration<double, std::nano>(t2 - t1).count();
-        cutTotal += cut.size();
+        frontierNs += std::chrono::duration<double, std::nano>(t2 - t1).count();
+        frontierTotal += cut.size();
         ++frames;
-        consumeCut(cut);
+        consumeFrontier(cut);
     }
     const double f = double(frames ? frames : 1);
     state.counters["churn_us"] = churnNs / f / 1000.0;
-    state.counters["cut_us"] = cutNs / f / 1000.0;
-    state.counters["avg_cut"] = double(cutTotal) / f;
+    state.counters["frontier_us"] = frontierNs / f / 1000.0;
+    state.counters["avg_frontier"] = double(frontierTotal) / f;
 }
 BENCHMARK(BM_Spawn_MarginalCost)
     ->Args({20000, 0, 0})->Args({20000, 1, 0})->Args({20000, 8, 0})
@@ -2867,30 +2867,30 @@ BENCHMARK(BM_Spawn_MarginalCost)
 // ---------------------------------------------------------------------------
 static void BM_Adversarial_StackedInstances(benchmark::State& state)
 {
-    UncachedView selection;
+    UncachedSpatialQuery selection;
     TreeGen gen;
     gen.fanout = 4;
     gen.depth = 1;
     const Page proto = gen.makeRootPage(unitRegion(5.0f), 16.0f, 0);
 
-    World w;
+    SpatialDatabase w;
     DeterministicRng fast(kDynamicWorkloadSeed);
     for (int i = 0; i < 10000; ++i)
         addResidentInstance(w, proto.clone(),
                             float4::point(fast.uniform(-0.01f, 0.01f), 0,
                                           fast.uniform(-0.01f, 0.01f)));
 
-    CutResults cut;
-    const CutParams p{4.0f, 0.0f};
+    FrontierResult cut;
+    const SelectionParams p{4.0f, 0.0f};
     const Camera v = makeLookAtCamera(float4::point(0, 20, -60), float4::point(0, 0, 0));
 
     for (auto _ : state)
     {
         w.applyUpdates();
-        selection.selectCut(w, v, p, cut);
-        consumeCut(cut);
+        selection.selectFrontier(w, v, p, cut);
+        consumeFrontier(cut);
     }
-    state.counters["cut"] = double(cut.size());
+    state.counters["frontier"] = double(cut.size());
 }
 BENCHMARK(BM_Adversarial_StackedInstances)->Unit(benchmark::kMicrosecond);
 
@@ -2901,8 +2901,8 @@ BENCHMARK(BM_Adversarial_StackedInstances)->Unit(benchmark::kMicrosecond);
 // ---------------------------------------------------------------------------
 static void BM_Adversarial_WideNode(benchmark::State& state)
 {
-    UncachedView selection;
-    HLodBuilder b;
+    UncachedSpatialQuery selection;
+    PageBuilder b;
     const auto root = b.createRoot(1, 512.0f, AABB::empty());
     DeterministicRng fast(kDynamicWorkloadSeed);
     for (uint32_t i = 0; i < kMaxChildren; ++i)
@@ -2911,21 +2911,21 @@ static void BM_Adversarial_WideNode(benchmark::State& state)
                                      fast.uniform(-200, 200));
         b.createNode(root, 100 + i, 0.0f, AABB::fromCenterExtent(c, float4::vec(1, 1, 1)));
     }
-    World w;
+    SpatialDatabase w;
     addResidentInstance(w, b.build(), float4::point(0, 0, 0));
 
-    CutResults cut;
-    const CutParams p{4.0f, 0.0f};
+    FrontierResult cut;
+    const SelectionParams p{4.0f, 0.0f};
 
     float t = 0.0f;
     for (auto _ : state)
     {
         t += 0.02f;
         w.applyUpdates();
-        selection.selectCut(w, orbitView(t, 300.0f), p, cut);
-        consumeCut(cut);
+        selection.selectFrontier(w, orbitView(t, 300.0f), p, cut);
+        consumeFrontier(cut);
     }
-    state.counters["cut"] = double(cut.size());
+    state.counters["frontier"] = double(cut.size());
 }
 BENCHMARK(BM_Adversarial_WideNode)->Unit(benchmark::kMicrosecond);
 
@@ -2936,11 +2936,11 @@ BENCHMARK(BM_Adversarial_WideNode)->Unit(benchmark::kMicrosecond);
 // ---------------------------------------------------------------------------
 static void BM_Adversarial_DeepPageChain(benchmark::State& state)
 {
-    UncachedView selection;
+    UncachedSpatialQuery selection;
     TreeGen gen;
     gen.fanout = 1;
     gen.depth = 1;
-    World w;
+    SpatialDatabase w;
     // Astronomical root error so refinement pressure survives 25 halving
     // pages and the walk is forced through the entire chain.
     addResidentInstance(w, gen.makeRootPage(unitRegion(50.0f), 1.0e15f, 25),
@@ -2962,18 +2962,18 @@ static void BM_Adversarial_DeepPageChain(benchmark::State& state)
         ++depth;
     }
 
-    CutResults cut;
-    const CutParams p{4.0f, 0.0f};
+    FrontierResult cut;
+    const SelectionParams p{4.0f, 0.0f};
     const Camera v = makeLookAtCamera(float4::point(0, 3, -8), float4::point(0, 0, 0));
 
     for (auto _ : state)
     {
         w.applyUpdates();
-        selection.selectCut(w, v, p, cut);
-        consumeCut(cut);
+        selection.selectFrontier(w, v, p, cut);
+        consumeFrontier(cut);
     }
     state.counters["pages"] = double(depth + 1);
-    state.counters["cut"] = double(cut.size());
+    state.counters["frontier"] = double(cut.size());
 }
 BENCHMARK(BM_Adversarial_DeepPageChain)->Unit(benchmark::kMicrosecond);
 

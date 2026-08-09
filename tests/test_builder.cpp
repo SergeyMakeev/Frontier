@@ -2,8 +2,8 @@
 
 #include "helpers.h"
 
-using namespace hlod;
-using namespace hlodtest;
+using namespace frontier;
+using namespace frontiertest;
 
 namespace {
 
@@ -76,7 +76,7 @@ void verifyInvariants(const Page& pg)
 
 TEST(Builder, TownExample)
 {
-    HLodBuilder b;
+    PageBuilder b;
     const auto town = b.createRoot(1, 16.0f);
     const auto bldA = b.createNode(town, 2, 8.0f);
     b.createNode(bldA, 10, 1.0f, AABB::fromCenterExtent(float4::vec(0, 0, 0), float4::vec(1, 1, 1)));
@@ -97,7 +97,7 @@ TEST(Builder, TownExample)
 
 TEST(Builder, ErrorClampEstablishesMonotonicity)
 {
-    HLodBuilder b;
+    PageBuilder b;
     const auto root = b.createRoot(1, 4.0f);
     b.createNode(root, 2, 9.0f,   // bad authored error: larger than parent
                  AABB::fromCenterExtent(float4::vec(0, 0, 0), float4::vec(1, 1, 1)));
@@ -108,7 +108,7 @@ TEST(Builder, ErrorClampEstablishesMonotonicity)
 
 TEST(Builder, MultiRootForestPage)
 {
-    HLodBuilder b;
+    PageBuilder b;
     for (int r = 0; r < 5; ++r)
         b.createRoot(uint64_t(100 + r), 2.0f,
                      AABB::fromCenterExtent(float4::vec(float(r) * 10, 0, 0), float4::vec(1, 1, 1)));
@@ -119,7 +119,7 @@ TEST(Builder, MultiRootForestPage)
 
 TEST(Builder, WideFanoutChainsBlocks)
 {
-    HLodBuilder b;
+    PageBuilder b;
     const auto root = b.createRoot(1, 100.0f);
     for (int c = 0; c < 21; ++c)   // 21 children -> 3 wide blocks
         b.createNode(root, uint64_t(10 + c), 1.0f,
@@ -246,9 +246,9 @@ TEST(HierarchyBuilder, GeneratedDetailPageAttachesToItsLogicalRoot)
     builder.splitBelow(floor);
     Hierarchy hierarchy = builder.build();
 
-    World world;
+    SpatialDatabase world;
     const AssetHandle rootAsset = world.registerAsset(hierarchy.page(0));
-    const World::InstanceRef instance =
+    const SpatialDatabase::InstanceRef instance =
         world.addInstance(rootAsset, float4::point(0, 0, 0));
 
     const Hierarchy::PageId details = hierarchy.page(0).detailPage(2);
@@ -298,13 +298,13 @@ TEST(HierarchyBuilder, DetailPageReferencesAreScopedByRootAsset)
     secondBuilder.splitBelow(secondBranch);
     Hierarchy secondHierarchy = secondBuilder.build();
 
-    World world;
+    SpatialDatabase world;
     const AssetHandle firstAsset = world.registerAsset(firstHierarchy.page(0));
     const AssetHandle secondAsset =
         world.registerAsset(secondHierarchy.page(0));
-    const World::InstanceRef firstInstance =
+    const SpatialDatabase::InstanceRef firstInstance =
         world.addInstance(firstAsset, float4::point(0, 0, 0));
-    const World::InstanceRef secondInstance =
+    const SpatialDatabase::InstanceRef secondInstance =
         world.addInstance(secondAsset, float4::point(10, 0, 0));
 
     const DetailPageRef firstDetail =
@@ -328,17 +328,17 @@ TEST(HierarchyBuilder, DetailPageReferencesAreScopedByRootAsset)
 TEST(Builder, ContractViolationsThrow)
 {
     {
-        HLodBuilder b;
+        PageBuilder b;
         EXPECT_THROW((void)b.build(), std::logic_error);   // no roots
     }
     {
-        HLodBuilder b;
+        PageBuilder b;
         const auto r = b.createRoot(1, 1.0f);
         EXPECT_THROW((void)b.createNode(99, 2, 1.0f), std::logic_error);   // bad parent
         (void)r;
     }
     {
-        HLodBuilder b;
+        PageBuilder b;
         const auto r = b.createRoot(1, 1.0f);
         const auto c = b.createNode(r, 2, 1.0f,
                                     AABB::fromCenterExtent(float4::vec(0, 0, 0), float4::vec(1, 1, 1)));
@@ -347,14 +347,14 @@ TEST(Builder, ContractViolationsThrow)
     }
     {
         // Payloads are opaque user data: duplicates are allowed by design.
-        HLodBuilder b;
+        PageBuilder b;
         const auto r = b.createRoot(1, 1.0f);
         b.createNode(r, 7, 1.0f, AABB::fromCenterExtent(float4::vec(0, 0, 0), float4::vec(1, 1, 1)));
         b.createNode(r, 7, 1.0f, AABB::fromCenterExtent(float4::vec(2, 0, 0), float4::vec(1, 1, 1)));
         EXPECT_NO_THROW((void)b.build());
     }
     {
-        HLodBuilder b;
+        PageBuilder b;
         b.createRoot(1, 1.0f);   // leaf root with no bbox
         EXPECT_THROW((void)b.build(), std::logic_error);
     }

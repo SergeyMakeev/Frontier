@@ -2,11 +2,11 @@
 
 #include <array>
 
-#include "hlod/math.h"
+#include "frontier/math.h"
 #include "deterministic_rng.h"
 
-using namespace hlod;
-using namespace hlodtest;
+using namespace frontier;
+using namespace frontiertest;
 
 TEST(DeterministicRandom, StableSequenceMappingAndShuffle)
 {

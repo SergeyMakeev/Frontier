@@ -1,7 +1,7 @@
 #pragma once
 // Authoring-time builders. HierarchyBuilder is the normal API: author one
-// logical tree and mark natural splitBelow() boundaries. HLodBuilder is the
-// low-level physical-page escape hatch. See docs/hlod_design.md §3.
+// logical tree and mark natural splitBelow() boundaries. PageBuilder is the
+// low-level physical-page escape hatch. See docs/frontier_design.md §3.
 
 #include <cstdint>
 #include <vector>
@@ -9,9 +9,9 @@
 #include "config.h"
 #include "page.h"
 
-namespace hlod {
+namespace frontier {
 
-class HLodBuilder
+class PageBuilder
 {
 public:
     using NodeId = uint32_t;
@@ -29,12 +29,12 @@ public:
 
     // Consumes the builder. Establishes invariants (A)-(E), emits wide child
     // blocks, verifies the contract, and packs everything into one blob
-    // allocated through `ctx`. Fires HLOD_FATAL on contract violations.
+    // allocated through `ctx`. Fires FRONTIER_FATAL on contract violations.
     //
     // The returned Page owns that blob; `ctx` must outlive it. Write
     // page.data()/page.byteSize() straight to disk to cache the result —
     // that byte range is the on-disk format.
-    Page build(const HlodContext& ctx = defaultContext());
+    Page build(const FrontierContext& ctx = defaultContext());
 
 private:
     struct BuildNode
@@ -76,7 +76,7 @@ public:
 
     PageView page(PageId id) const;
     Page     clonePage(PageId id,
-                       const HlodContext& ctx = defaultContext()) const;
+                       const FrontierContext& ctx = defaultContext()) const;
 
     // Transfers one generated blob to the caller. page(id) and clonePage(id)
     // are invalid for that id afterward.
@@ -108,7 +108,7 @@ public:
     void splitBelow(NodeId node);
 
     // Consumes the builder and generates deterministically indexed pages.
-    Hierarchy build(const HlodContext& ctx = defaultContext());
+    Hierarchy build(const FrontierContext& ctx = defaultContext());
 
 private:
     struct BuildNode
@@ -126,4 +126,4 @@ private:
     bool                   built_ = false;
 };
 
-} // namespace hlod
+} // namespace frontier

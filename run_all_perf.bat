@@ -5,13 +5,13 @@ set "RNG_POLICY=xorshift32-explicit-seeds-v1"
 
 set "ROOT=%~dp0"
 if "%ROOT:~-1%"=="\" set "ROOT=%ROOT:~0,-1%"
-if defined HLOD_ALL_PERF_BUILD_DIR (
-    set "BUILD_DIR=%HLOD_ALL_PERF_BUILD_DIR%"
+if defined FRONTIER_ALL_PERF_BUILD_DIR (
+    set "BUILD_DIR=%FRONTIER_ALL_PERF_BUILD_DIR%"
 ) else (
     set "BUILD_DIR=%ROOT%\build-perf-report"
 )
-if defined HLOD_PERF_REPORT_ROOT (
-    set "REPORT_ROOT=%HLOD_PERF_REPORT_ROOT%"
+if defined FRONTIER_PERF_REPORT_ROOT (
+    set "REPORT_ROOT=%FRONTIER_PERF_REPORT_ROOT%"
 ) else (
     set "REPORT_ROOT=%ROOT%\perf_reports"
 )
@@ -27,8 +27,8 @@ if errorlevel 1 (
     exit /b 1
 )
 
-if defined HLOD_PERF_LABEL (
-    set "RAW_LABEL=%HLOD_PERF_LABEL%"
+if defined FRONTIER_PERF_LABEL (
+    set "RAW_LABEL=%FRONTIER_PERF_LABEL%"
 ) else if not "%~1"=="" (
     set "RAW_LABEL=%~1"
 ) else (
@@ -43,7 +43,7 @@ for /f "usebackq delims=" %%I in (`powershell -NoProfile -Command "[DateTime]::U
 for /f "usebackq delims=" %%I in (`powershell -NoProfile -Command "[DateTimeOffset]::UtcNow.ToUnixTimeSeconds()"`) do set "START_EPOCH=%%I"
 set "GIT_ROOT=%ROOT:\=/%"
 
-set "REPORT_NAME=hlod-perf-%LABEL%-%TIMESTAMP%"
+set "REPORT_NAME=frontier-perf-%LABEL%-%TIMESTAMP%"
 set "REPORT_DIR=%REPORT_ROOT%\%REPORT_NAME%"
 if not exist "%REPORT_DIR%" mkdir "%REPORT_DIR%"
 if errorlevel 1 exit /b 1
@@ -72,7 +72,7 @@ if errorlevel 1 (
 )
 
 (
-    echo HLOD cross-machine performance collection
+    echo Frontier cross-machine performance collection
     echo Label: %RAW_LABEL%
     echo Started UTC: %TIMESTAMP%
     echo Host: Windows %PROCESSOR_ARCHITECTURE%
@@ -99,17 +99,17 @@ powercfg /getactivescheme >> "%REPORT_DIR%\hardware.txt" 2>&1
     echo   ctest --test-dir ^<build^> -C Release --output-on-failure
     echo.
     echo Real world:
-    echo   hlod_bench
-    echo     --benchmark_filter=BM_^(View_Breakdown^|View_MultiView^|FlatForest100k^|MixedForest100k^|RootDecisionForest100k^)
+    echo   frontier_bench
+    echo     --benchmark_filter=BM_^(SpatialQuery_Breakdown^|SpatialQuery_MultiQuery^|FlatForest100k^|MixedForest100k^|RootDecisionForest100k^)
     echo     --benchmark_repetitions=5
     echo     --benchmark_report_aggregates_only=true
     echo.
     echo Machine characterization:
-    echo   hlod_machine_bench --benchmark_min_time=0.15s --benchmark_repetitions=5
+    echo   frontier_machine_bench --benchmark_min_time=0.15s --benchmark_repetitions=5
     echo     --benchmark_report_aggregates_only=true
     echo.
     echo Focused architecture kernels:
-    echo   hlod_machine_bench
+    echo   frontier_machine_bench
     echo     --benchmark_filter=BM_^(Kernel^(WideAabb^|DistanceError^|CacheHit^)^|OutputAppend^)
     echo     --benchmark_min_time=0.75s --benchmark_repetitions=11
     echo     --benchmark_report_aggregates_only=true
@@ -129,10 +129,10 @@ set "FAILURE_STAGE=configure"
 echo Configuring Release AVX2 build...
 cmake -S "%ROOT%" -B "%BUILD_DIR%" !GENERATOR_ARGS! ^
     -DCMAKE_BUILD_TYPE=Release ^
-    -DHLOD_BUILD_TESTS=ON ^
-    -DHLOD_BUILD_BENCH=ON ^
-    -DHLOD_AVX2=ON ^
-    -DHLOD_FORCE_SCALAR=OFF > "%REPORT_DIR%\configure.log" 2>&1
+    -DFRONTIER_BUILD_TESTS=ON ^
+    -DFRONTIER_BUILD_BENCH=ON ^
+    -DFRONTIER_AVX2=ON ^
+    -DFRONTIER_FORCE_SCALAR=OFF > "%REPORT_DIR%\configure.log" 2>&1
 set "RUN_RC=!errorlevel!"
 type "%REPORT_DIR%\configure.log"
 if not "!RUN_RC!"=="0" goto package
@@ -140,21 +140,21 @@ if not "!RUN_RC!"=="0" goto package
 set "FAILURE_STAGE=build"
 echo Building tests and performance executables...
 cmake --build "%BUILD_DIR%" --config Release --parallel ^
-    --target hlod_tests hlod_bench hlod_machine_bench > "%REPORT_DIR%\build.log" 2>&1
+    --target frontier_tests frontier_bench frontier_machine_bench > "%REPORT_DIR%\build.log" 2>&1
 set "RUN_RC=!errorlevel!"
 type "%REPORT_DIR%\build.log"
 if not "!RUN_RC!"=="0" goto package
 
-set "BENCH_EXE=%BUILD_DIR%\bench\Release\hlod_bench.exe"
-set "MACHINE_EXE=%BUILD_DIR%\bench\Release\hlod_machine_bench.exe"
-if not exist "%BENCH_EXE%" set "BENCH_EXE=%BUILD_DIR%\bench\hlod_bench.exe"
-if not exist "%MACHINE_EXE%" set "MACHINE_EXE=%BUILD_DIR%\bench\hlod_machine_bench.exe"
+set "BENCH_EXE=%BUILD_DIR%\bench\Release\frontier_bench.exe"
+set "MACHINE_EXE=%BUILD_DIR%\bench\Release\frontier_machine_bench.exe"
+if not exist "%BENCH_EXE%" set "BENCH_EXE=%BUILD_DIR%\bench\frontier_bench.exe"
+if not exist "%MACHINE_EXE%" set "MACHINE_EXE=%BUILD_DIR%\bench\frontier_machine_bench.exe"
 if not exist "%BENCH_EXE%" (
-    echo ERROR: hlod_bench.exe was not found under "%BUILD_DIR%\bench".
+    echo ERROR: frontier_bench.exe was not found under "%BUILD_DIR%\bench".
     goto package
 )
 if not exist "%MACHINE_EXE%" (
-    echo ERROR: hlod_machine_bench.exe was not found under "%BUILD_DIR%\bench".
+    echo ERROR: frontier_machine_bench.exe was not found under "%BUILD_DIR%\bench".
     goto package
 )
 
@@ -165,7 +165,7 @@ if not exist "%MACHINE_EXE%" (
     echo.
     git --version
     echo.
-    findstr /R /B "CMAKE_BUILD_TYPE: CMAKE_CXX_COMPILER: CMAKE_CXX_COMPILER_ID: CMAKE_CXX_COMPILER_VERSION: CMAKE_GENERATOR: CMAKE_OSX_ARCHITECTURES: HLOD_AVX2: HLOD_FORCE_SCALAR:" "%BUILD_DIR%\CMakeCache.txt"
+    findstr /R /B "CMAKE_BUILD_TYPE: CMAKE_CXX_COMPILER: CMAKE_CXX_COMPILER_ID: CMAKE_CXX_COMPILER_VERSION: CMAKE_GENERATOR: CMAKE_OSX_ARCHITECTURES: FRONTIER_AVX2: FRONTIER_FORCE_SCALAR:" "%BUILD_DIR%\CMakeCache.txt"
 ) > "%REPORT_DIR%\toolchain.txt" 2>&1
 
 set "FAILURE_STAGE=correctness-tests"
@@ -178,7 +178,7 @@ if not "!RUN_RC!"=="0" goto package
 set "FAILURE_STAGE=real-world-benchmarks"
 echo Running real-world performance suite...
 "%BENCH_EXE%" ^
-    --benchmark_filter="BM_(View_Breakdown|View_MultiView|FlatForest100k|MixedForest100k|RootDecisionForest100k)" ^
+    --benchmark_filter="BM_(SpatialQuery_Breakdown|SpatialQuery_MultiQuery|FlatForest100k|MixedForest100k|RootDecisionForest100k)" ^
     --benchmark_repetitions=5 ^
     --benchmark_report_aggregates_only=true ^
     --benchmark_out="%REPORT_DIR%\real_world_perf.json" ^
@@ -228,9 +228,9 @@ set "GIT_DIRTY=no"
 for /f "delims=" %%I in ('git -c "safe.directory=%GIT_ROOT%" -C "%ROOT%" status --porcelain 2^>nul') do set "GIT_DIRTY=yes"
 
 (
-    echo # HLOD performance report
+    echo # Frontier performance report
     echo.
-    echo - Format: hlod-perf-report-v1
+    echo - Format: frontier-perf-report-v1
     echo - Status: %RUN_STATUS%
     echo - Failed stage: %FAILURE_STAGE%
     echo - Machine label: %RAW_LABEL%
@@ -261,7 +261,7 @@ for /f "delims=" %%I in ('git -c "safe.directory=%GIT_ROOT%" -C "%ROOT%" status 
 ) > "%REPORT_DIR%\REPORT.md"
 
 (
-    echo format=hlod-perf-report-v1
+    echo format=frontier-perf-report-v1
     echo status=%RUN_STATUS%
     echo failure_stage=%FAILURE_STAGE%
     echo label=%RAW_LABEL%

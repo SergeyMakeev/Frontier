@@ -1,10 +1,10 @@
-#include "hlod/config.h"
+#include "frontier/config.h"
 
 #if defined(_WIN32)
   #include <malloc.h>
 #endif
 
-namespace hlod {
+namespace frontier {
 
 void* defaultAlloc(size_t bytes, size_t alignment, void*)
 {
@@ -34,10 +34,10 @@ void defaultParallelFor(uint32_t count, void (*fn)(uint32_t i, void* payload),
     for (uint32_t i = 0; i < count; ++i) fn(i, payload);
 }
 
-const HlodContext& defaultContext()
+const FrontierContext& defaultContext()
 {
-    static const HlodContext ctx{};
+    static const FrontierContext ctx{};
     return ctx;
 }
 
-} // namespace hlod
+} // namespace frontier

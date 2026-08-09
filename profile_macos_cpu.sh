@@ -2,12 +2,12 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BUILD_DIR="${HLOD_PROFILE_BUILD_DIR:-${ROOT_DIR}/build-macos-profile}"
-OUTPUT_DIR="${HLOD_PROFILE_OUTPUT_DIR:-${ROOT_DIR}/profile_results}"
-BENCHMARK_FILTER="${HLOD_PROFILE_FILTER:-BM_MixedForest100k/flat_pct:0/cached:1$}"
-BENCHMARK_MIN_TIME="${HLOD_PROFILE_MIN_TIME:-18s}"
-TRACE_TIME_LIMIT="${HLOD_PROFILE_TIME_LIMIT:-25s}"
-EXPORT_TIME_START="${HLOD_PROFILE_EXPORT_START:-5s}"
+BUILD_DIR="${FRONTIER_PROFILE_BUILD_DIR:-${ROOT_DIR}/build-macos-profile}"
+OUTPUT_DIR="${FRONTIER_PROFILE_OUTPUT_DIR:-${ROOT_DIR}/profile_results}"
+BENCHMARK_FILTER="${FRONTIER_PROFILE_FILTER:-BM_MixedForest100k/flat_pct:0/cached:1$}"
+BENCHMARK_MIN_TIME="${FRONTIER_PROFILE_MIN_TIME:-18s}"
+TRACE_TIME_LIMIT="${FRONTIER_PROFILE_TIME_LIMIT:-25s}"
+EXPORT_TIME_START="${FRONTIER_PROFILE_EXPORT_START:-5s}"
 
 if [[ "$(uname -s)" != "Darwin" ]]; then
     echo "ERROR: CPU Counters profiling is available only on macOS." >&2
@@ -35,8 +35,8 @@ add_developer_dir() {
     developer_dirs+=("${candidate}")
 }
 
-if [[ -n "${HLOD_DEVELOPER_DIR:-}" ]]; then
-    add_developer_dir "${HLOD_DEVELOPER_DIR}"
+if [[ -n "${FRONTIER_DEVELOPER_DIR:-}" ]]; then
+    add_developer_dir "${FRONTIER_DEVELOPER_DIR}"
 elif [[ -n "${DEVELOPER_DIR:-}" ]]; then
     add_developer_dir "${DEVELOPER_DIR}"
 else
@@ -55,8 +55,8 @@ fi
 
 # Xcode 26 renamed the guided counter template to CPU Bottlenecks. Older
 # releases expose the same hardware-PMU workflow as CPU Counters.
-if [[ -n "${HLOD_XCTRACE_TEMPLATE:-}" ]]; then
-    template_candidates=("${HLOD_XCTRACE_TEMPLATE}")
+if [[ -n "${FRONTIER_XCTRACE_TEMPLATE:-}" ]]; then
+    template_candidates=("${FRONTIER_XCTRACE_TEMPLATE}")
 else
     template_candidates=('CPU Bottlenecks' 'CPU Counters')
 fi
@@ -64,9 +64,9 @@ fi
 selected_developer_dir=""
 selected_template=""
 selected_instrument=""
-if [[ -n "${HLOD_XCTRACE_TEMPLATE:-}" && -f "${HLOD_XCTRACE_TEMPLATE}" ]]; then
+if [[ -n "${FRONTIER_XCTRACE_TEMPLATE:-}" && -f "${FRONTIER_XCTRACE_TEMPLATE}" ]]; then
     selected_developer_dir="${developer_dirs[0]}"
-    selected_template="${HLOD_XCTRACE_TEMPLATE}"
+    selected_template="${FRONTIER_XCTRACE_TEMPLATE}"
 else
     # Prefer a configured template because it carries Apple's recommended
     # counter mode and derived metrics.
@@ -83,7 +83,7 @@ else
 
     # Recent xctrace versions can compose a recording from an Instrument even
     # when the corresponding GUI template is not published to the CLI.
-    if [[ -z "${selected_template}" && -z "${HLOD_XCTRACE_TEMPLATE:-}" ]]; then
+    if [[ -z "${selected_template}" && -z "${FRONTIER_XCTRACE_TEMPLATE:-}" ]]; then
         for developer_dir in "${developer_dirs[@]}"; do
             record_help="$(DEVELOPER_DIR="${developer_dir}" xcrun xctrace help record 2>/dev/null || true)"
             grep -Fq -- '--instrument' <<<"${record_help}" || continue
@@ -118,7 +118,7 @@ if [[ -z "${selected_template}" && -z "${selected_instrument}" ]]; then
     done
     echo "If full Xcode was just installed, open it once to finish setup, or run:" >&2
     echo "  sudo env DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcodebuild -runFirstLaunch" >&2
-    echo "Then rerun this script. HLOD_DEVELOPER_DIR and HLOD_XCTRACE_TEMPLATE can override discovery." >&2
+    echo "Then rerun this script. FRONTIER_DEVELOPER_DIR and FRONTIER_XCTRACE_TEMPLATE can override discovery." >&2
     exit 1
 fi
 
@@ -220,24 +220,24 @@ configure_benchmark() {
     cmake -S "${ROOT_DIR}" -B "${BUILD_DIR}" "$@" \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_OSX_ARCHITECTURES=arm64 \
-        -DHLOD_BUILD_TESTS=OFF \
-        -DHLOD_BUILD_BENCH=ON \
-        -DHLOD_AVX2=OFF \
-        -DHLOD_FORCE_SCALAR=OFF \
-        -DHLOD_PROFILE_SYMBOLS=ON
+        -DFRONTIER_BUILD_TESTS=OFF \
+        -DFRONTIER_BUILD_BENCH=ON \
+        -DFRONTIER_AVX2=OFF \
+        -DFRONTIER_FORCE_SCALAR=OFF \
+        -DFRONTIER_PROFILE_SYMBOLS=ON
 }
 if [[ ! -f "${BUILD_DIR}/CMakeCache.txt" ]] && command -v ninja >/dev/null 2>&1; then
     configure_benchmark -G Ninja
 else
     configure_benchmark
 fi
-cmake --build "${BUILD_DIR}" --config Release --target hlod_bench --parallel
+cmake --build "${BUILD_DIR}" --config Release --target frontier_bench --parallel
 
 cache_file="${BUILD_DIR}/CMakeCache.txt"
 if grep -Eq '^CMAKE_CONFIGURATION_TYPES:[^=]*=.+$' "${cache_file}"; then
-    bench_exe="${BUILD_DIR}/bench/Release/hlod_bench"
+    bench_exe="${BUILD_DIR}/bench/Release/frontier_bench"
 else
-    bench_exe="${BUILD_DIR}/bench/hlod_bench"
+    bench_exe="${BUILD_DIR}/bench/frontier_bench"
 fi
 if [[ ! -x "${bench_exe}" ]]; then
     echo "ERROR: Benchmark executable was not found at ${bench_exe}." >&2
@@ -246,8 +246,8 @@ fi
 
 stamp="$(date +%Y%m%d-%H%M%S)"
 mkdir -p "${OUTPUT_DIR}"
-trace="${OUTPUT_DIR}/hlod_cpu_counters_${stamp}.trace"
-info="${OUTPUT_DIR}/hlod_cpu_counters_${stamp}_info.txt"
+trace="${OUTPUT_DIR}/frontier_cpu_counters_${stamp}.trace"
+info="${OUTPUT_DIR}/frontier_cpu_counters_${stamp}_info.txt"
 
 {
     echo "developer_dir=${DEVELOPER_DIR}"

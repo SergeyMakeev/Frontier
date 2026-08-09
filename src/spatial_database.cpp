@@ -1,16 +1,16 @@
-#include "hlod/world.h"
+#include "frontier/spatial_database.h"
 
 #include <algorithm>
 #include <array>
 #include <bit>
 #include <memory>
 
-namespace hlod {
+namespace frontier {
 
-#ifdef HLOD_STATS
-  #define HLOD_STAT(w, field, n) ((w).stats.field += (n))
+#ifdef FRONTIER_STATS
+  #define FRONTIER_STAT(w, field, n) ((w).stats.field += (n))
 #else
-  #define HLOD_STAT(w, field, n) ((void)sizeof(w), (void)0)
+  #define FRONTIER_STAT(w, field, n) ((void)sizeof(w), (void)0)
 #endif
 
 namespace {
@@ -33,28 +33,28 @@ inline uint32_t nextPageGeneration(uint32_t generation)
     return generation == 0 ? 1u : generation;
 }
 
-inline uint32_t cutCount(uint32_t counts, uint32_t bucket)
+inline uint32_t frontierCount(uint32_t counts, uint32_t bucket)
 {
     return (counts >> (bucket * 10)) & 0x3ffu;
 }
 
-inline uint32_t cutTotal(uint32_t counts)
+inline uint32_t frontierTotal(uint32_t counts)
 {
-    return cutCount(counts, 0) + cutCount(counts, 1) + cutCount(counts, 2);
+    return frontierCount(counts, 0) + frontierCount(counts, 1) + frontierCount(counts, 2);
 }
 
-inline uint32_t cutDepCount(uint32_t counts)
+inline uint32_t frontierDependencyCount(uint32_t counts)
 {
     return counts >> 30;
 }
 
-inline uint32_t packCutCounts(uint32_t shared, uint32_t currentOnly,
+inline uint32_t packFrontierCounts(uint32_t shared, uint32_t currentOnly,
                               uint32_t idealOnly, uint32_t depCount)
 {
     return shared | (currentOnly << 10) | (idealOnly << 20) | (depCount << 30);
 }
 
-inline uint8_t encodeCutErrorRatio(float ratio, bool above)
+inline uint8_t encodeFrontierErrorRatio(float ratio, bool above)
 {
     if (!std::isfinite(ratio)) return above ? 255 : 127;
     if (!(ratio > 0.0f)) return 0;
@@ -72,19 +72,19 @@ inline uint8_t encodeCutErrorRatio(float ratio, bool above)
 
 } // namespace
 
-uint8_t encodeCutError(float error, float threshold)
+uint8_t encodeFrontierError(float error, float threshold)
 {
     if (!(error > 0.0f)) return 0;
     if (!(threshold > 0.0f)) return error > threshold ? 255 : 127;
 
     const bool above = error > threshold;
-    return encodeCutErrorRatio(error * (1.0f / threshold), above);
+    return encodeFrontierErrorRatio(error * (1.0f / threshold), above);
 }
 
-float decodeCutError(uint8_t code, float threshold)
+float decodeFrontierError(uint8_t code, float threshold)
 {
     if (!(threshold > 0.0f)) return threshold;
-    const int q = code < kCutErrorThreshold ? int(code) - 127
+    const int q = code < kFrontierErrorThreshold ? int(code) - 127
                                              : int(code) - 128;
     return threshold * std::exp2(float(q) * (1.0f / 8.0f));
 }
@@ -93,64 +93,64 @@ namespace {
 
 inline constexpr uint32_t kFlatZeroError = 1u << 31;
 
-inline CutEntry makeCutEntry(NodeHandle node, float error, float threshold,
+inline FrontierEntry makeFrontierEntry(NodeHandle node, float error, float threshold,
                              float thresholdInv, InstanceId instance)
 {
-    if (!(error > 0.0f)) return CutEntry{node, uint8_t(0), instance};
+    if (!(error > 0.0f)) return FrontierEntry{node, uint8_t(0), instance};
     if (!(threshold > 0.0f))
-        return CutEntry{node, uint8_t(error > threshold ? 255 : 127), instance};
-    return CutEntry{node,
-                    encodeCutErrorRatio(error * thresholdInv, error > threshold),
+        return FrontierEntry{node, uint8_t(error > threshold ? 255 : 127), instance};
+    return FrontierEntry{node,
+                    encodeFrontierErrorRatio(error * thresholdInv, error > threshold),
                     instance};
 }
 
 } // namespace
 
-// Opaque per-view query state. Cached and uncached selection both use it;
-// ownership by View is what makes every query a read-only World operation.
-struct ViewScratch
+// Opaque per-query state. Cached and uncached selection both use it;
+// ownership by SpatialQuery is what makes every query a read-only SpatialDatabase operation.
+struct QueryScratch
 {
-    std::vector<World::Worker>      workers{1};
-    std::vector<World::VisibleItem> visible;
-    std::vector<World::TlasItem>    tlasStack;
-    detail::CutBuffers              output;
+    std::vector<SpatialDatabase::Worker>      workers{1};
+    std::vector<SpatialDatabase::VisibleItem> visible;
+    std::vector<SpatialDatabase::TlasItem>    tlasStack;
+    detail::FrontierBuffers              output;
 
     size_t bytes() const
     {
         size_t n = visible.capacity() * sizeof(visible[0]) +
                    tlasStack.capacity() * sizeof(tlasStack[0]) +
-                   workers.capacity() * sizeof(World::Worker) +
-                   output.shared.capacity() * sizeof(CutEntry) +
-                   output.currentOnly.capacity() * sizeof(CutEntry) +
-                   output.idealOnly.capacity() * sizeof(CutEntry);
-        for (const World::Worker& w : workers)
+                   workers.capacity() * sizeof(SpatialDatabase::Worker) +
+                   output.shared.capacity() * sizeof(FrontierEntry) +
+                   output.currentOnly.capacity() * sizeof(FrontierEntry) +
+                   output.idealOnly.capacity() * sizeof(FrontierEntry);
+        for (const SpatialDatabase::Worker& w : workers)
         {
-            n += w.work.capacity() * sizeof(World::WorkItem);
-            n += w.nodeStack.capacity() * sizeof(World::NodeItem);
-            n += w.cutBuf.shared.capacity() * sizeof(CutEntry);
-            n += w.cutBuf.currentOnly.capacity() * sizeof(CutEntry);
-            n += w.cutBuf.idealOnly.capacity() * sizeof(CutEntry);
+            n += w.work.capacity() * sizeof(SpatialDatabase::WorkItem);
+            n += w.nodeStack.capacity() * sizeof(SpatialDatabase::NodeItem);
+            n += w.frontierBuffer.shared.capacity() * sizeof(FrontierEntry);
+            n += w.frontierBuffer.currentOnly.capacity() * sizeof(FrontierEntry);
+            n += w.frontierBuffer.idealOnly.capacity() * sizeof(FrontierEntry);
             n += w.touched.capacity() * sizeof(uint32_t);
         }
         return n;
     }
 };
 
-View::View()
-    : scratch_(std::make_unique<ViewScratch>())
+SpatialQuery::SpatialQuery()
+    : scratch_(std::make_unique<QueryScratch>())
 {}
 
-View::View(float halfLifeFrames)
-    : damper_(halfLifeFrames), scratch_(std::make_unique<ViewScratch>())
+SpatialQuery::SpatialQuery(float halfLifeFrames)
+    : damper_(halfLifeFrames), scratch_(std::make_unique<QueryScratch>())
 {}
 
-View::~View() = default;
-View::View(View&&) noexcept = default;
-View& View::operator=(View&&) noexcept = default;
+SpatialQuery::~SpatialQuery() = default;
+SpatialQuery::SpatialQuery(SpatialQuery&&) noexcept = default;
+SpatialQuery& SpatialQuery::operator=(SpatialQuery&&) noexcept = default;
 
 void PageUsageContext::reset()
 {
-    world_ = nullptr;
+    database_ = nullptr;
     rec_.clear();
     dirty_.clear();
 }
@@ -160,18 +160,18 @@ size_t PageUsageContext::bytes() const
     return rec_.capacity() * sizeof(Rec) + dirty_.capacity() * sizeof(uint32_t);
 }
 
-World::World(const WorldConfig& config) : config_(config)
+SpatialDatabase::SpatialDatabase(const SpatialDatabaseConfig& config) : config_(config)
 {
     if (config_.context.workerCount == 0) config_.context.workerCount = 1;
 }
 
-World::~World() = default;
+SpatialDatabase::~SpatialDatabase() = default;
 
 // ============================================================================
 // handle resolution — two loads and three compares, no hashing anywhere
 // ============================================================================
 
-const World::PageRt* World::resolve(NodeHandle h) const
+const SpatialDatabase::PageRt* SpatialDatabase::resolve(NodeHandle h) const
 {
     const uint32_t slot = h.slot();
     const uint32_t index = h.index();
@@ -183,7 +183,7 @@ const World::PageRt* World::resolve(NodeHandle h) const
     return &rt;
 }
 
-const World::AssetRt* World::resolveAsset(AssetHandle h) const
+const SpatialDatabase::AssetRt* SpatialDatabase::resolveAsset(AssetHandle h) const
 {
     if (h.slot >= assets_.size()) return nullptr;
     const AssetRt& as = assets_[h.slot];
@@ -195,7 +195,7 @@ const World::AssetRt* World::resolveAsset(AssetHandle h) const
 // assets — the unit of sharing
 // ============================================================================
 
-uint32_t World::allocAsset()
+uint32_t SpatialDatabase::allocAsset()
 {
     if (!freeAssets_.empty())
     {
@@ -207,7 +207,7 @@ uint32_t World::allocAsset()
     return uint32_t(assets_.size() - 1);
 }
 
-uint32_t World::createAsset(Page&& page, bool registered)
+uint32_t SpatialDatabase::createAsset(Page&& page, bool registered)
 {
     const uint32_t a = allocAsset();
     AssetRt& as = assets_[a];
@@ -221,37 +221,37 @@ uint32_t World::createAsset(Page&& page, bool registered)
     return a;
 }
 
-void World::destroyAssetIfUnused(uint32_t a)
+void SpatialDatabase::destroyAssetIfUnused(uint32_t a)
 {
     AssetRt& as = assets_[a];
     if (!as.inUse()) return;
     if (as.registered() || as.mountRefs() > 0 || as.instanceRefs > 0) return;
-    as = AssetRt{};   // releases the blob if the World owned it
+    as = AssetRt{};   // releases the blob if the SpatialDatabase owned it
     freeAssets_.push_back(a);
     --liveAssets_;
 }
 
-AssetHandle World::registerAsset(Page&& page)
+AssetHandle SpatialDatabase::registerAsset(Page&& page)
 {
-    HLOD_CHECK(page.nodeCount() > 1, "World::registerAsset: empty page");
+    FRONTIER_CHECK(page.nodeCount() > 1, "SpatialDatabase::registerAsset: empty page");
     const uint32_t a = createAsset(std::move(page), true);
     return AssetHandle{a, assets_[a].generation};
 }
 
-AssetHandle World::registerAsset(PageView borrowedPage)
+AssetHandle SpatialDatabase::registerAsset(PageView borrowedPage)
 {
-    HLOD_CHECK(borrowedPage.valid() && borrowedPage.nodeCount() > 1,
-               "World::registerAsset: empty page");
+    FRONTIER_CHECK(borrowedPage.valid() && borrowedPage.nodeCount() > 1,
+               "SpatialDatabase::registerAsset: empty page");
     const uint32_t a = createAsset(Page::borrow(borrowedPage), true);
     return AssetHandle{a, assets_[a].generation};
 }
 
-void World::releaseAsset(AssetHandle h)
+void SpatialDatabase::releaseAsset(AssetHandle h)
 {
     if (!resolveAsset(h)) return;   // already released; stale handles are quiet
     const uint32_t a = h.slot;
-    HLOD_CHECK(assets_[a].instanceRefs == 0,
-               "World::releaseAsset: instances still reference this asset");
+    FRONTIER_CHECK(assets_[a].instanceRefs == 0,
+               "SpatialDatabase::releaseAsset: instances still reference this asset");
     assets_[a].setRegistered(false);
     if (assets_[a].rootMount != kInvalidIndex)
     {
@@ -262,9 +262,9 @@ void World::releaseAsset(AssetHandle h)
     destroyAssetIfUnused(a);
 }
 
-bool World::isAsset(AssetHandle h) const { return resolveAsset(h) != nullptr; }
+bool SpatialDatabase::isAsset(AssetHandle h) const { return resolveAsset(h) != nullptr; }
 
-PageHandle World::assetRootPage(AssetHandle h) const
+PageHandle SpatialDatabase::assetRootPage(AssetHandle h) const
 {
     const AssetRt* as = resolveAsset(h);
     if (!as || as->rootMount == kInvalidIndex) return PageHandle{};
@@ -275,7 +275,7 @@ PageHandle World::assetRootPage(AssetHandle h) const
 // mounts / attach / detach
 // ============================================================================
 
-uint32_t World::allocSlot()
+uint32_t SpatialDatabase::allocSlot()
 {
     if (!freeSlots_.empty())
     {
@@ -283,15 +283,15 @@ uint32_t World::allocSlot()
         freeSlots_.pop_back();
         return s;
     }
-    HLOD_CHECK(slots_.size() < NodeHandle::kInvalidSlot,
-               "World: exhausted the 20-bit page-mount slot space");
+    FRONTIER_CHECK(slots_.size() < NodeHandle::kInvalidSlot,
+               "SpatialDatabase: exhausted the 20-bit page-mount slot space");
     slots_.emplace_back();
     pageStamps_.emplace_back();
     pageResidency_.emplace_back();
     return uint32_t(slots_.size() - 1);
 }
 
-uint32_t World::registerPage(uint32_t asset, NodeRef owner, bool pinned)
+uint32_t SpatialDatabase::registerPage(uint32_t asset, NodeRef owner, bool pinned)
 {
     const uint32_t slot = allocSlot();
     AssetRt& as = assets_[asset];
@@ -299,8 +299,8 @@ uint32_t World::registerPage(uint32_t asset, NodeRef owner, bool pinned)
     PageStamp& stamp = pageStamps_[slot];
     pageResidency_[slot] = PageResidency{};
 
-    HLOD_CHECK(as.page.nodeCount() <= (1u << NodeHandle::kIndexBits),
-               "World: page exceeds the 20-bit page-local node space");
+    FRONTIER_CHECK(as.page.nodeCount() <= (1u << NodeHandle::kIndexBits),
+               "SpatialDatabase: page exceeds the 20-bit page-local node space");
     rt.asset    = asset;
     rt.errClamp = FLT_MAX;
     rt.nodeState.assign(as.page.nodeCount(), 0);
@@ -311,7 +311,7 @@ uint32_t World::registerPage(uint32_t asset, NodeRef owner, bool pinned)
     rt.setGeneration(generation);
     // Bumped here as well as on every content change, so that a slot which was
     // detached and reused can never present the same contentVersion as before.
-    // That is what lets a View record identify a page's state with a
+    // That is what lets a SpatialQuery record identify a page's state with a
     // single word instead of a (generation, version) pair.
     ++stamp.contentVersion;
     stamp.setInUse(true);
@@ -330,7 +330,7 @@ uint32_t World::registerPage(uint32_t asset, NodeRef owner, bool pinned)
     return slot;
 }
 
-void World::pinRootPayloads(uint32_t slot)
+void SpatialDatabase::pinRootPayloads(uint32_t slot)
 {
     // Pin the roots' payloads: the base case of invariant (F).
     PageRt& rt = slots_[slot];
@@ -345,10 +345,10 @@ void World::pinRootPayloads(uint32_t slot)
     }
 }
 
-PageHandle World::attachPage(NodeHandle expansionNode, AssetHandle assetHandle)
+PageHandle SpatialDatabase::attachPage(NodeHandle expansionNode, AssetHandle assetHandle)
 {
     const AssetRt* as = resolveAsset(assetHandle);
-    HLOD_CHECK(as != nullptr, "World::attachPage: invalid or released asset");
+    FRONTIER_CHECK(as != nullptr, "SpatialDatabase::attachPage: invalid or released asset");
 
     // Stale expansion handle: the parent page was detached/collected while
     // this page was being streamed. Normal streaming race — reject quietly.
@@ -358,21 +358,21 @@ PageHandle World::attachPage(NodeHandle expansionNode, AssetHandle assetHandle)
     const NodeRef owner{expansionNode.slot(), expansionNode.index()};
     {
         const PageRt& ownerRt = slots_[owner.slot];
-        HLOD_CHECK(pageView(ownerRt).isExpansion(owner.index),
-                   "World::attachPage: not an expansion point");
-        HLOD_CHECK(ownerRt.expSlot.empty() || ownerRt.expSlot[owner.index] == kInvalidIndex,
-                   "World::attachPage: already attached");
+        FRONTIER_CHECK(pageView(ownerRt).isExpansion(owner.index),
+                   "SpatialDatabase::attachPage: not an expansion point");
+        FRONTIER_CHECK(ownerRt.expSlot.empty() || ownerRt.expSlot[owner.index] == kInvalidIndex,
+                   "SpatialDatabase::attachPage: already attached");
     }
-    HLOD_CHECK(assets_[asset].page.nodeCount() > 1, "World::attachPage: empty page");
+    FRONTIER_CHECK(assets_[asset].page.nodeCount() > 1, "SpatialDatabase::attachPage: empty page");
 
     // (C) across the boundary: the owner must contain the page's content.
     // Growing the owner here is not an option — its bytes back every instance
     // of the owning asset, so the growth would have to ripple into all of
     // their top-level bounds, and a streaming event would silently become an
     // O(instances) write. Author expansion bounds that contain what attaches.
-    HLOD_CHECK(pageView(slots_[owner.slot]).bbox[owner.index].contains(
+    FRONTIER_CHECK(pageView(slots_[owner.slot]).bbox[owner.index].contains(
                    assets_[asset].page.bbox[0]),
-               "World::attachPage: the attached page escapes the expansion node's "
+               "SpatialDatabase::attachPage: the attached page escapes the expansion node's "
                "authored bounds — author conservative expansion bounds at build time");
 
     // (D) across the boundary: the child page's effective error ceiling is
@@ -402,12 +402,12 @@ PageHandle World::attachPage(NodeHandle expansionNode, AssetHandle assetHandle)
     return PageHandle{slot, pageStamps_[slot].generation()};
 }
 
-PageHandle World::attachPage(NodeHandle expansionNode, Page&& page)
+PageHandle SpatialDatabase::attachPage(NodeHandle expansionNode, Page&& page)
 {
     // Check the handle before taking ownership so a stale attach leaves the
     // caller's page untouched (they just drop it).
     if (!resolve(expansionNode)) return PageHandle{};
-    HLOD_CHECK(page.nodeCount() > 1, "World::attachPage: empty page");
+    FRONTIER_CHECK(page.nodeCount() > 1, "SpatialDatabase::attachPage: empty page");
 
     const uint32_t a = createAsset(std::move(page), false);
     const PageHandle h = attachPage(expansionNode, AssetHandle{a, assets_[a].generation});
@@ -415,7 +415,7 @@ PageHandle World::attachPage(NodeHandle expansionNode, Page&& page)
     return h;
 }
 
-DetailPageRef World::detailPage(NodeHandle expansionNode) const
+DetailPageRef SpatialDatabase::detailPage(NodeHandle expansionNode) const
 {
     const PageRt* rt = resolve(expansionNode);
     if (!rt) return {};
@@ -433,29 +433,29 @@ DetailPageRef World::detailPage(NodeHandle expansionNode) const
         AssetHandle{rootAsset, assets_[rootAsset].generation}, page};
 }
 
-void World::detachPage(NodeHandle expansionNode)
+void SpatialDatabase::detachPage(NodeHandle expansionNode)
 {
     const PageRt* ownerRt = resolve(expansionNode);
     if (!ownerRt) return;   // parent page already gone; nothing to detach
     const uint32_t child = ownerRt->expSlot.empty()
                                ? kInvalidIndex
                                : ownerRt->expSlot[expansionNode.index()];
-    HLOD_CHECK(child != kInvalidIndex, "World::detachPage: not attached");
+    FRONTIER_CHECK(child != kInvalidIndex, "SpatialDatabase::detachPage: not attached");
     PageRt& rt = slots_[child];
-    HLOD_CHECK(rt.attachedChildPages() == 0,
-               "World::detachPage: attached child pages remain");
-    HLOD_CHECK(!rt.pinned(), "World::detachPage: page is pinned");
+    FRONTIER_CHECK(rt.attachedChildPages() == 0,
+               "SpatialDatabase::detachPage: attached child pages remain");
+    FRONTIER_CHECK(!rt.pinned(), "SpatialDatabase::detachPage: page is pinned");
     detachSlot(child, nullptr);
 }
 
-bool World::isAttached(NodeHandle expansionNode) const
+bool SpatialDatabase::isAttached(NodeHandle expansionNode) const
 {
     const PageRt* rt = resolve(expansionNode);
     return rt && !rt->expSlot.empty() &&
            rt->expSlot[expansionNode.index()] != kInvalidIndex;
 }
 
-void World::detachSlot(uint32_t slot, AppendBuffer<UserPayload>* freedPayloads)
+void SpatialDatabase::detachSlot(uint32_t slot, AppendBuffer<UserPayload>* freedPayloads)
 {
     PageRt& rt = slots_[slot];
     if (freedPayloads)
@@ -467,8 +467,8 @@ void World::detachSlot(uint32_t slot, AppendBuffer<UserPayload>* freedPayloads)
         const bool ownerWasFullyResident = pageTreeFullyResident(rt.owner.slot);
         if (!pageTreeFullyResident(slot))
         {
-            HLOD_CHECK(pageResidency_[rt.owner.slot].incompleteChildren != 0,
-                       "World: page residency summary underflow");
+            FRONTIER_CHECK(pageResidency_[rt.owner.slot].incompleteChildren != 0,
+                       "SpatialDatabase: page residency summary underflow");
             --pageResidency_[rt.owner.slot].incompleteChildren;
         }
         ownerRt.expSlot[rt.owner.index] = kInvalidIndex;
@@ -504,13 +504,13 @@ void World::detachSlot(uint32_t slot, AppendBuffer<UserPayload>* freedPayloads)
     }
 }
 
-void World::detachMountTree(uint32_t rootSlot,
+void SpatialDatabase::detachMountTree(uint32_t rootSlot,
                             AppendBuffer<UserPayload>* freedPayloads)
 {
     if (rootSlot == kInvalidIndex || !slots_[rootSlot].inUse()) return;
     // Collect the page tree from its root (preorder via the expansion-slot
     // links), then detach in reverse — children before their owners.
-    // O(this tree's pages), independent of the world's size.
+    // O(this tree's pages), independent of the database's size.
     std::vector<uint32_t> order;
     order.push_back(rootSlot);
     for (size_t k = 0; k < order.size(); ++k)
@@ -523,14 +523,14 @@ void World::detachMountTree(uint32_t rootSlot,
 // residency
 // ============================================================================
 
-bool World::pageTreeFullyResident(uint32_t slot) const
+bool SpatialDatabase::pageTreeFullyResident(uint32_t slot) const
 {
     const PageResidency& summary = pageResidency_[slot];
     return summary.incompleteChildren == 0 &&
            summary.residentNodes + 1 == pageView(slots_[slot]).nodeCount();
 }
 
-void World::propagateFullResidency(uint32_t slot, bool wasFullyResident)
+void SpatialDatabase::propagateFullResidency(uint32_t slot, bool wasFullyResident)
 {
     bool fullyResident = pageTreeFullyResident(slot);
     while (fullyResident != wasFullyResident)
@@ -543,8 +543,8 @@ void World::propagateFullResidency(uint32_t slot, bool wasFullyResident)
         const bool ownerWasFullyResident = pageTreeFullyResident(slot);
         if (fullyResident)
         {
-            HLOD_CHECK(summary.incompleteChildren != 0,
-                       "World: page residency summary underflow");
+            FRONTIER_CHECK(summary.incompleteChildren != 0,
+                       "SpatialDatabase: page residency summary underflow");
             --summary.incompleteChildren;
         }
         else
@@ -554,7 +554,7 @@ void World::propagateFullResidency(uint32_t slot, bool wasFullyResident)
     }
 }
 
-bool World::descendantsCovered(uint32_t slot, uint32_t node) const
+bool SpatialDatabase::descendantsCovered(uint32_t slot, uint32_t node) const
 {
     const PageRt& rt = slots_[slot];
     if (node != 0 && pageView(rt).isExpansion(node))
@@ -567,13 +567,13 @@ bool World::descendantsCovered(uint32_t slot, uint32_t node) const
     return count != 0 && rt.coveredChildren[node] == count;
 }
 
-bool World::computeCovered(uint32_t slot, uint32_t node) const
+bool SpatialDatabase::computeCovered(uint32_t slot, uint32_t node) const
 {
     const PageRt& rt = slots_[slot];
     return (node != 0 && rt.isResident(node)) || descendantsCovered(slot, node);
 }
 
-void World::propagateCoverage(uint32_t slot, uint32_t node)
+void SpatialDatabase::propagateCoverage(uint32_t slot, uint32_t node)
 {
     for (;;)
     {
@@ -602,7 +602,7 @@ void World::propagateCoverage(uint32_t slot, uint32_t node)
     }
 }
 
-void World::markResident(NodeHandle h)
+void SpatialDatabase::markResident(NodeHandle h)
 {
     PageRt* rt = resolve(h);
     if (!rt) return;   // page collected while the payload was loading
@@ -616,31 +616,31 @@ void World::markResident(NodeHandle h)
     propagateCoverage(h.slot(), index);
 }
 
-void World::markNonResident(NodeHandle h)
+void SpatialDatabase::markNonResident(NodeHandle h)
 {
     PageRt* rt = resolve(h);
     if (!rt) return;
     const uint32_t index = h.index();
-    HLOD_CHECK(!(rt->pinned() && pageView(*rt).parent[index] == 0),
-               "World::markNonResident: pinned root");
+    FRONTIER_CHECK(!(rt->pinned() && pageView(*rt).parent[index] == 0),
+               "SpatialDatabase::markNonResident: pinned root");
     if (!rt->isResident(index)) return;
     const bool wasFullyResident = pageTreeFullyResident(h.slot());
     rt->setResident(index, false);
-    HLOD_CHECK(pageResidency_[h.slot()].residentNodes != 0,
-               "World: page residency summary underflow");
+    FRONTIER_CHECK(pageResidency_[h.slot()].residentNodes != 0,
+               "SpatialDatabase: page residency summary underflow");
     --pageResidency_[h.slot()].residentNodes;
     propagateFullResidency(h.slot(), wasFullyResident);
     ++pageStamps_[h.slot()].contentVersion;
     propagateCoverage(h.slot(), index);
 }
 
-bool World::isResident(NodeHandle h) const
+bool SpatialDatabase::isResident(NodeHandle h) const
 {
     const PageRt* rt = resolve(h);
     return rt && rt->isResident(h.index());
 }
 
-bool World::tryGetPayload(NodeHandle h, UserPayload& outPayload) const
+bool SpatialDatabase::tryGetPayload(NodeHandle h, UserPayload& outPayload) const
 {
     const PageRt* rt = resolve(h);
     if (!rt) return false;
@@ -652,9 +652,9 @@ bool World::tryGetPayload(NodeHandle h, UserPayload& outPayload) const
 // instances
 // ============================================================================
 
-World::InstanceRef World::addInstanceInternal(uint32_t asset, const InstanceDesc& desc)
+SpatialDatabase::InstanceRef SpatialDatabase::addInstanceInternal(uint32_t asset, const InstanceDesc& desc)
 {
-    HLOD_CHECK(desc.scale > 0.0f, "World::addInstance: non-positive scale");
+    FRONTIER_CHECK(desc.scale > 0.0f, "SpatialDatabase::addInstance: non-positive scale");
 
     InstanceId id;
     if (!freeInstances_.empty())
@@ -664,11 +664,11 @@ World::InstanceRef World::addInstanceInternal(uint32_t asset, const InstanceDesc
     }
     else
     {
-        HLOD_CHECK(instances_.size() < kInvalidInstanceId,
-                   "World: exhausted the 24-bit InstanceId space");
+        FRONTIER_CHECK(instances_.size() < kInvalidInstanceId,
+                   "SpatialDatabase: exhausted the 24-bit InstanceId space");
         instances_.emplace_back();
         instanceTlas_.emplace_back();
-        instanceCutVersions_.emplace_back();
+        instanceFrontierVersions_.emplace_back();
         instanceDenseToHandle_.push_back(kInvalidInstanceId);
         id = InstanceId(instances_.size() - 1);
     }
@@ -681,8 +681,8 @@ World::InstanceRef World::addInstanceInternal(uint32_t asset, const InstanceDesc
     }
     else
     {
-        HLOD_CHECK(instanceHandleToDense_.size() < kInvalidInstanceId,
-                   "World: exhausted the 24-bit instance-handle space");
+        FRONTIER_CHECK(instanceHandleToDense_.size() < kInvalidInstanceId,
+                   "SpatialDatabase: exhausted the 24-bit instance-handle space");
         handle = InstanceId(instanceHandleToDense_.size());
         instanceHandleToDense_.push_back(kInvalidInstanceId);
     }
@@ -742,14 +742,14 @@ World::InstanceRef World::addInstanceInternal(uint32_t asset, const InstanceDesc
                        PageHandle{slot, pageStamps_[slot].generation()}};
 }
 
-World::InstanceRef World::addInstance(AssetHandle asset, const InstanceDesc& desc)
+SpatialDatabase::InstanceRef SpatialDatabase::addInstance(AssetHandle asset, const InstanceDesc& desc)
 {
-    HLOD_CHECK(resolveAsset(asset) != nullptr,
-               "World::addInstance: invalid or released asset");
+    FRONTIER_CHECK(resolveAsset(asset) != nullptr,
+               "SpatialDatabase::addInstance: invalid or released asset");
     return addInstanceInternal(asset.slot, desc);
 }
 
-World::InstanceRef World::addInstance(AssetHandle asset, float4 pos, float scale)
+SpatialDatabase::InstanceRef SpatialDatabase::addInstance(AssetHandle asset, float4 pos, float scale)
 {
     InstanceDesc d;
     d.pos = pos;
@@ -757,14 +757,14 @@ World::InstanceRef World::addInstance(AssetHandle asset, float4 pos, float scale
     return addInstance(asset, d);
 }
 
-World::InstanceRef World::addInstance(Page&& page, const InstanceDesc& desc)
+SpatialDatabase::InstanceRef SpatialDatabase::addInstance(Page&& page, const InstanceDesc& desc)
 {
-    HLOD_CHECK(page.nodeCount() > 1, "World::addInstance: empty page");
+    FRONTIER_CHECK(page.nodeCount() > 1, "SpatialDatabase::addInstance: empty page");
     const uint32_t a = createAsset(std::move(page), false);
     return addInstanceInternal(a, desc);
 }
 
-World::InstanceRef World::addInstance(Page&& page, float4 pos, float scale)
+SpatialDatabase::InstanceRef SpatialDatabase::addInstance(Page&& page, float4 pos, float scale)
 {
     InstanceDesc d;
     d.pos = pos;
@@ -772,13 +772,13 @@ World::InstanceRef World::addInstance(Page&& page, float4 pos, float scale)
     return addInstance(std::move(page), d);
 }
 
-World::Instance* World::resolveInstance(InstanceRef ref)
+SpatialDatabase::Instance* SpatialDatabase::resolveInstance(InstanceRef ref)
 {
     const InstanceId id = denseInstanceId(ref);
     return id == kInvalidInstanceId ? nullptr : &instances_[id];
 }
 
-InstanceId World::denseInstanceId(InstanceRef ref) const
+InstanceId SpatialDatabase::denseInstanceId(InstanceRef ref) const
 {
     if (ref.id >= instanceHandleToDense_.size()) return kInvalidInstanceId;
     const InstanceId id = instanceHandleToDense_[ref.id];
@@ -789,20 +789,20 @@ InstanceId World::denseInstanceId(InstanceRef ref) const
     return id;
 }
 
-InstanceId World::publicInstanceId(InstanceId dense) const
+InstanceId SpatialDatabase::publicInstanceId(InstanceId dense) const
 {
-    HLOD_ASSERT(dense < instanceDenseToHandle_.size() &&
+    FRONTIER_ASSERT(dense < instanceDenseToHandle_.size() &&
                     instanceDenseToHandle_[dense] != kInvalidInstanceId,
-                "World: live dense instance has no public handle");
+                "SpatialDatabase: live dense instance has no public handle");
     return instanceDenseToHandle_[dense];
 }
 
-World::MotionGroup::MotionGroup(std::span<const InstanceRef> instances)
+SpatialDatabase::MotionGroup::MotionGroup(std::span<const InstanceRef> instances)
 {
     reset(instances);
 }
 
-void World::MotionGroup::reset(std::span<const InstanceRef> instances)
+void SpatialDatabase::MotionGroup::reset(std::span<const InstanceRef> instances)
 {
     instances_.clear();
     instances_.append(instances.data(), instances.size());
@@ -812,13 +812,13 @@ void World::MotionGroup::reset(std::span<const InstanceRef> instances)
 }
 
 // Structural change policy: quality rebuilds are reserved for real population
-// drift — world assembly, level load, mass despawn. Under steady churn
+// drift — database assembly, level load, mass despawn. Under steady churn
 // (spawn/despawn at roughly constant population) the instance count barely
 // moves, so nothing is forced here at all: the edit is applied incrementally
 // and tlasEditFraction decides when the accumulated quality loss is worth a
 // rebuild. Only a real change in population size forces one immediately, and
 // then it takes the quality tier because it is rare and long-lived.
-void World::markTlasStructuralChange()
+void SpatialDatabase::markTlasStructuralChange()
 {
     const uint64_t alive = liveInstances_.size();
     const uint64_t drift = alive > tlasQualityCount_ ? alive - tlasQualityCount_
@@ -830,7 +830,7 @@ void World::markTlasStructuralChange()
     }
 }
 
-void World::removeInstance(InstanceRef ref)
+void SpatialDatabase::removeInstance(InstanceRef ref)
 {
     Instance* inst = resolveInstance(ref);
     if (!inst) return;   // stale ref: the instance is already gone
@@ -840,7 +840,7 @@ void World::removeInstance(InstanceRef ref)
     if (!instanceFlatSlots_.empty() &&
         instanceFlatSlots_[id] != kInvalidIndex)
     {
-        HLOD_CHECK(flatInstanceCount_ != 0, "World: flat-instance count underflow");
+        FRONTIER_CHECK(flatInstanceCount_ != 0, "SpatialDatabase: flat-instance count underflow");
         --flatInstanceCount_;
         instanceFlatSlots_[id] = kInvalidIndex;
     }
@@ -877,15 +877,15 @@ void World::removeInstance(InstanceRef ref)
     destroyAssetIfUnused(asset);
 }
 
-void World::moveInstance(InstanceRef ref, float4 pos, float scale)
+void SpatialDatabase::moveInstance(InstanceRef ref, float4 pos, float scale)
 {
-    HLOD_CHECK(scale > 0.0f, "World::moveInstance: non-positive scale");
+    FRONTIER_CHECK(scale > 0.0f, "SpatialDatabase::moveInstance: non-positive scale");
     const InstanceId dense = denseInstanceId(ref);
     if (dense == kInvalidInstanceId) return;
     moveInstanceDense(dense, pos, scale);
 }
 
-void World::moveInstanceDense(InstanceId dense, float4 pos, float scale)
+void SpatialDatabase::moveInstanceDense(InstanceId dense, float4 pos, float scale)
 {
     Instance& inst = instances_[dense];
     // Translation and bounds deformation cannot change geometric error.
@@ -896,7 +896,7 @@ void World::moveInstanceDense(InstanceId dense, float4 pos, float scale)
     refreshInstanceBounds(dense, scaleChanged);
 }
 
-void World::refreshMotionGroup(MotionGroup& group) const
+void SpatialDatabase::refreshMotionGroup(MotionGroup& group) const
 {
     group.physicalOrder_.clear();
     group.physicalOrder_.reserve(group.instances_.size());
@@ -926,13 +926,13 @@ void World::refreshMotionGroup(MotionGroup& group) const
     group.physicalOrderValid_ = true;
 }
 
-void World::moveInstances(MotionGroup& group,
+void SpatialDatabase::moveInstances(MotionGroup& group,
                           std::span<const float4> positions,
                           float scale)
 {
-    HLOD_CHECK(group.instances_.size() == positions.size(),
-               "World::moveInstances: motion-group/position count mismatch");
-    HLOD_CHECK(scale > 0.0f, "World::moveInstances: non-positive scale");
+    FRONTIER_CHECK(group.instances_.size() == positions.size(),
+               "SpatialDatabase::moveInstances: motion-group/position count mismatch");
+    FRONTIER_CHECK(scale > 0.0f, "SpatialDatabase::moveInstances: non-positive scale");
     if (!group.physicalOrderValid_ ||
         group.layoutVersion_ != instanceLayoutVersion_)
         refreshMotionGroup(group);
@@ -949,19 +949,19 @@ void World::moveInstances(MotionGroup& group,
     }
 }
 
-void World::refreshInstanceBounds(InstanceId id, bool recomputeError)
+void SpatialDatabase::refreshInstanceBounds(InstanceId id, bool recomputeError)
 {
     recomputeInstanceBounds(id, recomputeError);
     tlasOnInstanceMoved(id);
 }
 
-void World::recomputeInstanceBounds(InstanceId id, bool recomputeError)
+void SpatialDatabase::recomputeInstanceBounds(InstanceId id, bool recomputeError)
 {
     Instance& inst = instances_[id];
     InstanceTlas& spatial = instanceTlas_[id];
     // Globally unique rather than per-instance so a recycled slot can never
-    // match the previous occupant's View record.
-    instanceCutVersions_[id] = ++generationCounter_;
+    // match the previous occupant's SpatialQuery record.
+    instanceFrontierVersions_[id] = ++generationCounter_;
     const PageRt& rt = slots_[inst.rootSlot];
     const AABB* bbox = boundsFor(inst, inst.rootSlot, rt);
     spatial.worldBox = toWorld(bbox[0], inst.pos, inst.scale);
@@ -991,7 +991,7 @@ void World::recomputeInstanceBounds(InstanceId id, bool recomputeError)
 // duplicate the streaming state too, which is the expensive half.
 // ============================================================================
 
-const World::Overlay* World::findOverlay(const Instance& inst, uint32_t slot) const
+const SpatialDatabase::Overlay* SpatialDatabase::findOverlay(const Instance& inst, uint32_t slot) const
 {
     if (!inst.hasOverlayList()) return nullptr;   // common case, one compare
     const std::vector<OverlayRef>& refs = overlayLists_[inst.overlayList()].refs;
@@ -1006,7 +1006,7 @@ const World::Overlay* World::findOverlay(const Instance& inst, uint32_t slot) co
     return &ov;
 }
 
-void World::initOverlay(Overlay& ov, uint32_t slot, const PageRt& rt)
+void SpatialDatabase::initOverlay(Overlay& ov, uint32_t slot, const PageRt& rt)
 {
     const PageView& pg = pageView(rt);
     ov.generation = pageStamps_[slot].generation();
@@ -1027,7 +1027,7 @@ void World::initOverlay(Overlay& ov, uint32_t slot, const PageRt& rt)
     }
 }
 
-WideBounds& World::mutableWideBounds(Overlay& ov, const PageView& pg,
+WideBounds& SpatialDatabase::mutableWideBounds(Overlay& ov, const PageView& pg,
                                      uint32_t block)
 {
     if (!ov.sparseWide()) return ov.wide[block];
@@ -1057,7 +1057,7 @@ WideBounds& World::mutableWideBounds(Overlay& ov, const PageView& pg,
     return ov.patchedWide.back();
 }
 
-uint32_t World::ensureOverlay(Instance& inst, uint32_t slot)
+uint32_t SpatialDatabase::ensureOverlay(Instance& inst, uint32_t slot)
 {
     if (!inst.hasOverlayList())
     {
@@ -1069,8 +1069,8 @@ uint32_t World::ensureOverlay(Instance& inst, uint32_t slot)
         }
         else
         {
-            HLOD_CHECK(overlayLists_.size() < Instance::kOverlayListMask,
-                       "World: exhausted overlay-list index space");
+            FRONTIER_CHECK(overlayLists_.size() < Instance::kOverlayListMask,
+                       "SpatialDatabase: exhausted overlay-list index space");
             overlayLists_.emplace_back();
             list = uint32_t(overlayLists_.size() - 1);
         }
@@ -1109,7 +1109,7 @@ uint32_t World::ensureOverlay(Instance& inst, uint32_t slot)
     return idx;
 }
 
-void World::freeOverlays(Instance& inst)
+void SpatialDatabase::freeOverlays(Instance& inst)
 {
     if (!inst.hasOverlayList()) return;
     std::vector<OverlayRef>& refs = overlayLists_[inst.overlayList()].refs;
@@ -1126,14 +1126,14 @@ void World::freeOverlays(Instance& inst)
     inst.clearOverlayList();
 }
 
-const AABB* World::boundsFor(const Instance& inst, uint32_t slot, const PageRt& rt) const
+const AABB* SpatialDatabase::boundsFor(const Instance& inst, uint32_t slot, const PageRt& rt) const
 {
     if (const Overlay* ov = findOverlay(inst, slot))
         return ov->bbox.data();
     return pageView(rt).bbox;
 }
 
-WideBoundsRef World::wideBoundsFor(const Instance& inst, uint32_t slot,
+WideBoundsRef SpatialDatabase::wideBoundsFor(const Instance& inst, uint32_t slot,
                                    const PageRt& rt, uint32_t* sparseOverlay) const
 {
     if (const Overlay* ov = findOverlay(inst, slot))
@@ -1148,7 +1148,7 @@ WideBoundsRef World::wideBoundsFor(const Instance& inst, uint32_t slot,
     return pageView(rt).wideBounds();
 }
 
-World::WorkItem World::makeWorkItem(uint32_t slot, const Instance& inst,
+SpatialDatabase::WorkItem SpatialDatabase::makeWorkItem(uint32_t slot, const Instance& inst,
                                     uint8_t current, uint8_t ideal,
                                     uint8_t mask) const
 {
@@ -1158,7 +1158,7 @@ World::WorkItem World::makeWorkItem(uint32_t slot, const Instance& inst,
     return WorkItem{slot, wide, current, ideal, mask, sparse};
 }
 
-bool World::mountBelongsTo(const Instance& inst, uint32_t slot) const
+bool SpatialDatabase::mountBelongsTo(const Instance& inst, uint32_t slot) const
 {
     uint32_t s = slot;
     for (size_t guard = 0; guard <= slots_.size(); ++guard)
@@ -1171,7 +1171,7 @@ bool World::mountBelongsTo(const Instance& inst, uint32_t slot) const
     return false;
 }
 
-size_t World::overlayBytes() const
+size_t SpatialDatabase::overlayBytes() const
 {
     size_t n = 0;
     for (const Overlay& ov : overlays_)
@@ -1187,26 +1187,26 @@ size_t World::overlayBytes() const
 // motion: lazy, coalesced, deduplicated conservative grow-only refit
 // ============================================================================
 
-void World::setNodeBounds(InstanceRef ref, NodeHandle h, const AABB& localBounds)
+void SpatialDatabase::setNodeBounds(InstanceRef ref, NodeHandle h, const AABB& localBounds)
 {
     // Positive ordering check: rejects empty boxes AND NaN (every NaN
     // comparison is false, so !isEmpty() would let NaN through and poison
     // ancestor boxes forever — grow-only refit never un-grows).
     const AABB& b = localBounds;
-    HLOD_CHECK(b.mn.x <= b.mx.x && b.mn.y <= b.mx.y && b.mn.z <= b.mx.z &&
+    FRONTIER_CHECK(b.mn.x <= b.mx.x && b.mn.y <= b.mx.y && b.mn.z <= b.mx.z &&
                    b.mx.x - b.mn.x < FLT_MAX && b.mx.y - b.mn.y < FLT_MAX &&
                    b.mx.z - b.mn.z < FLT_MAX,
-               "World::setNodeBounds: empty or non-finite bounds");
+               "SpatialDatabase::setNodeBounds: empty or non-finite bounds");
     if (!h.valid()) return;
     const Instance* inst = resolveInstance(ref);
     if (!inst) return;         // stale instance ref
     if (!resolve(h)) return;   // stale handle: the page was detached or collected
-    HLOD_ASSERT(mountBelongsTo(*inst, h.slot()),
-                "World::setNodeBounds: the node is not in this instance's page tree");
+    FRONTIER_ASSERT(mountBelongsTo(*inst, h.slot()),
+                "SpatialDatabase::setNodeBounds: the node is not in this instance's page tree");
     pendingMoves_.push_back({localBounds, h, ref.id, ref.generation});
 }
 
-void World::applyUpdates()
+void SpatialDatabase::applyUpdates()
 {
     ++frame_;
     flushBounds();
@@ -1218,7 +1218,7 @@ void World::applyUpdates()
     }
 }
 
-void World::optimize()
+void SpatialDatabase::optimize()
 {
     flushBounds();
     tlasDirty_ = true;
@@ -1226,7 +1226,7 @@ void World::optimize()
     tlasRebuild(true);
 }
 
-void World::flushBounds()
+void SpatialDatabase::flushBounds()
 {
     // Applied in submission order, so the last box per node is the final
     // state (last write wins). There is deliberately NO dedup structure:
@@ -1252,7 +1252,7 @@ void World::flushBounds()
     pendingMoves_.clear();
 }
 
-void World::applyBoundsChange(InstanceId id, uint32_t slot, uint32_t index,
+void SpatialDatabase::applyBoundsChange(InstanceId id, uint32_t slot, uint32_t index,
                               const AABB& box)
 {
     uint32_t curSlot = slot;
@@ -1264,7 +1264,7 @@ void World::applyBoundsChange(InstanceId id, uint32_t slot, uint32_t index,
     // never reach another instance -- one counter on the instance is the whole
     // invalidation. Bumped here rather than deeper because a change that stops
     // early (the ancestor box already contained it) still moved this node.
-    instanceCutVersions_[id] = ++generationCounter_;
+    instanceFrontierVersions_[id] = ++generationCounter_;
 
     while (true)
     {
@@ -1313,7 +1313,7 @@ void World::applyBoundsChange(InstanceId id, uint32_t slot, uint32_t index,
 // Update a node's lane in its parent's wide block (the hot mirror of bbox).
 // Which lane holds the node is immutable authored data, so it is read from
 // the shared page; only the box is written, into the instance's overlay.
-void World::patchParentLane(const PageView& pg, AABB* bbox, Overlay& overlay,
+void SpatialDatabase::patchParentLane(const PageView& pg, AABB* bbox, Overlay& overlay,
                             uint32_t index)
 {
     const uint32_t p = pg.parent[index];
@@ -1332,10 +1332,10 @@ void World::patchParentLane(const PageView& pg, AABB* bbox, Overlay& overlay,
             }
         }
     }
-    HLOD_FATAL("World: internal: child lane not found");
+    FRONTIER_FATAL("SpatialDatabase: internal: child lane not found");
 }
 
-AABB World::nodeBounds(InstanceRef ref, NodeHandle h)
+AABB SpatialDatabase::nodeBounds(InstanceRef ref, NodeHandle h)
 {
     flushBounds();
     Instance* inst = resolveInstance(ref);
@@ -1348,7 +1348,7 @@ AABB World::nodeBounds(InstanceRef ref, NodeHandle h)
 // top-level BVH
 // ============================================================================
 
-void World::tlasNoteGrowth(float addedArea)
+void SpatialDatabase::tlasNoteGrowth(float addedArea)
 {
     tlasGrownArea_ += addedArea;
     // Cost drift: a population that stays constant while everything moves
@@ -1370,7 +1370,7 @@ void World::tlasNoteGrowth(float addedArea)
 // laneMask must be a superset of its subtree's instance masks, or tlasQuery's
 // layer filter will cull a visible instance. A move cannot change a mask, so
 // that term is always already satisfied on the motion path.
-float World::tlasGrowUp(uint32_t nodeIdx, const AABB& box, float maxErr,
+float SpatialDatabase::tlasGrowUp(uint32_t nodeIdx, const AABB& box, float maxErr,
                         uint32_t laneMask)
 {
     float added = 0.0f;
@@ -1398,7 +1398,7 @@ float World::tlasGrowUp(uint32_t nodeIdx, const AABB& box, float maxErr,
     return added;
 }
 
-AABB World::tlasNodeExtent(const TlasNode& n, float& maxErr, uint32_t& laneMask) const
+AABB SpatialDatabase::tlasNodeExtent(const TlasNode& n, float& maxErr, uint32_t& laneMask) const
 {
     AABB u = AABB::empty();
     maxErr = 0.0f;
@@ -1413,7 +1413,7 @@ AABB World::tlasNodeExtent(const TlasNode& n, float& maxErr, uint32_t& laneMask)
     return u;
 }
 
-bool World::instanceHasSingleRoot(InstanceId id) const
+bool SpatialDatabase::instanceHasSingleRoot(InstanceId id) const
 {
     const Instance& inst = instances_[id];
     const bool flat = !instanceFlatSlots_.empty() &&
@@ -1421,7 +1421,7 @@ bool World::instanceHasSingleRoot(InstanceId id) const
     return !flat && pageView(slots_[inst.rootSlot]).childCount(0) == 1;
 }
 
-int32_t World::tlasAllocNode()
+int32_t SpatialDatabase::tlasAllocNode()
 {
     if (!tlasFreeNodes_.empty())
     {
@@ -1439,8 +1439,8 @@ int32_t World::tlasAllocNode()
         }
         return idx;
     }
-    HLOD_CHECK(tlasNodes_.size() < kInvalidInstanceId,
-               "World: exhausted the 24-bit TLAS node space");
+    FRONTIER_CHECK(tlasNodes_.size() < kInvalidInstanceId,
+               "SpatialDatabase: exhausted the 24-bit TLAS node space");
     const int32_t idx = int32_t(tlasNodes_.size());
     TlasNode& n = tlasNodes_.emplace_back();
     n.bounds = WideBounds::allEmpty();
@@ -1456,7 +1456,7 @@ int32_t World::tlasAllocNode()
 
 // Incremental edits trade a little tree quality for O(depth) instead of a full
 // rebuild. This is what bounds how much of that accumulates.
-void World::tlasNoteEdit()
+void SpatialDatabase::tlasNoteEdit()
 {
     ++tlasEdits_;
     if (float(tlasEdits_) > float(tlasLeafCount_) * config_.tlasEditFraction)
@@ -1469,7 +1469,7 @@ void World::tlasNoteEdit()
 // there is no "the tree is full, give up and rebuild" case -- the alternative,
 // hunting for a free lane somewhere up the chain, fails immediately on a tree
 // that was just built full.
-void World::tlasInsert(InstanceId id)
+void SpatialDatabase::tlasInsert(InstanceId id)
 {
     if (tlasDirty_) return;   // the pending rebuild will enumerate this instance
     InstanceTlas& inst = instanceTlas_[id];
@@ -1557,7 +1557,7 @@ void World::tlasInsert(InstanceId id)
 // Invalidate the lane and unlink any node that empties. Boxes are left loose,
 // which is the same grow-only discipline motion uses: a lane that is larger
 // than its contents costs a little traversal and nothing else.
-void World::tlasRemove(InstanceId id)
+void SpatialDatabase::tlasRemove(InstanceId id)
 {
     if (tlasDirty_) return;
     InstanceTlas& inst = instanceTlas_[id];
@@ -1605,7 +1605,7 @@ void World::tlasRemove(InstanceId id)
     tlasNoteEdit();
 }
 
-void World::tlasOnInstanceMoved(InstanceId id)
+void SpatialDatabase::tlasOnInstanceMoved(InstanceId id)
 {
     if (tlasDirty_) return;
     InstanceTlas& inst = instanceTlas_[id];
@@ -1707,7 +1707,7 @@ static void radixSortMorton(std::vector<Item>& keys,
 // all three axes and takes the cheapest plane; Median (and any degenerate SAH
 // case, e.g. coincident centroids) falls back to a longest-axis median split,
 // which always makes progress.
-int World::tlasSplit(std::vector<uint32_t>& items, int lo, int hi)
+int SpatialDatabase::tlasSplit(std::vector<uint32_t>& items, int lo, int hi)
 {
     const int count = hi - lo;
     if (count <= 1) return hi;
@@ -1808,7 +1808,7 @@ int World::tlasSplit(std::vector<uint32_t>& items, int lo, int hi)
 // Recursive 8-way build: three levels of binary splits per node. Slower than
 // the Morton path but produces noticeably tighter trees. Used for structural
 // rebuilds (instances added/removed), which are rare and long-lived.
-int32_t World::tlasBuildRange(std::vector<uint32_t>& items, int lo, int hi, int32_t parent)
+int32_t SpatialDatabase::tlasBuildRange(std::vector<uint32_t>& items, int lo, int hi, int32_t parent)
 {
     const int32_t idx = tlasAllocNode();
     tlasNodes_[idx].parent = parent;
@@ -1869,10 +1869,10 @@ int32_t World::tlasBuildRange(std::vector<uint32_t>& items, int lo, int hi, int3
     return idx;
 }
 
-void World::reorderInstancesByTlas()
+void SpatialDatabase::reorderInstancesByTlas()
 {
-    HLOD_ASSERT(pendingMoves_.empty(),
-                "World: cannot reorder instances with queued deformation edits");
+    FRONTIER_ASSERT(pendingMoves_.empty(),
+                "SpatialDatabase: cannot reorder instances with queued deformation edits");
 
     const size_t slotCount = instances_.size();
     const size_t liveCount = liveInstances_.size();
@@ -1902,8 +1902,8 @@ void World::reorderInstancesByTlas()
             }
         }
     }
-    HLOD_ASSERT(order.size() == liveCount,
-                "World: TLAS traversal did not contain every live instance");
+    FRONTIER_ASSERT(order.size() == liveCount,
+                "SpatialDatabase: TLAS traversal did not contain every live instance");
 
     std::vector<InstanceId> oldToNew(slotCount, kInvalidInstanceId);
     for (InstanceId next = 0; next < liveCount; ++next)
@@ -1928,10 +1928,10 @@ void World::reorderInstancesByTlas()
     // Public handles are independent of dense positions, so dead dense slots
     // no longer need to survive a rebuild. Compacting them here makes both
     // memory and subsequent permutations scale with the live population,
-    // rather than with the world's historical peak.
+    // rather than with the database's historical peak.
     std::vector<Instance> newInstances(liveCount);
     std::vector<InstanceTlas> newSpatial(liveCount);
-    std::vector<uint32_t> newCutVersions(liveCount);
+    std::vector<uint32_t> newFrontierVersions(liveCount);
     std::vector<InstanceId> newDenseToHandle(liveCount, kInvalidInstanceId);
     std::vector<uint32_t> newFlat;
     const bool hadFlatStream = !instanceFlatSlots_.empty();
@@ -1942,13 +1942,13 @@ void World::reorderInstancesByTlas()
         const InstanceId old = order[next];
         newInstances[next] = std::move(instances_[old]);
         newSpatial[next] = std::move(instanceTlas_[old]);
-        newCutVersions[next] = instanceCutVersions_[old];
+        newFrontierVersions[next] = instanceFrontierVersions_[old];
         newDenseToHandle[next] = instanceDenseToHandle_[old];
         if (hadFlatStream) newFlat[next] = instanceFlatSlots_[old];
     }
     instances_.swap(newInstances);
     instanceTlas_.swap(newSpatial);
-    instanceCutVersions_.swap(newCutVersions);
+    instanceFrontierVersions_.swap(newFrontierVersions);
     instanceDenseToHandle_.swap(newDenseToHandle);
     if (hadFlatStream) instanceFlatSlots_.swap(newFlat);
 
@@ -1958,8 +1958,8 @@ void World::reorderInstancesByTlas()
         liveInstances_[dense] = dense;
         instanceTlas_[dense].liveIndex = dense;
         const InstanceId handle = instanceDenseToHandle_[dense];
-        HLOD_ASSERT(handle < instanceHandleToDense_.size(),
-                    "World: dense instance has an invalid public handle");
+        FRONTIER_ASSERT(handle < instanceHandleToDense_.size(),
+                    "SpatialDatabase: dense instance has an invalid public handle");
         instanceHandleToDense_[handle] = dense;
     }
     freeInstances_.clear();
@@ -1975,7 +1975,7 @@ void World::reorderInstancesByTlas()
 //  - motion rebuilds (escape/area threshold) take the Morton path: one sort
 //    plus contiguous groups of kWide per level, ~5x faster to build, letting
 //    the escape policy rebuild eagerly and keep bloat low under heavy motion.
-void World::tlasRebuild(bool reorderInstances)
+void SpatialDatabase::tlasRebuild(bool reorderInstances)
 {
     tlasNodes_.clear();
     tlasFreeNodes_.clear();
@@ -2101,13 +2101,13 @@ void World::tlasRebuild(bool reorderInstances)
 }
 
 template<bool UseMask, bool UseMinPix, bool SelectRoots>
-void World::tlasQueryImpl(const Camera& view, float minPix, float rootThreshold,
+void SpatialDatabase::tlasQueryImpl(const Camera& view, float minPix, float rootThreshold,
                           std::vector<VisibleItem>& outVisible,
                           std::vector<TlasItem>& stack) const
 {
     outVisible.clear();
-    HLOD_CHECK(!tlasDirty_ && pendingMoves_.empty(),
-               "View::selectCut: call applyUpdates() after world changes");
+    FRONTIER_CHECK(!tlasDirty_ && pendingMoves_.empty(),
+               "SpatialQuery::selectFrontier: call applyUpdates() after database changes");
     if (tlasRoot_ < 0) return;
 
     const float4 qmn = view.queryMin(), qmx = view.queryMax();
@@ -2156,7 +2156,7 @@ void World::tlasQueryImpl(const Camera& view, float minPix, float rootThreshold,
                 // One vector distance/error evaluation per TLAS leaf node.
                 // The exact root test below the query remains authoritative,
                 // so the rsqrt approximation can only miss an optimization
-                // opportunity, never change the selected cut.
+                // opportunity, never change the selected frontier.
                 const float8 d2 = distanceToBoxesSq(n.bounds, qmn, qmx);
                 const float8 errs = screenErrorFromSq8(n.maxErr, view.k, d2);
                 while (singleRoots)
@@ -2189,7 +2189,7 @@ void World::tlasQueryImpl(const Camera& view, float minPix, float rootThreshold,
 // garbage collection
 // ============================================================================
 
-void World::lruUnlink(uint32_t slot)
+void SpatialDatabase::lruUnlink(uint32_t slot)
 {
     PageRt& rt = slots_[slot];
     const uint32_t prev = rt.lruPrev();
@@ -2202,7 +2202,7 @@ void World::lruUnlink(uint32_t slot)
     rt.setLruNext(kInvalidIndex);
 }
 
-void World::lruPushFront(uint32_t slot)
+void SpatialDatabase::lruPushFront(uint32_t slot)
 {
     PageRt& rt = slots_[slot];
     rt.setLruPrev(kInvalidIndex);
@@ -2212,7 +2212,7 @@ void World::lruPushFront(uint32_t slot)
     if (lruTail_ == kInvalidIndex) lruTail_ = slot;
 }
 
-void World::lruTouch(uint32_t slot, uint32_t epoch)
+void SpatialDatabase::lruTouch(uint32_t slot, uint32_t epoch)
 {
     PageRt& rt = slots_[slot];
     if (rt.lastTouched == epoch || int32_t(epoch - rt.lastTouched) <= 0) return;
@@ -2222,13 +2222,13 @@ void World::lruTouch(uint32_t slot, uint32_t epoch)
     lruPushFront(slot);
 }
 
-void World::consumePageUsage(PageUsageContext& usage)
+void SpatialDatabase::consumePageUsage(PageUsageContext& usage)
 {
     PageUsageContext* usages[] = {&usage};
     consumePageUsage(usages);
 }
 
-void World::consumePageUsage(std::span<PageUsageContext* const> usages)
+void SpatialDatabase::consumePageUsage(std::span<PageUsageContext* const> usages)
 {
     struct Event
     {
@@ -2245,8 +2245,8 @@ void World::consumePageUsage(std::span<PageUsageContext* const> usages)
     for (PageUsageContext* usage : usages)
     {
         if (!usage) continue;
-        HLOD_CHECK(usage->world_ == nullptr || usage->world_ == this,
-                   "World::collect: PageUsageContext belongs to another World");
+        FRONTIER_CHECK(usage->database_ == nullptr || usage->database_ == this,
+                   "SpatialDatabase::collect: PageUsageContext belongs to another SpatialDatabase");
         for (const uint32_t slot : usage->dirty_)
         {
             if (slot >= usage->rec_.size()) continue;
@@ -2271,11 +2271,11 @@ void World::consumePageUsage(std::span<PageUsageContext* const> usages)
     for (const Event& event : events) lruTouch(event.slot, event.lastUsed);
 }
 
-void World::recordPageUsage(PageUsageContext& usage, uint32_t slot) const
+void SpatialDatabase::recordPageUsage(PageUsageContext& usage, uint32_t slot) const
 {
-    HLOD_CHECK(usage.world_ == nullptr || usage.world_ == this,
-               "View::selectCut: PageUsageContext belongs to another World");
-    usage.world_ = this;
+    FRONTIER_CHECK(usage.database_ == nullptr || usage.database_ == this,
+               "SpatialQuery::selectFrontier: PageUsageContext belongs to another SpatialDatabase");
+    usage.database_ = this;
     const PageRt& rt = slots_[slot];
     if (rt.pinned()) return;
     const uint32_t generation = pageStamps_[slot].generation();
@@ -2294,7 +2294,7 @@ void World::recordPageUsage(PageUsageContext& usage, uint32_t slot) const
     }
 }
 
-void World::tlasQuery(const Camera& view, float minPix, float rootThreshold,
+void SpatialDatabase::tlasQuery(const Camera& view, float minPix, float rootThreshold,
                       std::vector<VisibleItem>& outVisible,
                       std::vector<TlasItem>& stack) const
 {
@@ -2336,7 +2336,7 @@ void World::tlasQuery(const Camera& view, float minPix, float rootThreshold,
                                            outVisible, stack);
 }
 
-CollectResult World::collect(size_t maxAttachedPages, uint32_t minAge)
+CollectResult SpatialDatabase::collect(size_t maxAttachedPages, uint32_t minAge)
 {
     collectPayloads_.clear();
     size_t detached = 0;
@@ -2359,14 +2359,14 @@ CollectResult World::collect(size_t maxAttachedPages, uint32_t minAge)
             {collectPayloads_.data(), collectPayloads_.size()}};
 }
 
-CollectResult World::collect(PageUsageContext& usage, size_t maxAttachedPages,
+CollectResult SpatialDatabase::collect(PageUsageContext& usage, size_t maxAttachedPages,
                              uint32_t minAge)
 {
     consumePageUsage(usage);
     return collect(maxAttachedPages, minAge);
 }
 
-CollectResult World::collect(std::span<PageUsageContext* const> usage,
+CollectResult SpatialDatabase::collect(std::span<PageUsageContext* const> usage,
                              size_t maxAttachedPages, uint32_t minAge)
 {
     consumePageUsage(usage);
@@ -2374,7 +2374,7 @@ CollectResult World::collect(std::span<PageUsageContext* const> usage,
 }
 
 // ============================================================================
-// cut selection
+// frontier selection
 // ============================================================================
 
 // One SIMD issue per kWide children: masked tri-state frustum, distance and
@@ -2387,7 +2387,7 @@ CollectResult World::collect(std::span<PageUsageContext* const> usage,
 // branch. The sparse-overlay instantiation consults its compact patch table;
 // template dispatch happens once per page rather than once per block.
 template<bool FullyResident, bool SparseOverlay>
-void World::wideVisit(const WorkItem& item, const PageView& pg, float errClamp,
+void SpatialDatabase::wideVisit(const WorkItem& item, const PageView& pg, float errClamp,
                       uint32_t gen, InstanceId instance, uint32_t node, uint8_t mask,
                       uint8_t currentKids, uint8_t idealKids,
                       const Camera& local, Worker& w) const
@@ -2418,12 +2418,12 @@ void World::wideVisit(const WorkItem& item, const PageView& pg, float errClamp,
         // so ANDing it with the whole word keeps exactly the valid lanes and
         // the leaf lanes in the high half come along for free.
         const uint32_t lanes = pg.blockMask[b];
-        HLOD_STAT(w, wideBlocksTested, 1);
+        FRONTIER_STAT(w, wideBlocksTested, 1);
         uint8_t outMasks[kWide];
         const uint32_t survivors =
             testWideAabb(wb, local.frustum, mask, outMasks) & lanes;
         if (!survivors) continue;
-        HLOD_STAT(w, lanesSurvived, uint64_t(std::popcount(survivors)));
+        FRONTIER_STAT(w, lanesSurvived, uint64_t(std::popcount(survivors)));
 
         // The clamp is invariant (D) across the page boundary, applied here
         // rather than baked into the page. One vminps; a no-op for root pages
@@ -2443,11 +2443,11 @@ void World::wideVisit(const WorkItem& item, const PageView& pg, float errClamp,
             const uint32_t l = uint32_t(std::countr_zero(leaves));
             leaves &= leaves - 1;
             const uint32_t c = blk.child[l];
-            const CutEntry entry =
-                makeCutEntry(NodeHandle{item.slot(), c, gen}, errs.v[l], w.bar,
+            const FrontierEntry entry =
+                makeFrontierEntry(NodeHandle{item.slot(), c, gen}, errs.v[l], w.bar,
                              w.barInv, instance);
             if constexpr (FullyResident)
-                w.cut.shared.push(entry);
+                w.result.shared.push(entry);
             else
                 w.emit(entry, currentKids != 0, idealKids != 0);
         }
@@ -2470,7 +2470,7 @@ void World::wideVisit(const WorkItem& item, const PageView& pg, float errClamp,
             // above) are emitted without asking. The answer flips when the
             // distance reaches eff * k / bar, so the gap between where this
             // node is and where that happens is how far the camera may travel
-            // before this instance's cut could differ. See View.
+            // before this instance's cut could differ. See SpatialQuery.
             if (w.trackMargin && (FullyResident || idealKids))
             {
                 w.maxError = std::max(w.maxError, eff.v[l]);
@@ -2483,7 +2483,7 @@ void World::wideVisit(const WorkItem& item, const PageView& pg, float errClamp,
     }
 }
 
-bool World::visibleDescendantsCovered(uint32_t slot, uint32_t node, uint8_t mask,
+bool SpatialDatabase::visibleDescendantsCovered(uint32_t slot, uint32_t node, uint8_t mask,
                                       const Instance& inst,
                                       const Camera& local,
                                       std::vector<uint32_t>* touched,
@@ -2535,8 +2535,8 @@ bool World::visibleDescendantsCovered(uint32_t slot, uint32_t node, uint8_t mask
 }
 
 template<bool FullyResident>
-void World::runPage(const WorkItem& item, const Instance& inst, const Camera& local,
-                    const CutParams& params, Worker& w) const
+void SpatialDatabase::runPage(const WorkItem& item, const Instance& inst, const Camera& local,
+                    const SelectionParams& params, Worker& w) const
 {
     if (item.sparseOverlay == kInvalidIndex)
         runPageImpl<FullyResident, false>(item, inst, local, params, w);
@@ -2545,8 +2545,8 @@ void World::runPage(const WorkItem& item, const Instance& inst, const Camera& lo
 }
 
 template<bool FullyResident, bool SparseOverlay>
-void World::runPageImpl(const WorkItem& item, const Instance& inst,
-                        const Camera& local, const CutParams& params,
+void SpatialDatabase::runPageImpl(const WorkItem& item, const Instance& inst,
+                        const Camera& local, const SelectionParams& params,
                         Worker& w) const
 {
     const PageRt& rt = slots_[item.slot()];
@@ -2555,14 +2555,14 @@ void World::runPageImpl(const WorkItem& item, const Instance& inst,
          std::find(w.touched.begin(), w.touched.end(), item.slot()) == w.touched.end()))
         w.touched.push_back(item.slot());
 
-    HLOD_STAT(w, pagesVisited, 1);
+    FRONTIER_STAT(w, pagesVisited, 1);
     const PageView& pg = pageView(rt);
     const uint32_t gen = rt.generation();
     const InstanceId instance =
         publicInstanceId(InstanceId(&inst - instances_.data()));
     // One bar, no history: damping is already folded into the view's camera
     // envelope, which widened the measured error rather than moving the
-    // threshold. That is what makes selection a pure read of the World.
+    // threshold. That is what makes selection a pure read of the SpatialDatabase.
     const float bar = params.threshold;
 
     w.nodeStack.clear();
@@ -2575,7 +2575,7 @@ void World::runPageImpl(const WorkItem& item, const Instance& inst,
         const NodeItem e = w.nodeStack.back();
         w.nodeStack.pop_back();
         const uint32_t i = e.node();
-        HLOD_STAT(w, nodesVisited, 1);
+        FRONTIER_STAT(w, nodesVisited, 1);
 
         const NodeHandle here{item.slot(), i, gen};
 
@@ -2583,8 +2583,8 @@ void World::runPageImpl(const WorkItem& item, const Instance& inst,
         {
             if (!(e.err > bar))
             {
-                w.cut.shared.push(
-                    makeCutEntry(here, e.err, bar, w.barInv, instance));
+                w.result.shared.push(
+                    makeFrontierEntry(here, e.err, bar, w.barInv, instance));
                 continue;
             }
 
@@ -2594,8 +2594,8 @@ void World::runPageImpl(const WorkItem& item, const Instance& inst,
             if (exp)
             {
                 if (childSlot == kInvalidIndex)
-                    w.cut.shared.push(
-                        makeCutEntry(here, e.err, bar, w.barInv, instance));
+                    w.result.shared.push(
+                        makeFrontierEntry(here, e.err, bar, w.barInv, instance));
                 else
                     w.work.push_back(
                         makeWorkItem(childSlot, inst, 1, 1, e.planes()));
@@ -2612,7 +2612,7 @@ void World::runPageImpl(const WorkItem& item, const Instance& inst,
             uint8_t nextCurrent = 0;
             uint8_t nextIdeal = 0;
 
-            // Current-only traversal happens when the ideal cut stopped at a
+            // Current-only traversal happens when the ideal frontier stopped at a
             // non-resident proxy whose descendants nevertheless form a complete
             // resident cover. Stop at the nearest resident descendant; otherwise
             // continue through the precomputed cover.
@@ -2620,8 +2620,8 @@ void World::runPageImpl(const WorkItem& item, const Instance& inst,
             {
                 if (rt.isResident(i))
                 {
-                    w.cut.currentOnly.push(
-                        makeCutEntry(here, e.err, bar, w.barInv, instance));
+                    w.result.currentOnly.push(
+                        makeFrontierEntry(here, e.err, bar, w.barInv, instance));
                     continue;
                 }
                 nextCurrent = 1;
@@ -2629,8 +2629,8 @@ void World::runPageImpl(const WorkItem& item, const Instance& inst,
             else if (!(e.err > bar))
             {
                 const bool shared = current && rt.isResident(i);
-                const CutEntry entry =
-                    makeCutEntry(here, e.err, bar, w.barInv, instance);
+                const FrontierEntry entry =
+                    makeFrontierEntry(here, e.err, bar, w.barInv, instance);
                 w.emit(entry, shared, true);
                 if (!current || shared) continue;
                 // The ideal proxy is missing, but a recursively complete resident
@@ -2646,10 +2646,10 @@ void World::runPageImpl(const WorkItem& item, const Instance& inst,
 
             if (ideal && e.err > bar && exp && childSlot == kInvalidIndex)
             {
-                HLOD_CHECK(!current || rt.isResident(i),
-                           "View::selectCut: non-resident current expansion proxy");
-                const CutEntry entry =
-                    makeCutEntry(here, e.err, bar, w.barInv, instance);
+                FRONTIER_CHECK(!current || rt.isResident(i),
+                           "SpatialQuery::selectFrontier: non-resident current expansion proxy");
+                const FrontierEntry entry =
+                    makeFrontierEntry(here, e.err, bar, w.barInv, instance);
                 w.emit(entry, current, true);
                 continue;
             }
@@ -2663,21 +2663,21 @@ void World::runPageImpl(const WorkItem& item, const Instance& inst,
                                                w.uniqueTouches);
                 if (current && !canDescend)
                 {
-                    HLOD_CHECK(rt.isResident(i),
-                               "View::selectCut: uncovered current subtree");
-                    w.cut.currentOnly.push(
-                        makeCutEntry(here, e.err, bar, w.barInv, instance));
+                    FRONTIER_CHECK(rt.isResident(i),
+                               "SpatialQuery::selectFrontier: uncovered current subtree");
+                    w.result.currentOnly.push(
+                        makeFrontierEntry(here, e.err, bar, w.barInv, instance));
                 }
                 nextCurrent = uint8_t(current && canDescend);
                 nextIdeal = 1;
             }
 
-            HLOD_CHECK(nextCurrent || nextIdeal,
-                       "View::selectCut: node has no current or ideal continuation");
+            FRONTIER_CHECK(nextCurrent || nextIdeal,
+                       "SpatialQuery::selectFrontier: node has no current or ideal continuation");
             if (exp)
             {
-                HLOD_CHECK(childSlot != kInvalidIndex,
-                           "View::selectCut: uncovered expansion subtree");
+                FRONTIER_CHECK(childSlot != kInvalidIndex,
+                           "SpatialQuery::selectFrontier: uncovered expansion subtree");
                 w.work.push_back(makeWorkItem(childSlot, inst, nextCurrent,
                                               nextIdeal, e.planes()));
             }
@@ -2689,17 +2689,17 @@ void World::runPageImpl(const WorkItem& item, const Instance& inst,
     }
 }
 
-void World::runInstance(uint32_t instIdx, const Camera& view, const CutParams& params,
+void SpatialDatabase::runInstance(uint32_t instIdx, const Camera& view, const SelectionParams& params,
                         uint8_t mask, bool tryRoot, Worker& w) const
 {
     const Instance& inst = instances_[instIdx];
-    HLOD_STAT(w, instancesVisited, 1);
+    FRONTIER_STAT(w, instancesVisited, 1);
 
     // A root page normally contains one BLAS root. The TLAS already maintains
     // that root's exact world box and maximum effective error, so a distant
     // root can be selected before transforming the view or touching its wide
     // page data. Root payloads are pinned, making this entry shared by the
-    // current and ideal cuts. Multi-root page forests take the ordinary walk.
+    // current and ideal frontiers. Multi-root page forests take the ordinary walk.
     const PageRt& rootRt = slots_[inst.rootSlot];
     const PageView& rootPage = pageView(rootRt);
     if (tryRoot && rootPage.childCount(0) == 1)
@@ -2736,7 +2736,7 @@ void World::runInstance(uint32_t instIdx, const Camera& view, const CutParams& p
                          w.touched.end()))
                     w.touched.push_back(inst.rootSlot);
                 const InstanceId outputInstance = publicInstanceId(instIdx);
-                w.cut.shared.push(makeCutEntry(
+                w.result.shared.push(makeFrontierEntry(
                     NodeHandle{inst.rootSlot, 1, rootRt.generation()}, error,
                     w.bar, w.barInv, outputInstance));
                 return;
@@ -2760,7 +2760,7 @@ void World::runInstance(uint32_t instIdx, const Camera& view, const CutParams& p
     }
 }
 
-void World::runFlatInstance(uint32_t instIdx, const Camera& view,
+void SpatialDatabase::runFlatInstance(uint32_t instIdx, const Camera& view,
                             uint8_t mask, Worker& w) const
 {
     const uint32_t flatMarker = instanceFlatSlots_[instIdx];
@@ -2780,7 +2780,7 @@ void World::runFlatInstance(uint32_t instIdx, const Camera& view,
             return;
     }
 
-    HLOD_STAT(w, instancesVisited, 1);
+    FRONTIER_STAT(w, instancesVisited, 1);
     if (w.trackTouches &&
         (!w.uniqueTouches ||
          std::find(w.touched.begin(), w.touched.end(), slot) == w.touched.end()))
@@ -2793,28 +2793,28 @@ void World::runFlatInstance(uint32_t instIdx, const Camera& view,
                                                 view.queryMax()))
                             : 0.0f;
     const InstanceId outputInstance = publicInstanceId(instIdx);
-    w.cut.shared.push(makeCutEntry(NodeHandle{slot, 1,
+    w.result.shared.push(makeFrontierEntry(NodeHandle{slot, 1,
                                              pageStamps_[slot].generation()}, error,
                                    w.bar, w.barInv, outputInstance));
 }
 
-void World::selectCutUncached(const Camera& camera, const CutParams& params,
-                              View& view, PageUsageContext* usage,
-                              CutResultSink& outCut) const
+void SpatialDatabase::selectFrontierUncached(const Camera& camera, const SelectionParams& params,
+                              SpatialQuery& query, PageUsageContext* usage,
+                              FrontierResultSink& outResult) const
 {
-    ViewScratch& scratch = *view.scratch_;
-    view.stats_ = CutStats{};
-    view.reused_ = 0;
+    QueryScratch& scratch = *query.scratch_;
+    query.stats_ = SelectionStats{};
+    query.reused_ = 0;
 
     if (usage)
     {
-        HLOD_CHECK(usage->world_ == nullptr || usage->world_ == this,
-                   "View::selectCut: PageUsageContext belongs to another World");
-        usage->world_ = this;
+        FRONTIER_CHECK(usage->database_ == nullptr || usage->database_ == this,
+                   "SpatialQuery::selectFrontier: PageUsageContext belongs to another SpatialDatabase");
+        usage->database_ = this;
     }
 
-    const Camera damped = view.damper_.damp(camera);
-    const bool testRoots = view.rootQueryEnabled_ || view.rootProbeCountdown_ == 0;
+    const Camera damped = query.damper_.damp(camera);
+    const bool testRoots = query.rootQueryEnabled_ || query.rootProbeCountdown_ == 0;
     tlasQuery(damped, params.minPix, testRoots ? params.threshold : -1.0f,
               scratch.visible, scratch.tlasStack);
 
@@ -2827,13 +2827,13 @@ void World::selectCutUncached(const Camera& camera, const CutParams& params,
         // The query-side vector test costs roughly one eighth of a normal
         // root-page visit. Require a comfortable margin rather than enabling
         // it for a sparse handful of distant instances.
-        view.rootQueryEnabled_ = nVis != 0 && roots >= (nVis + 3u) / 4u;
-        view.rootProbeCountdown_ = view.rootQueryEnabled_ ? 0u : 31u;
+        query.rootQueryEnabled_ = nVis != 0 && roots >= (nVis + 3u) / 4u;
+        query.rootProbeCountdown_ = query.rootQueryEnabled_ ? 0u : 31u;
     }
     else
-        --view.rootProbeCountdown_;
+        --query.rootProbeCountdown_;
 
-    view.walked_ = nVis;
+    query.walked_ = nVis;
     const uint32_t workerCount = config_.context.workerCount;
     const bool parallel = config_.parallelInstanceThreshold > 0 && workerCount > 1 &&
                           nVis >= config_.parallelInstanceThreshold;
@@ -2845,28 +2845,28 @@ void World::selectCutUncached(const Camera& camera, const CutParams& params,
         w.touched.clear();
         w.trackTouches = usage != nullptr;
         w.uniqueTouches = false;
-        w.cut = outCut;
-        w.stats = CutStats{};
+        w.result = outResult;
+        w.stats = SelectionStats{};
         w.bar = params.threshold;
         w.barInv = params.threshold > 0.0f ? 1.0f / params.threshold : 0.0f;
 
         if (flatInstanceCount_ == 0)
         {
-            // Preserve the original hierarchical loop exactly: worlds with
+            // Preserve the hierarchical loop exactly: databases with
             // no one-node assets pay only this call-level dispatch.
             for (uint32_t i = 0; i < nVis; ++i)
             {
                 if (i + 2 < nVis)
-                    HLOD_PREFETCH(&instances_[scratch.visible[i + 2].instance()]);
+                    FRONTIER_PREFETCH(&instances_[scratch.visible[i + 2].instance()]);
                 if (i + 1 < nVis)
                 {
                     const Instance& next =
                         instances_[scratch.visible[i + 1].instance()];
                     const PageRt& nrt = slots_[next.rootSlot];
                     const PageView& nextPage = pageView(nrt);
-                    HLOD_PREFETCH(nextPage.wide);
-                    HLOD_PREFETCH(nextPage.meta);
-                    HLOD_PREFETCH(nextPage.payload);
+                    FRONTIER_PREFETCH(nextPage.wide);
+                    FRONTIER_PREFETCH(nextPage.meta);
+                    FRONTIER_PREFETCH(nextPage.payload);
                 }
                 runInstance(scratch.visible[i].instance(), damped, params,
                             scratch.visible[i].mask(),
@@ -2886,7 +2886,7 @@ void World::selectCutUncached(const Camera& camera, const CutParams& params,
                         scratch.visible[i + kFlatPrefetchDistance];
                     const uint32_t marker = instanceFlatSlots_[next.instance()];
                     if (next.mask() != 0 || (marker & kFlatZeroError) == 0)
-                        HLOD_PREFETCH(&instanceTlas_[next.instance()]);
+                        FRONTIER_PREFETCH(&instanceTlas_[next.instance()]);
                 }
                 const uint32_t instIdx = scratch.visible[i].instance();
                 runFlatInstance(instIdx, damped, scratch.visible[i].mask(), w);
@@ -2903,7 +2903,7 @@ void World::selectCutUncached(const Camera& camera, const CutParams& params,
                 {
                     const uint32_t next = scratch.visible[i + 2].instance();
                     if (instanceFlatSlots_[next] == kInvalidIndex)
-                        HLOD_PREFETCH(&instances_[next]);
+                        FRONTIER_PREFETCH(&instances_[next]);
                 }
                 if (i + 1 < nVis)
                 {
@@ -2913,9 +2913,9 @@ void World::selectCutUncached(const Camera& camera, const CutParams& params,
                         const Instance& next = instances_[nextIdx];
                         const PageRt& nrt = slots_[next.rootSlot];
                         const PageView& nextPage = pageView(nrt);
-                        HLOD_PREFETCH(nextPage.wide);
-                        HLOD_PREFETCH(nextPage.meta);
-                        HLOD_PREFETCH(nextPage.payload);
+                        FRONTIER_PREFETCH(nextPage.wide);
+                        FRONTIER_PREFETCH(nextPage.meta);
+                        FRONTIER_PREFETCH(nextPage.payload);
                     }
                 }
                 const uint32_t instIdx = scratch.visible[i].instance();
@@ -2928,11 +2928,11 @@ void World::selectCutUncached(const Camera& camera, const CutParams& params,
             }
         }
 
-        outCut = w.cut;
-        w.cut = CutResultSink{};
+        outResult = w.result;
+        w.result = FrontierResultSink{};
         if (usage)
             for (const uint32_t slot : w.touched) recordPageUsage(*usage, slot);
-        view.stats_ = w.stats;
+        query.stats_ = w.stats;
         return;
     }
 
@@ -2944,10 +2944,10 @@ void World::selectCutUncached(const Camera& camera, const CutParams& params,
 
     struct Chunk
     {
-        const World*     world;
-        ViewScratch*     scratch;
+        const SpatialDatabase* database;
+        QueryScratch*          scratch;
         const Camera*    camera;
-        const CutParams* params;
+        const SelectionParams* params;
         uint32_t         nVis;
         uint32_t         workerCount;
         uint32_t         flatMode;   // 0 none, 1 mixed, 2 all
@@ -2964,9 +2964,9 @@ void World::selectCutUncached(const Camera& camera, const CutParams& params,
         w.touched.clear();
         w.trackTouches = usage != nullptr;
         w.uniqueTouches = false;
-        w.cutBuf.clear();
-        w.cut = makeSink(w.cutBuf);
-        w.stats = CutStats{};
+        w.frontierBuffer.clear();
+        w.result = makeSink(w.frontierBuffer);
+        w.stats = SelectionStats{};
         w.bar = params.threshold;
         w.barInv = params.threshold > 0.0f ? 1.0f / params.threshold : 0.0f;
     }
@@ -2976,7 +2976,7 @@ void World::selectCutUncached(const Camera& camera, const CutParams& params,
         [](uint32_t k, void* payload)
         {
             auto* c = static_cast<Chunk*>(payload);
-            const World& world = *c->world;
+            const SpatialDatabase& database = *c->database;
             const uint32_t per = (c->nVis + c->workerCount - 1) / c->workerCount;
             const uint32_t lo = std::min(k * per, c->nVis);
             const uint32_t hi = std::min(lo + per, c->nVis);
@@ -2984,7 +2984,7 @@ void World::selectCutUncached(const Camera& camera, const CutParams& params,
             if (c->flatMode == 0)
             {
                 for (uint32_t i = lo; i < hi; ++i)
-                    world.runInstance(c->scratch->visible[i].instance(), *c->camera,
+                    database.runInstance(c->scratch->visible[i].instance(), *c->camera,
                                       *c->params, c->scratch->visible[i].mask(),
                                       c->scratch->visible[i].rootSelected(), w);
             }
@@ -2993,7 +2993,7 @@ void World::selectCutUncached(const Camera& camera, const CutParams& params,
                 for (uint32_t i = lo; i < hi; ++i)
                 {
                     const uint32_t instIdx = c->scratch->visible[i].instance();
-                    world.runFlatInstance(instIdx, *c->camera,
+                    database.runFlatInstance(instIdx, *c->camera,
                                           c->scratch->visible[i].mask(), w);
                 }
             }
@@ -3002,11 +3002,11 @@ void World::selectCutUncached(const Camera& camera, const CutParams& params,
                 for (uint32_t i = lo; i < hi; ++i)
                 {
                     const uint32_t instIdx = c->scratch->visible[i].instance();
-                    if (world.instanceFlatSlots_[instIdx] != kInvalidIndex)
-                        world.runFlatInstance(instIdx, *c->camera,
+                    if (database.instanceFlatSlots_[instIdx] != kInvalidIndex)
+                        database.runFlatInstance(instIdx, *c->camera,
                                               c->scratch->visible[i].mask(), w);
                     else
-                        world.runInstance(instIdx, *c->camera, *c->params,
+                        database.runInstance(instIdx, *c->camera, *c->params,
                                           c->scratch->visible[i].mask(),
                                           c->scratch->visible[i].rootSelected(), w);
                 }
@@ -3017,22 +3017,22 @@ void World::selectCutUncached(const Camera& camera, const CutParams& params,
     for (uint32_t k = 0; k < workerCount; ++k)
     {
         Worker& w = scratch.workers[k];
-        outCut.shared.pushRange(w.cutBuf.shared.data(),
-                                uint32_t(w.cutBuf.shared.size()));
-        outCut.currentOnly.pushRange(w.cutBuf.currentOnly.data(),
-                                     uint32_t(w.cutBuf.currentOnly.size()));
-        outCut.idealOnly.pushRange(w.cutBuf.idealOnly.data(),
-                                   uint32_t(w.cutBuf.idealOnly.size()));
+        outResult.shared.pushRange(w.frontierBuffer.shared.data(),
+                                uint32_t(w.frontierBuffer.shared.size()));
+        outResult.currentOnly.pushRange(w.frontierBuffer.currentOnly.data(),
+                                     uint32_t(w.frontierBuffer.currentOnly.size()));
+        outResult.idealOnly.pushRange(w.frontierBuffer.idealOnly.data(),
+                                   uint32_t(w.frontierBuffer.idealOnly.size()));
         if (usage)
             for (const uint32_t slot : w.touched) recordPageUsage(*usage, slot);
-#ifdef HLOD_STATS
-        view.stats_.instancesVisited += w.stats.instancesVisited;
-        view.stats_.pagesVisited += w.stats.pagesVisited;
-        view.stats_.nodesVisited += w.stats.nodesVisited;
-        view.stats_.wideBlocksTested += w.stats.wideBlocksTested;
-        view.stats_.lanesSurvived += w.stats.lanesSurvived;
+#ifdef FRONTIER_STATS
+        query.stats_.instancesVisited += w.stats.instancesVisited;
+        query.stats_.pagesVisited += w.stats.pagesVisited;
+        query.stats_.nodesVisited += w.stats.nodesVisited;
+        query.stats_.wideBlocksTested += w.stats.wideBlocksTested;
+        query.stats_.lanesSurvived += w.stats.lanesSurvived;
 #endif
-        w.cut = CutResultSink{};
+        w.result = FrontierResultSink{};
     }
 }
 
@@ -3040,7 +3040,7 @@ void World::selectCutUncached(const Camera& camera, const CutParams& params,
 // Cached selection
 // ---------------------------------------------------------------------------
 
-void View::reset()
+void SpatialQuery::reset()
 {
     rec_.clear();
     recCold_.clear();
@@ -3050,8 +3050,8 @@ void View::reset()
     travel_ = kTravel_ = 0.0f;
     primed_ = false;
     k_ = bar_ = 0.0f;
-    stats_ = CutStats{};
-    world_ = nullptr;
+    stats_ = SelectionStats{};
+    database_ = nullptr;
     instanceLayoutVersion_ = 0;
     rootQueryEnabled_ = true;
     rootProbeCountdown_ = 0;
@@ -3064,33 +3064,33 @@ void View::reset()
     damper_.reset();
 }
 
-void View::setReuseEnabled(bool enabled)
+void SpatialQuery::setReuseEnabled(bool enabled)
 {
     if (reuseEnabled_ == enabled) return;
     reset();
     reuseEnabled_ = enabled;
 }
 
-size_t View::bytes() const
+size_t SpatialQuery::bytes() const
 {
     return rec_.capacity() * sizeof(Rec) +
            recCold_.capacity() * sizeof(RecCold) +
            secondDep_.capacity() * sizeof(SecondDep) +
-           store_.capacity() * sizeof(CutEntry) +
+           store_.capacity() * sizeof(FrontierEntry) +
            (scratch_ ? scratch_->bytes() : 0);
 }
 
 // Runs are allocated by bumping and abandoned when an instance's cut outgrows
 // its block, so the slab accumulates holes. Squeeze them out once the holes
 // outweigh the live data. Records keep their contents; only `begin` moves.
-void View::compact()
+void SpatialQuery::compact()
 {
     // Record ids and slab-allocation order are unrelated (the latter follows
     // TLAS traversal order).  Compacting in-place while iterating rec_ could
     // therefore move one run over the still-unread source of another run.
     // Compaction is deliberately rare, so use a same-sized scratch slab and
     // keep the existing allocation headroom while making the copy order moot.
-    AppendBuffer<CutEntry> packed;
+    AppendBuffer<FrontierEntry> packed;
     packed.resize_uninitialized(store_.size());
     uint32_t w = 0;
     for (size_t i = 0; i < rec_.size(); ++i)
@@ -3105,10 +3105,10 @@ void View::compact()
             r.counts = 0;
             continue;
         }
-        const uint32_t count = cutTotal(r.counts);
+        const uint32_t count = frontierTotal(r.counts);
         if (count)
             std::memcpy(packed.data() + w, store_.data() + r.begin,
-                        size_t(count) * sizeof(CutEntry));
+                        size_t(count) * sizeof(FrontierEntry));
         r.begin = w;
         cold.capacity = count;
         w += count;
@@ -3118,84 +3118,84 @@ void View::compact()
     garbage_ = 0;
 }
 
-void World::selectCutCached(const Camera& camera, const CutParams& params,
-                            View& ctx, PageUsageContext* usage,
-                            CutResultSink& outCut) const
+void SpatialDatabase::selectFrontierCached(const Camera& camera, const SelectionParams& params,
+                            SpatialQuery& query, PageUsageContext* usage,
+                            FrontierResultSink& outResult) const
 {
-    ViewScratch& scratch = *ctx.scratch_;
-    ctx.stats_ = CutStats{};
+    QueryScratch& scratch = *query.scratch_;
+    query.stats_ = SelectionStats{};
 
     if (usage)
     {
-        HLOD_CHECK(usage->world_ == nullptr || usage->world_ == this,
-                   "View::selectCut: PageUsageContext belongs to another World");
-        usage->world_ = this;
+        FRONTIER_CHECK(usage->database_ == nullptr || usage->database_ == this,
+                   "SpatialQuery::selectFrontier: PageUsageContext belongs to another SpatialDatabase");
+        usage->database_ = this;
     }
 
-    // The View owns hysteresis, so it takes the raw Camera and damps it
+    // The SpatialQuery owns hysteresis, so it takes the raw Camera and damps it
     // here. Everything below -- the cull, the walk, the odometer -- sees `dv`
     // and only `dv`, which is what makes the reuse argument about the envelope
     // rather than about the camera.
-    const Camera dv = ctx.damper_.damp(camera);
+    const Camera dv = query.damper_.damp(camera);
 
     // Whole-cut cache hits already avoid the BLAS walk. Keep the universal
     // TLAS query lean and test the root only on the smaller miss population.
     tlasQuery(dv, params.minPix, -1.0f, scratch.visible, scratch.tlasStack);
 
-    ctx.reused_ = ctx.walked_ = 0;
-    if (ctx.instanceLayoutVersion_ != instanceLayoutVersion_)
+    query.reused_ = query.walked_ = 0;
+    if (query.instanceLayoutVersion_ != instanceLayoutVersion_)
     {
-        ctx.rec_.clear();
-        ctx.recCold_.clear();
-        ctx.secondDep_.clear();
-        ctx.store_.clear();
-        ctx.used_ = ctx.garbage_ = 0;
-        ctx.instanceLayoutVersion_ = instanceLayoutVersion_;
+        query.rec_.clear();
+        query.recCold_.clear();
+        query.secondDep_.clear();
+        query.store_.clear();
+        query.used_ = query.garbage_ = 0;
+        query.instanceLayoutVersion_ = instanceLayoutVersion_;
     }
-    if (ctx.rec_.size() < instances_.size())
+    if (query.rec_.size() < instances_.size())
     {
-        ctx.rec_.resize(instances_.size());
-        ctx.recCold_.resize(instances_.size());
-        if (!ctx.secondDep_.empty())
-            ctx.secondDep_.resize_uninitialized(instances_.size());
+        query.rec_.resize(instances_.size());
+        query.recCold_.resize(instances_.size());
+        if (!query.secondDep_.empty())
+            query.secondDep_.resize_uninitialized(instances_.size());
     }
 
     // How far the query envelope moved since the last call, added to this
     // view's odometer. One number for the whole frame; every record's validity
     // is then a single compare against it.
     const float4 qmn = dv.queryMin(), qmx = dv.queryMax();
-    if (ctx.primed_)
+    if (query.primed_)
     {
-        const float4 dmn = max4(qmn - ctx.lastQmn_, ctx.lastQmn_ - qmn);
-        const float4 dmx = max4(qmx - ctx.lastQmx_, ctx.lastQmx_ - qmx);
-        ctx.travel_ += length3(max4(dmn, dmx));
+        const float4 dmn = max4(qmn - query.lastQmn_, query.lastQmn_ - qmn);
+        const float4 dmx = max4(qmx - query.lastQmx_, query.lastQmx_ - qmx);
+        query.travel_ += length3(max4(dmn, dmx));
     }
-    ctx.lastQmn_ = qmn;
-    ctx.lastQmx_ = qmx;
-    ctx.primed_ = true;
+    query.lastQmn_ = qmn;
+    query.lastQmx_ = qmx;
+    query.primed_ = true;
 
     // Threshold changes alter every record's slope and still invalidate the
     // cache in O(1). Projection-scale changes instead feed an odometer: each
     // record bounds how far any flip point can move per unit k, so gradual
     // damped zoom consumes its margin instead of voiding the whole cache.
-    if (ctx.bar_ != params.threshold)
+    if (query.bar_ != params.threshold)
     {
-        ++ctx.epoch_;
-        ctx.bar_ = params.threshold;
-        ctx.kTravel_ = 0.0f;
+        ++query.epoch_;
+        query.bar_ = params.threshold;
+        query.kTravel_ = 0.0f;
     }
     else
-        ctx.kTravel_ += std::fabs(dv.k - ctx.k_);
-    ctx.k_ = dv.k;
+        query.kTravel_ += std::fabs(dv.k - query.k_);
+    query.k_ = dv.k;
 
     // The one safe moment to squeeze the slab: before any offset recorded this
     // pass could be moved out from under us.
-    if (ctx.garbage_ > ctx.used_ / 2) ctx.compact();
+    if (query.garbage_ > query.used_ / 2) query.compact();
 
     Worker& w = scratch.workers[0];
     w.work.clear();
     w.nodeStack.clear();
-    w.stats = CutStats{};
+    w.stats = SelectionStats{};
     w.trackTouches = true;
     w.uniqueTouches = true;
     w.bar = params.threshold;
@@ -3211,17 +3211,17 @@ void World::selectCutCached(const Camera& camera, const CutParams& params,
     {
         const uint32_t instIdx = scratch.visible[i].instance();
         const uint8_t  mask = scratch.visible[i].mask();
-        View::Rec& r = ctx.rec_[instIdx];
-        const uint32_t depCount = cutDepCount(r.counts);
+        SpatialQuery::Rec& r = query.rec_[instIdx];
+        const uint32_t depCount = frontierDependencyCount(r.counts);
 
         // Everything the record was taken under, re-checked, in one cache
         // line. `mask == 0` is the frustum condition: this instance is wholly
         // inside, so no plane was tested anywhere within it and camera
         // rotation cannot matter. `travel_ < validUntil` is the margin.
         bool hit = mask == 0 &&
-                   ctx.travel_ + r.kSlope * ctx.kTravel_ < r.validUntil &&
-                   r.epoch == ctx.epoch_ &&
-                   r.cutVersion == instanceCutVersions_[instIdx];
+                   query.travel_ + r.kSlope * query.kTravel_ < r.validUntil &&
+                   r.epoch == query.epoch_ &&
+                   r.frontierVersion == instanceFrontierVersions_[instIdx];
         if (hit && depCount != 0)
         {
             const PageStamp& stamp = pageStamps_[r.depSlot];
@@ -3229,7 +3229,7 @@ void World::selectCutCached(const Camera& camera, const CutParams& params,
         }
         if (hit && depCount == 2)
         {
-            const View::SecondDep& dep = ctx.secondDep_[instIdx];
+            const SpatialQuery::SecondDep& dep = query.secondDep_[instIdx];
             const PageStamp& stamp = pageStamps_[dep.slot];
             hit = stamp.inUse() && stamp.contentVersion == dep.version;
         }
@@ -3237,19 +3237,19 @@ void World::selectCutCached(const Camera& camera, const CutParams& params,
         if (hit)
         {
             if (depCount != 0) recordUsage(r.depSlot);
-            if (depCount == 2) recordUsage(ctx.secondDep_[instIdx].slot);
+            if (depCount == 2) recordUsage(query.secondDep_[instIdx].slot);
             // The whole saving is the walk that did not happen. Copying the
             // recorded entries out is ~1.5% of the call at 80k instances, and
             // handing back a descriptor instead measured no better while
-            // costing the caller an indirection: see View.
-            const uint32_t shared = cutCount(r.counts, 0);
-            const uint32_t current = cutCount(r.counts, 1);
-            const uint32_t ideal = cutCount(r.counts, 2);
-            const CutEntry* entries = ctx.store_.data() + r.begin;
-            outCut.shared.pushRange(entries, shared);
-            outCut.currentOnly.pushRange(entries + shared, current);
-            outCut.idealOnly.pushRange(entries + shared + current, ideal);
-            ++ctx.reused_;
+            // costing the caller an indirection: see SpatialQuery.
+            const uint32_t shared = frontierCount(r.counts, 0);
+            const uint32_t current = frontierCount(r.counts, 1);
+            const uint32_t ideal = frontierCount(r.counts, 2);
+            const FrontierEntry* entries = query.store_.data() + r.begin;
+            outResult.shared.pushRange(entries, shared);
+            outResult.currentOnly.pushRange(entries + shared, current);
+            outResult.idealOnly.pushRange(entries + shared + current, ideal);
+            ++query.reused_;
             continue;
         }
 
@@ -3257,10 +3257,10 @@ void World::selectCutCached(const Camera& camera, const CutParams& params,
         // Hits deliberately never fetch the 32-byte Instance record. Once a
         // miss is known, start that read before resetting the worker scratch;
         // the bookkeeping below gives the cache line a little useful lead.
-        HLOD_PREFETCH(&instances_[instIdx]);
+        FRONTIER_PREFETCH(&instances_[instIdx]);
         const Instance& inst = instances_[instIdx];
-        w.cutBuf.clear();
-        w.cut = makeSink(w.cutBuf);
+        w.frontierBuffer.clear();
+        w.result = makeSink(w.frontierBuffer);
         w.touched.clear();
         w.margin = FLT_MAX;
         w.maxError = 0.0f;
@@ -3273,41 +3273,41 @@ void World::selectCutCached(const Camera& camera, const CutParams& params,
         w.trackMargin = false;
         for (const uint32_t slot : w.touched) recordUsage(slot);
 
-        const uint32_t nShared = uint32_t(w.cutBuf.shared.size());
-        const uint32_t nCurrent = uint32_t(w.cutBuf.currentOnly.size());
-        const uint32_t nIdeal = uint32_t(w.cutBuf.idealOnly.size());
+        const uint32_t nShared = uint32_t(w.frontierBuffer.shared.size());
+        const uint32_t nCurrent = uint32_t(w.frontierBuffer.currentOnly.size());
+        const uint32_t nIdeal = uint32_t(w.frontierBuffer.idealOnly.size());
         const uint32_t n = nShared + nCurrent + nIdeal;
         const bool eligible = mask == 0 &&
-                              w.touched.size() <= View::kMaxDeps &&
+                              w.touched.size() <= SpatialQuery::kMaxDeps &&
                               nShared <= 0x3ffu && nCurrent <= 0x3ffu &&
                               nIdeal <= 0x3ffu;
-        View::RecCold& cold = ctx.recCold_[instIdx];
+        SpatialQuery::RecCold& cold = query.recCold_[instIdx];
         if (cold.capacity < n)
         {
-            ctx.garbage_ += cold.capacity;
-            if (size_t(ctx.used_) + n > ctx.store_.size())
-                ctx.store_.resize_uninitialized(
-                    std::max<size_t>(size_t(ctx.used_) + n, ctx.store_.size() * 2 + 256));
-            r.begin = ctx.used_;
+            query.garbage_ += cold.capacity;
+            if (size_t(query.used_) + n > query.store_.size())
+                query.store_.resize_uninitialized(
+                    std::max<size_t>(size_t(query.used_) + n, query.store_.size() * 2 + 256));
+            r.begin = query.used_;
             cold.capacity = n;
-            ctx.used_ += n;
+            query.used_ += n;
         }
-        if (eligible && w.touched.size() == 2 && ctx.secondDep_.empty())
-            ctx.secondDep_.resize_uninitialized(instances_.size());
+        if (eligible && w.touched.size() == 2 && query.secondDep_.empty())
+            query.secondDep_.resize_uninitialized(instances_.size());
         r.counts = eligible
-                       ? packCutCounts(nShared, nCurrent, nIdeal,
+                       ? packFrontierCounts(nShared, nCurrent, nIdeal,
                                        uint32_t(w.touched.size()))
                        : 0;
-        CutEntry* dst = ctx.store_.data() + r.begin;
+        FrontierEntry* dst = query.store_.data() + r.begin;
         if (nShared)
-            std::memcpy(dst, w.cutBuf.shared.data(),
-                        size_t(nShared) * sizeof(CutEntry));
+            std::memcpy(dst, w.frontierBuffer.shared.data(),
+                        size_t(nShared) * sizeof(FrontierEntry));
         if (nCurrent)
-            std::memcpy(dst + nShared, w.cutBuf.currentOnly.data(),
-                        size_t(nCurrent) * sizeof(CutEntry));
+            std::memcpy(dst + nShared, w.frontierBuffer.currentOnly.data(),
+                        size_t(nCurrent) * sizeof(FrontierEntry));
         if (nIdeal)
-            std::memcpy(dst + nShared + nCurrent, w.cutBuf.idealOnly.data(),
-                        size_t(nIdeal) * sizeof(CutEntry));
+            std::memcpy(dst + nShared + nCurrent, w.frontierBuffer.idealOnly.data(),
+                        size_t(nIdeal) * sizeof(FrontierEntry));
 
         if (eligible)
         {
@@ -3317,10 +3317,10 @@ void World::selectCutCached(const Camera& camera, const CutParams& params,
             // so nothing can flip) becomes an unbounded budget.
             const float m = w.margin * inst.scale;
             r.kSlope = w.maxError * inst.scale / params.threshold;
-            const float consumed = ctx.travel_ + r.kSlope * ctx.kTravel_;
+            const float consumed = query.travel_ + r.kSlope * query.kTravel_;
             r.validUntil = m >= FLT_MAX - consumed ? FLT_MAX : consumed + m;
-            r.epoch = ctx.epoch_;
-            r.cutVersion = instanceCutVersions_[instIdx];
+            r.epoch = query.epoch_;
+            r.frontierVersion = instanceFrontierVersions_[instIdx];
             if (!w.touched.empty())
             {
                 r.depSlot = w.touched[0];
@@ -3328,7 +3328,7 @@ void World::selectCutCached(const Camera& camera, const CutParams& params,
             }
             if (w.touched.size() == 2)
             {
-                View::SecondDep& dep = ctx.secondDep_[instIdx];
+                SpatialQuery::SecondDep& dep = query.secondDep_[instIdx];
                 dep.slot = w.touched[1];
                 dep.version = pageStamps_[w.touched[1]].contentVersion;
             }
@@ -3339,75 +3339,75 @@ void World::selectCutCached(const Camera& camera, const CutParams& params,
         }
 
         // From the walk buffer, not from the slab: same bytes, still hot.
-        outCut.shared.pushRange(w.cutBuf.shared.data(), nShared);
-        outCut.currentOnly.pushRange(w.cutBuf.currentOnly.data(), nCurrent);
-        outCut.idealOnly.pushRange(w.cutBuf.idealOnly.data(), nIdeal);
-        ++ctx.walked_;
+        outResult.shared.pushRange(w.frontierBuffer.shared.data(), nShared);
+        outResult.currentOnly.pushRange(w.frontierBuffer.currentOnly.data(), nCurrent);
+        outResult.idealOnly.pushRange(w.frontierBuffer.idealOnly.data(), nIdeal);
+        ++query.walked_;
     }
 
-    w.cut = CutResultSink{};
-    ctx.stats_ = w.stats;
+    w.result = FrontierResultSink{};
+    query.stats_ = w.stats;
 }
 
-void View::selectCut(const World& world, const Camera& camera,
-                     const CutParams& params, CutResultSink& outCut)
+void SpatialQuery::selectFrontier(const SpatialDatabase& database, const Camera& camera,
+                             const SelectionParams& params, FrontierResultSink& outResult)
 {
-    HLOD_CHECK(world_ == nullptr || world_ == &world,
-               "View::selectCut: View belongs to another World; call reset()");
-    world_ = &world;
+    FRONTIER_CHECK(database_ == nullptr || database_ == &database,
+               "SpatialQuery::selectFrontier: SpatialQuery belongs to another SpatialDatabase; call reset()");
+    database_ = &database;
     if (reuseEnabled_)
-        world.selectCutCached(camera, params, *this, nullptr, outCut);
+        database.selectFrontierCached(camera, params, *this, nullptr, outResult);
     else
-        world.selectCutUncached(camera, params, *this, nullptr, outCut);
+        database.selectFrontierUncached(camera, params, *this, nullptr, outResult);
 }
 
-void View::selectCut(const World& world, const Camera& camera,
-                     const CutParams& params, PageUsageContext& usage,
-                     CutResultSink& outCut)
+void SpatialQuery::selectFrontier(const SpatialDatabase& database, const Camera& camera,
+                             const SelectionParams& params, PageUsageContext& usage,
+                             FrontierResultSink& outResult)
 {
-    HLOD_CHECK(world_ == nullptr || world_ == &world,
-               "View::selectCut: View belongs to another World; call reset()");
-    world_ = &world;
+    FRONTIER_CHECK(database_ == nullptr || database_ == &database,
+               "SpatialQuery::selectFrontier: SpatialQuery belongs to another SpatialDatabase; call reset()");
+    database_ = &database;
     if (reuseEnabled_)
-        world.selectCutCached(camera, params, *this, &usage, outCut);
+        database.selectFrontierCached(camera, params, *this, &usage, outResult);
     else
-        world.selectCutUncached(camera, params, *this, &usage, outCut);
+        database.selectFrontierUncached(camera, params, *this, &usage, outResult);
 }
 
-void View::selectCut(const World& world, const Camera& camera,
-                     const CutParams& params,
-                     CutResults& outCut)
+void SpatialQuery::selectFrontier(const SpatialDatabase& database, const Camera& camera,
+                             const SelectionParams& params,
+                             FrontierResult& outResult)
 {
-    CutResultSink cut = World::makeSink(outCut.buffers_);
-    selectCut(world, camera, params, cut);
-    outCut.sync();
+    FrontierResultSink sink = SpatialDatabase::makeSink(outResult.buffers_);
+    selectFrontier(database, camera, params, sink);
+    outResult.sync();
 }
 
-void View::selectCut(const World& world, const Camera& camera,
-                     const CutParams& params, PageUsageContext& usage,
-                     CutResults& outCut)
+void SpatialQuery::selectFrontier(const SpatialDatabase& database, const Camera& camera,
+                             const SelectionParams& params, PageUsageContext& usage,
+                             FrontierResult& outResult)
 {
-    CutResultSink cut = World::makeSink(outCut.buffers_);
-    selectCut(world, camera, params, usage, cut);
-    outCut.sync();
+    FrontierResultSink sink = SpatialDatabase::makeSink(outResult.buffers_);
+    selectFrontier(database, camera, params, usage, sink);
+    outResult.sync();
 }
 
-CutView View::selectCut(const World& world, const Camera& camera,
-                        const CutParams& params)
+FrontierResultView SpatialQuery::selectFrontier(const SpatialDatabase& database, const Camera& camera,
+                                      const SelectionParams& params)
 {
-    detail::CutBuffers& output = scratch_->output;
-    CutResultSink cut = World::makeSink(output);
-    selectCut(world, camera, params, cut);
+    detail::FrontierBuffers& output = scratch_->output;
+    FrontierResultSink sink = SpatialDatabase::makeSink(output);
+    selectFrontier(database, camera, params, sink);
     return output.view();
 }
 
-CutView View::selectCut(const World& world, const Camera& camera,
-                        const CutParams& params, PageUsageContext& usage)
+FrontierResultView SpatialQuery::selectFrontier(const SpatialDatabase& database, const Camera& camera,
+                                      const SelectionParams& params, PageUsageContext& usage)
 {
-    detail::CutBuffers& output = scratch_->output;
-    CutResultSink cut = World::makeSink(output);
-    selectCut(world, camera, params, usage, cut);
+    detail::FrontierBuffers& output = scratch_->output;
+    FrontierResultSink sink = SpatialDatabase::makeSink(output);
+    selectFrontier(database, camera, params, usage, sink);
     return output.view();
 }
 
-} // namespace hlod
+} // namespace frontier

@@ -2,8 +2,8 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BUILD_DIR="${HLOD_ALL_PERF_BUILD_DIR:-${ROOT_DIR}/build-perf-report}"
-REPORT_ROOT="${HLOD_PERF_REPORT_ROOT:-${ROOT_DIR}/perf_reports}"
+BUILD_DIR="${FRONTIER_ALL_PERF_BUILD_DIR:-${ROOT_DIR}/build-perf-report}"
+REPORT_ROOT="${FRONTIER_PERF_REPORT_ROOT:-${ROOT_DIR}/perf_reports}"
 RNG_POLICY="xorshift32-explicit-seeds-v1"
 
 if (( $# > 1 )); then
@@ -18,7 +18,7 @@ fi
 
 host_system="$(uname -s)"
 host_machine="$(uname -m)"
-raw_label="${HLOD_PERF_LABEL:-${1:-${host_system}-${host_machine}}}"
+raw_label="${FRONTIER_PERF_LABEL:-${1:-${host_system}-${host_machine}}}"
 label="$(printf '%s' "${raw_label}" | tr -cs '[:alnum:]. _-' '_' | tr ' ' '_')"
 label="${label#_}"
 label="${label%_}"
@@ -29,7 +29,7 @@ fi
 
 timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
 start_epoch="$(date +%s)"
-report_name="hlod-perf-${label}-${timestamp}"
+report_name="frontier-perf-${label}-${timestamp}"
 report_dir="${REPORT_ROOT}/${report_name}"
 mkdir -p "${report_dir}"
 
@@ -49,9 +49,9 @@ write_report()
     elapsed_seconds=$(( $(date +%s) - start_epoch ))
 
     cat > "${report_dir}/REPORT.md" <<EOF
-# HLOD performance report
+# Frontier performance report
 
-- Format: hlod-perf-report-v1
+- Format: frontier-perf-report-v1
 - Status: ${run_status}
 - Failed stage: ${failure_stage}
 - Machine label: ${raw_label}
@@ -84,7 +84,7 @@ for the most useful cross-machine comparison.
 EOF
 
     cat > "${report_dir}/manifest.txt" <<EOF
-format=hlod-perf-report-v1
+format=frontier-perf-report-v1
 status=${run_status}
 failure_stage=${failure_stage}
 label=${raw_label}
@@ -138,7 +138,7 @@ finish()
 trap finish EXIT
 
 {
-    echo "HLOD cross-machine performance collection"
+    echo "Frontier cross-machine performance collection"
     echo "Label: ${raw_label}"
     echo "Started UTC: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "Host: ${host_system} ${host_machine}"
@@ -202,19 +202,19 @@ Correctness:
   ctest --test-dir <build> -C Release --output-on-failure
 
 Real world:
-  hlod_bench
-    --benchmark_filter=BM_(View_Breakdown|View_MultiView|FlatForest100k|MixedForest100k|RootDecisionForest100k)
+  frontier_bench
+    --benchmark_filter=BM_(SpatialQuery_Breakdown|SpatialQuery_MultiQuery|FlatForest100k|MixedForest100k|RootDecisionForest100k)
     --benchmark_repetitions=5
     --benchmark_report_aggregates_only=true
 
 Machine characterization:
-  hlod_machine_bench
+  frontier_machine_bench
     --benchmark_min_time=0.15s
     --benchmark_repetitions=5
     --benchmark_report_aggregates_only=true
 
 Focused architecture kernels:
-  hlod_machine_bench
+  frontier_machine_bench
     --benchmark_filter=BM_(Kernel(WideAabb|DistanceError|CacheHit)|OutputAppend)
     --benchmark_min_time=0.75s
     --benchmark_repetitions=11
@@ -246,10 +246,10 @@ configure_args=(
     -S "${ROOT_DIR}"
     -B "${BUILD_DIR}"
     -DCMAKE_BUILD_TYPE=Release
-    -DHLOD_BUILD_TESTS=ON
-    -DHLOD_BUILD_BENCH=ON
-    -DHLOD_AVX2="${avx2}"
-    -DHLOD_FORCE_SCALAR=OFF
+    -DFRONTIER_BUILD_TESTS=ON
+    -DFRONTIER_BUILD_BENCH=ON
+    -DFRONTIER_AVX2="${avx2}"
+    -DFRONTIER_FORCE_SCALAR=OFF
 )
 if [[ ! -f "${BUILD_DIR}/CMakeCache.txt" ]] && command -v ninja >/dev/null 2>&1; then
     configure_args+=(-G Ninja)
@@ -265,7 +265,7 @@ cmake "${configure_args[@]}" 2>&1 | tee "${report_dir}/configure.log"
 failure_stage=build
 echo "Building tests and performance executables..."
 cmake --build "${BUILD_DIR}" --config Release --parallel \
-    --target hlod_tests hlod_bench hlod_machine_bench 2>&1 |
+    --target frontier_tests frontier_bench frontier_machine_bench 2>&1 |
     tee "${report_dir}/build.log"
 
 cache_file="${BUILD_DIR}/CMakeCache.txt"
@@ -280,8 +280,8 @@ else
     binary_dir="${BUILD_DIR}/bench"
 fi
 
-bench_exe="${binary_dir}/hlod_bench"
-machine_exe="${binary_dir}/hlod_machine_bench"
+bench_exe="${binary_dir}/frontier_bench"
+machine_exe="${binary_dir}/frontier_machine_bench"
 if [[ ! -x "${bench_exe}" || ! -x "${machine_exe}" ]]; then
     echo "ERROR: Release benchmark executables were not found under ${binary_dir}." >&2
     exit 1
@@ -294,7 +294,7 @@ fi
     echo
     git --version 2>&1 || true
     echo
-    grep -E '^(CMAKE_(BUILD_TYPE|CXX_COMPILER|CXX_COMPILER_ID|CXX_COMPILER_VERSION|GENERATOR|OSX_ARCHITECTURES)|HLOD_(AVX2|FORCE_SCALAR)):' \
+    grep -E '^(CMAKE_(BUILD_TYPE|CXX_COMPILER|CXX_COMPILER_ID|CXX_COMPILER_VERSION|GENERATOR|OSX_ARCHITECTURES)|FRONTIER_(AVX2|FORCE_SCALAR)):' \
         "${cache_file}" || true
     echo
     file "${bench_exe}" 2>&1 || true
@@ -308,7 +308,7 @@ ctest --test-dir "${BUILD_DIR}" -C Release --output-on-failure 2>&1 |
 failure_stage=real-world-benchmarks
 echo "Running real-world performance suite..."
 "${bench_exe}" \
-    '--benchmark_filter=BM_(View_Breakdown|View_MultiView|FlatForest100k|MixedForest100k|RootDecisionForest100k)' \
+    '--benchmark_filter=BM_(SpatialQuery_Breakdown|SpatialQuery_MultiQuery|FlatForest100k|MixedForest100k|RootDecisionForest100k)' \
     --benchmark_repetitions=5 \
     --benchmark_report_aggregates_only=true \
     "--benchmark_out=${report_dir}/real_world_perf.json" \

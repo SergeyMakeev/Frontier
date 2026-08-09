@@ -1,5 +1,5 @@
 #pragma once
-// Minimal SIMD-friendly math for HLodTree. float4 is the public vector
+// Minimal SIMD-friendly math for Frontier. float4 is the public vector
 // interface; float8 and WideBounds form the fixed eight-lane working set used
 // by the AVX2, SSE2, NEON, and scalar backends.
 
@@ -14,9 +14,9 @@
 // ---------------------------------------------------------------------------
 // Bring your own vector types.
 //
-// Define HLOD_USE_CUSTOM_VECTOR_TYPES and declare hlod::float4 and
-// hlod::float4x4 (typically `using` aliases for your engine's types) before
-// including any hlod header. A conforming float4 must be 16 bytes, 16-byte
+// Define FRONTIER_USE_CUSTOM_VECTOR_TYPES and declare frontier::float4 and
+// frontier::float4x4 (typically `using` aliases for your engine's types) before
+// including any frontier header. A conforming float4 must be 16 bytes, 16-byte
 // aligned, expose public float x, y, z, w, and support the free functions
 // declared in the block below. The static_asserts after the block catch the
 // common mistakes.
@@ -26,50 +26,50 @@
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// SIMD backend selection. At most one of HLOD_SIMD_AVX2 / HLOD_SIMD_NEON /
-// HLOD_SIMD_SSE2 is defined; with none of them the wide paths fall back to
-// portable scalar loops. Define HLOD_FORCE_SCALAR (CMake option of the same
+// SIMD backend selection. At most one of FRONTIER_SIMD_AVX2 / FRONTIER_SIMD_NEON /
+// FRONTIER_SIMD_SSE2 is defined; with none of them the wide paths fall back to
+// portable scalar loops. Define FRONTIER_FORCE_SCALAR (CMake option of the same
 // name) to force the scalar fallback everywhere.
 // ---------------------------------------------------------------------------
 
-#if !defined(HLOD_FORCE_SCALAR)
+#if !defined(FRONTIER_FORCE_SCALAR)
   #if defined(__AVX2__)
     #include <immintrin.h>
-    #define HLOD_SIMD_AVX2 1
+    #define FRONTIER_SIMD_AVX2 1
   #elif defined(__aarch64__) || defined(_M_ARM64) || defined(_M_ARM64EC)
     // 64-bit ARM only: the wide paths use vaddvq/vdivq/vsqrtq, which 32-bit
     // NEON lacks. armv7 falls back to the scalar loops.
     #include <arm_neon.h>
-    #define HLOD_SIMD_NEON 1
+    #define FRONTIER_SIMD_NEON 1
   #elif defined(__SSE2__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
     #include <immintrin.h>
-    #define HLOD_SIMD_SSE2 1
+    #define FRONTIER_SIMD_SSE2 1
     #if defined(__SSE4_1__) || defined(__AVX__)
-      #define HLOD_SIMD_SSE41 1
+      #define FRONTIER_SIMD_SSE41 1
     #endif
   #endif
 #endif
 
 // Best-effort cache prefetch hint.
-#if HLOD_SIMD_AVX2 || HLOD_SIMD_SSE2
-  #define HLOD_PREFETCH(p) _mm_prefetch(reinterpret_cast<const char*>(p), _MM_HINT_T0)
+#if FRONTIER_SIMD_AVX2 || FRONTIER_SIMD_SSE2
+  #define FRONTIER_PREFETCH(p) _mm_prefetch(reinterpret_cast<const char*>(p), _MM_HINT_T0)
 #elif defined(__GNUC__) || defined(__clang__)
-  #define HLOD_PREFETCH(p) __builtin_prefetch(p)
+  #define FRONTIER_PREFETCH(p) __builtin_prefetch(p)
 #elif defined(_MSC_VER) && (defined(_M_ARM64) || defined(_M_ARM64EC))
   #include <intrin.h>
-  #define HLOD_PREFETCH(p) __prefetch(reinterpret_cast<const void*>(p))
+  #define FRONTIER_PREFETCH(p) __prefetch(reinterpret_cast<const void*>(p))
 #else
-  #define HLOD_PREFETCH(p) ((void)(p))
+  #define FRONTIER_PREFETCH(p) ((void)(p))
 #endif
 
-namespace hlod {
+namespace frontier {
 
 // Fused multiply-add matching the active wide path. The unit tests require
 // scalar and wide results to be bit-identical, so the scalar code must fuse
 // exactly when the wide intrinsics fuse. The only backend without hardware
 // FMA is plain SSE; there mul+add is used on both sides (and the target has
 // no fma instruction the compiler could contract to, keeping them in sync).
-#if HLOD_SIMD_SSE2 && !defined(__FMA__)
+#if FRONTIER_SIMD_SSE2 && !defined(__FMA__)
 inline float fmadd(float a, float b, float c) { return a * b + c; }
 #else
 inline float fmadd(float a, float b, float c) { return std::fma(a, b, c); }
@@ -81,7 +81,7 @@ inline constexpr uint32_t kWide = 8;   // SIMD width of the wide paths
 // float4
 // ---------------------------------------------------------------------------
 
-#ifndef HLOD_USE_CUSTOM_VECTOR_TYPES
+#ifndef FRONTIER_USE_CUSTOM_VECTOR_TYPES
 
 struct alignas(16) float4
 {
@@ -121,7 +121,7 @@ inline float4 normalize3(float4 a) { return a / length3(a); }
 // The storage convention is deliberately the one that row-vector row-major
 // (DirectXMath) and column-vector column-major (glm/GL) agree on: in BOTH,
 // the coefficients that produce clip.x sit at memory indices 0, 4, 8, 12. So
-// a single fromMemory() serves both worlds and there is no convention flag
+// a single fromMemory() serves both conventions and there is no flag
 // to get wrong.
 struct alignas(16) float4x4
 {
@@ -142,10 +142,10 @@ struct alignas(16) float4x4
     }
 };
 
-#endif // HLOD_USE_CUSTOM_VECTOR_TYPES
+#endif // FRONTIER_USE_CUSTOM_VECTOR_TYPES
 
-static_assert(sizeof(float4) == 16, "hlod::float4 must be 16 bytes");
-static_assert(alignof(float4) >= 16, "hlod::float4 must be 16-byte aligned");
+static_assert(sizeof(float4) == 16, "frontier::float4 must be 16 bytes");
+static_assert(alignof(float4) >= 16, "frontier::float4 must be 16-byte aligned");
 
 // ---------------------------------------------------------------------------
 // float8 — lane-wise; lanes carry independent values (typically 8 boxes)
@@ -344,7 +344,7 @@ struct WideBounds
     }
 };
 
-#if HLOD_SIMD_NEON
+#if FRONTIER_SIMD_NEON
 namespace detail {
 // Lane bitmask (bit l set when lane l is all-ones), like _mm_movemask_ps.
 // (vld1q rather than brace-init: MSVC has no NEON vector literals.)
@@ -356,18 +356,18 @@ inline uint32_t movemask4(uint32x4_t m)
 } // namespace detail
 #endif
 
-#if HLOD_SIMD_SSE2
+#if FRONTIER_SIMD_SSE2
 namespace detail {
 // mask ? a : b, per lane; mask lanes are all-ones or all-zeros.
 inline __m128 select4(__m128 mask, __m128 a, __m128 b)
 {
-#if HLOD_SIMD_SSE41
+#if FRONTIER_SIMD_SSE41
     return _mm_blendv_ps(b, a, mask);
 #else
     return _mm_or_ps(_mm_and_ps(mask, a), _mm_andnot_ps(mask, b));
 #endif
 }
-// Fused only when the target has FMA, mirroring hlod::fmadd.
+// Fused only when the target has FMA, mirroring frontier::fmadd.
 inline __m128 fmadd4(__m128 a, __m128 b, __m128 c)
 {
 #if defined(__FMA__)
@@ -383,7 +383,7 @@ inline __m128 fmadd4(__m128 a, __m128 b, __m128 c)
 // Returns the survivor lane bitmask; outMasks[l] is lane l's narrowed plane
 // mask (valid only for surviving lanes). inMask == 0 means an ancestor was
 // fully inside: every lane survives untested with mask 0.
-#if HLOD_SIMD_AVX2
+#if FRONTIER_SIMD_AVX2
 inline uint32_t testWideAabb(const WideBounds& b, const Frustum& fr,
                              uint8_t inMask, uint8_t outMasks[kWide])
 {
@@ -431,7 +431,7 @@ inline uint32_t testWideAabb(const WideBounds& b, const Frustum& fr,
     return alive & ((1u << kWide) - 1);
 }
 
-#elif HLOD_SIMD_NEON
+#elif FRONTIER_SIMD_NEON
 inline uint32_t testWideAabb(const WideBounds& b, const Frustum& fr,
                              uint8_t inMask, uint8_t outMasks[kWide])
 {
@@ -491,7 +491,7 @@ inline uint32_t testWideAabb(const WideBounds& b, const Frustum& fr,
     return detail::movemask4(alive[0]) |
            (detail::movemask4(alive[1]) << 4);
 }
-#elif HLOD_SIMD_SSE2
+#elif FRONTIER_SIMD_SSE2
 inline uint32_t testWideAabb(const WideBounds& b, const Frustum& fr,
                              uint8_t inMask, uint8_t outMasks[kWide])
 {
@@ -581,7 +581,7 @@ inline uint32_t testWideAabb(const WideBounds& b, const Frustum& fr,
 // This is the same instruction count as the point query it replaces: the two
 // broadcasts differ, nothing else. That is what makes envelope-based LOD
 // damping free in the hot loop.
-#if HLOD_SIMD_AVX2
+#if FRONTIER_SIMD_AVX2
 inline float8 distanceToBoxes(const WideBounds& b, float4 qmn, float4 qmx)
 {
     const __m256 lox = _mm256_set1_ps(qmn.x), loy = _mm256_set1_ps(qmn.y),
@@ -604,7 +604,7 @@ inline float8 distanceToBoxes(const WideBounds& b, float4 qmn, float4 qmx)
     _mm256_store_ps(r.v, _mm256_sqrt_ps(d2));
     return r;
 }
-#elif HLOD_SIMD_NEON
+#elif FRONTIER_SIMD_NEON
 inline float8 distanceToBoxes(const WideBounds& b, float4 qmn, float4 qmx)
 {
     const float32x4_t lox = vdupq_n_f32(qmn.x), loy = vdupq_n_f32(qmn.y),
@@ -630,7 +630,7 @@ inline float8 distanceToBoxes(const WideBounds& b, float4 qmn, float4 qmx)
     }
     return r;
 }
-#elif HLOD_SIMD_SSE2
+#elif FRONTIER_SIMD_SSE2
 inline float8 distanceToBoxes(const WideBounds& b, float4 qmn, float4 qmx)
 {
     const __m128 lox = _mm_set1_ps(qmn.x), loy = _mm_set1_ps(qmn.y),
@@ -708,7 +708,7 @@ struct Camera
     // Both components are non-negative and default to zero, which collapses
     // the envelope onto pos and makes the arithmetic bit-identical to an
     // undamped point query. Any hand-built Camera is therefore correct
-    // without knowing this field exists. View's internal CameraDamper
+    // without knowing this field exists. SpatialQuery's internal CameraDamper
     // maintains it during selection.
     float4 envLo{}, envHi{};
 
@@ -877,7 +877,7 @@ inline float screenError(float geomError, float k, float dist)
 {
     return geomError * k / (dist > 1.0e-30f ? dist : 1.0e-30f);
 }
-#if HLOD_SIMD_AVX2
+#if FRONTIER_SIMD_AVX2
 inline float8 screenError8(const float8& geomError, float k, const float8& dist)
 {
     const __m256 d = _mm256_max_ps(_mm256_load_ps(dist.v), _mm256_set1_ps(1.0e-30f));
@@ -886,7 +886,7 @@ inline float8 screenError8(const float8& geomError, float k, const float8& dist)
     _mm256_store_ps(r.v, _mm256_div_ps(e, d));
     return r;
 }
-#elif HLOD_SIMD_NEON
+#elif FRONTIER_SIMD_NEON
 inline float8 screenError8(const float8& geomError, float k, const float8& dist)
 {
     const float32x4_t kk = vdupq_n_f32(k), eps = vdupq_n_f32(1.0e-30f);
@@ -899,7 +899,7 @@ inline float8 screenError8(const float8& geomError, float k, const float8& dist)
     }
     return r;
 }
-#elif HLOD_SIMD_SSE2
+#elif FRONTIER_SIMD_SSE2
 inline float8 screenError8(const float8& geomError, float k, const float8& dist)
 {
     const __m128 kk = _mm_set1_ps(k), eps = _mm_set1_ps(1.0e-30f);
@@ -934,7 +934,7 @@ inline float8 screenError8(const float8& geomError, float k, const float8& dist)
 // Both implementations reproduce the max(dist, 1e-30) zero-distance floor.
 // ---------------------------------------------------------------------------
 
-#if HLOD_SIMD_AVX2
+#if FRONTIER_SIMD_AVX2
 inline float8 distanceToBoxesSq(const WideBounds& b, float4 qmn, float4 qmx)
 {
     const __m256 lox = _mm256_set1_ps(qmn.x), loy = _mm256_set1_ps(qmn.y),
@@ -975,7 +975,7 @@ inline float8 screenErrorFromSq8(const float8& geomError, float k, const float8&
         _mm256_mul_ps(_mm256_load_ps(geomError.v), _mm256_set1_ps(k)), inv));
     return r;
 }
-#elif HLOD_SIMD_NEON
+#elif FRONTIER_SIMD_NEON
 inline float8 distanceToBoxesSq(const WideBounds& b, float4 qmn, float4 qmx)
 {
     const float32x4_t lox = vdupq_n_f32(qmn.x), loy = vdupq_n_f32(qmn.y),
@@ -1059,9 +1059,9 @@ inline float8 screenErrorFromSq8(const float8& geomError, float k, const float8&
 // after the camera pulls back past the threshold. 0 disables damping, and then
 // selection is bit-identical to an undamped run.
 //
-// View owns one of these and calls damp() from View::selectCut. The class is
+// SpatialQuery owns one of these and calls damp() from SpatialQuery::selectFrontier. The class is
 // also public for code that needs a damped Camera outside selection. Do not
-// pre-damp a Camera and also enable damping on its View, or damping is applied
+// pre-damp a Camera and also enable damping on its SpatialQuery, or damping is applied
 // twice.
 // ---------------------------------------------------------------------------
 
@@ -1116,4 +1116,4 @@ private:
     float  kMax_ = 0.0f;
 };
 
-} // namespace hlod
+} // namespace frontier

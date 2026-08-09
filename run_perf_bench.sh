@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BUILD_DIR="${HLOD_PERF_BUILD_DIR:-${ROOT_DIR}/build-perf}"
+BUILD_DIR="${FRONTIER_PERF_BUILD_DIR:-${ROOT_DIR}/build-perf}"
 
 if ! command -v cmake >/dev/null 2>&1; then
     echo "ERROR: CMake was not found in PATH." >&2
@@ -46,10 +46,10 @@ configure_args=(
     -S "${ROOT_DIR}"
     -B "${BUILD_DIR}"
     -DCMAKE_BUILD_TYPE=Release
-    -DHLOD_BUILD_TESTS=OFF
-    -DHLOD_BUILD_BENCH=ON
-    -DHLOD_AVX2="${avx2}"
-    -DHLOD_FORCE_SCALAR=OFF
+    -DFRONTIER_BUILD_TESTS=OFF
+    -DFRONTIER_BUILD_BENCH=ON
+    -DFRONTIER_AVX2="${avx2}"
+    -DFRONTIER_FORCE_SCALAR=OFF
 )
 if [[ -n "${generator}" ]]; then
     configure_args+=(-G "${generator}")
@@ -59,8 +59,8 @@ if [[ -n "${target_architecture}" ]]; then
 fi
 cmake "${configure_args[@]}"
 
-echo "Building hlod_bench..."
-cmake --build "${BUILD_DIR}" --config Release --target hlod_bench --parallel
+echo "Building frontier_bench..."
+cmake --build "${BUILD_DIR}" --config Release --target frontier_bench --parallel
 
 # Multi-config generators (notably Xcode) put each configuration in its own
 # directory. Never fall back from Release/ to a top-level executable there: it
@@ -79,8 +79,8 @@ fi
 
 bench_exe=""
 for candidate in \
-    "${bench_dir}/hlod_bench" \
-    "${bench_dir}/hlod_bench.exe"
+    "${bench_dir}/frontier_bench" \
+    "${bench_dir}/frontier_bench.exe"
 do
     if [[ -x "${candidate}" || -f "${candidate}" ]]; then
         bench_exe="${candidate}"
@@ -96,7 +96,7 @@ fi
 echo "Using Release benchmark: ${bench_exe}"
 
 if (( $# > 0 )); then
-    echo "Running hlod_bench with caller-supplied arguments..."
+    echo "Running frontier_bench with caller-supplied arguments..."
     exec "${bench_exe}" "$@"
 fi
 
@@ -104,7 +104,7 @@ echo "Running the documented performance suite with five repetitions..."
 echo "Pass Google Benchmark arguments to this script to override the default suite."
 echo "Writing ${ROOT_DIR}/real_world_perf.json"
 exec "${bench_exe}" \
-    '--benchmark_filter=BM_(View_Breakdown|View_MultiView|FlatForest100k|MixedForest100k|RootDecisionForest100k)' \
+    '--benchmark_filter=BM_(SpatialQuery_Breakdown|SpatialQuery_MultiQuery|FlatForest100k|MixedForest100k|RootDecisionForest100k)' \
     --benchmark_repetitions=5 \
     --benchmark_report_aggregates_only=true \
     "--benchmark_out=${ROOT_DIR}/real_world_perf.json" \
