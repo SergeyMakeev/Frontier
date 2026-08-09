@@ -73,6 +73,21 @@ struct AssetHandle
 };
 static_assert(sizeof(AssetHandle) == 8, "AssetHandle must stay 64 bits");
 
+// Unambiguous reference to a generated detail page. Page ids are local to one
+// Hierarchy, so the root asset identifies which hierarchy package owns `page`.
+struct DetailPageRef
+{
+    AssetHandle     rootAsset;
+    HierarchyPageId page = kInvalidHierarchyPage;
+
+    bool valid() const
+    {
+        return rootAsset.valid() && page != kInvalidHierarchyPage;
+    }
+};
+static_assert(sizeof(DetailPageRef) == 12,
+              "detail-page reference must stay 12 bytes");
+
 // Attached page (a "mount"): one placement of an asset in the world. Returned
 // by addInstance/attachPage. Compose node handles with nodeAt(); node indices
 // are page-local, fixed at build time.
@@ -179,8 +194,8 @@ static_assert(sizeof(CutEntry) == 12, "CutEntry must stay 12 bytes");
 
 // One traversal produces both realities without per-entry tags. The current
 // render cut is shared + currentOnly. The fully-resident ideal frontier is
-// shared + idealOnly. A high-error leaf on that ideal side is enough for caller-side
-// policy to decide whether its external content graph can expand it.
+// shared + idealOnly. For a high-error ideal-side leaf, detailPage() reports
+// whether HierarchyBuilder generated a finer page for caller-side streaming.
 // Non-owning result of one View selection. The spans remain valid until the
 // next selection or reset on that View, or until the View is destroyed.
 struct CutView
@@ -866,7 +881,7 @@ public:
 
     // ---- topology streaming -------------------------------------------------
     // An expansion handle comes from a high-error ideal-side CutEntry (or is
-    // composed via nodeAt after consulting the caller's content graph).
+    // composed via nodeAt from a known packed expansion index).
     // attachPage returns an invalid PageHandle if the
     // expansion handle went stale while the page was being built (its parent
     // page was detached/collected) — drop the page in that case. It fires
@@ -885,6 +900,12 @@ public:
     PageHandle attachPage(NodeHandle expansionNode, Page&& page);
     void       detachPage(NodeHandle expansionNode);   // no-op if stale
     bool       isAttached(NodeHandle expansionNode) const;
+
+    // Generated HierarchyBuilder pages carry their stable local detail-page id
+    // in the expansion node. The returned root asset scopes that id to one
+    // hierarchy package. Returns an invalid reference for a stale handle, a
+    // non-expansion node, or a manually authored expansion without an id.
+    DetailPageRef detailPage(NodeHandle expansionNode) const;
 
     // ---- payload residency --------------------------------------------------
     // Handles come from ideal-side CutEntry values. Stale handles are ignored

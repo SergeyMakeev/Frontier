@@ -1,6 +1,6 @@
 # HLodTree API and integration guide
 
-This is the self-contained integration reference for HLodTree 0.4.0. It
+This is the self-contained integration reference for HLodTree 0.5.0. It
 explains the vocabulary, public interface, ownership rules, frame lifecycle,
 threading contract, and streaming model needed to use the library correctly.
 The [README](../README.md) is a shorter project overview; this guide is the
@@ -28,16 +28,31 @@ including a node whose deeper children are streamed separately. A
 object to a terrain region or city block; it does not have to correspond to a
 single mesh or entity.
 
+A node has no transform. Its bounds and renderer data use hierarchy-local
+coordinates. The world transform belongs to an instance; per-instance
+deformation can override node bounds without adding a node transform.
+
 ### Page and expansion point
 
-A **page** is an immutable, serialized chunk of a hierarchy. A root page
-normally contains the hierarchy root. Large hierarchies can be split into
-child pages. The leaf node where a child page can be attached is an
-**expansion point**. Until that child page is attached, the expansion point is
-the renderable coarse representation of the missing subtree.
+A **logical page** represents the refinements below exactly one hierarchy
+node. Page zero contains the hierarchy root. Calling
+`HierarchyBuilder::splitBelow(node)` keeps that renderable node in its parent
+page and generates one detail page for its descendants. The boundary node is
+an **expansion point** and remains the coarse fallback while its detail page is
+unavailable.
 
-`hlod::Page` owns its page bytes and is move-only. `hlod::PageView` borrows
-page bytes owned by the application, such as a memory-mapped asset bundle.
+`hlod::Hierarchy` owns the indexed generated pages. `hlod::Page` is one
+move-only packed page blob, while `hlod::PageView` borrows such a blob from
+application-owned storage. A detail blob may physically begin with several
+children of its logical root; that continuation layout is an internal packing
+detail. Its single logical root is the expansion point that names the page.
+`Hierarchy` is also move-only; keep it alive while any of its borrowed page
+views are registered with a `World`.
+
+Page ids are local to one `Hierarchy`. At runtime, `hlod::DetailPageRef`
+combines a generated page id with the registered root asset that identifies
+its hierarchy package, so independent hierarchies may both use page id one
+without ambiguity.
 
 ### Asset
 
@@ -45,7 +60,13 @@ An **asset** is a page registered with a world as a reusable unit of storage
 and sharing. Registering an asset returns an `hlod::AssetHandle`. Every
 instance of that asset shares the immutable page bytes, attached child-page
 graph, and payload-residency state. In this API, *asset* means a registered
-hierarchy; it does not imply one conventional game object.
+hierarchy page; it does not imply one conventional game object.
+
+`Hierarchy` and `AssetHandle` are different levels: a `Hierarchy` is the
+content-pipeline package containing every generated logical page, while an
+asset registers one currently available page blob with one `World`. The root
+page asset is instanced; a detail page may be transferred when loaded or
+registered separately when it is reusable.
 
 ### Instance
 
@@ -118,10 +139,10 @@ in `currentOnly`, and ideal-only choices in `idealOnly`. Each
 authored node hierarchy
         | build or deserialize
         v
-      Page ---- registerAsset() ----> AssetHandle
-                                         |
-                                  addInstance()
-                                         v
+logical node hierarchy -- splitBelow() --> Hierarchy pages
+                                               |
+                                      register root page
+                                               v
 World <---- InstanceRef ------------ asset instance
   |
   | applyUpdates(), then View::selectCut(Camera)
@@ -152,8 +173,10 @@ No third-party library is required at runtime.
 
 A normal integration follows this order:
 
-1. Build page blobs offline with `HLodBuilder`, or validate serialized blobs
-   with `Page::fromBytes()` or `PageView::fromBytes()`.
+1. Author one complete logical tree with `HierarchyBuilder`, mark natural
+   boundaries with `splitBelow()`, and build its `Hierarchy` package. A content
+   pipeline may instead validate serialized page blobs with `Page::fromBytes()`
+   or `PageView::fromBytes()`.
 2. Construct one `World`, register reusable assets, and add their instances.
 3. Construct one persistent `View` per camera-like query.
 4. Each frame, submit world changes and call `applyUpdates()` once.
@@ -169,7 +192,7 @@ A normal integration follows this order:
 |---|---|
 | Add the library to a CMake target | [Add HLodTree to a CMake target](#add-hlodtree-to-a-cmake-target) |
 | Publish a frame safely or select several cameras | [Frame lifecycle and threading](#frame-lifecycle-and-threading) |
-| Build, serialize, borrow, or own hierarchy data | [Authoring pages](#authoring-pages) |
+| Build, split, serialize, or own hierarchy data | [Authoring a paged hierarchy](#authoring-a-paged-hierarchy) |
 | Share content and move instances | [Assets and instances](#assets-and-instances) |
 | Attach hierarchy data or report payload availability | [Topology and residency](#topology-and-residency) |
 | Render a cut and choose result storage | [Selection and result ownership](#selection-and-result-ownership) |
@@ -193,30 +216,43 @@ points; HLodTree deliberately does not implement those systems.
 
 // Functions supplied by the application.
 void submitToRenderer(hlod::UserPayload payload, hlod::InstanceId instance);
-bool contentHasChildPage(hlod::UserPayload payload);
 bool payloadIsLoaded(hlod::UserPayload payload);
-void requestChildPageLoad(hlod::NodeHandle node,
-                          hlod::UserPayload payload);
+void requestDetailPageLoad(hlod::NodeHandle node,
+                           hlod::DetailPageRef page);
 void requestPayloadLoad(hlod::NodeHandle node,
                         hlod::UserPayload payload);
 void releaseRenderPayload(hlod::UserPayload payload);
 
-hlod::Page buildTreePage()
+hlod::Hierarchy buildTownHierarchy()
 {
-    hlod::HLodBuilder builder;
-    const hlod::HLodBuilder::NodeId tree = builder.createRoot(
-        100, 16.0f,
-        hlod::AABB::fromCenterExtent(hlod::float4::point(0, 4, 0),
-                                     hlod::float4::vec(4, 4, 4)));
+    hlod::HierarchyBuilder builder;
+    const hlod::HierarchyBuilder::NodeId town =
+        builder.createRoot(100, 64.0f, hlod::AABB::empty());
 
+    const hlod::HierarchyBuilder::NodeId building1 =
+        builder.createNode(town, 101, 16.0f, hlod::AABB::empty());
     builder.createNode(
-        tree, 101, 2.0f,
+        building1, 1001, 2.0f,
         hlod::AABB::fromCenterExtent(hlod::float4::point(-2, 2, 0),
                                      hlod::float4::vec(2, 2, 2)));
     builder.createNode(
-        tree, 102, 2.0f,
+        building1, 1002, 2.0f,
         hlod::AABB::fromCenterExtent(hlod::float4::point(2, 2, 0),
                                      hlod::float4::vec(2, 2, 2)));
+
+    const hlod::HierarchyBuilder::NodeId building2 =
+        builder.createNode(town, 102, 16.0f, hlod::AABB::empty());
+    builder.createNode(
+        building2, 2001, 2.0f,
+        hlod::AABB::fromCenterExtent(hlod::float4::point(18, 2, 0),
+                                     hlod::float4::vec(2, 2, 2)));
+    builder.createNode(
+        building2, 2002, 2.0f,
+        hlod::AABB::fromCenterExtent(hlod::float4::point(22, 2, 0),
+                                     hlod::float4::vec(2, 2, 2)));
+
+    builder.splitBelow(building1);
+    builder.splitBelow(building2);
     return builder.build();
 }
 
@@ -242,10 +278,13 @@ void updateStreamingForEntry(hlod::World& world,
     if (!world.tryGetPayload(entry.nodeHandle, payload))
         return; // The page was detached while this request was pending.
 
-    if (entry.overThreshold() && contentHasChildPage(payload) &&
+    const hlod::DetailPageRef detailPage =
+        world.detailPage(entry.nodeHandle);
+    if (entry.overThreshold() &&
+        detailPage.valid() &&
         !world.isAttached(entry.nodeHandle))
     {
-        requestChildPageLoad(entry.nodeHandle, payload);
+        requestDetailPageLoad(entry.nodeHandle, detailPage);
     }
 
     if (!world.isResident(entry.nodeHandle))
@@ -269,13 +308,13 @@ void updateStreamingForIdealCut(hlod::World& world,
 
 // Call when an asynchronous topology load completes. An invalid return is the
 // expected result when the expansion point became stale while loading.
-void attachLoadedChildPage(hlod::World& world,
-                           hlod::NodeHandle expansionNode,
-                           hlod::Page childPage)
+void attachLoadedDetailPage(hlod::World& world,
+                            hlod::NodeHandle expansionNode,
+                            hlod::Page detailPage)
 {
-    const hlod::PageHandle childMount =
-        world.attachPage(expansionNode, std::move(childPage));
-    if (!childMount.valid())
+    const hlod::PageHandle detailMount =
+        world.attachPage(expansionNode, std::move(detailPage));
+    if (!detailMount.valid())
         return;
 }
 
@@ -288,9 +327,11 @@ void publishLoadedPayload(hlod::World& world, hlod::NodeHandle node)
 
 int main()
 {
+    // The borrowed root-page bytes remain valid while World uses the asset.
+    hlod::Hierarchy hierarchy = buildTownHierarchy();
     hlod::World world;
     const hlod::AssetHandle treeAsset =
-        world.registerAsset(buildTreePage());
+        world.registerAsset(hierarchy.page(hierarchy.rootPage()));
 
     const hlod::World::InstanceRef first =
         world.addInstance(treeAsset, hlod::float4::point(0, 0, 0));
@@ -324,10 +365,10 @@ int main()
 }
 ```
 
-The application must deduplicate `requestChildPageLoad()` and
+The application must deduplicate `requestDetailPageLoad()` and
 `requestPayloadLoad()` calls and apply its own priorities and IO budgets. Page
 and payload completions normally arrive in later frames through functions such
-as `attachLoadedChildPage()` and `publishLoadedPayload()`. HLodTree makes stale
+as `attachLoadedDetailPage()` and `publishLoadedPayload()`. HLodTree makes stale
 completion handles safe, but it does not own the asynchronous loader.
 
 ## Frame lifecycle and threading
@@ -371,35 +412,63 @@ must not return until all tasks have completed.
 - Keep borrowed page bytes and page allocator contexts alive for the full
   lifetimes documented below.
 
-## Authoring pages
+## Authoring a paged hierarchy
 
-`hlod::HLodBuilder` builds one immutable page at a time:
+`hlod::HierarchyBuilder` accepts one ordinary, single-root logical tree. Mark
+natural entity boundaries after authoring the nodes:
 
 ```cpp
-hlod::HLodBuilder builder;
-const hlod::HLodBuilder::NodeId root =
-    builder.createRoot(rootPayload, rootError, rootBounds);
-const hlod::HLodBuilder::NodeId child =
-    builder.createNode(root, childPayload, childError, childBounds);
-builder.markExpansion(child);  // child remains renderable and has no local children
-hlod::Page page = builder.build(context);
+hlod::HierarchyBuilder builder;
+const hlod::HierarchyBuilder::NodeId town =
+    builder.createRoot(townPayload, townError, hlod::AABB::empty());
+const hlod::HierarchyBuilder::NodeId building =
+    builder.createNode(town, buildingPayload, buildingError,
+                       hlod::AABB::empty());
+
+builder.createNode(building, wall1Payload, wallError, wall1Bounds);
+builder.createNode(building, wall2Payload, wallError, wall2Bounds);
+
+builder.splitBelow(building);
+hlod::Hierarchy hierarchy = builder.build(context);
 ```
 
-`createRoot()` adds a root to the page forest. `createNode()` adds a child to
-an authoring node. Insertion order is arbitrary. `NodeId` is valid only while
-authoring that builder; `build()` consumes the builder and packs nodes into
-preorder, so it is not a persistent runtime node index.
+The generated root page contains `town` and the renderable `building` proxy.
+The generated Building detail page contains the walls and is logically rooted
+at `building`. The builder automatically:
 
-Every leaf needs non-empty bounds. The builder unions child bounds into their
-ancestors, clamps child geometric error so it never exceeds the parent's
-effective error, verifies the page contract, and emits the versioned blob.
-Every real node needs a renderable `UserPayload`, including expansion points.
-Payload values need not be unique.
+- marks `building` as an expansion point in its parent page;
+- derives its bounds from every descendant, including descendants moved to a
+  detail page;
+- clamps geometric errors monotonically across page boundaries;
+- assigns deterministic `HierarchyPageId` values;
+- writes the detail-page id into the expansion metadata.
 
-An expansion point is a leaf whose children live in another page. The attached
-child page's root bounds must fit inside the expansion point's authored bounds.
-Author those bounds conservatively because attaching shared topology does not
-grow the parent.
+`splitBelow()` may be called before or after adding the node's children. It is
+invalid on a leaf because there would be no detail page to generate. Boundaries
+can nest: splitting below a building and then below one of its floors produces
+Town, Building, and Floor pages.
+
+`HierarchyBuilder::NodeId` is stable only within that authoring operation and
+is consumed by `build()`. Runtime work uses `NodeHandle`. Payload values remain
+opaque and need not be unique.
+
+The root page is `hierarchy.rootPage()`. Use `page(id)` to borrow a generated
+blob, `clonePage(id)` to make an owned copy, or `takePage(id)` to transfer its
+original allocation. No separate mount manifest is needed: every expansion
+stores the id of its detail page. During streaming,
+`World::detailPage(nodeHandle)` reads that local id and scopes it with the
+registered root asset. The application can map that root asset to its
+`Hierarchy` or serialized package without recovering a page through
+`UserPayload` or tracking every mounted page.
+
+### Low-level physical page construction
+
+`HLodBuilder` remains available for content pipelines that already own a
+physical page partitioner. It builds one packed blob and can expose a forest of
+continuation roots. `markExpansion(node, detailPageId)` optionally embeds the
+same generated-page lookup. Normal integrations should use
+`HierarchyBuilder`; the low-level builder exposes storage representation rather
+than the logical single-root model.
 
 ### Owned and borrowed page data
 
@@ -451,10 +520,12 @@ An instance is visible only when `desc.mask & camera.viewMask` is nonzero.
 Rotation and non-uniform scale are not part of `InstanceDesc`; bake them into
 authored data or adapt them outside the library.
 
-`addInstance(Page&&, ...)` is a convenience for one-off content. Repeated
-content should use `registerAsset()` so its pages and streaming state are
-shared. `removeInstance()` and `moveInstance()` ignore stale references.
-`releaseAsset()` requires that no live instances still reference the asset.
+`addInstance(Page&&, ...)` is a convenience for one-off, single-page content.
+Paged hierarchies should use `registerAsset()` and retain the root
+`AssetHandle`: it scopes `DetailPageRef` values and also lets repeated instances
+share pages and streaming state. `removeInstance()` and `moveInstance()` ignore
+stale references. `releaseAsset()` requires that no live instances still
+reference the asset.
 
 `assetRootPage()` returns the shared root mount after at least one instance has
 materialized it. `InstanceRef::rootPage` provides the same kind of handle
@@ -517,12 +588,25 @@ selection phase. Retain `InstanceRef`, not the bare id, for later mutation.
 Attach deeper topology under a live expansion node:
 
 ```cpp
-const hlod::PageHandle childMount =
-    world.attachPage(expansionNode, childAsset);
-// Or transfer a one-off page:
-const hlod::PageHandle anonymousChild =
-    world.attachPage(expansionNode, std::move(childPage));
+const hlod::DetailPageRef detailPage =
+    world.detailPage(expansionNode);
+if (detailPage.valid())
+    requestDetailPageLoad(expansionNode, detailPage);
+
+// Later, after the application loads that generated page blob:
+const hlod::PageHandle detailMount =
+    world.attachPage(expansionNode, std::move(loadedDetailPage));
 ```
+
+`detailPage()` is a read-only lookup encoded by `HierarchyBuilder`; it returns
+an invalid `DetailPageRef` for a stale handle, a non-expansion node, or a
+low-level page whose content pipeline did not embed an id. The reference's
+`rootAsset` selects the hierarchy package and its `page` field selects the
+generated blob inside that package. The local page id remains stable when the
+same generated hierarchy is serialized and loaded again.
+
+Applications that pre-register or memory-map every generated blob can attach
+its registered `AssetHandle` instead of transferring an owned `Page`.
 
 Attaching under a shared asset makes that topology available to every instance
 of the asset. `detachPage()` collapses the branch. It is a no-op for a stale
@@ -687,12 +771,13 @@ config.tlasQuality = hlod::TlasQuality::BinnedSAH;
 config.parallelInstanceThreshold = 4096;
 hlod::World world(config);
 
-hlod::HLodBuilder builder;
+hlod::HierarchyBuilder builder;
 // ...author nodes...
-hlod::Page page = builder.build(context);
+hlod::Hierarchy hierarchy = builder.build(context);
 ```
 
-`HLodBuilder::build()`, `Page::fromBytes()`, and `Page::clone()` use the
+`HierarchyBuilder::build()`, `HLodBuilder::build()`, `Page::fromBytes()`, and
+`Page::clone()` use the
 allocation callbacks of the context passed to them; `World` uses
 `parallelFor`, `workerCount`, and `user` for an enabled uncached parallel
 selection. Allocation callbacks must honor the requested alignment. Callback
@@ -739,6 +824,20 @@ The guide above shows the normal lifecycle. The remaining public helpers are
 summarized here so ownership or introspection code does not need to depend on
 internal structures.
 
+### Generated hierarchy package
+
+| Member | Result |
+|---|---|
+| `rootPage()` | page zero, or invalid for an empty package |
+| `pageCount()` | number of generated logical pages |
+| `page(id)` | borrowed view of one generated blob |
+| `clonePage(id, context)` | explicit owned copy of one blob |
+| `takePage(id)` | transfers one blob out of the package |
+
+`HierarchyPageId` values are deterministic for one authored tree: page zero is
+the root and generated detail pages start at one. `takePage()` invalidates
+subsequent `page()` or `clonePage()` access for that id.
+
 ### World queries
 
 | Member | Result |
@@ -748,6 +847,7 @@ internal structures.
 | `assetCount()` | number of registered live assets |
 | `assetRootPage(asset)` | shared root mount, or invalid before materialization/stale asset |
 | `isAttached(node)` | whether an expansion point currently has a child page |
+| `detailPage(node)` | generated `DetailPageRef`, scoped by root asset, or invalid |
 | `isResident(node)` | whether a live node payload is resident |
 | `tryGetPayload(node, out)` | resolves a live node's opaque payload |
 | `attachedPageCount()` | all mounted pages, including pinned roots |
@@ -787,7 +887,8 @@ streamers. Index zero is the page sentinel; real nodes begin at index one.
 | `wide`, `blockMask` | eight-lane child blocks and valid/leaf masks |
 | `payload`, `bbox`, `geometricError` | immutable authored node data |
 | `childCount(i)` / `isExpansion(i)` | decoded node metadata |
-| `wideOffset(i)` / `wideBlockCount(i)` | the node's child-block range |
+| `detailPage(i)` | generated page id for an expansion, or invalid |
+| `wideOffset(i)` / `wideBlockCount(i)` | child-block range; `wideOffset` requires local children |
 | `validLanes(b)` / `leafLanes(b)` | decoded lane masks for block `b` |
 | `wideBounds()` | strided read-only access to page child bounds |
 
@@ -831,6 +932,7 @@ serialized page version is independent and is exposed as `kPageVersion`.
 | `CutResults` spans | mutation/destruction of that owning `CutResults` |
 | fixed `CutResultSink` output | caller-defined storage lifetime |
 | `CollectResult::freedPayloads` | next `collect()` call or world destruction |
+| `Hierarchy::page(id)` view | `takePage(id)`, hierarchy destruction, or replacement |
 | borrowed `PageView` asset bytes | asset release, with storage kept alive throughout |
 | `PageUsageContext` observations | consumed by collection or `reset()` |
 | published selection snapshot | next world mutation after all queries join |

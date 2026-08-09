@@ -51,43 +51,47 @@ HLodTree to own an IO system.
 
 This one-node BLAS is intentionally small so the complete build, instance,
 view, and selection loop is visible. Real hierarchies add children with
-`HLodBuilder::createNode` and split large hierarchies at expansion points.
+`HierarchyBuilder::createNode` and mark natural streaming boundaries with
+`splitBelow()`.
 
 ```cpp
 #include "hlod/builder.h"
 #include "hlod/world.h"
 
+void drawEntry(const hlod::World& world, const hlod::CutEntry& entry)
+{
+    hlod::UserPayload payload;
+    if (world.tryGetPayload(entry.nodeHandle, payload))
+        (void)payload; // submit with entry.instance()
+}
+
 int main()
 {
-    using namespace hlod;
-
-    HLodBuilder builder;
+    hlod::HierarchyBuilder builder;
     builder.createRoot(
         42,                       // opaque payload, e.g. a mesh-table index
         0.0f,                     // geometric error in world units
-        AABB::fromCenterExtent(float4::point(0, 0, 0),
-                               float4::vec(1, 1, 1)));
+        hlod::AABB::fromCenterExtent(hlod::float4::point(0, 0, 0),
+                                     hlod::float4::vec(1, 1, 1)));
 
-    World world;
-    world.addInstance(builder.build(), float4::point(0, 0, 0));
+    hlod::Hierarchy hierarchy = builder.build();
+    hlod::World world;
+    world.addInstance(hierarchy.takePage(hierarchy.rootPage()),
+                      hlod::float4::point(0, 0, 0));
 
-    const Camera camera = makeLookAtCamera(
-        float4::point(0, 2, -8), float4::point(0, 0, 0));
+    const hlod::Camera camera = hlod::makeLookAtCamera(
+        hlod::float4::point(0, 2, -8), hlod::float4::point(0, 0, 0));
 
-    View view;                            // owns cache, scratch, and cut storage
+    hlod::View view;                      // owns cache, scratch, and cut storage
     world.applyUpdates();                 // publish a stable read-only snapshot
-    const World& published = world;
-    const CutView cut =
-        view.selectCut(published, camera, CutParams{4.0f, 0.0f});
+    const hlod::World& published = world;
+    const hlod::CutView cut =
+        view.selectCut(published, camera, hlod::CutParams{4.0f, 0.0f});
 
-    const auto draw = [&](const CutEntry& entry)
-    {
-        UserPayload payloadToDraw;
-        if (published.tryGetPayload(entry.nodeHandle, payloadToDraw))
-            (void)payloadToDraw; // submit with entry.instance()
-    };
-    for (const CutEntry& entry : cut.shared) draw(entry);
-    for (const CutEntry& entry : cut.currentOnly) draw(entry);
+    for (const hlod::CutEntry& entry : cut.shared)
+        drawEntry(published, entry);
+    for (const hlod::CutEntry& entry : cut.currentOnly)
+        drawEntry(published, entry);
 }
 ```
 
@@ -137,11 +141,11 @@ can instead use `CutResultSink` to write directly into fixed spans.
 
 Render `shared + currentOnly`; inspect the fully-resident frontier as
 `shared + idealOnly`. A high-error leaf on the ideal side is the point where
-the caller may consult its external content graph and attach a child page. If
-that graph has no children, the leaf is simply the finest authored
-representation. There is deliberately no load-request type or built-in
-deduplication: shared assets can produce the same node in many placements, and
-the host owns IO priority, budgets, and content identity. Output order is
+the caller may query `World::detailPage()` and attach the generated detail
+page. The returned `DetailPageRef` combines the root asset with its local page
+id; an invalid reference means the leaf is the finest authored representation.
+There is deliberately no load scheduler or built-in request deduplication: the
+host owns IO priority, budgets, and package identity. Output order is
 traversal-defined, not a priority order.
 
 `CutEntry` is 12 bytes: a generation-stamped 64-bit `nodeHandle`, plus a packed
@@ -162,8 +166,9 @@ mutations using it become safe no-ops.
 ## Runtime model
 
 - Immutable, versioned page blobs hold each BLAS's preorder node arrays and
-  8-lane wide child blocks. A registered hierarchy can be instanced thousands
-  of times while sharing page bytes, residency, and its attachment graph.
+  8-lane wide child blocks. A registered root-page asset can be instanced
+  thousands of times while sharing page bytes, residency, and its attachment
+  graph.
 - A dynamic wide TLAS owns placement of independent BLAS roots, layer masks,
   coarse frustum and contribution culling, and incremental spawn/remove edits.
   TLAS leaves may reference either deep hierarchies or one-node BLASes. When a

@@ -80,8 +80,8 @@ expected race: mutating calls ignore it and queries report it absent.
 
 The `World` keeps no payload-to-node index and no hash map. Persistent systems
 should retain handles from `CutEntry`, `InstanceRef::rootPage`, or
-`attachPage`. If a content pipeline needs a payload-to-packed-index table, it
-owns that table outside the library.
+`attachPage`. Generated expansion nodes embed their `HierarchyPageId`; only a
+low-level custom partitioner needs to own additional page-index metadata.
 
 `InstanceDesc` contains:
 
@@ -103,6 +103,28 @@ The following uses the actual API. Page loading is application-specific and is
 shown as placeholders:
 
 ```cpp
+void renderEntry(const World& world, const CutEntry& entry)
+{
+    UserPayload payload;
+    if (world.tryGetPayload(entry.nodeHandle, payload))
+        submit(payload, transforms[entry.instance()]);
+}
+
+void updateStreaming(World& world, const CutEntry& entry)
+{
+    UserPayload payload;
+    if (!world.tryGetPayload(entry.nodeHandle, payload))
+        return;
+
+    const DetailPageRef detail = world.detailPage(entry.nodeHandle);
+    if (entry.overThreshold() && detail.valid() &&
+        !world.isAttached(entry.nodeHandle))
+        world.attachPage(entry.nodeHandle, loadHierarchyPage(detail));
+
+    if (!world.isResident(entry.nodeHandle) && payloadFinishedLoading(payload))
+        world.markResident(entry.nodeHandle);
+}
+
 World world;
 AssetHandle tree = world.registerAsset(loadRootPage());
 
@@ -120,30 +142,16 @@ const World& published = world;
 const CutView cut = view.selectCut(
     published, camera, CutParams{4.0f, 0.0f}, primaryUsage);
 
-const auto render = [&](const CutEntry& entry)
-{
-    UserPayload payload;
-    if (published.tryGetPayload(entry.nodeHandle, payload))
-        submit(payload, transforms[entry.instance()]);
-};
-for (const CutEntry& entry : cut.shared) render(entry);
-for (const CutEntry& entry : cut.currentOnly) render(entry);
+for (const CutEntry& entry : cut.shared)
+    renderEntry(published, entry);
+for (const CutEntry& entry : cut.currentOnly)
+    renderEntry(published, entry);
 
 // After all view queries join, streaming and World mutation are serial again.
-const auto streamIdeal = [&](const CutEntry& entry)
-{
-    UserPayload payload;
-    if (!world.tryGetPayload(entry.nodeHandle, payload)) return;
-
-    if (entry.overThreshold() && contentGraph.hasChildren(payload) &&
-        !world.isAttached(entry.nodeHandle))
-        world.attachPage(entry.nodeHandle, loadChildPage(payload));
-    else if (!world.isResident(entry.nodeHandle) &&
-             payloadFinishedLoading(payload))
-        world.markResident(entry.nodeHandle);
-};
-for (const CutEntry& entry : cut.shared) streamIdeal(entry);
-for (const CutEntry& entry : cut.idealOnly) streamIdeal(entry);
+for (const CutEntry& entry : cut.shared)
+    updateStreaming(world, entry);
+for (const CutEntry& entry : cut.idealOnly)
+    updateStreaming(world, entry);
 
 const CollectResult collected =
     world.collect(primaryUsage, pageBudget, minPageAge);
@@ -153,18 +161,37 @@ for (UserPayload payload : collected.freedPayloads) releasePayload(payload);
 In a real asynchronous streamer, completions normally arrive in later frames.
 It normally deduplicates content identities and applies IO/page budgets before
 scheduling work; `World` deliberately does neither. The loop above shows the
-state transitions, not a production scheduler. The caller's content graph is
-also what distinguishes a high-error terminal leaf from an expandable leaf.
+state transitions, not a production scheduler. Generated expansion metadata
+distinguishes a high-error terminal leaf from one with a detail page.
 
 The generation check is why no extra page-lifetime lock is needed at completion
 time. A stale `attachPage` returns an invalid `PageHandle` and leaves the caller
 free to discard or cache the loaded page.
 
-## 3. Page format and builder invariants
+## 3. Logical hierarchy pages and packed-page invariants
 
-`HLodBuilder` consumes an arbitrary insertion-order authoring tree and emits
-one packed page. The content pipeline decides page boundaries and marks a leaf
-with `markExpansion(node)` when its children live in another page.
+`HierarchyBuilder` consumes one arbitrary insertion-order, single-root logical
+tree. `splitBelow(node)` defines a natural entity boundary: the renderable node
+stays in its parent page as an expansion point, while the builder generates one
+detail page containing its descendants. Boundaries may nest. The result is a
+`Hierarchy` containing deterministically indexed packed blobs. Each expansion
+stores its detail-page id, so the same relationship is not duplicated in a
+separate manifest.
+
+Every generated page has one logical root. The root page physically contains
+that node. A detail page physically begins with the logical root's children;
+index zero acts as their common continuation sentinel. Users author and stream
+the single logical root, not this packed multi-root representation.
+
+The generated local detail-page id is stored in otherwise unused expansion
+metadata. `World::detailPage(NodeHandle)` scopes it with the hierarchy's root
+asset and can therefore resolve an unambiguous streaming request without a
+payload lookup or a map for every mounted page. Payloads remain non-unique
+opaque application data.
+
+`HLodBuilder` is the low-level escape hatch for a content pipeline that already
+owns physical partitioning. It emits one packed blob and may explicitly mark a
+leaf with `markExpansion(node, detailPageId)`.
 
 The blob begins with a 64-byte `PageHeader` and contains aligned arrays for:
 
@@ -183,7 +210,7 @@ storage. `PageView::fromBytes` validates a borrowed blob without taking
 ownership; the storage must remain valid and suitably aligned for the lifetime
 of every asset registered from it.
 
-`HLodBuilder::build()` establishes these invariants:
+Both builders establish these packed-page invariants:
 
 | ID | Invariant | Purpose |
 |---|---|---|
@@ -193,10 +220,10 @@ of every asset registered from it.
 | D | Effective geometric error never increases downward | Both cuts remain antichains |
 | E | An expansion point has no local children | One unambiguous refinement source |
 
-The builder derives parent bounds by unioning children; an authored parent box
-acts as a conservative lower bound. Every leaf must have a non-empty box.
-Errors that exceed the parent are clamped downward. Payload uniqueness is not a
-requirement.
+`HierarchyBuilder` derives bounds and clamps errors over the complete logical
+tree before partitioning, so the same contracts hold across generated
+boundaries. An authored parent box acts as a conservative lower bound. Every
+leaf must have a non-empty box. Payload uniqueness is not a requirement.
 
 Cross-page invariant C is checked when attaching: the attached page's sentinel
 bounds must fit inside the expansion node's authored box. The runtime cannot
@@ -279,9 +306,9 @@ An expansion point is a renderable collapsed proxy whose children live in a
 different page. If its error is acceptable it remains a normal ideal-cut entry.
 If it is too coarse and no child page is attached, it appears as a high-error
 ideal-side leaf. Attaching a child page makes traversal able to cross the
-boundary on the next cut. No per-entry expansion tag is needed: the caller's
-external content graph says whether that node has another page, while the
-quantized error says whether expansion is currently useful.
+boundary on the next cut. No per-entry expansion tag is needed:
+`World::detailPage()` reports whether a generated detail page exists, while
+the quantized error says whether loading it is currently useful.
 
 Instance-root payloads are pinned resident. This is the base case for the
 runtime invariant:

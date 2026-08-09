@@ -13,9 +13,9 @@
 #include <cstdlib>
 
 #define HLOD_VERSION_MAJOR 0
-#define HLOD_VERSION_MINOR 4
+#define HLOD_VERSION_MINOR 5
 #define HLOD_VERSION_PATCH 0
-#define HLOD_VERSION_STRING "0.4.0"
+#define HLOD_VERSION_STRING "0.5.0"
 
 // ---------------------------------------------------------------------------
 // Diagnostics
@@ -62,9 +62,9 @@ namespace hlod {
 // ---------------------------------------------------------------------------
 // Host context: page-blob allocation and optional task parallelism.
 //
-// HLodBuilder and the owned Page factories use alloc/free. World uses the
-// blocking parallelFor callback and workerCount for an enabled uncached
-// parallel selection. Other retained runtime storage is library-owned.
+// HierarchyBuilder, HLodBuilder, and the owned Page factories use alloc/free.
+// World uses the blocking parallelFor callback and workerCount for an enabled
+// uncached parallel selection. Other retained runtime storage is library-owned.
 // ---------------------------------------------------------------------------
 
 using AllocFn = void* (*)(size_t bytes, size_t alignment, void* user);

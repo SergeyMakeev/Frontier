@@ -19,10 +19,15 @@ describe runtime roles rather than object size.
   instances. It performs coarse frustum, layer, and contribution culling. Its
   internal nodes are acceleration data and never appear in a cut.
 
-`HLodBuilder` converts an authoring tree into immutable, versioned page blobs.
-Expansion points connect independently streamed pages. Instances of a
-registered root asset share page bytes, residency, and the attached-page graph;
-per-instance deformation allocates bounds-only copy-on-write overlays.
+`HierarchyBuilder` accepts one logical tree and turns natural `splitBelow()`
+boundaries into immutable, deterministically indexed pages. Each generated page
+has one logical root; continuation roots inside a packed detail blob remain an
+implementation detail. Expansion metadata carries the generated local
+detail-page id, eliminating a separate mount manifest. Runtime lookup scopes
+that id with the hierarchy's root asset, so streaming does not depend on
+payload uniqueness and independent hierarchies may reuse local ids. Instances
+of a registered root asset share page bytes, residency, and the attached-page
+graph; per-instance deformation allocates bounds-only copy-on-write overlays.
 
 ## Published-world lifecycle
 

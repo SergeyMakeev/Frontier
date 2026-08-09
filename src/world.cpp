@@ -415,6 +415,24 @@ PageHandle World::attachPage(NodeHandle expansionNode, Page&& page)
     return h;
 }
 
+DetailPageRef World::detailPage(NodeHandle expansionNode) const
+{
+    const PageRt* rt = resolve(expansionNode);
+    if (!rt) return {};
+
+    const HierarchyPageId page =
+        pageView(*rt).detailPage(expansionNode.index());
+    if (page == kInvalidHierarchyPage) return {};
+
+    uint32_t rootSlot = expansionNode.slot();
+    while (slots_[rootSlot].owner.valid())
+        rootSlot = slots_[rootSlot].owner.slot;
+
+    const uint32_t rootAsset = slots_[rootSlot].asset;
+    return DetailPageRef{
+        AssetHandle{rootAsset, assets_[rootAsset].generation}, page};
+}
+
 void World::detachPage(NodeHandle expansionNode)
 {
     const PageRt* ownerRt = resolve(expansionNode);

@@ -1,6 +1,7 @@
 #pragma once
 // Immutable flat page: preorder SoA arrays + BVH8-style wide child blocks,
-// laid out as ONE contiguous blob. Produced by HLodBuilder::build();
+// laid out as ONE contiguous blob. Produced by HierarchyBuilder::build() or
+// the low-level HLodBuilder::build();
 // see docs/hlod_design.md §3.
 //
 // The in-memory layout IS the on-disk format. A streamed page can be read into
@@ -31,8 +32,15 @@ using UserPayload = uint64_t;
 inline constexpr UserPayload kSentinelPayload = ~0ull;   // page sentinel [0] only
 inline constexpr uint32_t    kInvalidIndex    = 0xFFFFFFFFu;
 
-// meta packing: childCount | EXPANSION flag | wide-block offset.
-// Fits in one word because pages are bounded; build() enforces the limits.
+// Stable id assigned to each logical page generated from one hierarchy.
+// Page zero is the root page; detail-page ids therefore start at one.
+using HierarchyPageId = uint32_t;
+inline constexpr HierarchyPageId kInvalidHierarchyPage = kInvalidIndex;
+
+// meta packing: childCount | EXPANSION flag | wide-block offset/detail-page id.
+// Nodes with local children use the high bits as their wide-block offset;
+// expansion leaves use the same otherwise-idle bits as a generated logical
+// detail-page id. Fits in one word because pages are bounded.
 inline constexpr uint32_t kMetaChildBits  = 9;                          // <= 511 children
 inline constexpr uint32_t kMaxChildren    = (1u << kMetaChildBits) - 1;
 static_assert(kMaxChildren <= UINT16_MAX,
@@ -44,6 +52,11 @@ inline constexpr uint32_t kMaxWideOffset  = (1u << (32 - kMetaOffsetShift)) - 1;
 inline uint32_t metaChildCount(uint32_t m) { return m & kMaxChildren; }
 inline bool     metaIsExpansion(uint32_t m) { return (m & kMetaExpansion) != 0; }
 inline uint32_t metaWideOffset(uint32_t m) { return m >> kMetaOffsetShift; }
+inline HierarchyPageId metaDetailPage(uint32_t m)
+{
+    const HierarchyPageId encoded = m >> kMetaOffsetShift;
+    return encoded == 0 ? kInvalidHierarchyPage : encoded;
+}
 
 // One wide child block: up to kWide children of one node, SoA-transposed so a
 // single SIMD issue tests them all (frustum + distance + error).
@@ -204,7 +217,14 @@ public:
 
     uint32_t childCount(uint32_t i) const { return metaChildCount(meta[i]); }
     bool     isExpansion(uint32_t i) const { return metaIsExpansion(meta[i]); }
+    // Valid for nodes with local children. Expansion leaves reuse these bits
+    // for detailPage(), so callers skip this accessor when childCount(i) == 0.
     uint32_t wideOffset(uint32_t i) const { return metaWideOffset(meta[i]); }
+    HierarchyPageId detailPage(uint32_t i) const
+    {
+        return isExpansion(i) ? metaDetailPage(meta[i])
+                              : kInvalidHierarchyPage;
+    }
     uint32_t wideBlockCount(uint32_t i) const
     {
         return (childCount(i) + kWide - 1) / kWide;
