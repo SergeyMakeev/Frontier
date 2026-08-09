@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cmath>
 #include <memory>
 
 namespace frontier {
@@ -46,6 +47,16 @@ inline uint32_t frontierTotal(uint32_t counts)
 inline uint32_t frontierDependencyCount(uint32_t counts)
 {
     return counts >> 30;
+}
+
+inline bool frontierCountsOverflow(uint32_t counts)
+{
+    return frontierDependencyCount(counts) == 3;
+}
+
+inline uint32_t frontierOverflowIndex(uint32_t counts)
+{
+    return counts & 0x3fffffffu;
 }
 
 inline uint32_t packFrontierCounts(uint32_t shared, uint32_t currentOnly,
@@ -191,9 +202,133 @@ const SpatialDatabase::AssetRt* SpatialDatabase::resolveAsset(AssetHandle h) con
     return &as;
 }
 
+inline uint32_t packFrontierOverflow(uint32_t index)
+{
+    FRONTIER_CHECK(index < (1u << 30),
+                   "SpatialQuery: exhausted large-frontier count records");
+    return (3u << 30) | index;
+}
+
+const SpatialDatabase::SubtreeAssetRt*
+SpatialDatabase::resolveSubtree(SubtreeHandle h) const
+{
+    if (h.slot >= assets_.size() || h.slot >= subtreeAssets_.size()) return nullptr;
+    const AssetRt& as = assets_[h.slot];
+    const SubtreeAssetRt& subtree = subtreeAssets_[h.slot];
+    if (!as.inUse() || as.generation != h.generation || !subtree.inUse())
+        return nullptr;
+    return &subtree;
+}
+
+const SubtreeExpansion* SpatialDatabase::findSubtreeExpansion(uint32_t asset,
+                                                               uint32_t node) const
+{
+    if (asset >= subtreeAssets_.size()) return nullptr;
+    const std::vector<SubtreeExpansion>& expansions =
+        subtreeAssets_[asset].expansions;
+    const auto it = std::lower_bound(
+        expansions.begin(), expansions.end(), node,
+        [](const SubtreeExpansion& expansion, uint32_t packedNode) {
+            return expansion.nodeIndex < packedNode;
+        });
+    return it != expansions.end() && it->nodeIndex == node ? &*it : nullptr;
+}
+
+uint32_t SpatialDatabase::traversalDependency(uint32_t slot) const
+{
+    return kMountTreeDependency | slots_[slot].rootSlot;
+}
+
+void SpatialDatabase::recordTraversalDependency(Worker& worker,
+                                                 uint32_t slot) const
+{
+    if (!worker.trackTouches) return;
+    const uint32_t dependency = worker.coalesceMountTreeDependencies
+                                    ? traversalDependency(slot)
+                                    : slot;
+    if (!worker.uniqueTouches ||
+        std::find(worker.touched.begin(), worker.touched.end(), dependency) ==
+            worker.touched.end())
+        worker.touched.push_back(dependency);
+}
+
+uint32_t SpatialDatabase::dependencyVersion(uint32_t dependency) const
+{
+    return pageStamps_[dependency & ~kMountTreeDependency].contentVersion;
+}
+
+bool SpatialDatabase::dependencyMatches(uint32_t dependency,
+                                        uint32_t version) const
+{
+    const uint32_t slot = dependency & ~kMountTreeDependency;
+    return slot < pageStamps_.size() && pageStamps_[slot].inUse() &&
+           pageStamps_[slot].contentVersion == version;
+}
+
+void SpatialDatabase::bumpContentVersion(uint32_t slot)
+{
+    ++pageStamps_[slot].contentVersion;
+    const uint32_t root = slots_[slot].rootSlot;
+    if (root != slot) ++pageStamps_[root].contentVersion;
+}
+
 // ============================================================================
 // assets — the unit of sharing
 // ============================================================================
+
+uint16_t* SpatialDatabase::NodeStatePoolRt::acquire(uint32_t nodeCount)
+{
+    FRONTIER_CHECK(nodeCount != 0,
+                   "SpatialDatabase: empty node-state allocation");
+    if (wordsPerBlock == 0) wordsPerBlock = nodeCount;
+    FRONTIER_CHECK(wordsPerBlock == nodeCount,
+                   "SpatialDatabase: asset node count changed");
+
+    if (!freeBlocks.empty())
+    {
+        uint16_t* state = freeBlocks.back();
+        freeBlocks.pop_back();
+        std::fill(state, state + wordsPerBlock, uint16_t(0));
+        return state;
+    }
+
+    if (slabs.empty() ||
+        slabs.back().usedBlocks == slabs.back().blockCount)
+    {
+        constexpr size_t kTargetSlabBytes = 1u << 20;
+        const uint32_t maxBlocks = uint32_t(std::max<size_t>(
+            1, kTargetSlabBytes /
+                   (size_t(wordsPerBlock) * sizeof(uint16_t))));
+        const uint32_t blocks = std::min(nextSlabBlocks, maxBlocks);
+        Slab slab;
+        slab.words = std::make_unique<uint16_t[]>(
+            size_t(wordsPerBlock) * blocks);
+        slab.blockCount = blocks;
+        slabs.push_back(std::move(slab));
+        nextSlabBlocks = blocks < maxBlocks
+                             ? std::min(blocks * 2u, maxBlocks)
+                             : maxBlocks;
+    }
+
+    Slab& slab = slabs.back();
+    uint16_t* state = slab.words.get() +
+                      size_t(slab.usedBlocks++) * wordsPerBlock;
+    return state;
+}
+
+void SpatialDatabase::NodeStatePoolRt::release(uint16_t* state)
+{
+    if (state) freeBlocks.push_back(state);
+}
+
+size_t SpatialDatabase::NodeStatePoolRt::bytes() const
+{
+    size_t result = slabs.capacity() * sizeof(Slab) +
+                    freeBlocks.capacity() * sizeof(uint16_t*);
+    for (const Slab& slab : slabs)
+        result += size_t(slab.blockCount) * wordsPerBlock * sizeof(uint16_t);
+    return result;
+}
 
 uint32_t SpatialDatabase::allocAsset()
 {
@@ -204,6 +339,8 @@ uint32_t SpatialDatabase::allocAsset()
         return a;
     }
     assets_.emplace_back();
+    subtreeAssets_.emplace_back();
+    nodeStatePools_.emplace_back();
     return uint32_t(assets_.size() - 1);
 }
 
@@ -212,6 +349,8 @@ uint32_t SpatialDatabase::createAsset(Page&& page, bool registered)
     const uint32_t a = allocAsset();
     AssetRt& as = assets_[a];
     as = AssetRt{};
+    subtreeAssets_[a] = SubtreeAssetRt{};
+    nodeStatePools_[a] = NodeStatePoolRt{};
     // Every pointer in Page points into the blob, not into AssetRt, so moving
     // this vector never invalidates mounted page data.
     as.page       = std::move(page);
@@ -227,6 +366,8 @@ void SpatialDatabase::destroyAssetIfUnused(uint32_t a)
     if (!as.inUse()) return;
     if (as.registered() || as.mountRefs() > 0 || as.instanceRefs > 0) return;
     as = AssetRt{};   // releases the blob if the SpatialDatabase owned it
+    subtreeAssets_[a] = SubtreeAssetRt{};
+    nodeStatePools_[a] = NodeStatePoolRt{};
     freeAssets_.push_back(a);
     --liveAssets_;
 }
@@ -244,6 +385,59 @@ AssetHandle SpatialDatabase::registerAsset(PageView borrowedPage)
                "SpatialDatabase::registerAsset: empty page");
     const uint32_t a = createAsset(Page::borrow(borrowedPage), true);
     return AssetHandle{a, assets_[a].generation};
+}
+
+SubtreeHandle SpatialDatabase::registerSubtree(Subtree&& subtree)
+{
+    FRONTIER_CHECK(subtree.valid(),
+                   "SpatialDatabase::registerSubtree: invalid subtree");
+    for (const SubtreeAssetRt& existing : subtreeAssets_)
+        FRONTIER_CHECK(!existing.inUse() || existing.key != subtree.key_,
+                       "SpatialDatabase::registerSubtree: duplicate subtree key");
+
+    const uint32_t nodeCount = subtree.page_.nodeCount();
+    for (const SubtreeExpansion& expansion : subtree.expansions_)
+    {
+        FRONTIER_CHECK(expansion.nodeIndex > 0 &&
+                           expansion.nodeIndex < nodeCount,
+                       "SpatialDatabase::registerSubtree: invalid expansion node");
+        FRONTIER_CHECK(expansion.dependency < subtree.dependencies_.size(),
+                       "SpatialDatabase::registerSubtree: invalid dependency index");
+        FRONTIER_CHECK(subtree.page_.isExpansion(expansion.nodeIndex),
+                       "SpatialDatabase::registerSubtree: expansion metadata mismatch");
+    }
+
+    const SubtreeKey key = subtree.key_;
+    const uint32_t a = createAsset(std::move(subtree.page_), true);
+    SubtreeAssetRt& rt = subtreeAssets_[a];
+    rt.key = key;
+    rt.dependencies = std::move(subtree.dependencies_);
+    rt.expansions = std::move(subtree.expansions_);
+    const PageView& page = assets_[a].page;
+    rt.rootLeavesOnly = true;
+    const uint32_t firstBlock = page.wideOffset(0);
+    for (uint32_t b = 0; b < page.wideBlockCount(0); ++b)
+    {
+        const uint32_t lanes = page.blockMask[firstBlock + b];
+        if (blockValidLanes(lanes) != blockLeafLanes(lanes))
+        {
+            rt.rootLeavesOnly = false;
+            break;
+        }
+    }
+    subtree.key_ = {};
+    return SubtreeHandle{a, assets_[a].generation};
+}
+
+void SpatialDatabase::releaseSubtree(SubtreeHandle subtree)
+{
+    if (!resolveSubtree(subtree)) return;
+    releaseAsset(AssetHandle{subtree.slot, subtree.generation});
+}
+
+bool SpatialDatabase::isSubtree(SubtreeHandle subtree) const
+{
+    return resolveSubtree(subtree) != nullptr;
 }
 
 void SpatialDatabase::releaseAsset(AssetHandle h)
@@ -286,9 +480,56 @@ uint32_t SpatialDatabase::allocSlot()
     FRONTIER_CHECK(slots_.size() < NodeHandle::kInvalidSlot,
                "SpatialDatabase: exhausted the 20-bit page-mount slot space");
     slots_.emplace_back();
+    mountTransforms_.emplace_back();
     pageStamps_.emplace_back();
     pageResidency_.emplace_back();
     return uint32_t(slots_.size() - 1);
+}
+
+const std::vector<uint32_t>*
+SpatialDatabase::expansionSlots(const PageRt& page) const
+{
+    return page.expansionLinks == kInvalidIndex
+               ? nullptr
+               : &expansionLinks_[page.expansionLinks].slots;
+}
+
+std::vector<uint32_t>& SpatialDatabase::ensureExpansionSlots(uint32_t slot)
+{
+    PageRt& page = slots_[slot];
+    if (page.expansionLinks == kInvalidIndex)
+    {
+        uint32_t index;
+        if (!freeExpansionLinks_.empty())
+        {
+            index = freeExpansionLinks_.back();
+            freeExpansionLinks_.pop_back();
+        }
+        else
+        {
+            expansionLinks_.emplace_back();
+            index = uint32_t(expansionLinks_.size() - 1);
+        }
+        page.expansionLinks = index;
+        expansionLinks_[index].slots.assign(pageView(page).nodeCount(),
+                                             kInvalidIndex);
+    }
+    return expansionLinks_[page.expansionLinks].slots;
+}
+
+uint32_t SpatialDatabase::attachedChildSlot(const PageRt& page,
+                                             uint32_t node) const
+{
+    const std::vector<uint32_t>* links = expansionSlots(page);
+    return links ? (*links)[node] : kInvalidIndex;
+}
+
+void SpatialDatabase::releaseExpansionSlots(PageRt& page)
+{
+    if (page.expansionLinks == kInvalidIndex) return;
+    expansionLinks_[page.expansionLinks].slots.clear();
+    freeExpansionLinks_.push_back(page.expansionLinks);
+    page.expansionLinks = kInvalidIndex;
 }
 
 uint32_t SpatialDatabase::registerPage(uint32_t asset, NodeRef owner, bool pinned)
@@ -298,14 +539,14 @@ uint32_t SpatialDatabase::registerPage(uint32_t asset, NodeRef owner, bool pinne
     PageRt& rt = slots_[slot];
     PageStamp& stamp = pageStamps_[slot];
     pageResidency_[slot] = PageResidency{};
+    mountTransforms_[slot] = MountTransformRt{};
 
     FRONTIER_CHECK(as.page.nodeCount() <= (1u << NodeHandle::kIndexBits),
                "SpatialDatabase: page exceeds the 20-bit page-local node space");
     rt.asset    = asset;
     rt.errClamp = FLT_MAX;
-    rt.nodeState.assign(as.page.nodeCount(), 0);
-    rt.coveredChildren.assign(as.page.nodeCount(), 0);
-    rt.expSlot.clear();
+    rt.nodeState = nodeStatePools_[asset].acquire(as.page.nodeCount());
+    rt.expansionLinks = kInvalidIndex;
     const uint32_t generation = nextPageGeneration(stamp.generation());
     stamp.setGeneration(generation);
     rt.setGeneration(generation);
@@ -319,6 +560,14 @@ uint32_t SpatialDatabase::registerPage(uint32_t asset, NodeRef owner, bool pinne
     rt.attachedChildrenAndPinned = 0;
     rt.setPinned(pinned);
     rt.owner = owner;
+    rt.rootSlot = owner.valid() ? slots_[owner.slot].rootSlot : slot;
+
+    MountTransformRt& hot = mountTransforms_[slot];
+    hot.generation = generation;
+    hot.assetAndFlags = asset;
+    if (asset < subtreeAssets_.size() &&
+        subtreeAssets_[asset].rootLeavesOnly)
+        hot.assetAndFlags |= MountTransformRt::kRootLeavesOnly;
 
     as.addMountRef();
     ++attachedPages_;
@@ -350,17 +599,32 @@ PageHandle SpatialDatabase::attachPage(NodeHandle expansionNode, AssetHandle ass
     const AssetRt* as = resolveAsset(assetHandle);
     FRONTIER_CHECK(as != nullptr, "SpatialDatabase::attachPage: invalid or released asset");
 
+    return attachPageTransformed(expansionNode, assetHandle.slot,
+                                 SubtreeTransform{});
+}
+
+PageHandle SpatialDatabase::attachPageTransformed(
+    NodeHandle expansionNode, uint32_t asset,
+    const SubtreeTransform& transform)
+{
+    FRONTIER_CHECK(asset < assets_.size() && assets_[asset].inUse(),
+                   "SpatialDatabase: invalid or released mounted asset");
+    FRONTIER_CHECK(transform.scale > 0.0f && std::isfinite(transform.scale) &&
+                       std::isfinite(transform.pos.x) &&
+                       std::isfinite(transform.pos.y) &&
+                       std::isfinite(transform.pos.z),
+                   "SpatialDatabase: invalid mount transform");
+
     // Stale expansion handle: the parent page was detached/collected while
     // this page was being streamed. Normal streaming race — reject quietly.
     if (!resolve(expansionNode)) return PageHandle{};
 
-    const uint32_t asset = assetHandle.slot;
     const NodeRef owner{expansionNode.slot(), expansionNode.index()};
     {
         const PageRt& ownerRt = slots_[owner.slot];
         FRONTIER_CHECK(pageView(ownerRt).isExpansion(owner.index),
                    "SpatialDatabase::attachPage: not an expansion point");
-        FRONTIER_CHECK(ownerRt.expSlot.empty() || ownerRt.expSlot[owner.index] == kInvalidIndex,
+        FRONTIER_CHECK(attachedChildSlot(ownerRt, owner.index) == kInvalidIndex,
                    "SpatialDatabase::attachPage: already attached");
     }
     FRONTIER_CHECK(assets_[asset].page.nodeCount() > 1, "SpatialDatabase::attachPage: empty page");
@@ -370,9 +634,11 @@ PageHandle SpatialDatabase::attachPage(NodeHandle expansionNode, AssetHandle ass
     // of the owning asset, so the growth would have to ripple into all of
     // their top-level bounds, and a streaming event would silently become an
     // O(instances) write. Author expansion bounds that contain what attaches.
+    const AABB childBounds = toWorld(assets_[asset].page.bbox[0],
+                                     transform.pos, transform.scale);
     FRONTIER_CHECK(pageView(slots_[owner.slot]).bbox[owner.index].contains(
-                   assets_[asset].page.bbox[0]),
-               "SpatialDatabase::attachPage: the attached page escapes the expansion node's "
+                   childBounds),
+               "SpatialDatabase: the mounted subtree escapes the expansion node's "
                "authored bounds — author conservative expansion bounds at build time");
 
     // (D) across the boundary: the child page's effective error ceiling is
@@ -382,22 +648,28 @@ PageHandle SpatialDatabase::attachPage(NodeHandle expansionNode, AssetHandle ass
     // its own ceiling, and attach stays O(1) instead of O(nodeCount).
     const float childClamp =
         std::min(pageView(slots_[owner.slot]).geometricError[owner.index],
-                 slots_[owner.slot].errClamp);
+                 slots_[owner.slot].errClamp) /
+        transform.scale;
+
+    const MountTransformRt parentTransform = mountTransforms_[owner.slot];
 
     // NOTE: registerPage can reallocate slots_, so nothing above may be held
     // as a reference across this call.
     const uint32_t slot = registerPage(asset, owner, false);
     slots_[slot].errClamp = childClamp;
+    MountTransformRt& mounted = mountTransforms_[slot];
+    mounted.scale = parentTransform.scale * transform.scale;
+    mounted.errClamp = childClamp;
+    mounted.pos = parentTransform.pos + transform.pos * parentTransform.scale;
+    mounted.pos.w = 1.0f;
 
     PageRt& ort = slots_[owner.slot];
     const bool ownerWasFullyResident = pageTreeFullyResident(owner.slot);
-    if (ort.expSlot.empty())
-        ort.expSlot.assign(pageView(ort).nodeCount(), kInvalidIndex);
-    ort.expSlot[owner.index] = slot;
+    ensureExpansionSlots(owner.slot)[owner.index] = slot;
     ort.addAttachedChild();
     ++pageResidency_[owner.slot].incompleteChildren;
     propagateFullResidency(owner.slot, ownerWasFullyResident);
-    ++pageStamps_[owner.slot].contentVersion;   // this page now refines further
+    bumpContentVersion(owner.slot);   // this page now refines further
 
     return PageHandle{slot, pageStamps_[slot].generation()};
 }
@@ -413,6 +685,52 @@ PageHandle SpatialDatabase::attachPage(NodeHandle expansionNode, Page&& page)
     const PageHandle h = attachPage(expansionNode, AssetHandle{a, assets_[a].generation});
     if (!h.valid()) destroyAssetIfUnused(a);
     return h;
+}
+
+MountHandle SpatialDatabase::mount(NodeHandle expansionNode,
+                                   SubtreeHandle subtreeHandle)
+{
+    const SubtreeAssetRt* child = resolveSubtree(subtreeHandle);
+    FRONTIER_CHECK(child != nullptr,
+                   "SpatialDatabase::mount: invalid or released subtree");
+
+    const PageRt* owner = resolve(expansionNode);
+    if (!owner) return MountHandle{};
+    const SubtreeExpansion* expansion =
+        findSubtreeExpansion(owner->asset, expansionNode.index());
+    FRONTIER_CHECK(expansion != nullptr,
+                   "SpatialDatabase::mount: expansion has no subtree target");
+    const SubtreeAssetRt& parent = subtreeAssets_[owner->asset];
+    FRONTIER_CHECK(expansion->dependency < parent.dependencies.size(),
+                   "SpatialDatabase::mount: invalid authored dependency");
+    FRONTIER_CHECK(parent.dependencies[expansion->dependency] == child->key,
+                   "SpatialDatabase::mount: subtree key does not match expansion target");
+
+    return attachPageTransformed(expansionNode, subtreeHandle.slot,
+                                 expansion->transform());
+}
+
+SubtreeKey SpatialDatabase::expansionTarget(NodeHandle expansionNode) const
+{
+    const PageRt* owner = resolve(expansionNode);
+    if (!owner) return {};
+    const SubtreeExpansion* expansion =
+        findSubtreeExpansion(owner->asset, expansionNode.index());
+    if (!expansion) return {};
+    const SubtreeAssetRt& parent = subtreeAssets_[owner->asset];
+    return expansion->dependency < parent.dependencies.size()
+               ? parent.dependencies[expansion->dependency]
+               : SubtreeKey{};
+}
+
+bool SpatialDatabase::tryGetNodeTransform(
+    NodeHandle node, SubtreeTransform& outTransform) const
+{
+    if (!resolve(node)) return false;
+    const MountTransformRt& transform = mountTransforms_[node.slot()];
+    outTransform.pos = transform.pos;
+    outTransform.scale = transform.scale;
+    return true;
 }
 
 DetailPageRef SpatialDatabase::detailPage(NodeHandle expansionNode) const
@@ -437,9 +755,8 @@ void SpatialDatabase::detachPage(NodeHandle expansionNode)
 {
     const PageRt* ownerRt = resolve(expansionNode);
     if (!ownerRt) return;   // parent page already gone; nothing to detach
-    const uint32_t child = ownerRt->expSlot.empty()
-                               ? kInvalidIndex
-                               : ownerRt->expSlot[expansionNode.index()];
+    const uint32_t child =
+        attachedChildSlot(*ownerRt, expansionNode.index());
     FRONTIER_CHECK(child != kInvalidIndex, "SpatialDatabase::detachPage: not attached");
     PageRt& rt = slots_[child];
     FRONTIER_CHECK(rt.attachedChildPages() == 0,
@@ -451,8 +768,7 @@ void SpatialDatabase::detachPage(NodeHandle expansionNode)
 bool SpatialDatabase::isAttached(NodeHandle expansionNode) const
 {
     const PageRt* rt = resolve(expansionNode);
-    return rt && !rt->expSlot.empty() &&
-           rt->expSlot[expansionNode.index()] != kInvalidIndex;
+    return rt && attachedChildSlot(*rt, expansionNode.index()) != kInvalidIndex;
 }
 
 void SpatialDatabase::detachSlot(uint32_t slot, AppendBuffer<UserPayload>* freedPayloads)
@@ -471,16 +787,18 @@ void SpatialDatabase::detachSlot(uint32_t slot, AppendBuffer<UserPayload>* freed
                        "SpatialDatabase: page residency summary underflow");
             --pageResidency_[rt.owner.slot].incompleteChildren;
         }
-        ownerRt.expSlot[rt.owner.index] = kInvalidIndex;
+        ensureExpansionSlots(rt.owner.slot)[rt.owner.index] = kInvalidIndex;
         ownerRt.removeAttachedChild();
         propagateFullResidency(rt.owner.slot, ownerWasFullyResident);
-        ++pageStamps_[rt.owner.slot].contentVersion;   // it collapses to a leaf
+        bumpContentVersion(rt.owner.slot);   // it collapses to a leaf
         propagateCoverage(rt.owner.slot, rt.owner.index);
     }
     lruUnlink(slot);
     if (rt.pinned()) --pinnedPages_;
     const uint32_t asset = rt.asset;
     const uint32_t generation = rt.generation();
+    releaseExpansionSlots(rt);
+    nodeStatePools_[rt.asset].release(rt.nodeState);
     rt = PageRt{};
     rt.setGeneration(generation);
     // The compact stamps belong to the slot rather than the mounted page.
@@ -488,6 +806,7 @@ void SpatialDatabase::detachSlot(uint32_t slot, AppendBuffer<UserPayload>* freed
     // dependency validation until registerPage reuses them with a new version.
     pageStamps_[slot].setInUse(false);
     pageResidency_[slot] = PageResidency{};
+    mountTransforms_[slot] = MountTransformRt{};
     freeSlots_.push_back(slot);
     --attachedPages_;
     // Any per-instance bounds overlay on this mount is now describing a page
@@ -514,8 +833,10 @@ void SpatialDatabase::detachMountTree(uint32_t rootSlot,
     std::vector<uint32_t> order;
     order.push_back(rootSlot);
     for (size_t k = 0; k < order.size(); ++k)
-        for (const uint32_t child : slots_[order[k]].expSlot)
-            if (child != kInvalidIndex) order.push_back(child);
+        if (const std::vector<uint32_t>* links =
+                expansionSlots(slots_[order[k]]))
+            for (const uint32_t child : *links)
+                if (child != kInvalidIndex) order.push_back(child);
     for (size_t k = order.size(); k-- > 0;) detachSlot(order[k], freedPayloads);
 }
 
@@ -559,12 +880,12 @@ bool SpatialDatabase::descendantsCovered(uint32_t slot, uint32_t node) const
     const PageRt& rt = slots_[slot];
     if (node != 0 && pageView(rt).isExpansion(node))
     {
-        const uint32_t child = rt.expSlot.empty() ? kInvalidIndex : rt.expSlot[node];
+        const uint32_t child = attachedChildSlot(rt, node);
         return child != kInvalidIndex && slots_[child].inUse() &&
                slots_[child].isCovered(0);
     }
     const uint32_t count = pageView(rt).childCount(node);
-    return count != 0 && rt.coveredChildren[node] == count;
+    return count != 0 && rt.coveredChildCount(node) == count;
 }
 
 bool SpatialDatabase::computeCovered(uint32_t slot, uint32_t node) const
@@ -587,7 +908,7 @@ void SpatialDatabase::propagateCoverage(uint32_t slot, uint32_t node)
         {
             if (!rt.owner.valid()) return;
             const NodeRef owner = rt.owner;
-            ++pageStamps_[owner.slot].contentVersion;
+            bumpContentVersion(owner.slot);
             slot = owner.slot;
             node = owner.index;
             continue;
@@ -595,9 +916,9 @@ void SpatialDatabase::propagateCoverage(uint32_t slot, uint32_t node)
 
         const uint32_t parent = pageView(rt).parent[node];
         if (now)
-            ++rt.coveredChildren[parent];
+            rt.addCoveredChild(parent);
         else
-            --rt.coveredChildren[parent];
+            rt.removeCoveredChild(parent);
         node = parent;
     }
 }
@@ -612,7 +933,7 @@ void SpatialDatabase::markResident(NodeHandle h)
     rt->setResident(index, true);
     ++pageResidency_[h.slot()].residentNodes;
     propagateFullResidency(h.slot(), wasFullyResident);
-    ++pageStamps_[h.slot()].contentVersion;
+    bumpContentVersion(h.slot());
     propagateCoverage(h.slot(), index);
 }
 
@@ -630,7 +951,7 @@ void SpatialDatabase::markNonResident(NodeHandle h)
                "SpatialDatabase: page residency summary underflow");
     --pageResidency_[h.slot()].residentNodes;
     propagateFullResidency(h.slot(), wasFullyResident);
-    ++pageStamps_[h.slot()].contentVersion;
+    bumpContentVersion(h.slot());
     propagateCoverage(h.slot(), index);
 }
 
@@ -755,6 +1076,23 @@ SpatialDatabase::InstanceRef SpatialDatabase::addInstance(AssetHandle asset, flo
     d.pos = pos;
     d.scale = scale;
     return addInstance(asset, d);
+}
+
+SpatialDatabase::InstanceRef SpatialDatabase::instantiate(
+    SubtreeHandle subtree, const InstanceDesc& desc)
+{
+    FRONTIER_CHECK(resolveSubtree(subtree) != nullptr,
+                   "SpatialDatabase::instantiate: invalid or released subtree");
+    return addInstanceInternal(subtree.slot, desc);
+}
+
+SpatialDatabase::InstanceRef SpatialDatabase::instantiate(
+    SubtreeHandle subtree, float4 pos, float scale)
+{
+    InstanceDesc desc;
+    desc.pos = pos;
+    desc.scale = scale;
+    return instantiate(subtree, desc);
 }
 
 SpatialDatabase::InstanceRef SpatialDatabase::addInstance(Page&& page, const InstanceDesc& desc)
@@ -1158,6 +1496,35 @@ SpatialDatabase::WorkItem SpatialDatabase::makeWorkItem(uint32_t slot, const Ins
     return WorkItem{slot, wide, current, ideal, mask, sparse};
 }
 
+Camera SpatialDatabase::mountLocalCamera(const Camera& rootLocal,
+                                         uint32_t slot, uint8_t mask) const
+{
+    const MountTransformRt& transform = mountTransforms_[slot];
+    if (transform.scale == 1.0f && transform.pos.x == 0.0f &&
+        transform.pos.y == 0.0f && transform.pos.z == 0.0f)
+        return rootLocal;
+
+    // A traversal mask only loses planes as it descends.  Transforming the
+    // already-dismissed planes at every mount is wasted work, and is
+    // particularly expensive for scenes made from many small shared assets.
+    const float invScale = 1.0f / transform.scale;
+    Camera local{};
+    local.pos = (rootLocal.pos - transform.pos) * invScale;
+    local.k = rootLocal.k;
+    local.viewMask = rootLocal.viewMask;
+    local.envLo = rootLocal.envLo * invScale;
+    local.envHi = rootLocal.envHi * invScale;
+    for (uint32_t p = 0; p < 6; ++p)
+    {
+        if ((mask & (uint8_t(1u) << p)) == 0) continue;
+        const float4 plane = rootLocal.frustum.plane[p];
+        local.frustum.plane[p] = {
+            plane.x, plane.y, plane.z,
+            (dot3(plane, transform.pos) + plane.w) * invScale};
+    }
+    return local;
+}
+
 bool SpatialDatabase::mountBelongsTo(const Instance& inst, uint32_t slot) const
 {
     uint32_t s = slot;
@@ -1181,6 +1548,23 @@ size_t SpatialDatabase::overlayBytes() const
                  ov.widePatch.size() * sizeof(uint32_t) +
                  ov.patchedWide.size() * sizeof(WideBounds);
     return n;
+}
+
+size_t SpatialDatabase::mountStateBytes() const
+{
+    size_t bytes = slots_.capacity() * sizeof(PageRt) +
+                   mountTransforms_.capacity() * sizeof(MountTransformRt) +
+                   pageStamps_.capacity() * sizeof(PageStamp) +
+                   pageResidency_.capacity() * sizeof(PageResidency) +
+                   freeSlots_.capacity() * sizeof(uint32_t) +
+                   expansionLinks_.capacity() * sizeof(ExpansionLinksRt) +
+                   freeExpansionLinks_.capacity() * sizeof(uint32_t);
+    bytes += nodeStatePools_.capacity() * sizeof(NodeStatePoolRt);
+    for (const NodeStatePoolRt& pool : nodeStatePools_)
+        bytes += pool.bytes();
+    for (const ExpansionLinksRt& links : expansionLinks_)
+        bytes += links.slots.capacity() * sizeof(uint32_t);
+    return bytes;
 }
 
 // ============================================================================
@@ -1303,7 +1687,13 @@ void SpatialDatabase::applyBoundsChange(InstanceId id, uint32_t slot, uint32_t i
             refreshInstanceBounds(id, false);
             return;
         }
-        curBox  = bbox[0];
+        const MountTransformRt childTransform = mountTransforms_[curSlot];
+        const MountTransformRt parentTransform = mountTransforms_[owner.slot];
+        const float relativeScale = childTransform.scale / parentTransform.scale;
+        float4 relativePos =
+            (childTransform.pos - parentTransform.pos) / parentTransform.scale;
+        relativePos.w = 1.0f;
+        curBox = toWorld(bbox[0], relativePos, relativeScale);
         curSlot = owner.slot;
         cur     = owner.index;
         exact   = false;
@@ -2387,10 +2777,10 @@ CollectResult SpatialDatabase::collect(std::span<PageUsageContext* const> usage,
 // branch. The sparse-overlay instantiation consults its compact patch table;
 // template dispatch happens once per page rather than once per block.
 template<bool FullyResident, bool SparseOverlay>
-void SpatialDatabase::wideVisit(const WorkItem& item, const PageView& pg, float errClamp,
-                      uint32_t gen, InstanceId instance, uint32_t node, uint8_t mask,
-                      uint8_t currentKids, uint8_t idealKids,
-                      const Camera& local, Worker& w) const
+void SpatialDatabase::wideVisit(
+    const WorkItem& item, const PageView& pg, float errClamp, uint32_t gen,
+    InstanceId instance, uint32_t node, uint8_t mask, uint8_t currentKids,
+    uint8_t idealKids, const Camera& local, Worker& w) const
 {
     const uint32_t cc = pg.childCount(node);
     uint32_t b = pg.wideOffset(node);
@@ -2473,26 +2863,134 @@ void SpatialDatabase::wideVisit(const WorkItem& item, const PageView& pg, float 
             // before this instance's cut could differ. See SpatialQuery.
             if (w.trackMargin && (FullyResident || idealKids))
             {
-                w.maxError = std::max(w.maxError, eff.v[l]);
+                const float mountScale = mountTransforms_[item.slot()].scale;
+                w.maxError = std::max(w.maxError, eff.v[l] * mountScale);
                 const float flipAt = eff.v[l] * local.k / w.bar;
                 const float d = std::sqrt(d2.v[l]);
-                const float slack = d > flipAt ? d - flipAt : flipAt - d;
+                const float slack =
+                    (d > flipAt ? d - flipAt : flipAt - d) * mountScale;
                 if (slack < w.margin) w.margin = slack;
             }
         }
     }
 }
 
+void SpatialDatabase::emitMountedRootLeavesInside(
+    const WorkItem& item, const PageView& page, float errClamp,
+    uint32_t generation, InstanceId instance, float4 qmn, float4 qmx,
+    float cameraK, Worker& w) const
+{
+    const uint32_t count = page.childCount(0);
+    uint32_t block = page.wideOffset(0);
+    const float8 clamp = float8::splat(errClamp);
+    for (uint32_t base = 0; base < count; base += kWide, ++block)
+    {
+        const WideBlock& children = page.wide[block];
+        const WideBounds& bounds = item.wide[block];
+        const uint32_t lanes = blockValidLanes(page.blockMask[block]);
+        FRONTIER_STAT(w, wideBlocksTested, 1);
+        FRONTIER_STAT(w, lanesSurvived, uint64_t(std::popcount(lanes)));
+
+        const float8 error = min8(children.error, clamp);
+        const float8 distanceSq = distanceToBoxesSq(bounds, qmn, qmx);
+        const float8 screen =
+            screenErrorFromSq8(error, cameraK, distanceSq);
+        uint32_t remaining = lanes;
+        while (remaining)
+        {
+            const uint32_t lane = uint32_t(std::countr_zero(remaining));
+            remaining &= remaining - 1;
+            w.result.shared.push(makeFrontierEntry(
+                NodeHandle{item.slot(), children.child[lane], generation},
+                screen.v[lane], w.bar, w.barInv, instance));
+        }
+    }
+}
+
+void SpatialDatabase::emitMountedLeafBatchInside(
+    const PageRt& owner, const PageView& ownerPage, NodeItem current,
+    size_t stackBase, InstanceId instance, const Camera& rootLocal,
+    Worker& w) const
+{
+    const std::vector<uint32_t>& ownerLinks =
+        expansionLinks_[owner.expansionLinks].slots;
+    uint32_t childSlot = ownerLinks[current.node()];
+    const uint32_t childAsset = mountTransforms_[childSlot].asset();
+    const PageView& childPage = assets_[childAsset].page;
+    const uint32_t childCount = childPage.childCount(0);
+    const uint32_t firstBlock = childPage.wideOffset(0);
+    const float4 rootQmn = rootLocal.queryMin();
+    const float4 rootQmx = rootLocal.queryMax();
+    // Cached traversal needs one exact root stamp. Page-usage traversal still
+    // records each physical placement, but does so inside this tight batch.
+    if (w.coalesceMountTreeDependencies)
+        recordTraversalDependency(w, childSlot);
+
+    for (;;)
+    {
+        if (!w.coalesceMountTreeDependencies)
+            recordTraversalDependency(w, childSlot);
+        const MountTransformRt& mount = mountTransforms_[childSlot];
+        const float invScale = 1.0f / mount.scale;
+        const float4 qmn = (rootQmn - mount.pos) * invScale;
+        const float4 qmx = (rootQmx - mount.pos) * invScale;
+        const float8 clamp = float8::splat(mount.errClamp);
+        FRONTIER_STAT(w, pagesVisited, 1);
+
+        uint32_t block = firstBlock;
+        for (uint32_t base = 0; base < childCount;
+             base += kWide, ++block)
+        {
+            const WideBlock& children = childPage.wide[block];
+            const uint32_t lanes =
+                blockValidLanes(childPage.blockMask[block]);
+            FRONTIER_STAT(w, wideBlocksTested, 1);
+            FRONTIER_STAT(w, lanesSurvived,
+                          uint64_t(std::popcount(lanes)));
+
+            const float8 error = min8(children.error, clamp);
+            const float8 distanceSq =
+                distanceToBoxesSq(children.bounds, qmn, qmx);
+            const float8 screen =
+                screenErrorFromSq8(error, rootLocal.k, distanceSq);
+            uint32_t remaining = lanes;
+            while (remaining)
+            {
+                const uint32_t lane =
+                    uint32_t(std::countr_zero(remaining));
+                remaining &= remaining - 1;
+                w.result.shared.push(makeFrontierEntry(
+                    NodeHandle{childSlot, children.child[lane],
+                               mount.generation},
+                    screen.v[lane], w.bar, w.barInv, instance));
+            }
+        }
+
+        if (w.nodeStack.size() <= stackBase) return;
+        const NodeItem next = w.nodeStack.back();
+        if (!(next.err > w.bar) || next.planes() != 0 ||
+            !metaIsExpansion(ownerPage.meta[next.node()]))
+            return;
+        const uint32_t nextSlot = ownerLinks[next.node()];
+        if (nextSlot == kInvalidIndex) return;
+        const MountTransformRt& nextMount = mountTransforms_[nextSlot];
+        if (!nextMount.rootLeavesOnly() || nextMount.asset() != childAsset)
+            return;
+
+        w.nodeStack.pop_back();
+        FRONTIER_STAT(w, nodesVisited, 1);
+        current = next;
+        childSlot = nextSlot;
+    }
+}
+
 bool SpatialDatabase::visibleDescendantsCovered(uint32_t slot, uint32_t node, uint8_t mask,
                                       const Instance& inst,
-                                      const Camera& local,
-                                      std::vector<uint32_t>* touched,
-                                      bool uniqueTouches) const
+                                      const Camera& rootLocal,
+                                      Worker* dependencyWorker) const
 {
-    if (touched &&
-        (!uniqueTouches ||
-         std::find(touched->begin(), touched->end(), slot) == touched->end()))
-        touched->push_back(slot);
+    if (dependencyWorker)
+        recordTraversalDependency(*dependencyWorker, slot);
     if (descendantsCovered(slot, node)) return true;
 
     // A fully-inside node has no invisible branch that can excuse a missing
@@ -2502,17 +3000,16 @@ bool SpatialDatabase::visibleDescendantsCovered(uint32_t slot, uint32_t node, ui
     const PageRt* rt = &slots_[slot];
     if (node != 0 && pageView(*rt).isExpansion(node))
     {
-        const uint32_t child = rt->expSlot.empty() ? kInvalidIndex : rt->expSlot[node];
+        const uint32_t child = attachedChildSlot(*rt, node);
         if (child == kInvalidIndex) return false;
         slot = child;
         node = 0;
         rt = &slots_[slot];
-        if (touched &&
-            (!uniqueTouches ||
-             std::find(touched->begin(), touched->end(), slot) == touched->end()))
-            touched->push_back(slot);
+        if (dependencyWorker)
+            recordTraversalDependency(*dependencyWorker, slot);
     }
 
+    const Camera local = mountLocalCamera(rootLocal, slot, mask);
     const PageView& page = pageView(*rt);
     const uint32_t count = page.childCount(node);
     if (count == 0) return false;
@@ -2525,8 +3022,8 @@ bool SpatialDatabase::visibleDescendantsCovered(uint32_t slot, uint32_t node, ui
         if (testAabb(bounds[child], local.frustum, childMask) != CullState::Outside &&
             !rt->isCovered(child))
         {
-            if (!visibleDescendantsCovered(slot, child, childMask, inst, local,
-                                           touched, uniqueTouches))
+            if (!visibleDescendantsCovered(slot, child, childMask, inst, rootLocal,
+                                           dependencyWorker))
                 return false;
         }
         child += page.subtreeSize[child];
@@ -2546,14 +3043,12 @@ void SpatialDatabase::runPage(const WorkItem& item, const Instance& inst, const 
 
 template<bool FullyResident, bool SparseOverlay>
 void SpatialDatabase::runPageImpl(const WorkItem& item, const Instance& inst,
-                        const Camera& local, const SelectionParams& params,
+                        const Camera& rootLocal, const SelectionParams& params,
                         Worker& w) const
 {
     const PageRt& rt = slots_[item.slot()];
-    if (w.trackTouches &&
-        (!w.uniqueTouches ||
-         std::find(w.touched.begin(), w.touched.end(), item.slot()) == w.touched.end()))
-        w.touched.push_back(item.slot());
+    const Camera local = mountLocalCamera(rootLocal, item.slot(), item.mask());
+    recordTraversalDependency(w, item.slot());
 
     FRONTIER_STAT(w, pagesVisited, 1);
     const PageView& pg = pageView(rt);
@@ -2566,6 +3061,7 @@ void SpatialDatabase::runPageImpl(const WorkItem& item, const Instance& inst,
     const float bar = params.threshold;
 
     w.nodeStack.clear();
+    const size_t stackBase = 0;
     wideVisit<FullyResident, SparseOverlay>(
         item, pg, rt.errClamp, gen, instance, 0, item.mask(), item.current(),
         item.ideal(), local, w);
@@ -2581,6 +3077,22 @@ void SpatialDatabase::runPageImpl(const WorkItem& item, const Instance& inst,
 
         if constexpr (FullyResident)
         {
+            if (e.err > bar && e.planes() == 0 &&
+                !inst.hasOverlayList() &&
+                metaIsExpansion(pg.meta[i]) &&
+                rt.expansionLinks != kInvalidIndex)
+            {
+                const uint32_t childSlot =
+                    expansionLinks_[rt.expansionLinks].slots[i];
+                if (childSlot != kInvalidIndex &&
+                    mountTransforms_[childSlot].rootLeavesOnly())
+                {
+                    emitMountedLeafBatchInside(
+                        rt, pg, e, stackBase, instance, rootLocal, w);
+                    continue;
+                }
+            }
+
             if (!(e.err > bar))
             {
                 w.result.shared.push(
@@ -2590,15 +3102,57 @@ void SpatialDatabase::runPageImpl(const WorkItem& item, const Instance& inst,
 
             const bool exp = metaIsExpansion(pg.meta[i]);
             const uint32_t childSlot =
-                (exp && !rt.expSlot.empty()) ? rt.expSlot[i] : kInvalidIndex;
+                exp ? attachedChildSlot(rt, i) : kInvalidIndex;
             if (exp)
             {
                 if (childSlot == kInvalidIndex)
                     w.result.shared.push(
                         makeFrontierEntry(here, e.err, bar, w.barInv, instance));
                 else
-                    w.work.push_back(
-                        makeWorkItem(childSlot, inst, 1, 1, e.planes()));
+                {
+                    const MountTransformRt& childMount =
+                        mountTransforms_[childSlot];
+                    const bool directLeaves =
+                        childMount.rootLeavesOnly() &&
+                        !inst.hasOverlayList();
+                    if (directLeaves)
+                    {
+                        recordTraversalDependency(w, childSlot);
+                        const PageView& childPage =
+                            assets_[childMount.asset()].page;
+                        const WorkItem childItem{
+                            childSlot, childPage.wideBounds(), 1, 1,
+                            e.planes()};
+                        FRONTIER_STAT(w, pagesVisited, 1);
+                        if (e.planes() == 0)
+                        {
+                            const MountTransformRt& transform =
+                                mountTransforms_[childSlot];
+                            const float invScale = 1.0f / transform.scale;
+                            const float4 qmn =
+                                (rootLocal.queryMin() - transform.pos) * invScale;
+                            const float4 qmx =
+                                (rootLocal.queryMax() - transform.pos) * invScale;
+                            emitMountedRootLeavesInside(
+                                childItem, childPage, childMount.errClamp,
+                                childMount.generation, instance, qmn, qmx,
+                                rootLocal.k, w);
+                        }
+                        else
+                        {
+                            const Camera childLocal = mountLocalCamera(
+                                rootLocal, childSlot, e.planes());
+                            wideVisit<true, false>(
+                                childItem, childPage, childMount.errClamp,
+                                childMount.generation, instance, 0,
+                                e.planes(), 1, 1, childLocal, w);
+                        }
+                    }
+                    else
+                        w.work.push_back(
+                            makeWorkItem(childSlot, inst, 1, 1,
+                                         e.planes()));
+                }
             }
             else
                 wideVisit<true, SparseOverlay>(item, pg, rt.errClamp, gen,
@@ -2642,7 +3196,7 @@ void SpatialDatabase::runPageImpl(const WorkItem& item, const Instance& inst,
             const bool exp = metaIsExpansion(m);
 
             const uint32_t childSlot =
-                (exp && !rt.expSlot.empty()) ? rt.expSlot[i] : kInvalidIndex;
+                exp ? attachedChildSlot(rt, i) : kInvalidIndex;
 
             if (ideal && e.err > bar && exp && childSlot == kInvalidIndex)
             {
@@ -2658,9 +3212,8 @@ void SpatialDatabase::runPageImpl(const WorkItem& item, const Instance& inst,
             {
                 const bool canDescend =
                     !current ||
-                    visibleDescendantsCovered(item.slot(), i, e.planes(), inst, local,
-                                               w.trackTouches ? &w.touched : nullptr,
-                                               w.uniqueTouches);
+                    visibleDescendantsCovered(item.slot(), i, e.planes(), inst, rootLocal,
+                                               w.trackTouches ? &w : nullptr);
                 if (current && !canDescend)
                 {
                     FRONTIER_CHECK(rt.isResident(i),
@@ -2678,8 +3231,8 @@ void SpatialDatabase::runPageImpl(const WorkItem& item, const Instance& inst,
             {
                 FRONTIER_CHECK(childSlot != kInvalidIndex,
                            "SpatialQuery::selectFrontier: uncovered expansion subtree");
-                w.work.push_back(makeWorkItem(childSlot, inst, nextCurrent,
-                                              nextIdeal, e.planes()));
+                w.work.push_back(makeWorkItem(
+                    childSlot, inst, nextCurrent, nextIdeal, e.planes()));
             }
             else
                 wideVisit<false, SparseOverlay>(
@@ -2730,11 +3283,7 @@ void SpatialDatabase::runInstance(uint32_t instIdx, const Camera& view, const Se
                     w.maxError = std::max(
                         w.maxError, spatial.maxErrWorld / inst.scale);
                 }
-                if (w.trackTouches &&
-                    (!w.uniqueTouches ||
-                     std::find(w.touched.begin(), w.touched.end(), inst.rootSlot) ==
-                         w.touched.end()))
-                    w.touched.push_back(inst.rootSlot);
+                recordTraversalDependency(w, inst.rootSlot);
                 const InstanceId outputInstance = publicInstanceId(instIdx);
                 w.result.shared.push(makeFrontierEntry(
                     NodeHandle{inst.rootSlot, 1, rootRt.generation()}, error,
@@ -2781,10 +3330,7 @@ void SpatialDatabase::runFlatInstance(uint32_t instIdx, const Camera& view,
     }
 
     FRONTIER_STAT(w, instancesVisited, 1);
-    if (w.trackTouches &&
-        (!w.uniqueTouches ||
-         std::find(w.touched.begin(), w.touched.end(), slot) == w.touched.end()))
-        w.touched.push_back(slot);
+    recordTraversalDependency(w, slot);
 
     const float error = !zeroError && spatial->maxErrWorld > 0.0f
                             ? screenError(
@@ -2845,6 +3391,7 @@ void SpatialDatabase::selectFrontierUncached(const Camera& camera, const Selecti
         w.touched.clear();
         w.trackTouches = usage != nullptr;
         w.uniqueTouches = false;
+        w.coalesceMountTreeDependencies = false;
         w.result = outResult;
         w.stats = SelectionStats{};
         w.bar = params.threshold;
@@ -2964,6 +3511,7 @@ void SpatialDatabase::selectFrontierUncached(const Camera& camera, const Selecti
         w.touched.clear();
         w.trackTouches = usage != nullptr;
         w.uniqueTouches = false;
+        w.coalesceMountTreeDependencies = false;
         w.frontierBuffer.clear();
         w.result = makeSink(w.frontierBuffer);
         w.stats = SelectionStats{};
@@ -3045,6 +3593,8 @@ void SpatialQuery::reset()
     rec_.clear();
     recCold_.clear();
     secondDep_.clear();
+    overflowCounts_.clear();
+    freeOverflowCounts_.clear();
     store_.clear();
     used_ = garbage_ = reused_ = walked_ = 0;
     travel_ = kTravel_ = 0.0f;
@@ -3076,6 +3626,8 @@ size_t SpatialQuery::bytes() const
     return rec_.capacity() * sizeof(Rec) +
            recCold_.capacity() * sizeof(RecCold) +
            secondDep_.capacity() * sizeof(SecondDep) +
+           overflowCounts_.capacity() * sizeof(OverflowCounts) +
+           freeOverflowCounts_.capacity() * sizeof(uint32_t) +
            store_.capacity() * sizeof(FrontierEntry) +
            (scratch_ ? scratch_->bytes() : 0);
 }
@@ -3102,10 +3654,17 @@ void SpatialQuery::compact()
         {
             // Not reusable anyway: drop the block rather than move it.
             cold.capacity = 0;
+            if (frontierCountsOverflow(r.counts))
+                freeOverflowCounts_.push_back(frontierOverflowIndex(r.counts));
             r.counts = 0;
             continue;
         }
-        const uint32_t count = frontierTotal(r.counts);
+        uint32_t count = frontierTotal(r.counts);
+        if (frontierCountsOverflow(r.counts))
+        {
+            const OverflowCounts& counts = overflowCounts_[frontierOverflowIndex(r.counts)];
+            count = counts.shared + counts.current + counts.ideal;
+        }
         if (count)
             std::memcpy(packed.data() + w, store_.data() + r.begin,
                         size_t(count) * sizeof(FrontierEntry));
@@ -3148,6 +3707,8 @@ void SpatialDatabase::selectFrontierCached(const Camera& camera, const Selection
         query.rec_.clear();
         query.recCold_.clear();
         query.secondDep_.clear();
+        query.overflowCounts_.clear();
+        query.freeOverflowCounts_.clear();
         query.store_.clear();
         query.used_ = query.garbage_ = 0;
         query.instanceLayoutVersion_ = instanceLayoutVersion_;
@@ -3198,6 +3759,7 @@ void SpatialDatabase::selectFrontierCached(const Camera& camera, const Selection
     w.stats = SelectionStats{};
     w.trackTouches = true;
     w.uniqueTouches = true;
+    w.coalesceMountTreeDependencies = usage == nullptr;
     w.bar = params.threshold;
     w.barInv = params.threshold > 0.0f ? 1.0f / params.threshold : 0.0f;
 
@@ -3212,7 +3774,12 @@ void SpatialDatabase::selectFrontierCached(const Camera& camera, const Selection
         const uint32_t instIdx = scratch.visible[i].instance();
         const uint8_t  mask = scratch.visible[i].mask();
         SpatialQuery::Rec& r = query.rec_[instIdx];
-        const uint32_t depCount = frontierDependencyCount(r.counts);
+        const bool overflow = frontierCountsOverflow(r.counts);
+        const SpatialQuery::OverflowCounts* fullCounts =
+            overflow ? &query.overflowCounts_[frontierOverflowIndex(r.counts)]
+                     : nullptr;
+        const uint32_t depCount = overflow ? fullCounts->dependencies
+                                           : frontierDependencyCount(r.counts);
 
         // Everything the record was taken under, re-checked, in one cache
         // line. `mask == 0` is the frustum condition: this instance is wholly
@@ -3223,16 +3790,20 @@ void SpatialDatabase::selectFrontierCached(const Camera& camera, const Selection
                    r.epoch == query.epoch_ &&
                    r.frontierVersion == instanceFrontierVersions_[instIdx];
         if (hit && depCount != 0)
-        {
-            const PageStamp& stamp = pageStamps_[r.depSlot];
-            hit = stamp.inUse() && stamp.contentVersion == r.depVersion;
-        }
+            hit = dependencyMatches(r.depSlot, r.depVersion);
         if (hit && depCount == 2)
         {
             const SpatialQuery::SecondDep& dep = query.secondDep_[instIdx];
-            const PageStamp& stamp = pageStamps_[dep.slot];
-            hit = stamp.inUse() && stamp.contentVersion == dep.version;
+            hit = dependencyMatches(dep.slot, dep.version);
         }
+        // A mounted-tree dependency does not enumerate the physical pages
+        // needed by streaming usage feedback. Re-walk that uncommon
+        // overload so its PageUsageContext remains exact.
+        if (hit && usage &&
+            ((depCount != 0 && (r.depSlot & kMountTreeDependency) != 0) ||
+             (depCount == 2 &&
+              (query.secondDep_[instIdx].slot & kMountTreeDependency) != 0)))
+            hit = false;
 
         if (hit)
         {
@@ -3242,9 +3813,12 @@ void SpatialDatabase::selectFrontierCached(const Camera& camera, const Selection
             // recorded entries out is ~1.5% of the call at 80k instances, and
             // handing back a descriptor instead measured no better while
             // costing the caller an indirection: see SpatialQuery.
-            const uint32_t shared = frontierCount(r.counts, 0);
-            const uint32_t current = frontierCount(r.counts, 1);
-            const uint32_t ideal = frontierCount(r.counts, 2);
+            const uint32_t shared = overflow ? fullCounts->shared
+                                             : frontierCount(r.counts, 0);
+            const uint32_t current = overflow ? fullCounts->current
+                                              : frontierCount(r.counts, 1);
+            const uint32_t ideal = overflow ? fullCounts->ideal
+                                            : frontierCount(r.counts, 2);
             const FrontierEntry* entries = query.store_.data() + r.begin;
             outResult.shared.pushRange(entries, shared);
             outResult.currentOnly.pushRange(entries + shared, current);
@@ -3278,9 +3852,7 @@ void SpatialDatabase::selectFrontierCached(const Camera& camera, const Selection
         const uint32_t nIdeal = uint32_t(w.frontierBuffer.idealOnly.size());
         const uint32_t n = nShared + nCurrent + nIdeal;
         const bool eligible = mask == 0 &&
-                              w.touched.size() <= SpatialQuery::kMaxDeps &&
-                              nShared <= 0x3ffu && nCurrent <= 0x3ffu &&
-                              nIdeal <= 0x3ffu;
+                              w.touched.size() <= SpatialQuery::kMaxDeps;
         SpatialQuery::RecCold& cold = query.recCold_[instIdx];
         if (cold.capacity < n)
         {
@@ -3294,10 +3866,42 @@ void SpatialDatabase::selectFrontierCached(const Camera& camera, const Selection
         }
         if (eligible && w.touched.size() == 2 && query.secondDep_.empty())
             query.secondDep_.resize_uninitialized(instances_.size());
-        r.counts = eligible
-                       ? packFrontierCounts(nShared, nCurrent, nIdeal,
-                                       uint32_t(w.touched.size()))
-                       : 0;
+        const uint32_t oldCounts = r.counts;
+        if (!eligible)
+        {
+            if (frontierCountsOverflow(oldCounts))
+                query.freeOverflowCounts_.push_back(
+                    frontierOverflowIndex(oldCounts));
+            r.counts = 0;
+        }
+        else if (nShared <= 0x3ffu && nCurrent <= 0x3ffu && nIdeal <= 0x3ffu)
+        {
+            if (frontierCountsOverflow(oldCounts))
+                query.freeOverflowCounts_.push_back(
+                    frontierOverflowIndex(oldCounts));
+            r.counts = packFrontierCounts(nShared, nCurrent, nIdeal,
+                                          uint32_t(w.touched.size()));
+        }
+        else
+        {
+            uint32_t overflowIndex;
+            if (frontierCountsOverflow(oldCounts))
+                overflowIndex = frontierOverflowIndex(oldCounts);
+            else if (!query.freeOverflowCounts_.empty())
+            {
+                overflowIndex = query.freeOverflowCounts_.back();
+                query.freeOverflowCounts_.resize_uninitialized(
+                    query.freeOverflowCounts_.size() - 1);
+            }
+            else
+            {
+                overflowIndex = uint32_t(query.overflowCounts_.size());
+                query.overflowCounts_.emplace_back();
+            }
+            query.overflowCounts_[overflowIndex] = {
+                nShared, nCurrent, nIdeal, uint32_t(w.touched.size())};
+            r.counts = packFrontierOverflow(overflowIndex);
+        }
         FrontierEntry* dst = query.store_.data() + r.begin;
         if (nShared)
             std::memcpy(dst, w.frontierBuffer.shared.data(),
@@ -3324,13 +3928,13 @@ void SpatialDatabase::selectFrontierCached(const Camera& camera, const Selection
             if (!w.touched.empty())
             {
                 r.depSlot = w.touched[0];
-                r.depVersion = pageStamps_[w.touched[0]].contentVersion;
+                r.depVersion = dependencyVersion(w.touched[0]);
             }
             if (w.touched.size() == 2)
             {
                 SpatialQuery::SecondDep& dep = query.secondDep_[instIdx];
                 dep.slot = w.touched[1];
-                dep.version = pageStamps_[w.touched[1]].contentVersion;
+                dep.version = dependencyVersion(w.touched[1]);
             }
         }
         else

@@ -57,6 +57,7 @@
 #include "config.h"
 #include "math.h"
 #include "page.h"
+#include "subtree.h"
 
 namespace frontier {
 
@@ -72,6 +73,16 @@ struct AssetHandle
     bool valid() const { return slot != kInvalidIndex; }
 };
 static_assert(sizeof(AssetHandle) == 8, "AssetHandle must stay 64 bits");
+
+// Registered logical reusable component. Unlike AssetHandle (one physical
+// page), this handle also carries permanent expansion-target metadata.
+struct SubtreeHandle
+{
+    uint32_t slot = kInvalidIndex;
+    uint32_t generation = 0;
+    bool valid() const { return slot != kInvalidIndex; }
+};
+static_assert(sizeof(SubtreeHandle) == 8, "SubtreeHandle must stay 64 bits");
 
 // Unambiguous reference to a generated detail page. Page ids are local to one
 // Hierarchy, so the root asset identifies which hierarchy package owns `page`.
@@ -98,6 +109,7 @@ struct PageHandle
     bool valid() const { return slot != kInvalidIndex; }
 };
 static_assert(sizeof(PageHandle) == 8, "PageHandle must stay 64 bits");
+using MountHandle = PageHandle;
 
 // Resolved node reference: page slot + node index + generation stamp, packed
 // into 64 bits. A mount slot and a page-local node index each get 20 bits; the
@@ -609,10 +621,9 @@ public:
 private:
     friend class SpatialDatabase;
 
-    // Pages whose state this instance's frontier depended on. Two covers an
-    // instance root plus one attachment; a walk that touches more is simply
-    // not cached, which costs nothing, because an instance that deep is
-    // usually still streaming and being re-walked anyway.
+    // Mounted trees whose state this instance's frontier depended on. Every
+    // descendant mutation bumps the tree root, so a city assembled from any
+    // number of placements normally has one dependency.
     static constexpr uint32_t kMaxDeps = 2;
 
     // EXACTLY 32 HOT BYTES, and that is the whole design constraint.
@@ -626,8 +637,8 @@ private:
     //    query's accumulated travel (see travel_);
     //  - no per-record k / threshold copies: threshold changes bump epoch_,
     //    while k motion consumes the scalar slope budget below;
-    //  - no page generations: contentVersion is bumped on attach too, so it
-    //    alone distinguishes a recycled slot.
+    //  - no page generations: the mounted-tree root contentVersion is bumped
+    //    on descendant mutation and attach, and distinguishes a recycled slot.
     struct Rec
     {
         // Reusable while positionTravel + kSlope * kTravel has not passed
@@ -638,8 +649,8 @@ private:
         uint32_t frontierVersion = 0;     // unique instance transform/deform version
         uint32_t begin = 0;          // block in store_
         // Three 10-bit counts for [shared, currentOnly, idealOnly], plus the
-        // two-bit dependency count. A record with more than 1023 entries in
-        // any one bucket is simply not cached.
+        // two-bit dependency count. Dependency count 3 is an escape marker;
+        // the low 30 bits then index sparse full-width counts.
         uint32_t counts = 0;
         // The overwhelmingly common one-page dependency stays inline. A
         // second dependency lives in the cold spill array below.
@@ -661,7 +672,17 @@ private:
         uint32_t slot = 0;
         uint32_t version = 0;
     };
-    static_assert(sizeof(SecondDep) == 8, "second page dependency must stay 8 bytes");
+    static_assert(sizeof(SecondDep) == 8, "second dependency must stay 8 bytes");
+
+    struct OverflowCounts
+    {
+        uint32_t shared = 0;
+        uint32_t current = 0;
+        uint32_t ideal = 0;
+        uint32_t dependencies = 0;
+    };
+    static_assert(sizeof(OverflowCounts) == 16,
+                  "large-frontier count spill must stay 16 bytes");
 
     void compact();
 
@@ -671,9 +692,13 @@ private:
 
     std::vector<Rec>      rec_;      // hit-path state, by InstanceId
     std::vector<RecCold>  recCold_;  // miss/compaction state, by InstanceId
-    // Allocated only after a cacheable walk actually touches two pages. The
-    // common one-page database therefore pays no dense second-dependency array.
+    // Allocated only after a cacheable walk actually needs two dependencies.
+    // Ordinary selection coalesces a whole mounted tree to its root stamp.
     AppendBuffer<SecondDep> secondDep_;
+    // Sparse: allocated only for cacheable frontiers whose bucket counts do
+    // not fit the inline 10-bit fields.
+    AppendBuffer<OverflowCounts> overflowCounts_;
+    AppendBuffer<uint32_t> freeOverflowCounts_;
     AppendBuffer<FrontierEntry> store_;   // slab of recorded runs
     uint32_t              used_ = 0;
     uint32_t              garbage_ = 0;
@@ -797,6 +822,13 @@ public:
     AssetHandle registerAsset(Page&& page);
     AssetHandle registerAsset(PageView borrowedPage);
 
+    // Register one assembly component. Its immutable page bytes and dependency
+    // table are stored once no matter how many top-level or nested placements
+    // reference it.
+    SubtreeHandle registerSubtree(Subtree&& subtree);
+    void          releaseSubtree(SubtreeHandle subtree);
+    bool          isSubtree(SubtreeHandle subtree) const;
+
     // Drops the SpatialDatabase's own reference. Contract violation if instances still
     // reference the asset. Detaches its whole page tree.
     void   releaseAsset(AssetHandle asset);
@@ -864,6 +896,11 @@ public:
     InstanceRef addInstance(AssetHandle asset, const InstanceDesc& desc);
     InstanceRef addInstance(AssetHandle asset, float4 pos, float scale = 1.0f);
 
+    // Top-level placement of an implicit-root Subtree beneath the TLAS.
+    InstanceRef instantiate(SubtreeHandle subtree, const InstanceDesc& desc);
+    InstanceRef instantiate(SubtreeHandle subtree, float4 pos,
+                            float scale = 1.0f);
+
     // Convenience for one-off content: registers the page as an anonymous
     // asset owned by the SpatialDatabase and instances it. The asset is freed when its
     // last instance goes away. Instancing the same tree more than once should
@@ -899,6 +936,20 @@ public:
     // conservative expansion bounds at build time.
     PageHandle attachPage(NodeHandle expansionNode, AssetHandle asset);
     PageHandle attachPage(NodeHandle expansionNode, Page&& page);
+
+    // Place the permanently referenced child Subtree at this expansion site.
+    // The site's authored relative transform is applied without rewriting the
+    // shared child bytes. A mismatched child key is a contract violation.
+    MountHandle mount(NodeHandle expansionNode, SubtreeHandle subtree);
+
+    // Stable content target authored on a Subtree expansion site. Invalid for
+    // stale handles and legacy/generated page expansions.
+    SubtreeKey expansionTarget(NodeHandle expansionNode) const;
+
+    // Local-to-top-level-instance transform for the mount containing `node`.
+    // The caller composes this with its transform table at entry.instance().
+    bool tryGetNodeTransform(NodeHandle node,
+                             SubtreeTransform& outTransform) const;
     void       detachPage(NodeHandle expansionNode);   // no-op if stale
     bool       isAttached(NodeHandle expansionNode) const;
 
@@ -995,6 +1046,9 @@ public:
     // Both stay zero for a scene that never calls setNodeBounds.
     size_t overlayCount() const { return liveOverlays_; }
     size_t overlayBytes() const;
+    // Retained capacity for mount records, transforms, node state, stamps,
+    // and expansion links. Immutable asset blobs are excluded.
+    size_t mountStateBytes() const;
 
     struct TestAccess;   // defined by tests; full access to internals
 
@@ -1045,11 +1099,67 @@ private:
     };
     static_assert(sizeof(AssetRt) == 112, "asset runtime state must stay 112 bytes");
 
-    // The two words queried independently of the rest of a mount. Cached SpatialQuery
-    // hits validate a page dependency through contentVersion, while handles
-    // and overlays validate through generation. Keeping these stamps in a
-    // compact parallel stream avoids fetching a sparse 104-byte PageRt record
-    // for every visible instance in a database with many unique pages.
+    // Cold logical metadata parallel to assets_. Legacy page assets leave this
+    // empty. Expansion records are sorted by packed node index.
+    struct SubtreeAssetRt
+    {
+        SubtreeKey key{};
+        std::vector<SubtreeKey> dependencies;
+        std::vector<SubtreeExpansion> expansions;
+        bool rootLeavesOnly = false;
+
+        bool inUse() const { return key.valid(); }
+    };
+
+    // Asset-local slab for per-mount node state. Repeated placements of one
+    // definition have the same node count, so geometric slabs remove one heap
+    // allocation per placement while retaining independently mutable state.
+    struct NodeStatePoolRt
+    {
+        struct Slab
+        {
+            std::unique_ptr<uint16_t[]> words;
+            uint32_t usedBlocks = 0;
+            uint32_t blockCount = 0;
+        };
+
+        std::vector<Slab> slabs;
+        std::vector<uint16_t*> freeBlocks;
+        uint32_t wordsPerBlock = 0;
+        uint32_t nextSlabBlocks = 1;
+
+        uint16_t* acquire(uint32_t nodeCount);
+        void release(uint16_t* state);
+        size_t bytes() const;
+    };
+
+    // Accumulated page-local -> top-level-instance-local placement, parallel
+    // to mount slots. Root mounts are identity.
+    struct MountTransformRt
+    {
+        static constexpr uint32_t kRootLeavesOnly = 1u << 31;
+        static constexpr uint32_t kAssetMask = ~kRootLeavesOnly;
+
+        float4 pos = float4::point(0.0f, 0.0f, 0.0f);
+        float scale = 1.0f;
+        float errClamp = FLT_MAX;
+        uint32_t generation = 0;
+        uint32_t assetAndFlags = kAssetMask;
+
+        uint32_t asset() const { return assetAndFlags & kAssetMask; }
+        bool rootLeavesOnly() const
+        {
+            return (assetAndFlags & kRootLeavesOnly) != 0;
+        }
+    };
+    static_assert(sizeof(MountTransformRt) == 32,
+                  "hot mount record must stay 32 bytes");
+
+    // The two words queried independently of the rest of a mount. Cached
+    // SpatialQuery hits validate the mounted-tree root through contentVersion;
+    // descendant mutations propagate there. Handles and overlays validate
+    // through generation. Keeping these stamps in a compact parallel stream
+    // avoids fetching a 48-byte PageRt record for every visible instance.
     struct PageStamp
     {
         uint32_t contentVersion = 0;
@@ -1091,15 +1201,12 @@ private:
         // lets a single immutable page back mounts with different parent
         // error ceilings without rewriting the page's node data.
         float                 errClamp = FLT_MAX;
-        // Two bits per node in one byte: payload residency and whether the
-        // node has a complete resident frontier. Keeping them together halves the
-        // state bytes and removes one allocation per mounted page.
-        static constexpr uint8_t kResident = 1u << 0;
-        static constexpr uint8_t kCovered = 1u << 1;
-        std::vector<uint8_t> nodeState;
-        // A page node has at most kMaxChildren (511), so 16 bits are ample and
-        // halve this per-node propagation counter.
-        std::vector<uint16_t> coveredChildren;
+        // Two flag bits plus the covered-child count share one word. Keeping
+        // them together removes an allocation and a pointer chase per mount.
+        static constexpr uint16_t kResident = 1u << 0;
+        static constexpr uint16_t kCovered = 1u << 1;
+        static constexpr uint16_t kCoveredChildShift = 2;
+        uint16_t* nodeState = nullptr;
         // LRU links need 20 bits each and the handle generation needs 24.
         // Packing all three into one word retains generation beside the page
         // data used by an actual walk without growing this cold record.
@@ -1114,10 +1221,11 @@ private:
         static constexpr uint32_t kPinned = 1u << 31;
         uint32_t   attachedChildrenAndPinned = 0;
         NodeRef    owner;                     // expansion node above; invalid for root pages
-        // Attached child slot per expansion node, kInvalidIndex when
-        // collapsed. Allocated on the page's first child attach; this IS the
-        // expansion link — there is no by-id index.
-        std::vector<uint32_t> expSlot;
+        // Sparse-pool index; leaf placements never allocate a child array.
+        uint32_t expansionLinks = kInvalidIndex;
+        // Root of this mounted page tree. Occupies what was tail padding and
+        // lets cached traversal coalesce every descendant to one exact stamp.
+        uint32_t rootSlot = kInvalidIndex;
 
         bool isResident(uint32_t node) const
         {
@@ -1130,12 +1238,24 @@ private:
         void setResident(uint32_t node, bool resident)
         {
             if (resident) nodeState[node] |= kResident;
-            else nodeState[node] &= uint8_t(~kResident);
+            else nodeState[node] &= ~kResident;
         }
         void setCovered(uint32_t node, bool covered)
         {
             if (covered) nodeState[node] |= kCovered;
-            else nodeState[node] &= uint8_t(~kCovered);
+            else nodeState[node] &= ~kCovered;
+        }
+        uint16_t coveredChildCount(uint32_t node) const
+        {
+            return nodeState[node] >> kCoveredChildShift;
+        }
+        void addCoveredChild(uint32_t node)
+        {
+            nodeState[node] += 1u << kCoveredChildShift;
+        }
+        void removeCoveredChild(uint32_t node)
+        {
+            nodeState[node] -= 1u << kCoveredChildShift;
         }
         bool inUse() const { return asset != kInvalidIndex; }
         uint32_t generation() const
@@ -1196,7 +1316,12 @@ private:
         void addAttachedChild() { ++attachedChildrenAndPinned; }
         void removeAttachedChild() { --attachedChildrenAndPinned; }
     };
-    static_assert(sizeof(PageRt) == 104, "mounted-page state must stay 104 bytes");
+    static_assert(sizeof(PageRt) == 48, "mounted-page state must stay 48 bytes");
+
+    struct ExpansionLinksRt
+    {
+        std::vector<uint32_t> slots;
+    };
 
     // Compact mount-wide summary for the shared-only traversal. A mount tree
     // is fully resident when every payload-bearing node in this page is
@@ -1485,9 +1610,10 @@ private:
                 result.idealOnly.push(entry);
         }
 
-        std::vector<uint32_t> touched;      // page dependencies / optional usage
+        std::vector<uint32_t> touched;      // tree dependencies or optional page usage
         bool trackTouches = false;
         bool uniqueTouches = false;         // SpatialQuery dependency list
+        bool coalesceMountTreeDependencies = false;
         SelectionStats stats;
 
         // Validity-margin tracking for SpatialQuery. Off for every ordinary
@@ -1511,6 +1637,15 @@ private:
     uint32_t createAsset(Page&& page, bool registered);
     void     destroyAssetIfUnused(uint32_t asset);
     const AssetRt* resolveAsset(AssetHandle h) const;
+    const SubtreeAssetRt* resolveSubtree(SubtreeHandle h) const;
+    const SubtreeExpansion* findSubtreeExpansion(uint32_t asset,
+                                                  uint32_t node) const;
+    static constexpr uint32_t kMountTreeDependency = 1u << 31;
+    uint32_t traversalDependency(uint32_t slot) const;
+    void recordTraversalDependency(Worker& worker, uint32_t slot) const;
+    uint32_t dependencyVersion(uint32_t dependency) const;
+    bool dependencyMatches(uint32_t dependency, uint32_t version) const;
+    void bumpContentVersion(uint32_t slot);
 
     const PageView& pageView(const PageRt& rt) const
     {
@@ -1519,6 +1654,12 @@ private:
 
     uint32_t allocSlot();
     uint32_t registerPage(uint32_t asset, NodeRef owner, bool pinned);
+    const std::vector<uint32_t>* expansionSlots(const PageRt& page) const;
+    std::vector<uint32_t>& ensureExpansionSlots(uint32_t slot);
+    uint32_t attachedChildSlot(const PageRt& page, uint32_t node) const;
+    void releaseExpansionSlots(PageRt& page);
+    PageHandle attachPageTransformed(NodeHandle expansionNode, uint32_t asset,
+                                     const SubtreeTransform& transform);
     void     detachSlot(uint32_t slot, AppendBuffer<UserPayload>* freedPayloads);
     void     detachMountTree(uint32_t rootSlot,
                              AppendBuffer<UserPayload>* freedPayloads);
@@ -1600,9 +1741,10 @@ private:
 
     bool visibleDescendantsCovered(uint32_t slot, uint32_t node, uint8_t mask,
                                    const Instance& inst,
-                                   const Camera& local,
-                                   std::vector<uint32_t>* touched = nullptr,
-                                   bool uniqueTouches = true) const;
+                                   const Camera& rootLocal,
+                                   Worker* dependencyWorker = nullptr) const;
+    Camera mountLocalCamera(const Camera& rootLocal, uint32_t slot,
+                            uint8_t mask) const;
     bool pageTreeFullyResident(uint32_t slot) const;
     void propagateFullResidency(uint32_t slot, bool wasFullyResident);
     void runInstance(uint32_t instIdx, const Camera& view, const SelectionParams& params,
@@ -1621,6 +1763,18 @@ private:
                    uint32_t gen, InstanceId instance, uint32_t node, uint8_t mask,
                    uint8_t currentKids, uint8_t idealKids,
                    const Camera& local, Worker& w) const;
+    void emitMountedRootLeavesInside(const WorkItem& item,
+                                     const PageView& page, float errClamp,
+                                     uint32_t generation,
+                                     InstanceId instance, float4 qmn,
+                                     float4 qmx, float cameraK,
+                                     Worker& w) const;
+    void emitMountedLeafBatchInside(const PageRt& owner,
+                                    const PageView& ownerPage,
+                                    NodeItem first, size_t stackBase,
+                                    InstanceId instance,
+                                    const Camera& rootLocal,
+                                    Worker& w) const;
     void selectFrontierCached(const Camera& camera, const SelectionParams& params,
                          SpatialQuery& query, PageUsageContext* usage,
                          FrontierResultSink& outResult) const;
@@ -1633,12 +1787,17 @@ private:
     SpatialDatabaseConfig config_;
 
     std::vector<AssetRt>  assets_;
+    std::vector<SubtreeAssetRt> subtreeAssets_;
+    std::vector<NodeStatePoolRt> nodeStatePools_;
     std::vector<uint32_t> freeAssets_;
     size_t                liveAssets_ = 0;
 
     std::vector<PageRt>   slots_;
+    std::vector<MountTransformRt> mountTransforms_;
     std::vector<PageStamp> pageStamps_;
     std::vector<PageResidency> pageResidency_;
+    std::vector<ExpansionLinksRt> expansionLinks_;
+    std::vector<uint32_t> freeExpansionLinks_;
     std::vector<uint32_t> freeSlots_;
     size_t                attachedPages_ = 0;
     size_t                pinnedPages_ = 0;

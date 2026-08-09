@@ -2004,6 +2004,217 @@ static void BM_TlasSparseRebuild(benchmark::State& state)
 BENCHMARK(BM_TlasSparseRebuild)->Arg(100000)->Unit(benchmark::kMicrosecond);
 
 // ---------------------------------------------------------------------------
+// Reusable subtree assembly versus a flattened authored city. Both arms have
+// one city root, N house proxies, eight fully resident detail leaves per house,
+// identical bounds/errors, and the same fully refined frontier. The assembled
+// arm stores the house detail bytes once and crosses one transformed mount per
+// house; the flat arm bakes every detail node into the city page.
+//
+// arg0 0 = flattened city page; 1 = shared mounted house subtree
+// arg1 = house count (kept below the packed per-node fanout cap)
+// arg2 0 = raw traversal; 1 = stationary warm SpatialQuery reuse
+// ---------------------------------------------------------------------------
+static void BM_SubtreeAssembly_FrontierCost(benchmark::State& state)
+{
+    const bool assembled = state.range(0) != 0;
+    const uint32_t count = uint32_t(state.range(1));
+    const bool cached = state.range(2) != 0;
+    SpatialQuery selection;
+    selection.setReuseEnabled(cached);
+    constexpr uint32_t detailCount = 8;
+    const uint32_t side = uint32_t(std::ceil(std::sqrt(double(count))));
+    const float pitch = 12.0f;
+    const auto position = [&](uint32_t i) {
+        return float4::point(float(int(i % side) - int(side / 2)) * pitch,
+                             0.0f,
+                             float(int(i / side) - int(side / 2)) * pitch);
+    };
+    const auto detailBounds = [](uint32_t i) {
+        const float x = (float(i) - 3.5f) * 0.8f;
+        return AABB::fromCenterExtent(float4::point(x, 0, 0),
+                                      float4::vec(0.3f, 1.0f, 0.3f));
+    };
+
+    SpatialDatabase world;
+    size_t immutableBytes = 0;
+    if (assembled)
+    {
+        constexpr SubtreeKey houseKey{0xB001};
+        constexpr SubtreeKey cityKey{0xC001};
+        SubtreeBuilder house(houseKey);
+        for (uint32_t d = 0; d < detailCount; ++d)
+            house.createNode(house.root(), 1000 + d, 0.0f, detailBounds(d));
+        Subtree houseSubtree = house.build();
+        const uint32_t houseNodes = houseSubtree.page().nodeCount();
+        immutableBytes += houseSubtree.page().byteSize();
+
+        SubtreeBuilder city(cityKey);
+        const auto root = city.createNode(city.root(), 1, 64.0f, AABB::empty());
+        for (uint32_t i = 0; i < count; ++i)
+        {
+            const float4 pos = position(i);
+            const auto proxy = city.createNode(
+                root, 10 + i, 16.0f,
+                AABB::fromCenterExtent(pos, float4::vec(4, 2, 2)));
+            city.setExpansion(proxy, houseKey,
+                              SubtreeTransform{pos, 1.0f});
+        }
+        Subtree citySubtree = city.build();
+        immutableBytes += citySubtree.page().byteSize() +
+                          citySubtree.expansions().size() * sizeof(SubtreeExpansion) +
+                          citySubtree.dependencies().size() * sizeof(SubtreeKey);
+
+        const SubtreeHandle houseAsset =
+            world.registerSubtree(std::move(houseSubtree));
+        const SubtreeHandle cityAsset =
+            world.registerSubtree(std::move(citySubtree));
+        const auto instance =
+            world.instantiate(cityAsset, float4::point(0, 0, 0));
+        markAllResident(world, instance.rootPage, count + 2);
+        for (uint32_t i = 0; i < count; ++i)
+        {
+            const MountHandle mount =
+                world.mount(nodeAt(instance.rootPage, i + 2), houseAsset);
+            markAllResident(world, mount, houseNodes);
+        }
+    }
+    else
+    {
+        PageBuilder city;
+        const auto root = city.createRoot(1, 64.0f, AABB::empty());
+        for (uint32_t i = 0; i < count; ++i)
+        {
+            const float4 pos = position(i);
+            const auto proxy = city.createNode(
+                root, 10 + i, 16.0f,
+                AABB::fromCenterExtent(pos, float4::vec(4, 2, 2)));
+            for (uint32_t d = 0; d < detailCount; ++d)
+                city.createNode(proxy, 1000 + d, 0.0f,
+                                toWorld(detailBounds(d), pos, 1.0f));
+        }
+        Page page = city.build();
+        const uint32_t nodes = page.nodeCount();
+        immutableBytes = page.byteSize();
+        const AssetHandle asset = world.registerAsset(std::move(page));
+        const auto instance = world.addInstance(asset, float4::point(0, 0, 0));
+        markAllResident(world, instance.rootPage, nodes);
+    }
+
+    const float span = float(side) * pitch;
+    const Camera view = makeLookAtCamera(
+        float4::point(0, span * 0.8f, -span * 0.8f),
+        float4::point(0, 0, 0));
+    FrontierResult cut;
+    const SelectionParams params{1.0f, 0.0f};
+    if (cached)
+    {
+        world.applyUpdates();
+        selection.selectFrontier(world, view, params, cut);
+        consumeFrontier(cut);
+    }
+    for (auto _ : state)
+    {
+        world.applyUpdates();
+        selection.selectFrontier(world, view, params, cut);
+        consumeFrontier(cut);
+    }
+    state.counters["frontier"] = double(cut.size());
+    state.counters["mounts"] = double(world.attachedPageCount());
+    state.counters["immutable_KB"] = double(immutableBytes) / 1024.0;
+    state.counters["mount_state_KB"] =
+        double(world.mountStateBytes()) / 1024.0;
+    state.counters["total_KB"] =
+        double(immutableBytes + world.mountStateBytes()) / 1024.0;
+}
+BENCHMARK(BM_SubtreeAssembly_FrontierCost)
+    ->Args({0, 32, 0})->Args({1, 32, 0})
+    ->Args({0, 128, 0})->Args({1, 128, 0})
+    ->Args({0, 400, 0})->Args({1, 400, 0})
+    ->Args({0, 32, 1})->Args({1, 32, 1})
+    ->Args({0, 128, 1})->Args({1, 128, 1})
+    ->Args({0, 400, 1})->Args({1, 400, 1})
+    ->ArgNames({"assembled", "houses", "cached"})
+    ->Unit(benchmark::kMicrosecond);
+
+static void BM_SubtreeAssembly_ConstructCost(benchmark::State& state)
+{
+    const bool assembled = state.range(0) != 0;
+    const uint32_t count = uint32_t(state.range(1));
+    constexpr uint32_t detailCount = 8;
+    const uint32_t side = uint32_t(std::ceil(std::sqrt(double(count))));
+    const auto position = [&](uint32_t i) {
+        return float4::point(float(int(i % side) - int(side / 2)) * 12.0f,
+                             0.0f,
+                             float(int(i / side) - int(side / 2)) * 12.0f);
+    };
+    const auto detailBounds = [](uint32_t i) {
+        return AABB::fromCenterExtent(
+            float4::point((float(i) - 3.5f) * 0.8f, 0, 0),
+            float4::vec(0.3f, 1.0f, 0.3f));
+    };
+
+    for (auto _ : state)
+    {
+        SpatialDatabase world;
+        if (assembled)
+        {
+            constexpr SubtreeKey houseKey{0xB101};
+            constexpr SubtreeKey cityKey{0xC101};
+            SubtreeBuilder house(houseKey);
+            for (uint32_t d = 0; d < detailCount; ++d)
+                house.createNode(house.root(), 1000 + d, 0.0f,
+                                 detailBounds(d));
+
+            SubtreeBuilder city(cityKey);
+            const auto root =
+                city.createNode(city.root(), 1, 64.0f, AABB::empty());
+            for (uint32_t i = 0; i < count; ++i)
+            {
+                const float4 pos = position(i);
+                const auto proxy = city.createNode(
+                    root, 10 + i, 16.0f,
+                    AABB::fromCenterExtent(pos, float4::vec(4, 2, 2)));
+                city.setExpansion(proxy, houseKey,
+                                  SubtreeTransform{pos, 1.0f});
+            }
+
+            const SubtreeHandle houseAsset =
+                world.registerSubtree(house.build());
+            const SubtreeHandle cityAsset =
+                world.registerSubtree(city.build());
+            const auto instance =
+                world.instantiate(cityAsset, float4::point(0, 0, 0));
+            for (uint32_t i = 0; i < count; ++i)
+                world.mount(nodeAt(instance.rootPage, i + 2), houseAsset);
+        }
+        else
+        {
+            PageBuilder city;
+            const auto root = city.createRoot(1, 64.0f, AABB::empty());
+            for (uint32_t i = 0; i < count; ++i)
+            {
+                const float4 pos = position(i);
+                const auto proxy = city.createNode(
+                    root, 10 + i, 16.0f,
+                    AABB::fromCenterExtent(pos, float4::vec(4, 2, 2)));
+                for (uint32_t d = 0; d < detailCount; ++d)
+                    city.createNode(proxy, 1000 + d, 0.0f,
+                                    toWorld(detailBounds(d), pos, 1.0f));
+            }
+            const AssetHandle asset = world.registerAsset(city.build());
+            world.addInstance(asset, float4::point(0, 0, 0));
+        }
+        benchmark::DoNotOptimize(world.attachedPageCount());
+    }
+}
+BENCHMARK(BM_SubtreeAssembly_ConstructCost)
+    ->Args({0, 32})->Args({1, 32})
+    ->Args({0, 128})->Args({1, 128})
+    ->Args({0, 400})->Args({1, 400})
+    ->ArgNames({"assembled", "houses"})
+    ->Unit(benchmark::kMicrosecond);
+
+// ---------------------------------------------------------------------------
 // Asset sharing vs. cloning: the SAME scene and the SAME cut, built two ways.
 // arg0 0 = every instance owns a private copy of the page (N assets, N
 // mounts); arg0 1 = one registered asset instanced N times (1 asset, 1 mount).

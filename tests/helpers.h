@@ -429,7 +429,7 @@ private:
         }
 
         const uint32_t childSlot =
-            (exp && !rt.expSlot.empty()) ? rt.expSlot[i] : kInvalidIndex;
+            exp ? w.attachedChildSlot(rt, i) : kInvalidIndex;
         if (ideal && wants && exp && childSlot == kInvalidIndex)
         {
             const FrontierEntry entry{here, err, p.threshold, instance};

@@ -1,5 +1,6 @@
 #include "frontier/builder.h"
 
+#include <cmath>
 #include <cstring>
 #include <functional>
 #include <utility>
@@ -417,6 +418,117 @@ Hierarchy HierarchyBuilder::build(const FrontierContext& ctx)
     buildReservedPage(rootPage, root_, true);
 
     return hierarchy;
+}
+
+// ---------------------------------------------------------------------------
+// SubtreeBuilder -- reusable implicit-root component assembly
+// ---------------------------------------------------------------------------
+
+SubtreeBuilder::NodeId SubtreeBuilder::createNode(NodeId parent,
+                                                   UserPayload payload,
+                                                   float geometricError,
+                                                   const AABB& bbox)
+{
+    FRONTIER_CHECK(!built_, "SubtreeBuilder: builder already consumed");
+    FRONTIER_CHECK(key_.valid(), "SubtreeBuilder: invalid subtree key");
+    FRONTIER_CHECK(parent == root() || parent < nodes_.size(),
+                   "SubtreeBuilder: invalid parent");
+    if (parent != root())
+        FRONTIER_CHECK(!nodes_[parent].expansion,
+                       "SubtreeBuilder: expansion point must stay a leaf");
+
+    BuildNode node;
+    node.bbox = bbox;
+    node.geometricError = geometricError;
+    node.parent = parent;
+    node.payload = payload;
+    nodes_.push_back(node);
+    const NodeId id = NodeId(nodes_.size() - 1);
+
+    if (parent == root())
+    {
+        roots_.push_back(id);
+        FRONTIER_CHECK(roots_.size() <= kMaxChildren,
+                       "SubtreeBuilder: too many implicit-root children");
+    }
+    else
+    {
+        nodes_[parent].children.push_back(id);
+        FRONTIER_CHECK(nodes_[parent].children.size() <= kMaxChildren,
+                       "SubtreeBuilder: fanout exceeds kMaxChildren");
+    }
+    return id;
+}
+
+void SubtreeBuilder::setExpansion(NodeId node, SubtreeKey target,
+                                  const SubtreeTransform& transform)
+{
+    FRONTIER_CHECK(!built_, "SubtreeBuilder: builder already consumed");
+    FRONTIER_CHECK(node < nodes_.size(), "SubtreeBuilder: invalid node");
+    FRONTIER_CHECK(nodes_[node].children.empty(),
+                   "SubtreeBuilder: expansion point must stay a leaf");
+    FRONTIER_CHECK(target.valid(), "SubtreeBuilder: invalid expansion target");
+    FRONTIER_CHECK(target != key_, "SubtreeBuilder: direct self-expansion is invalid");
+    FRONTIER_CHECK(transform.scale > 0.0f && std::isfinite(transform.scale) &&
+                       std::isfinite(transform.pos.x) &&
+                       std::isfinite(transform.pos.y) &&
+                       std::isfinite(transform.pos.z),
+                   "SubtreeBuilder: invalid expansion transform");
+    nodes_[node].expansion = true;
+    nodes_[node].target = target;
+    nodes_[node].transform = transform;
+}
+
+Subtree SubtreeBuilder::build(const FrontierContext& ctx)
+{
+    FRONTIER_CHECK(!built_, "SubtreeBuilder: builder already consumed");
+    built_ = true;
+    FRONTIER_CHECK(key_.valid(), "SubtreeBuilder: invalid subtree key");
+    FRONTIER_CHECK(!roots_.empty(), "SubtreeBuilder: subtree has no nodes");
+
+    PageBuilder pageBuilder;
+    Subtree result;
+    result.key_ = key_;
+    uint32_t packedIndex = 1; // packed index zero is the implicit anchor
+
+    const auto dependencyIndex = [&](SubtreeKey target) -> uint32_t
+    {
+        for (uint32_t i = 0; i < result.dependencies_.size(); ++i)
+            if (result.dependencies_[i] == target) return i;
+        result.dependencies_.push_back(target);
+        return uint32_t(result.dependencies_.size() - 1);
+    };
+
+    const auto emit = [&](auto&& self, NodeId source,
+                          PageBuilder::NodeId physicalParent,
+                          bool pageRoot) -> void
+    {
+        const BuildNode& node = nodes_[source];
+        const uint32_t packed = packedIndex++;
+        const PageBuilder::NodeId physical =
+            pageRoot ? pageBuilder.createRoot(node.payload, node.geometricError,
+                                              node.bbox)
+                     : pageBuilder.createNode(physicalParent, node.payload,
+                                              node.geometricError, node.bbox);
+        if (node.expansion)
+        {
+            pageBuilder.markExpansion(physical);
+            result.expansions_.push_back(SubtreeExpansion{
+                node.transform.pos, node.transform.scale, packed,
+                dependencyIndex(node.target)});
+            return;
+        }
+        for (NodeId child : node.children)
+            self(self, child, physical, false);
+    };
+
+    for (NodeId rootNode : roots_)
+        emit(emit, rootNode, 0, true);
+
+    result.page_ = pageBuilder.build(ctx);
+    FRONTIER_CHECK(result.page_.nodeCount() == packedIndex,
+                   "SubtreeBuilder: internal packed-node mapping failure");
+    return result;
 }
 
 } // namespace frontier

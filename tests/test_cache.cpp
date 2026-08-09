@@ -206,6 +206,90 @@ TEST(Cache, SharedPageChangeInvalidatesEveryInstanceOfIt)
     EXPECT_EQ(keysOf(cut), keysOf(ref));
 }
 
+TEST(Cache, LargeAssembledSubtreeCoalescesDependenciesAndInvalidates)
+{
+    constexpr uint32_t houseCount = 130;
+    constexpr uint32_t detailCount = 8;
+    constexpr SubtreeKey houseKey{0xCA01};
+    constexpr SubtreeKey cityKey{0xCA02};
+
+    const auto detailBounds = [](uint32_t i) {
+        return AABB::fromCenterExtent(
+            float4::point((float(i) - 3.5f) * 0.8f, 0, 0),
+            float4::vec(0.3f, 1.0f, 0.3f));
+    };
+
+    SubtreeBuilder house(houseKey);
+    for (uint32_t d = 0; d < detailCount; ++d)
+        house.createNode(house.root(), 1000 + d, 0.0f, detailBounds(d));
+    Subtree houseSubtree = house.build();
+    const uint32_t houseNodes = houseSubtree.page().nodeCount();
+
+    SubtreeBuilder city(cityKey);
+    const auto root = city.createNode(city.root(), 1, 64.0f, AABB::empty());
+    constexpr uint32_t side = 12;
+    for (uint32_t i = 0; i < houseCount; ++i)
+    {
+        const float4 pos = float4::point(
+            float(int(i % side) - int(side / 2)) * 10.0f, 0,
+            float(int(i / side) - 5) * 10.0f);
+        const auto proxy = city.createNode(
+            root, 10 + i, 16.0f,
+            AABB::fromCenterExtent(pos, float4::vec(4, 2, 2)));
+        city.setExpansion(proxy, houseKey, SubtreeTransform{pos, 1.0f});
+    }
+
+    SpatialDatabase world;
+    const SubtreeHandle houseAsset =
+        world.registerSubtree(std::move(houseSubtree));
+    const SubtreeHandle cityAsset = world.registerSubtree(city.build());
+    const auto instance =
+        world.instantiate(cityAsset, float4::point(0, 0, 2500));
+    markAllResident(world, instance.rootPage, houseCount + 2);
+
+    std::vector<MountHandle> mounts;
+    mounts.reserve(houseCount);
+    for (uint32_t i = 0; i < houseCount; ++i)
+    {
+        mounts.push_back(
+            world.mount(nodeAt(instance.rootPage, i + 2), houseAsset));
+        markAllResident(world, mounts.back(), houseNodes);
+    }
+    world.applyUpdates();
+
+    SpatialQuery cache;
+    FrontierResult cut;
+    const Camera view = viewAt(float4::point(0, 0, 0));
+    const SelectionParams params{1.0f, 0.0f};
+
+    cache.selectFrontier(world, view, params, cut);
+    ASSERT_EQ(cut.size(), houseCount * detailCount);
+    ASSERT_EQ(cache.walked(), 1u);
+
+    cache.selectFrontier(world, view, params, cut);
+    EXPECT_EQ(cache.walked(), 0u);
+    EXPECT_EQ(cache.reused(), 1u);
+
+    // Per-mount residency remains independent; the mutation propagates to
+    // this assembled city's root stamp and invalidates exactly its cut.
+    world.markNonResident(nodeAt(mounts[17], 1));
+    cache.selectFrontier(world, view, params, cut);
+    EXPECT_EQ(cache.walked(), 1u);
+    EXPECT_EQ(cache.reused(), 0u);
+
+    FrontierResult reference;
+    selectFrontierUncached(world, view, params, reference);
+    EXPECT_EQ(keysOf(cut), keysOf(reference));
+
+    cache.selectFrontier(world, view, params, cut);
+    EXPECT_EQ(cache.walked(), 0u);
+    EXPECT_EQ(cache.reused(), 1u);
+
+    PageUsageContext usage;
+    cache.selectFrontier(world, view, params, usage, cut);
+    EXPECT_EQ(cache.walked(), 1u); // enumerate physical mounts for exact LRU feedback
+}
+
 // Under damping the query is a box that grows and shrinks, not a point, so the
 // odometer has to bound the movement of the whole envelope rather than of the
 // eye. Jitter is the case that would expose a bound that only tracked position.

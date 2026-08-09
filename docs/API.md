@@ -28,9 +28,31 @@ including a node whose deeper children are streamed separately. A
 object to a terrain region or city block; it does not have to correspond to a
 single mesh or entity.
 
-A node has no transform. Its bounds and renderer data use hierarchy-local
-coordinates. The world transform belongs to an instance; per-instance
-deformation can override node bounds without adding a node transform.
+A node has no transform. Its bounds and renderer data use its subtree-local
+coordinates. The world transform belongs to a top-level instance, and a
+nested subtree mount may add a relative translation and positive uniform
+scale. Per-instance deformation can override node bounds without rewriting
+shared subtree data.
+
+### Subtree and assembly
+
+A **subtree** is a reusable hierarchy fragment whose root is an implicit,
+non-renderable anchor. Its real nodes live in one packed page. When the
+subtree is instantiated, the anchor is its TLAS leaf. When it is mounted, the
+anchor is the parent expansion node, which remains the renderable coarse
+fallback.
+
+Every subtree has a stable application/package `SubtreeKey`. An expansion site
+stores a permanent target key and a relative translation/uniform scale.
+Repeated target keys are deduplicated in the parent subtree's dependency
+table; each site stores only a compact dependency index. Authored content is
+therefore a DAG of reusable subtree definitions, while each database placement
+is a tree of mounts.
+
+`SubtreeBuilder` is the assembly API. `HierarchyBuilder::splitBelow()` remains
+the monolithic-authoring and physical-page-partitioning API. The current
+`Subtree` representation owns one packed page plus its dependency sidecar;
+compose subtrees for deeper reusable structures.
 
 ### Page and expansion point
 
@@ -91,7 +113,9 @@ state. The application should store and pass handles, not infer internal
 indices:
 
 - `frontier::AssetHandle` identifies a registered asset;
+- `frontier::SubtreeHandle` identifies a registered logical subtree;
 - `frontier::PageHandle` identifies one runtime mount of a page;
+- `frontier::MountHandle` is the assembly name for a page mount;
 - `frontier::NodeHandle` identifies a node inside a page mount; and
 - `frontier::SpatialDatabase::InstanceRef` identifies a live instance.
 
@@ -178,11 +202,11 @@ No third-party library is required at runtime.
 
 A normal integration follows this order:
 
-1. Author one complete logical tree with `HierarchyBuilder`, mark natural
-   boundaries with `splitBelow()`, and build its `Hierarchy` package. A content
-   pipeline may instead validate serialized page blobs with `Page::fromBytes()`
-   or `PageView::fromBytes()`.
-2. Construct one `SpatialDatabase`, register reusable assets, and add their instances.
+1. Build reusable components with `SubtreeBuilder` and connect expansion sites
+   with permanent `SubtreeKey` values. Monolithic content may instead use
+   `HierarchyBuilder::splitBelow()`.
+2. Construct one `SpatialDatabase`, register subtrees, and instantiate top-level
+   components. Register or transfer legacy pages as needed.
 3. Construct one persistent `SpatialQuery` per camera-like query.
 4. Each frame, submit database changes and call `applyUpdates()` once.
 5. Execute all spatial queries against the published database snapshot.
@@ -198,6 +222,7 @@ A normal integration follows this order:
 | Add the library to a CMake target | [Add Frontier to a CMake target](#add-frontier-to-a-cmake-target) |
 | Publish a frame safely or select several cameras | [Frame lifecycle and threading](#frame-lifecycle-and-threading) |
 | Build, split, serialize, or own hierarchy data | [Authoring a paged hierarchy](#authoring-a-paged-hierarchy) |
+| Assemble reusable hierarchy components | [Assembling reusable subtrees](#assembling-reusable-subtrees) |
 | Share content and move instances | [Assets and instances](#assets-and-instances) |
 | Attach hierarchy data or report payload availability | [Topology and residency](#topology-and-residency) |
 | Render a frontier and choose result storage | [Selection and result ownership](#selection-and-result-ownership) |
@@ -418,6 +443,90 @@ must not return until all tasks have completed.
   handles as an expected outcome of asynchronous streaming.
 - Keep borrowed page bytes and page allocator contexts alive for the full
   lifetimes documented below.
+
+## Assembling reusable subtrees
+
+Use `SubtreeBuilder` when several hierarchy sites refine into the same authored
+component. The builder exposes an implicit root through `root()`; pass it as
+the parent of every real top-level node in the component.
+
+This example authors detailed house contents once and references them from two
+coarse house proxies:
+
+```cpp
+constexpr frontier::SubtreeKey houseKey{1};
+constexpr frontier::SubtreeKey cityKey{2};
+
+frontier::SubtreeBuilder house(houseKey);
+house.createNode(
+    house.root(), wallPayload, 0.0f,
+    frontier::AABB::fromCenterExtent(frontier::float4::point(0, 0, 0),
+                                     frontier::float4::vec(1, 2, 1)));
+frontier::Subtree houseDetails = house.build();
+
+frontier::SubtreeBuilder city(cityKey);
+const auto cityProxy =
+    city.createNode(city.root(), cityPayload, 64.0f, frontier::AABB::empty());
+
+const auto leftHouse = city.createNode(
+    cityProxy, houseProxyPayload, 16.0f,
+    frontier::AABB::fromCenterExtent(frontier::float4::point(-10, 0, 0),
+                                     frontier::float4::vec(2, 3, 2)));
+city.setExpansion(
+    leftHouse, houseKey,
+    frontier::SubtreeTransform{frontier::float4::point(-10, 0, 0), 1.0f});
+
+const auto rightHouse = city.createNode(
+    cityProxy, houseProxyPayload, 16.0f,
+    frontier::AABB::fromCenterExtent(frontier::float4::point(10, 0, 0),
+                                     frontier::float4::vec(2, 3, 2)));
+city.setExpansion(
+    rightHouse, houseKey,
+    frontier::SubtreeTransform{frontier::float4::point(10, 0, 0), 1.0f});
+
+frontier::SpatialDatabase database;
+const frontier::SubtreeHandle houseAsset =
+    database.registerSubtree(std::move(houseDetails));
+const frontier::SubtreeHandle cityAsset =
+    database.registerSubtree(city.build());
+const frontier::SpatialDatabase::InstanceRef cityInstance =
+    database.instantiate(cityAsset, frontier::float4::point(0, 0, 0));
+```
+
+Before mounting, an over-threshold ideal-frontier entry still selects the
+coarse house proxy. Query its permanent content target and attach the already
+registered shared definition:
+
+```cpp
+if (entry.overThreshold() &&
+    database.expansionTarget(entry.nodeHandle) == houseKey &&
+    !database.isAttached(entry.nodeHandle))
+{
+    const frontier::MountHandle mount =
+        database.mount(entry.nodeHandle, houseAsset);
+    if (mount.valid())
+    {
+        // Payload residency remains explicit and mount-specific.
+        // Mark loaded node handles resident as their renderer data completes.
+    }
+}
+```
+
+Each call to `mount()` creates distinct placement state but retains the same
+immutable house page bytes. Mount transforms are authored in the parent
+subtree and therefore shared by every top-level instance of that parent. Use
+`tryGetNodeTransform()` to recover a selected node's accumulated
+mount-to-instance transform; compose it with the transform indexed by
+`FrontierEntry::instance()` when submitting renderer work.
+
+The transformed child sentinel bounds must fit inside the expansion proxy's
+authored bounds. Effective error is converted across mount scale. Bounds edits
+remain child-local and propagate through the relative transform into the
+instance's bounds-only COW overlays.
+
+`SubtreeBuilder::build()` currently produces one packed page and an owned
+dependency sidecar. Register the resulting object directly; only raw `Page`
+blobs currently have the standalone `data()`/`fromBytes()` serialization API.
 
 ## Authoring a paged hierarchy
 
@@ -715,6 +824,14 @@ proof margin. `reused()`, `walked()`, `bytes()`, and `lastSelectionStats()` expo
 diagnostics. `SelectionStats` counters are populated only in builds with
 `FRONTIER_STATS`.
 
+A cached traversal versions an entire mounted tree at its root. Descendant
+residency and attachment changes propagate to that stamp, so reuse validation
+is one dependency for both a flat page and a city assembled from many mounted
+subtrees. Output buckets larger than 1,023 entries remain cacheable through a
+sparse full-width count spill; the 32-byte hot per-instance record is unchanged.
+When a `PageUsageContext` is supplied, selection re-walks an aggregate cache hit
+as needed to enumerate the exact physical pages for retention feedback.
+
 ## Per-query page usage and collection
 
 Passing a `PageUsageContext` to selection records which pages that query needed
@@ -832,6 +949,18 @@ The guide above shows the normal lifecycle. The remaining public helpers are
 summarized here so ownership or introspection code does not need to depend on
 internal structures.
 
+### Reusable subtree package
+
+| Member | Result |
+|---|---|
+| `key()` | stable authored `SubtreeKey` |
+| `page()` | borrowed view of the packed real nodes below the implicit root |
+| `dependencies()` | deduplicated permanent child keys |
+| `expansions()` | packed-node/dependency/transform records sorted by node |
+
+`Subtree` is move-only. `registerSubtree(std::move(subtree))` transfers its
+page and logical metadata into the database.
+
 ### Generated hierarchy package
 
 | Member | Result |
@@ -852,16 +981,20 @@ subsequent `page()` or `clonePage()` access for that id.
 |---|---|
 | `config()` | the copied `SpatialDatabaseConfig` |
 | `isAsset(handle)` | whether an asset handle is live |
+| `isSubtree(handle)` | whether a logical subtree handle is live |
 | `assetCount()` | number of registered live assets |
 | `assetRootPage(asset)` | shared root mount, or invalid before materialization/stale asset |
 | `isAttached(node)` | whether an expansion point currently has a child page |
 | `detailPage(node)` | generated `DetailPageRef`, scoped by root asset, or invalid |
+| `expansionTarget(node)` | permanent `SubtreeKey`, or invalid for legacy/stale nodes |
+| `tryGetNodeTransform(node, out)` | accumulated mount-to-instance translation/scale |
 | `isResident(node)` | whether a live node payload is resident |
 | `tryGetPayload(node, out)` | resolves a live node's opaque payload |
 | `attachedPageCount()` | all mounted pages, including pinned roots |
 | `streamedPageCount()` | mounted pages eligible for the streaming budget |
 | `frame()` | update epoch advanced by `applyUpdates()` |
 | `overlayCount()` / `overlayBytes()` | live deformation-overlay count and storage |
+| `mountStateBytes()` | retained mount/transform/residency/link capacity, excluding asset blobs |
 | `nodeBounds(instance, node)` | local bounds seen by that instance; flushes pending edits |
 
 All count and state inspection obeys the same phase rule as other database access:

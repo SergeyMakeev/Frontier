@@ -1,6 +1,7 @@
 #pragma once
-// Authoring-time builders. HierarchyBuilder is the normal API: author one
-// logical tree and mark natural splitBelow() boundaries. PageBuilder is the
+// Authoring-time builders. SubtreeBuilder assembles reusable implicit-root
+// components; HierarchyBuilder authors one monolithic logical tree with
+// splitBelow() boundaries. PageBuilder is the
 // low-level physical-page escape hatch. See docs/frontier_design.md §3.
 
 #include <cstdint>
@@ -8,6 +9,7 @@
 
 #include "config.h"
 #include "page.h"
+#include "subtree.h"
 
 namespace frontier {
 
@@ -124,6 +126,49 @@ private:
     std::vector<BuildNode> nodes_;
     NodeId                 root_ = kInvalidIndex;
     bool                   built_ = false;
+};
+
+// Assembly-first authoring API. The builder's root() is an implicit,
+// non-renderable anchor. Real nodes may be added directly below it; an
+// expansion leaf can permanently reference another reusable SubtreeKey.
+class SubtreeBuilder
+{
+public:
+    using NodeId = uint32_t;
+
+    explicit SubtreeBuilder(SubtreeKey key) : key_(key) {}
+
+    static constexpr NodeId root() { return kInvalidIndex; }
+
+    NodeId createNode(NodeId parent, UserPayload payload, float geometricError,
+                      const AABB& bbox = AABB::empty());
+
+    // Turns a real leaf into a composition site. The child Subtree is not
+    // copied or required to be present while this parent is authored.
+    void setExpansion(NodeId node, SubtreeKey target,
+                      const SubtreeTransform& transform = {});
+
+    // Consumes the builder and emits one packed implicit-root page plus the
+    // deduplicated external dependency/placement sidecar.
+    Subtree build(const FrontierContext& ctx = defaultContext());
+
+private:
+    struct BuildNode
+    {
+        AABB bbox;
+        float geometricError = 0.0f;
+        NodeId parent = kInvalidIndex;
+        UserPayload payload = 0;
+        bool expansion = false;
+        SubtreeKey target{};
+        SubtreeTransform transform{};
+        std::vector<NodeId> children;
+    };
+
+    SubtreeKey key_{};
+    std::vector<BuildNode> nodes_;
+    std::vector<NodeId> roots_;
+    bool built_ = false;
 };
 
 } // namespace frontier

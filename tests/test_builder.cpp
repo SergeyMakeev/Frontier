@@ -117,6 +117,251 @@ TEST(Builder, MultiRootForestPage)
     verifyInvariants(pg);
 }
 
+TEST(SubtreeBuilder, ImplicitRootAndRepeatedDependencyArePackedOnce)
+{
+    constexpr SubtreeKey cityKey{100};
+    constexpr SubtreeKey houseKey{200};
+
+    SubtreeBuilder city(cityKey);
+    const auto cityProxy = city.createNode(
+        city.root(), 1, 64.0f, AABB::empty());
+    for (uint32_t i = 0; i < 128; ++i)
+    {
+        const float x = float(i) * 8.0f;
+        const auto house = city.createNode(
+            cityProxy, 10 + i, 16.0f,
+            AABB::fromCenterExtent(float4::point(x, 0, 0),
+                                   float4::vec(2, 2, 2)));
+        city.setExpansion(
+            house, houseKey,
+            SubtreeTransform{float4::point(x, 0, 0), 1.0f});
+    }
+
+    Subtree subtree = city.build();
+    ASSERT_TRUE(subtree.valid());
+    EXPECT_EQ(subtree.key(), cityKey);
+    EXPECT_EQ(subtree.page().childCount(0), 1u); // one real root below anchor
+    EXPECT_EQ(subtree.page().nodeCount(), 130u); // sentinel + city + houses
+    ASSERT_EQ(subtree.dependencies().size(), 1u);
+    EXPECT_EQ(subtree.dependencies()[0], houseKey);
+    ASSERT_EQ(subtree.expansions().size(), 128u);
+    for (uint32_t i = 0; i < subtree.expansions().size(); ++i)
+    {
+        EXPECT_EQ(subtree.expansions()[i].nodeIndex, i + 2);
+        EXPECT_EQ(subtree.expansions()[i].dependency, 0u);
+    }
+}
+
+TEST(SubtreeAssembly, SharedHouseMountsKeepDistinctPlacements)
+{
+    constexpr SubtreeKey houseKey{1001};
+    constexpr SubtreeKey cityKey{1002};
+
+    SubtreeBuilder house(houseKey);
+    house.createNode(
+        house.root(), 100, 0.0f,
+        AABB::fromCenterExtent(float4::point(-0.75f, 0, 0),
+                               float4::vec(0.25f, 1, 1)));
+    house.createNode(
+        house.root(), 101, 0.0f,
+        AABB::fromCenterExtent(float4::point(0.75f, 0, 0),
+                               float4::vec(0.25f, 1, 1)));
+    Subtree houseSubtree = house.build();
+    const uint32_t houseNodes = houseSubtree.page().nodeCount();
+
+    SubtreeBuilder city(cityKey);
+    const auto cityProxy = city.createNode(city.root(), 1, 64.0f, AABB::empty());
+    const auto left = city.createNode(
+        cityProxy, 10, 16.0f,
+        AABB::fromCenterExtent(float4::point(-10, 0, 0),
+                               float4::vec(2, 2, 2)));
+    const auto right = city.createNode(
+        cityProxy, 11, 16.0f,
+        AABB::fromCenterExtent(float4::point(10, 0, 0),
+                               float4::vec(2, 2, 2)));
+    city.setExpansion(
+        left, houseKey,
+        SubtreeTransform{float4::point(-10, 0, 0), 1.0f});
+    city.setExpansion(
+        right, houseKey,
+        SubtreeTransform{float4::point(10, 0, 0), 1.0f});
+
+    SpatialDatabase world;
+    const SubtreeHandle houseHandle =
+        world.registerSubtree(std::move(houseSubtree));
+    const SubtreeHandle cityHandle = world.registerSubtree(city.build());
+    const SpatialDatabase::InstanceRef instance =
+        world.instantiate(cityHandle, float4::point(0, 0, 0));
+
+    const NodeHandle leftNode = nodeAt(instance.rootPage, 2);
+    const NodeHandle rightNode = nodeAt(instance.rootPage, 3);
+    EXPECT_EQ(world.expansionTarget(leftNode), houseKey);
+    EXPECT_EQ(world.expansionTarget(rightNode), houseKey);
+
+    const MountHandle leftMount = world.mount(leftNode, houseHandle);
+    const MountHandle rightMount = world.mount(rightNode, houseHandle);
+    ASSERT_TRUE(leftMount.valid());
+    ASSERT_TRUE(rightMount.valid());
+    EXPECT_NE(leftMount.slot, rightMount.slot);
+    EXPECT_EQ(world.assetCount(), 2u);       // city + one shared house definition
+    EXPECT_EQ(world.attachedPageCount(), 3u); // city + two placements
+
+    world.markResident(leftNode);
+    world.markResident(rightNode);
+    markAllResident(world, leftMount, houseNodes);
+    markAllResident(world, rightMount, houseNodes);
+
+    SubtreeTransform leftTransform, rightTransform;
+    ASSERT_TRUE(world.tryGetNodeTransform(nodeAt(leftMount, 1), leftTransform));
+    ASSERT_TRUE(world.tryGetNodeTransform(nodeAt(rightMount, 1), rightTransform));
+    EXPECT_FLOAT_EQ(leftTransform.pos.x, -10.0f);
+    EXPECT_FLOAT_EQ(rightTransform.pos.x, 10.0f);
+
+    world.applyUpdates();
+    SpatialQuery query;
+    query.setReuseEnabled(false);
+    const Camera camera = makeLookAtCamera(float4::point(0, 4, -25),
+                                           float4::point(0, 0, 0));
+    const FrontierResultView result =
+        query.selectFrontier(world, camera, SelectionParams{1.0f, 0.0f});
+    uint32_t wall100 = 0, wall101 = 0;
+    for (const FrontierEntry& entry : currentFrontier(result))
+    {
+        const UserPayload payload = payloadOf(world, entry);
+        wall100 += payload == 100;
+        wall101 += payload == 101;
+    }
+    EXPECT_EQ(wall100, 2u);
+    EXPECT_EQ(wall101, 2u);
+
+    world.detachPage(leftNode);
+    EXPECT_FALSE(world.isAttached(leftNode));
+    EXPECT_TRUE(world.isAttached(rightNode));
+}
+
+TEST(SubtreeAssembly, TransformedBoundsPropagateInOwnerSpacePerInstance)
+{
+    constexpr SubtreeKey detailKey{2001};
+    constexpr SubtreeKey parentKey{2002};
+
+    SubtreeBuilder detail(detailKey);
+    detail.createNode(
+        detail.root(), 100, 1.0f,
+        AABB::fromCenterExtent(float4::point(0, 0, 0),
+                               float4::vec(1, 1, 1)));
+
+    SubtreeBuilder parent(parentKey);
+    const auto root = parent.createNode(parent.root(), 1, 32.0f, AABB::empty());
+    const auto proxy = parent.createNode(
+        root, 10, 8.0f,
+        AABB::fromCenterExtent(float4::point(-10, 0, 0),
+                               float4::vec(2, 2, 2)));
+    parent.setExpansion(
+        proxy, detailKey,
+        SubtreeTransform{float4::point(-10, 0, 0), 1.0f});
+
+    SpatialDatabase world;
+    const SubtreeHandle detailHandle = world.registerSubtree(detail.build());
+    const SubtreeHandle parentHandle = world.registerSubtree(parent.build());
+    const auto first = world.instantiate(parentHandle, float4::point(0, 0, 0));
+    const auto second = world.instantiate(parentHandle, float4::point(100, 0, 0));
+    const NodeHandle proxyNode = nodeAt(first.rootPage, 2);
+    const MountHandle detailMount = world.mount(proxyNode, detailHandle);
+    ASSERT_TRUE(detailMount.valid());
+
+    const AABB moved = AABB::fromCenterExtent(float4::point(-4, 0, 0),
+                                               float4::vec(1, 1, 1));
+    world.setNodeBounds(first, nodeAt(detailMount, 1), moved);
+    world.flushBounds();
+
+    const AABB firstProxy = world.nodeBounds(first, proxyNode);
+    const AABB secondProxy = world.nodeBounds(second, proxyNode);
+    EXPECT_FLOAT_EQ(firstProxy.mn.x, -15.0f); // child-local -5, mounted at -10
+    EXPECT_FLOAT_EQ(secondProxy.mn.x, -12.0f);
+    EXPECT_FLOAT_EQ(secondProxy.mx.x, -8.0f);
+}
+
+TEST(SubtreeAssembly, NestedMountTransformsComposeThroughImplicitRoots)
+{
+    constexpr SubtreeKey detailKey{2501};
+    constexpr SubtreeKey blockKey{2502};
+    constexpr SubtreeKey cityKey{2503};
+
+    SubtreeBuilder detail(detailKey);
+    detail.createNode(
+        detail.root(), 100, 0.0f,
+        AABB::fromCenterExtent(float4::point(0, 0, 0),
+                               float4::vec(1, 1, 1)));
+
+    SubtreeBuilder block(blockKey);
+    const auto building = block.createNode(
+        block.root(), 10, 8.0f,
+        AABB::fromCenterExtent(float4::point(3, 0, 0),
+                               float4::vec(1, 1, 1)));
+    block.setExpansion(
+        building, detailKey,
+        SubtreeTransform{float4::point(3, 0, 0), 0.5f});
+
+    SubtreeBuilder city(cityKey);
+    const auto cityBlock = city.createNode(
+        city.root(), 1, 32.0f,
+        AABB::fromCenterExtent(float4::point(16, 0, 0),
+                               float4::vec(3, 3, 3)));
+    city.setExpansion(
+        cityBlock, blockKey,
+        SubtreeTransform{float4::point(10, 0, 0), 2.0f});
+
+    SpatialDatabase world;
+    const SubtreeHandle detailHandle = world.registerSubtree(detail.build());
+    const SubtreeHandle blockHandle = world.registerSubtree(block.build());
+    const SubtreeHandle cityHandle = world.registerSubtree(city.build());
+    const auto instance =
+        world.instantiate(cityHandle, float4::point(100, 0, 0));
+
+    const MountHandle blockMount =
+        world.mount(nodeAt(instance.rootPage, 1), blockHandle);
+    ASSERT_TRUE(blockMount.valid());
+    const MountHandle detailMount =
+        world.mount(nodeAt(blockMount, 1), detailHandle);
+    ASSERT_TRUE(detailMount.valid());
+
+    SubtreeTransform transform;
+    ASSERT_TRUE(
+        world.tryGetNodeTransform(nodeAt(detailMount, 1), transform));
+    EXPECT_FLOAT_EQ(transform.pos.x, 16.0f); // 10 + 3 * 2
+    EXPECT_FLOAT_EQ(transform.scale, 1.0f);  // 2 * 0.5
+}
+
+TEST(SubtreeAssembly, MountRejectsTheWrongPermanentTarget)
+{
+    constexpr SubtreeKey expectedKey{3001};
+    constexpr SubtreeKey wrongKey{3002};
+    constexpr SubtreeKey parentKey{3003};
+
+    auto makeLeaf = [](SubtreeKey key, UserPayload payload) {
+        SubtreeBuilder builder(key);
+        builder.createNode(
+            builder.root(), payload, 0.0f,
+            AABB::fromCenterExtent(float4::point(0, 0, 0),
+                                   float4::vec(1, 1, 1)));
+        return builder.build();
+    };
+
+    SubtreeBuilder parent(parentKey);
+    const auto proxy = parent.createNode(
+        parent.root(), 1, 8.0f,
+        AABB::fromCenterExtent(float4::point(0, 0, 0),
+                               float4::vec(2, 2, 2)));
+    parent.setExpansion(proxy, expectedKey);
+
+    SpatialDatabase world;
+    const SubtreeHandle wrong = world.registerSubtree(makeLeaf(wrongKey, 20));
+    const SubtreeHandle parentHandle = world.registerSubtree(parent.build());
+    const auto instance = world.instantiate(parentHandle, float4::point(0, 0, 0));
+    EXPECT_THROW(world.mount(nodeAt(instance.rootPage, 1), wrong),
+                 std::logic_error);
+}
+
 TEST(Builder, WideFanoutChainsBlocks)
 {
     PageBuilder b;

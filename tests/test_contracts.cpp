@@ -710,7 +710,7 @@ TEST(Contracts, MemoryBudgets)
     RecordProperty("tlas_item_bytes", int(TA::tlasItemBytes()));
     RecordProperty("morton_item_bytes", int(TA::mortonItemBytes()));
     EXPECT_EQ(TA::assetRtBytes(), 112u);
-    EXPECT_EQ(TA::pageRtBytes(), 104u);
+    EXPECT_EQ(TA::pageRtBytes(), 48u);
     EXPECT_EQ(TA::pageStampBytes(), 8u);
     EXPECT_EQ(TA::pageResidencyBytes(), 8u);
     EXPECT_EQ(TA::overlayBytes(), 104u);

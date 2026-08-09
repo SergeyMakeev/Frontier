@@ -53,9 +53,9 @@ Frontier to own an IO system.
 ## Minimal example
 
 This one-node BLAS is intentionally small so the complete build, instance,
-query, and selection loop is visible. Real hierarchies add children with
-`HierarchyBuilder::createNode` and mark natural streaming boundaries with
-`splitBelow()`.
+query, and selection loop is visible. Real hierarchies may be assembled from
+reusable implicit-root components with `SubtreeBuilder`, or authored
+monolithically with `HierarchyBuilder` and partitioned using `splitBelow()`.
 
 ```cpp
 #include "frontier/builder.h"
@@ -101,6 +101,30 @@ int main()
 `SelectionParams::threshold` is the permitted projected error in pixels.
 `SelectionParams::minPix` optionally culls entire instances whose maximum
 contribution is smaller than that value; zero disables contribution culling.
+
+## Reusable subtree assembly
+
+`SubtreeBuilder` builds the real nodes below an implicit anchor. Instantiating
+the result places that anchor in the TLAS; mounting it places the anchor at an
+expansion node in another subtree. This lets content form a DAG of reusable
+definitions while each runtime placement remains an ordinary tree mount.
+
+For example, build detailed house nodes once, give every coarse house proxy in
+a city the same permanent `SubtreeKey`, then call `mount()` as those proxies
+need to refine. The house page bytes are registered once. Each site retains its
+own relative translation/scale, mount handle, bounds overlay, and collection
+state. Repeated keys are deduplicated in the parent's dependency table, so a
+city with many identical houses stores the full house key once.
+
+Fully resident leaf-only placements are traversed as a consecutive batch: the
+house page is resolved once and the query streams compact placement transforms.
+Temporal reuse versions the assembled mount tree at its root, so a city with a
+million house placements still needs one cache dependency rather than a million
+page checks.
+
+`splitBelow()` remains useful for choosing physical streaming boundaries inside
+one monolithic authored hierarchy. It is not required to express reuse:
+composition uses `SubtreeBuilder::setExpansion()`.
 
 ## Performance at a glance
 
@@ -168,6 +192,9 @@ mutations using it become safe no-ops.
 
 ## Runtime model
 
+- Authored subtree definitions form a DAG keyed by stable `SubtreeKey` values;
+  runtime `MountHandle` placements form a tree. A top-level `InstanceRef` is a
+  subtree mount whose implicit anchor belongs to the TLAS.
 - Immutable, versioned page blobs hold each BLAS's preorder node arrays and
   8-lane wide child blocks. A registered root-page asset can be instanced
   thousands of times while sharing page bytes, residency, and its attachment

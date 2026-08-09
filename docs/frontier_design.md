@@ -59,14 +59,18 @@ envelope, providing LOD hysteresis without sticky state on every node.
 
 ## 2. Public objects and handles
 
-The runtime has four distinct concepts:
+The runtime has six distinct concepts:
 
 - A `Page` or `PageView` is an immutable, packed BLAS fragment.
 - An `AssetHandle` names page bytes registered with a `SpatialDatabase` for reuse. Here
   *asset* is an API/storage term and does not mean that the BLAS represents one
   object.
+- A `Subtree` owns one implicit-root page plus permanent external expansion
+  targets. `SubtreeHandle` names its registered logical definition.
 - A page mount places an asset at an instance root or below an expansion point;
   a `PageHandle` names that mount.
+- `MountHandle` is the assembly-facing alias for a page mount. A subtree mount
+  also carries an accumulated translation and positive uniform scale.
 - An instance applies a translation and positive uniform scale to one
   independent BLAS root. `SpatialDatabase::InstanceRef` also contains a generation and
   its root page handle.
@@ -83,6 +87,11 @@ The `SpatialDatabase` keeps no payload-to-node index and no hash map. Persistent
 should retain handles from `FrontierEntry`, `InstanceRef::rootPage`, or
 `attachPage`. Generated expansion nodes embed their `HierarchyPageId`; only a
 low-level custom partitioner needs to own additional page-index metadata.
+
+Assembly streaming uses `expansionTarget(NodeHandle)` instead. The target is a
+stable `SubtreeKey` stored once in the parent's deduplicated dependency table;
+`mount(node, subtreeHandle)` validates that key before creating placement
+state.
 
 `InstanceDesc` contains:
 
@@ -171,6 +180,19 @@ free to discard or cache the loaded page.
 
 ## 3. Logical hierarchy pages and packed-page invariants
 
+`SubtreeBuilder` exposes the packed sentinel as a public implicit-root concept.
+Every real top-level node is created with `builder.root()` as its parent. An
+expansion leaf may reference an independently built `SubtreeKey` without
+authoring or copying that child's descendants. The content definitions form a
+DAG, but every runtime reference produces a distinct mount, so traversal still
+sees a tree and node handles remain placement-specific.
+
+The parent stores one `SubtreeKey` per unique dependency and one 32-byte
+expansion record per site. That record contains the packed parent-node index,
+a dependency-table index, and the child's relative translation/uniform scale.
+The current `Subtree` package owns one Page and this sidecar; raw Page blob
+serialization does not include the sidecar.
+
 `HierarchyBuilder` consumes one arbitrary insertion-order, single-root logical
 tree. `splitBelow(node)` defines a natural entity boundary: the renderable node
 stays in its parent page as an expansion point, while the builder generates one
@@ -248,6 +270,18 @@ execute lane loops, so page blobs do not vary by CPU backend.
 
 ## 4. Assets, mounts, and sharing
 
+`registerSubtree(Subtree&&)` transfers the immutable page and logical
+dependency metadata together. `instantiate()` places its implicit anchor in
+the TLAS. `mount()` places the same definition beneath an authored expansion
+site and validates transformed child bounds plus the permanent target key.
+
+Different sites mounting one subtree share page bytes but have distinct owner,
+transform, error clamp, residency coverage, and LRU records. Accumulated mount
+transforms live in a dense slot-parallel array. Selection transforms the
+instance-local camera when it crosses a non-identity mount; page bounds remain
+canonical and immutable. Bounds-only COW propagation converts a child page's
+sentinel box back into its owner coordinate system at each boundary.
+
 `registerAsset(Page&&)` transfers ownership of a blob to the `SpatialDatabase`.
 `registerAsset(PageView)` borrows one. Instancing a registered root asset reuses
 one root mount, including its residency and attached child-page graph. Ten
@@ -270,18 +304,24 @@ when their last mount and instance reference disappear.
 
 ## 5. Residency and topology streaming
 
-Each mounted page has compact runtime arrays parallel to its nodes:
+Each mounted page stores one 16-bit word per node. Two bits hold `resident`
+(the caller has the payload available) and `covered` (that payload or its
+descendants provide a complete resident structural cover); nine bits hold the
+covered-child count. The authored fanout cap is 511, so the count cannot
+overflow. Keeping these together removes one allocation per mount.
 
-- one byte holds both `resident` (the caller has the payload available) and
-  `covered` (that payload or its descendants provide a complete resident
-  structural cover); and
-- one 16-bit `coveredChildren` count incrementally maintains that summary from
-  immediate children, including attached child pages. The authored fanout cap
-  is 511, so the count cannot overflow.
+Attached-child slot arrays live in a sparse pool and are created only when a
+mount actually gains a child. Per-node state comes from geometric, asset-local
+slabs rather than one allocation per placement. Consequently a reusable leaf
+placement carries no vector headers. `PageRt` is 48 bytes. A slot-parallel
+32-byte hot mount record holds its transform, error clamp, generation, and asset id.
 
-Each mount also has two compact 8-byte records outside the 104-byte `PageRt`.
+Each mount also has two compact 8-byte records outside `PageRt`.
 `PageStamp` holds the content version plus the generation/live stamp used by
-handles and cached-query dependency checks. The residency summary holds a
+handles and cached-query dependency checks. Each mount stores its mounted-tree
+root slot in `PageRt` tail padding, and descendant residency or topology changes
+bump that root version. A cached assembled city therefore validates one exact
+tree dependency regardless of its placement count. The residency summary holds a
 resident node count and a count of recursively incomplete attached child
 mounts. It changes only with residency or topology and propagates upward only
 when a mount tree crosses the fully-resident boundary. Selection uses that
@@ -432,9 +472,11 @@ Important limits are explicit:
 
 - An instance crossing a frustum plane is always walked because camera
   rotation can change culling independently of camera translation.
-- An instance with more than two distinct page dependencies is not cached.
-  Streaming does not otherwise disable reuse: residency and topology versions
-  invalidate records that depend on changed pages.
+- Ordinary selection coalesces every visited page to the mounted-tree root, so
+  an assembled city has one dependency. The overload that records exact
+  `PageUsageContext` feedback enumerates physical pages; a record needing more
+  than two of those is not cached. Streaming does not otherwise disable reuse:
+  descendant residency and topology changes bump the root version.
 - The emitted node set matches uncached selection exactly. `errorCode()` on a
   reused entry is the recorded quantized value and can be stale within the
   proven margin; use its magnitude for prioritization or dithering, not
@@ -443,8 +485,10 @@ Important limits are explicit:
   concurrently because all mutable query state is query-owned.
 
 Each per-instance cache record is split into 32 hot bytes and 4 cold bytes,
-plus an optional 8-byte second-page dependency allocated only after a
-cacheable walk actually touches two pages. The common hit reads the hot record
+plus an optional 8-byte second dependency allocated only after a cacheable walk
+actually needs two stamps. Counts up to 1,023 per output bucket stay inline;
+larger cacheable frontiers allocate one sparse 16-byte full-width count record.
+The common hit reads the hot record
 and a parallel 4-byte instance-version stream; it does not fetch the 32-byte
 instance record. Recorded frontier entries remain separate slab storage.
 `reset()` clears logical state and its damping window but retains capacity,

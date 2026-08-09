@@ -29,6 +29,14 @@ payload uniqueness and independent hierarchies may reuse local ids. Instances
 of a registered root asset share page bytes, residency, and the attached-page
 graph; per-instance deformation allocates bounds-only copy-on-write overlays.
 
+`SubtreeBuilder` is the composition path. It emits a packed forest beneath an
+implicit, non-renderable anchor plus a deduplicated dependency table and dense
+32-byte expansion-site records. Authored definitions therefore form a DAG:
+many city nodes can reference one house `SubtreeKey`. At runtime every
+reference becomes a distinct mount with an accumulated local transform, while
+the immutable house bytes remain shared. A top-level subtree instance uses the
+TLAS leaf as its implicit anchor; a nested mount uses its expansion node.
+
 ## Published-database lifecycle
 
 `SpatialDatabase` is single-writer. Mutations, streaming completions, residency changes,
@@ -52,9 +60,11 @@ Selection is output-sensitive:
 2. Emit exact one-node BLASes and acceptable hierarchical roots directly when
    possible.
 3. Transform the camera into each remaining instance's local space.
-4. Walk attached pages with an explicit DFS carrying the undecided frustum
+4. Transform again at a non-identity subtree mount without rewriting its
+   shared page bounds.
+5. Walk attached pages with an explicit DFS carrying the undecided frustum
    planes plus current- and ideal-frontier liveness.
-5. Test up to eight children together. Plain leaves emit directly; interior
+6. Test up to eight children together. Plain leaves emit directly; interior
    and expansion nodes continue through the stack.
 
 The walk returns three disjoint sequences. `shared + currentOnly` is the
@@ -83,11 +93,35 @@ Hot multiplied data is deliberately compact:
 | `PageUsageContext` record | 8 B | generation, pending flag, last-use epoch |
 | instance selection / TLAS state | 32 B + 48 B | selection state separated from maintenance |
 | visible hit / TLAS stack item | 4 B / 4 B | packed instance or node index and flags |
-| mounted-node residency state | 3 B | flags plus covered-child count |
+| mounted-node residency state | 2 B | flags plus 9-bit covered-child count |
+| authored subtree expansion site | 32 B | local transform, packed node, dependency-table index |
 
 Immutable pages keep shared working sets hot. Output contains handles rather
 than duplicated payloads. Generation stamps make stale asynchronous streaming
 completions cheap to reject without a hash table or payload index.
+
+Reusable leaf-root components have a direct fully-resident traversal path.
+Consecutive placements of the same definition are consumed as one run: the
+shared page and its metadata are resolved once, while only the dense transform,
+error clamp, generation, and asset id advance per placement. This avoids a
+generic page-work item per house and lets the repeated wide blocks remain hot.
+`BM_SubtreeAssembly_FrontierCost` compares that path with an exactly equivalent
+flattened frontier in raw and warm-cache modes, and reports immutable,
+mount-state, and combined bytes.
+
+The generic streaming path remains available for partial residency, COW
+overlays, active frustum planes, and nested interior nodes. Its mount records
+are 48 bytes rather than 104: residency flags and the covered-child count share
+one 16-bit word, node state comes from asset-local geometric slabs, and
+attached-child arrays come from a sparse pool. A separate 32-byte hot record keeps accumulated
+transform, effective error clamp, generation, and asset id in one stream.
+
+Each mount also stores its mounted-tree root slot in former tail padding. Any
+descendant residency or topology mutation bumps that root's content stamp.
+Consequently a cached assembled-city frontier validates one exact dependency,
+independent of the number of house placements. Frontiers whose three bucket
+counts exceed the inline 10-bit fields use a sparse 16-byte count spill while
+the common 32-byte hot query record remains unchanged.
 
 ## TLAS maintenance and locality
 
@@ -120,6 +154,11 @@ Topology attachment is shared per mounted asset graph. Attaching a child page
 under a shared root makes it available to every instance of that root. Payload
 residency is tracked independently from topology.
 
+Reusable subtree mounts share immutable child bytes but retain separate owner,
+transform, error-clamp, residency-cover, and LRU state. The parent asset stores
+one full `SubtreeKey` per unique dependency and one compact index per expansion
+site rather than repeating a global key at every placement.
+
 Selection does not mutate the database to update recency. An optional
 `PageUsageContext` records pages needed by a query. `SpatialDatabase::collect()` consumes
 only the contexts selected by the host, updates the intrusive LRU, and detaches
@@ -134,10 +173,14 @@ retention.
 
 - Instances support translation and positive uniform scale. Rotation and
   non-uniform scale must be baked or adapted by the integration layer.
+- `SubtreeBuilder` currently emits one packed page plus its logical dependency
+  sidecar. Deeper reusable assemblies are formed by composition; the legacy
+  `HierarchyBuilder` remains the multi-page `splitBelow()` path.
 - Cached parallelism is across independent queries. Parallel work within one
   query is available on the uncached selection path.
-- SpatialQuery reuse records at most two page dependencies per instance; deeper walks
-  are simply re-evaluated.
+- SpatialQuery reuse coalesces a mounted tree to one root dependency. Exact
+  `PageUsageContext` feedback still enumerates physical pages and may choose to
+  re-evaluate a deep walk rather than cache more than two page stamps.
 - Page overlay refits are grow-only. TLAS rebuilds retighten the top level but
   do not shrink internal overlay ancestors.
 - Compact identifiers cap mounted page slots and page entries at 20 bits and
