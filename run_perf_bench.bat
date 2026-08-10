@@ -60,7 +60,7 @@ echo Running the documented performance suite with five repetitions...
 echo Pass Google Benchmark arguments to this script to override the default suite.
 echo Writing %ROOT%\real_world_perf.json
 "%BENCH_EXE%" ^
-    --benchmark_filter="BM_(SpatialQuery_Breakdown|SpatialQuery_MultiQuery|FlatForest100k|MixedForest100k|RootDecisionForest100k)" ^
+    --benchmark_filter="BM_SubtreeAssembly" ^
     --benchmark_repetitions=5 ^
     --benchmark_report_aggregates_only=true ^
     --benchmark_out="%ROOT%\real_world_perf.json" ^

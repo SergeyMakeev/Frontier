@@ -1,198 +1,143 @@
 # Frontier architecture
 
-This document describes the current implementation. See the
-[README](../README.md) for an overview. For public API usage and
-lifetime rules, see [API.md](API.md). For behavioral invariants and complexity,
-see [frontier_design.md](frontier_design.md). Historical measurements and superseded
-designs are kept separately in [HISTORY.md](HISTORY.md).
+This document describes the current implementation. Public workflows are in
+[API.md](API.md); behavioral contracts are in
+[frontier_design.md](frontier_design.md).
 
-## Spatial model
+## Spatial structure
 
-Frontier has two spatial levels. The names mirror ray-tracing terminology but
-describe runtime roles rather than object size.
+The dynamic TLAS is an 8-wide BVH. Every leaf lane names a live top-level
+instance whose permanent renderable root data is stored in dense instance
+streams. Internal TLAS nodes contain wide bounds, maximum error, layer masks,
+child references, and a flag indicating whether a hierarchical root can be
+tested directly.
 
-- A BLAS is an independently rooted renderable hierarchy. It may represent a
-  city block, a building, a terrain region, a reusable prop, or one flat
-  object. Every real node carries a `UserPayload`, so selection may stop at
-  any level.
-- The TLAS is a dynamic 8-wide BVH over translated, uniformly scaled BLAS
-  instances. Every leaf owns one permanent renderable root record; the BVH's
-  internal nodes perform coarse frustum, layer, and contribution culling and
-  never appear in a frontier.
+Each mounted `Subtree` is a BLAS fragment below one renderable parent. A
+definition can have several direct roots because the parent is external. A
+definition reference is immutable content-DAG data; a `SubtreeInstanceRt` is a
+single placement in one runtime tree.
 
-`HierarchyBuilder` accepts one logical tree and turns natural `splitBelow()`
-boundaries into immutable, deterministically indexed pages. Each generated page
-has one logical root; continuation roots inside a packed detail blob remain an
-implementation detail. Expansion metadata carries the generated local
-detail-page id, eliminating a separate mount manifest. Runtime lookup scopes
-that id with the hierarchy's root asset, so streaming does not depend on
-payload uniqueness and independent hierarchies may reuse local ids. Instances
-of a registered root asset share page bytes, residency, and the attached-page
-graph; per-instance deformation allocates bounds-only copy-on-write overlays.
+## Serialized subtree blob
 
-`SubtreeBuilder` is the composition path. It emits a packed descendant forest
-beneath a mount sentinel plus a deduplicated dependency table and dense
-32-byte expansion-site records. The sentinel is not a hierarchy node. Authored definitions therefore form a DAG:
-many city nodes can reference one house `SubtreeKey`. At runtime every
-reference becomes a distinct mount with an accumulated local transform, while
-the immutable house bytes remain shared. Top-level code instantiates a
-renderable root record in the TLAS and mounts its first subtree beneath that
-root; nested mounts use ordinary renderable expansion nodes.
+`SubtreeBuilder` emits one aligned, versioned allocation with:
 
-## Published-database lifecycle
+- a 128-byte header;
+- interleaved `WideBlock` data;
+- valid/leaf lane masks;
+- authored bounds and payload arrays;
+- parent, contiguous-subtree-size, and packed metadata arrays;
+- geometric errors;
+- deduplicated `SubtreeKey` dependencies;
+- fixed-size expansion records containing transform, packed node, and
+  dependency index.
 
-`SpatialDatabase` is single-writer. Mutations, streaming completions, residency changes,
-and collection happen outside selection. `SpatialDatabase::applyUpdates()` flushes queued
-bounds edits, performs required TLAS maintenance, and publishes a stable
-snapshot. Distinct `SpatialQuery` objects may then query the same `const SpatialDatabase`
-concurrently. All queries must finish before the next mutation or collection.
+The public `Subtree` object is a move-only bound view plus optional allocator
+ownership. Owned and borrowed blobs use the same type and runtime layout.
+Registration moves that object into a cold `SubtreeDefinitionRt` and creates a
+definition-local geometric slab allocator for per-placement node state.
 
-Each `SpatialQuery` owns its camera damper, temporal reuse records, traversal scratch,
-output storage, and statistics. A camera therefore has no mutable query state in
-the database and cannot interfere with another camera. Cached selection is the
-default. An uncached query can use the host's blocking `parallelFor` when
-`parallelInstanceThreshold` and `workerCount` enable it.
+## Mounted placement state
 
-## Selection pipeline
+The placement hot/cold split is:
 
-Selection is output-sensitive:
-
-1. Query the TLAS and discard instances outside the frustum, layer mask, or
-   optional minimum projected contribution.
-2. Emit page-free one-node TLAS roots and acceptable hierarchical roots directly when
-   possible.
-3. Transform the camera into each remaining instance's local space.
-4. Transform again at a non-identity subtree mount without rewriting its
-   shared page bounds.
-5. Walk attached pages with an explicit DFS carrying the undecided frustum
-   planes plus current- and ideal-frontier liveness.
-6. Test up to eight children together. Plain leaves emit directly; interior
-   and expansion nodes continue through the stack.
-
-The walk returns three disjoint sequences. `shared + currentOnly` is the
-resident, hole-free render frontier. `shared + idealOnly` is the frontier known
-topology would choose if every payload were resident. Membership lives in the
-sequence rather than in each entry, keeping `FrontierEntry` at 12 bytes.
-
-Residency changes maintain a complete-descendant-cover summary. A fully
-covered subtree passes in constant time. A partially visible uncovered branch
-examines only the branches that survive frustum culling, so resident descendants
-can replace a missing intermediate proxy without creating a hole.
-
-## Data layout and SIMD
-
-Page blobs always use eight logical lanes. A `WideBlock` is 256 bytes and holds
-child bounds, errors, and local indices; valid and leaf masks live in a compact
-side array. AVX2 processes eight lanes directly. SSE2 and NEON process two
-four-lane halves. Scalar builds keep the same serialized format.
-
-Hot multiplied data is deliberately compact:
-
-| Structure | 64-bit size | Purpose |
+| Record | Size | Contents |
 |---|---:|---|
-| `FrontierEntry` | 12 B | node handle, 24-bit instance id, encoded error |
-| `SpatialQuery` reuse record | 32 B hot + 4 B cold | frontier validity proof and slab location |
-| `PageUsageContext` record | 8 B | generation, pending flag, last-use epoch |
-| instance selection / TLAS state | 32 B + 48 B | selection state separated from maintenance |
-| visible hit / TLAS stack item | 4 B / 4 B | packed instance or node index and flags |
-| mounted-node residency state | 2 B | flags plus 9-bit covered-child count |
-| authored subtree expansion site | 32 B | local transform, packed node, dependency-table index |
+| `MountTransformRt` | 32 B | accumulated translation/scale, error clamp, generation, definition id, root-leaf flag |
+| `MountStamp` | 8 B | content version, generation, live flag |
+| `MountResidency` | 8 B | resident-node count, incomplete-child count |
+| `SubtreeInstanceRt` | 48 B | definition, node-state pointer, LRU, owner, expansion links, mounted-tree root |
+| node state | 2 B/node | resident/covered flags and covered-child count |
 
-Immutable pages keep shared working sets hot. Output contains handles rather
-than duplicated payloads. Generation stamps make stale asynchronous streaming
-completions cheap to reject without a hash table or payload index.
+Expansion-link arrays are allocated only for placements that gain mounted
+children. Node-state blocks come from definition-local geometric slabs, avoiding
+one heap allocation per placement.
 
-Reusable leaf-root components have a direct fully-resident traversal path.
-Consecutive placements of the same definition are consumed as one run: the
-shared page and its metadata are resolved once, while only the dense transform,
-error clamp, generation, and asset id advance per placement. This avoids a
-generic page-work item per house and lets the repeated wide blocks remain hot.
-`BM_SubtreeAssembly_FrontierCost` compares that path with an exactly equivalent
-flattened frontier in raw and warm-cache modes, and reports immutable,
-mount-state, and combined bytes.
+Each placement stores the root slot of its mounted tree. Descendant topology or
+residency mutations bump the root content stamp, so a cached assembled-city cut
+normally validates one exact dependency rather than every house placement.
 
-The generic streaming path remains available for partial residency, COW
-overlays, active frustum planes, and nested interior nodes. Its mount records
-are 48 bytes rather than 104: residency flags and the covered-child count share
-one 16-bit word, node state comes from asset-local geometric slabs, and
-attached-child arrays come from a sparse pool. A separate 32-byte hot record keeps accumulated
-transform, effective error clamp, generation, and asset id in one stream.
+## Traversal
 
-Each mount also stores its mounted-tree root slot in former tail padding. Any
-descendant residency or topology mutation bumps that root's content stamp.
-Consequently a cached assembled-city frontier validates one exact dependency,
-independent of the number of house placements. Frontiers whose three bucket
-counts exceed the inline 10-bit fields use a sparse 16-byte count spill while
-the common 32-byte hot query record remains unchanged.
+Selection first queries the TLAS using 8-lane bound/error tests. Flat roots use
+a direct path that does not read mounted-state arrays. Hierarchical roots either
+terminate in the TLAS or enqueue their first mounted placement.
 
-## TLAS maintenance and locality
+A `WorkItem` carries placement slot, effective wide bounds, current/ideal
+liveness, and narrowed frustum mask. One dispatch selects dense authored/COW
+bounds or sparse-overlay lookup for the whole subtree walk. `wideVisit()` tests
+up to eight children together. Plain leaves emit immediately; other survivors
+go onto a compact DFS stack.
 
-The first published snapshot builds the configured TLAS quality tier:
-`BinnedSAH`, `Median`, or `Morton`. Later insertions and removals update the
-tree in expected O(depth). Count drift, escaped leaves, accumulated edit cost,
-and area growth trigger repair or rebuild according to `SpatialDatabaseConfig`.
+Reusable definitions whose direct roots are all leaves have a batched
+fully-resident path. Consecutive placements of the same definition reuse the
+resolved immutable block while transform, error clamp, and generation advance
+through a dense stream.
 
-The first TLAS build spatially reorders physical instance storage while public
-`InstanceRef` values and frontier instance ids remain stable. Routine repair builds
-keep that physical order to avoid turning maintenance into a data shuffle.
-`SpatialDatabase::optimize()` is the explicit safe-point operation that compacts dead
-slots, performs a quality rebuild, and restores spatial instance/SpatialQuery-record
-locality after disruptive changes such as a teleport or level transition.
+## Current and ideal coverage
 
-Each spatially ordered 80-byte instance record keeps translation/scale beside
-the exact world bound derived from them, along with root-selection and TLAS
-back-pointer state. Compared with separate 32-byte selection and 48-byte TLAS
-streams, this removes parallel-array maintenance and improves transform-heavy
-updates. The tradeoff is a wider stride during uncommon full TLAS rebuilds;
-steady traversal remains effectively unchanged.
+Mounted nodes carry resident and covered state. Per-placement summaries make a
+fully resident mounted tree a constant-time test. The lean traversal then emits
+only the shared bucket.
 
-`MotionGroup` serves a persistent cohort whose caller-visible order is fixed.
-It caches the corresponding physical order so per-frame transform submission
-touches instance and TLAS state coherently, and refreshes that mapping after a
-layout change.
+For partial residency, current/ideal liveness travels with the DFS item. An
+ideal proxy can be missing while a recursively complete resident descendant cut
+keeps the current traversal alive. Visibility-aware coverage checks ignore
+unseen missing branches without allowing a visible hole.
 
-Queued node-bound edits preserve caller order. Grouping them by instance and
-page improves overlay locality; the runtime does not sort the queue. Ancestors
-grow only until a box already contains the change. Internal overlay bounds do
-not shrink, so sustained large deformation can loosen page culling without
-affecting correctness.
+## TLAS maintenance
 
-## Streaming and collection
+Initial and quality builds use the configured `BinnedSAH`, `Median`, or `Morton`
+tier. Incremental insertion descends by least bound growth and splits a full
+leaf. Removal invalidates a lane. Motion grows ancestor lanes until already
+contained. Population drift, escapes, edit fraction, and added surface area
+schedule rebuilds.
 
-Topology attachment is shared per mounted asset graph. Attaching a child page
-under a shared root makes it available to every instance of that root. Payload
-residency is tracked independently from topology.
+An 80-byte `Instance` keeps transform, exact world bound, maximum root error,
+mask, mounted-root slot, generation, overlay-list index, TLAS back-pointer, and
+dense-list index together. Public ids map through stable handle-to-dense tables.
+`optimize()` compacts dead dense slots and rewrites physical back-pointers while
+preserving those ids.
 
-Reusable subtree mounts share immutable child bytes but retain separate owner,
-transform, error-clamp, residency-cover, and LRU state. The parent asset stores
-one full `SubtreeKey` per unique dependency and one compact index per expansion
-site rather than repeating a global key at every placement.
+## Copy-on-write bounds
 
-Selection does not mutate the database to update recency. An optional
-`PageUsageContext` records pages needed by a query. `SpatialDatabase::collect()` consumes
-only the contexts selected by the host, updates the intrusive LRU, and detaches
-old leaf mounts until the requested streamed-page budget is met. Pinned root
-mounts are never collected and do not count toward that budget.
+Authored bounds are immutable and usually read directly from the definition.
+The first `setNodeBounds()` touching an `(instance, placement)` pair creates an
+overlay. Small definitions materialize dense wide bounds. Large definitions
+start with a dense block-to-patch index plus only modified wide blocks, then
+promote when edits reach the configured fraction.
 
-The host retains policy control over page sizing, IO scheduling,
-deduplication, attach budgets, residency, and which cameras influence page
-retention.
+Queued edits retain caller order. Ancestor propagation stops as soon as an
+existing bound contains the change, crosses mount boundaries through owner
+links, and updates the instance/TLAS bound. Runtime overlay ancestors are
+grow-only; top-level rebuilds do not shrink them.
 
-## Current constraints
+## Query reuse and concurrency
 
-- Instances support translation and positive uniform scale. Rotation and
-  non-uniform scale must be baked or adapted by the integration layer.
-- `SubtreeBuilder` currently emits one packed page plus its logical dependency
-  sidecar. Deeper reusable assemblies are formed by composition; the legacy
-  `HierarchyBuilder` remains the multi-page `splitBelow()` path.
-- Cached parallelism is across independent queries. Parallel work within one
-  query is available on the uncached selection path.
-- SpatialQuery reuse coalesces a mounted tree to one root dependency. Exact
-  `PageUsageContext` feedback still enumerates physical pages and may choose to
-  re-evaluate a deep walk rather than cache more than two page stamps.
-- Page overlay refits are grow-only. TLAS rebuilds retighten the top level but
-  do not shrink internal overlay ancestors.
-- Compact identifiers cap mounted page slots and page entries at 20 bits and
-  live instance ids at 24 bits.
-- Rendering, content identity, asynchronous IO, and streaming policy remain
-  application responsibilities.
+Each `SpatialQuery` owns a camera damper, 32-byte hot reuse records, 4-byte cold
+allocation records, a compact output slab, optional dependency spill, scratch,
+statistics, and optional mount-use records. Cache validity is proved using a
+position/projection travel budget plus instance and mounted-tree versions.
+
+Only instances fully inside the frustum are reusable because no plane decision
+then depends on camera rotation. Uncached selection can split visible instance
+runs across the host's blocking `parallelFor`; workers own all temporary output
+and are concatenated deterministically.
+
+`SpatialDatabase::applyUpdates()` is the writer/read barrier. It flushes bound
+edits, performs scheduled TLAS maintenance, and advances the collection epoch.
+After publication, distinct queries may read concurrently until the next write.
+
+## Memory and performance result
+
+The city/house benchmark compares 400 houses with eight fully refined detail
+nodes each. On the reference machine, the assembled representation occupies
+about 104.3 KiB versus 318.6 KiB flattened (67% less), while raw traversal is
+about 10.6 us versus 11.7 us and construction about 79.5 us versus 179.3 us.
+Warm cached traversal is effectively representation-independent (~0.7 us).
+
+Against the pre-cleanup assembled API, the same 400-house case is 0.9% faster
+in raw traversal and 27% faster to construct. Cached traversal and total memory
+remain effectively unchanged (within 1% and 0.2%, respectively).
+
+The benchmark JSON is retained under `bench_results/subtree_api_after.json`;
+the pre-change comparison is `subtree_api_before.json`.

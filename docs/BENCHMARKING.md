@@ -1,209 +1,99 @@
 # Benchmarking Frontier
 
-This guide describes the current performance executables, repeatable
-cross-machine collection, and macOS CPU-counter capture. For headline results,
-see [README.md](../README.md); for implementation analysis, see
-[ARCHITECTURE.md](ARCHITECTURE.md).
+Use Release builds on an otherwise idle machine in its normal high-performance
+power mode. Compare median aggregates and inspect coefficient of variation
+before treating a small delta as meaningful.
 
-Always benchmark a Release build on an otherwise idle machine in its normal
-high-performance power mode. The supplied collectors intentionally use the
-operating system's default scheduler placement rather than pinning a core, so
-the result represents normal application placement.
+## End-to-end subtree benchmark
 
-## Complete cross-machine report
+`frontier_bench` contains the paired city/house experiment:
 
-Use the unified collector when comparing machines:
+- `BM_SubtreeAssembly_FrontierCost` compares a flattened city definition with
+  a city whose house nodes mount one shared house definition;
+- `BM_SubtreeAssembly_ConstructCost` compares complete authoring,
+  registration, instantiation, and mounting cost.
+
+Both representations produce the same fully refined frontier. Cases cover 32,
+128, and 400 houses. Frontier selection runs both raw and with a stationary
+warm `SpatialQuery`. Counters report immutable definition bytes, mounted state,
+total memory, placement count, and frontier size.
+
+```sh
+./run_perf_bench.sh \
+  --benchmark_filter=BM_SubtreeAssembly \
+  --benchmark_repetitions=7 \
+  --benchmark_report_aggregates_only=true
+```
+
+```bat
+run_perf_bench.bat --benchmark_filter=BM_SubtreeAssembly --benchmark_repetitions=7 --benchmark_report_aggregates_only=true
+```
+
+Run the executable directly after a build when preferred:
+
+```sh
+build/bench/frontier_bench \
+  --benchmark_filter=BM_SubtreeAssembly \
+  --benchmark_out=result.json \
+  --benchmark_out_format=json
+```
+
+The repository retains the API migration comparison in:
+
+- `bench_results/subtree_api_before.json`
+- `bench_results/subtree_api_after.json`
+
+## Machine characterization
+
+`frontier_machine_bench` is kept separate so synthetic probes do not perturb
+end-to-end code layout. It covers scalar dependency/throughput, SIMD, division
+and square root, cache and memory bandwidth, hardware prefetch, dependent-load
+latency, random-load parallelism, branches, sparse masks, and production wide
+bound/error kernels.
+
+```sh
+./run_machine_bench.sh
+./run_arch_bench.sh
+```
+
+Use machine results to explain an end-to-end difference, not as a substitute
+for it. Matching source revisions, compiler flags, architecture backend, and
+power state matter.
+
+## Cross-machine collector
+
+The unified collectors configure a dedicated Release build, run correctness,
+capture benchmarks and system/toolchain metadata, and package the result:
 
 ```sh
 ./run_all_perf.sh m2-max
-./run_all_perf.sh epyc
-./run_all_perf.sh armbian-sbc
 ```
 
 ```bat
 run_all_perf.bat i9
 ```
 
-`run_all_perf.sh` supports macOS and Linux, including arm64 Linux distributions
-such as Armbian. It selects native arm64/NEON on Apple Silicon, AVX2 on x86-64,
-and the appropriate non-AVX2 backend on other supported hosts. The Windows
-collector builds the AVX2 configuration.
+Output is written below `perf_reports/`. `FRONTIER_PERF_LABEL`,
+`FRONTIER_ALL_PERF_BUILD_DIR`, and `FRONTIER_PERF_REPORT_ROOT` override the
+label and locations.
 
-Each invocation:
+## macOS hardware counters
 
-- configures a dedicated Release build;
-- builds and runs the correctness suite;
-- runs the real-world, machine-characterization, and focused kernel suites;
-- records CPU, memory, topology, OS, power, compiler, build, Git, and command
-  information; and
-- creates a timestamped directory and archive under `perf_reports/`.
+`profile_macos_cpu.sh` records a selected end-to-end case with optimized source
+line tables and the available Xcode CPU counter template. The default is the
+400-house assembled raw traversal case. It writes the Instruments trace plus a
+compact summary under `profile_results/`.
 
-A complete archive contains:
-
-| File | Contents |
-|---|---|
-| `real_world_perf.json` | end-to-end selection and moving-object workloads |
-| `machine_perf.json` | ALU, SIMD, branch, cache, latency, and bandwidth probes |
-| `arch_kernel_perf.json` | longer samples of production kernels and output append |
-| `REPORT.md` | concise run summary and status |
-| `manifest.txt` | machine-readable metadata |
-| `hardware.txt` | CPU, memory, topology, OS, and power information |
-| `toolchain.txt` | compiler, CMake, target, and build configuration |
-| `source.txt` | Git revision and working-tree state |
-| `commands.txt` | exact benchmark filters and sampling parameters |
-| `tests.log` and benchmark logs | correctness and raw console output |
-
-The archive is `.zip` when a ZIP tool is available; the shell collector falls
-back to `.tar.gz`. A failed run still packages partial data and identifies the
-failed stage in `REPORT.md`.
-
-The optional label is only for report naming. It can also be supplied through
-`FRONTIER_PERF_LABEL`. Override the build and report directories with:
-
-```sh
-FRONTIER_ALL_PERF_BUILD_DIR=/fast/build \
-FRONTIER_PERF_REPORT_ROOT=/results \
-./run_all_perf.sh test-machine
-```
-
-On Windows, set the same environment variables before invoking
-`run_all_perf.bat`.
-
-## Interpreting reports
-
-Compare matching source revisions and build options. Start with Google
-Benchmark's `median` aggregate. Check the coefficient of variation (`cv`) and
-the run logs before treating a small difference as meaningful. Thermal state,
-background work, power policy, and scheduler placement can easily move a
-single sample.
-
-`real_world_perf.json` is the primary end-to-end comparison. Use
-`machine_perf.json` to test whether a platform gap correlates with memory
-bandwidth, dependent-load latency, SIMD arithmetic, branches, or sparse-mask
-iteration. Use `arch_kernel_perf.json` to connect those machine traits to the
-wide AABB, distance/error, cache-hit, and output-append kernels used by the
-runtime.
-
-Randomized tests and benchmarks use repository-owned xorshift32 generation
-with explicit fixed seeds. Float mapping, bounded integers, and shuffling are
-also local implementations, so one source revision and seed describe the same
-generated workload on MSVC, libc++, and libstdc++. Benchmark cases run in
-registration order.
-
-## Focused benchmark runner
-
-For a quick runtime benchmark without collecting a full report:
-
-```sh
-./run_perf_bench.sh
-./run_perf_bench.sh \
-  --benchmark_filter=BM_RootDecisionForest100k \
-  --benchmark_repetitions=7
-```
-
-```bat
-run_perf_bench.bat
-run_perf_bench.bat --benchmark_filter=BM_RootDecisionForest100k --benchmark_repetitions=7
-```
-
-These scripts configure and verify a Release-only performance build. On Apple
-Silicon the shell runner explicitly targets native arm64 even when launched
-from a Rosetta terminal. Set `FRONTIER_PERF_BUILD_DIR` to choose another build
-directory.
-
-The executable can also be run directly after a normal build:
-
-```sh
-build/bench/frontier_bench --benchmark_list_tests
-```
-
-For a multi-config generator, use the Release subdirectory, for example
-`build/bench/Release/frontier_bench` or
-`build\bench\Release\frontier_bench.exe`.
-
-## Machine and production-kernel probes
-
-`run_machine_bench.sh` builds a separate `frontier_machine_bench` executable and
-writes `machine_perf.json` by default:
-
-```sh
-./run_machine_bench.sh
-```
-
-Pass Google Benchmark arguments to replace the default run. Set
-`FRONTIER_MACHINE_BUILD_DIR` to select another build directory. The synthetic
-probes cover scalar dependency and throughput, 128-bit SIMD arithmetic and
-compare-to-mask cost, square root/divide, sequential cache and memory
-bandwidth, constant-stride hardware prefetch, dependent-load latency,
-random-load parallelism, branch prediction, and sparse-mask iteration.
-
-The diagnostic executable is separate so adding a probe cannot perturb the
-code layout of `frontier_bench`. Architecture-neutral SIMD probes use one 128-bit
-vector on both x86-64 and arm64. The `BM_Kernel*` group instead uses the active
-production backend recorded as `frontier_kernel_backend` in the JSON context.
-
-For only the focused production kernels with longer sampling:
-
-```sh
-./run_arch_bench.sh
-```
-
-This wrapper writes `arch_kernel_perf.json` and uses its own default build
-directory.
-
-## macOS hardware CPU counters
-
-On Apple Silicon, `profile_macos_cpu.sh` records the cached hierarchical
-benchmark with optimized source line tables and hardware counters:
-
-```sh
-./profile_macos_cpu.sh
-```
-
-The script discovers a full Xcode installation and selects the available
-`CPU Bottlenecks` or `CPU Counters` instrument/template. It writes an
-Instruments `.trace`, metadata, an exported table of contents, and a compact
-`_summary.zip` under `profile_results/`. The summary contains exported
-process/thread bottleneck metrics, counter samples, core placement, and time
-profile hotspots. The raw trace remains local because it can be hundreds of
-megabytes.
-
-If recording succeeded but export or packaging failed, process an existing
-trace without another capture:
-
-```sh
-./profile_macos_cpu.sh --process
-./profile_macos_cpu.sh --process path/to/capture.trace
-```
-
-Useful overrides are:
-
-| Variable | Purpose |
-|---|---|
-| `FRONTIER_PROFILE_BUILD_DIR` | profiling build directory |
-| `FRONTIER_PROFILE_OUTPUT_DIR` | trace and summary output directory |
-| `FRONTIER_PROFILE_FILTER` | Google Benchmark case to record |
-| `FRONTIER_PROFILE_MIN_TIME` | benchmark minimum run time |
-| `FRONTIER_PROFILE_TIME_LIMIT` | Instruments recording limit |
-| `FRONTIER_PROFILE_EXPORT_START` | beginning of the focused export window |
-| `FRONTIER_DEVELOPER_DIR` | exact Xcode developer directory |
-| `FRONTIER_XCTRACE_TEMPLATE` | exact template name or `.tracetemplate` path |
-
-Hardware-counter capture requires a full Xcode with `xctrace`; Command Line
-Tools alone are insufficient. macOS may also require enabling the terminal
-under **Privacy & Security > Developer Tools**. Older `xctrace export`
-versions do not support a focused time-start option; in that case the exported
-data includes process setup and should be filtered during analysis.
+Useful overrides include `FRONTIER_PROFILE_FILTER`,
+`FRONTIER_PROFILE_MIN_TIME`, `FRONTIER_PROFILE_TIME_LIMIT`,
+`FRONTIER_PROFILE_OUTPUT_DIR`, and `FRONTIER_DEVELOPER_DIR`.
 
 ## Build options
 
 | Option | Default | Meaning |
 |---|---:|---|
-| `FRONTIER_BUILD_TESTS` | `ON` | build the correctness suite |
-| `FRONTIER_BUILD_BENCH` | `ON` | build the benchmark executables |
-| `FRONTIER_AVX2` | `ON` | use AVX2/FMA on supported x86-64 targets |
+| `FRONTIER_BUILD_TESTS` | `ON` | build correctness tests |
+| `FRONTIER_BUILD_BENCH` | `ON` | build benchmark executables |
+| `FRONTIER_AVX2` | `ON` | enable AVX2/FMA on supported x86-64 targets |
 | `FRONTIER_FORCE_SCALAR` | `OFF` | disable intrinsic implementations |
-| `FRONTIER_PROFILE_SYMBOLS` | `OFF` | add optimized Clang line tables for profiling |
-
-When comparing a scalar or fallback build, use a separate build directory so
-cached CMake options and stale binaries cannot contaminate the result.
+| `FRONTIER_PROFILE_SYMBOLS` | `OFF` | keep optimized Clang line tables |

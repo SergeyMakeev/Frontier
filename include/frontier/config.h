@@ -21,12 +21,12 @@
 // Diagnostics
 //
 // FRONTIER_FATAL fires on a TRUE CONTRACT VIOLATION only — a caller bug that no
-// correct program can trigger (attaching to a node that is not an expansion
-// point, submitting non-finite bounds, deforming a shared asset). It must not
+// correct program can trigger (mounting on a node that is not an expansion
+// point or submitting non-finite bounds). It must not
 // return.
 //
 // Expected runtime races are NOT fatal and never route here: a handle that
-// went stale because its page was collected mid-stream makes mutating calls
+// went stale because its subtree was collected mid-stream makes mutating calls
 // quiet no-ops and queries report absent. That distinction is the whole
 // reason streaming callers can be written without locks.
 //
@@ -60,9 +60,9 @@
 namespace frontier {
 
 // ---------------------------------------------------------------------------
-// Host context: page-blob allocation and optional task parallelism.
+// Host context: subtree-blob allocation and optional task parallelism.
 //
-// HierarchyBuilder, PageBuilder, and the owned Page factories use alloc/free.
+// SubtreeBuilder and owned Subtree factories use alloc/free.
 // SpatialDatabase uses the blocking parallelFor callback and workerCount for an enabled
 // uncached parallel selection. Other retained runtime storage is library-owned.
 // ---------------------------------------------------------------------------

@@ -26,7 +26,7 @@ endif()
 add_library(frontier STATIC
     src/builder.cpp
     src/config.cpp
-    src/page.cpp
+    src/subtree.cpp
     src/spatial_database.cpp
 )
 target_include_directories(frontier PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)

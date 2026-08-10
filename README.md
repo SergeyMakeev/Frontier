@@ -1,316 +1,130 @@
 # Frontier
 
-[![CI](https://github.com/SergeyMakeev/HLod-tree/actions/workflows/ci.yml/badge.svg)](https://github.com/SergeyMakeev/HLod-tree/actions/workflows/ci.yml)
+Frontier is a C++20 hierarchical-LOD selection library. It maintains a dynamic
+8-wide top-level acceleration structure (TLAS), streams reusable hierarchy
+fragments, tracks payload residency, and returns both the renderable current cut
+and the fully available ideal cut.
 
-**CPU scene culling at the right level of detail.**
+The data model is deliberately small:
 
-Frontier is a high-performance C++20 spatial scene container for CPU frustum
-culling and optimal hierarchical LOD selection. The selected nodes form the
-active frontier through the scene hierarchy: you tell Frontier which payloads
-and topology pages are resident, and it returns one compact result separating
-what to draw now from what complete residency would select.
+- Every top-level instance is one permanent, renderable node stored directly in
+  the TLAS.
+- A `Subtree` is one immutable reusable descendant forest. Its parent is not
+  stored in the blob.
+- A subtree can only be mounted beneath a renderable TLAS root or an extendable
+  node in another mounted subtree.
+- `NodeDesc` describes both TLAS roots and authored subtree nodes.
+- transforms belong to instances and mounts; immutable payload, error, and
+  authored bounds remain in the reusable subtree blob; runtime bound changes
+  use copy-on-write overlays.
 
-It exists for scenes where per-object LOD is not enough. Replacing every wall
-with a cheaper wall still leaves a distant town with thousands of submissions;
-a hierarchical frontier can replace the entire town with one proxy, refine
-nearby buildings, and stream deeper topology only where the camera needs it. The
-library owns no meshes, materials, jobs, or renderer state, so it can sit in
-front of an existing asset and rendering system.
+This makes a one-node object exceptionally cheap: it has no subtree definition
+or mount state. Deep assemblies remain composable—a city subtree can contain a
+million extendable house nodes that all target the same house definition.
 
-See [API.md](docs/API.md) for the complete integration guide and lifetime rules.
-
-### BLAS and TLAS terminology
-
-BLAS describes an independently rooted **renderable hierarchy**, not
-necessarily one object or one reusable mesh. A BLAS can represent a city
-block, a skyscraper whose children are floors and walls, a terrain region, or
-a conventional reusable asset. Every node has its own renderable
-`UserPayload`, so selection may stop at any level. A one-node BLAS is equally
-valid and is useful for things such as vehicles, characters, and other content
-with no authored hierarchy.
-
-The TLAS is the dynamic spatial acceleration structure over placements of
-those independent BLAS roots. Each TLAS leaf owns one permanent renderable
-root node. The TLAS's internal BVH nodes provide bounds, layer masks, and
-coarse contribution information; they are not renderable proxies and do not
-appear in a render frontier. This lets a database mix large authored
-regions, reusable hierarchies, and flat objects without imposing one artificial root for the
-whole map. In API names such as `AssetHandle`, *asset* means a registered unit
-of immutable page storage and sharing; it does not constrain what part of the
-scene that hierarchy represents.
-
-Streaming has two independent dimensions. **Residency** says whether a known
-node's render payload is loaded. The nearest resident fallback remains in the
-current frontier until more detailed resident nodes completely cover the visible
-region; intermediate proxies need not be resident, and partial loads never
-create holes or parent/child overlap. **Expansion and collapse** control
-whether deeper topology is known at all: a collapsed expansion point is a
-renderable coarse proxy. Attaching a child page expands that branch, while
-explicit detach or cold-page garbage collection collapses it again. One
-traversal returns the shared, current-only, and ideal-only parts of the two
-frontiers, so the host can choose what to expand or load without forcing
-Frontier to own an IO system.
-
-## Minimal example
-
-This one-node hierarchy is intentionally small so the complete instance,
-query, and selection loop is visible. It allocates no page: the renderable
-node lives directly in the TLAS. Real hierarchies may be assembled from
-reusable mount-only components with `SubtreeBuilder`, or authored
-monolithically with `HierarchyBuilder` and partitioned using `splitBelow()`.
+## Example
 
 ```cpp
-#include "frontier/spatial_database.h"
+#include <frontier/builder.h>
+#include <frontier/spatial_database.h>
 
-void drawEntry(const frontier::SpatialDatabase& database, const frontier::FrontierEntry& entry)
-{
-    frontier::UserPayload payload;
-    if (database.tryGetPayload(entry.nodeHandle, payload))
-        (void)payload; // submit with entry.instance()
-}
+using namespace frontier;
 
-int main()
-{
-    frontier::SpatialDatabase database;
-    const frontier::RootNodeDesc root{
-        42,                       // opaque payload, e.g. a mesh-table index
-        0.0f,                     // geometric error in local units
-        frontier::AABB::fromCenterExtent(frontier::float4::point(0, 0, 0),
-                                         frontier::float4::vec(1, 1, 1)),
-        {}};                      // no mounted subtree: exactly one node
-    database.instantiate(root, frontier::float4::point(0, 0, 0));
+constexpr SubtreeKey houseKey{0x1001};
+constexpr SubtreeKey cityKey{0x2001};
 
-    const frontier::Camera camera = frontier::makeLookAtCamera(
-        frontier::float4::point(0, 2, -8), frontier::float4::point(0, 0, 0));
+SubtreeBuilder houseBuilder(houseKey);
+houseBuilder.createNode(NodeDesc{
+    .payload = 100,
+    .geometricError = 0.0f,
+    .bounds = houseBounds,
+});
+Subtree house = houseBuilder.build();
 
-    frontier::SpatialQuery query;             // owns cache, scratch, and result storage
-    database.applyUpdates();              // publish a stable read-only snapshot
-    const frontier::SpatialDatabase& publishedDatabase = database;
-    const frontier::FrontierResultView result =
-        query.selectFrontier(publishedDatabase, camera, frontier::SelectionParams{4.0f, 0.0f});
+SubtreeBuilder cityBuilder(cityKey);
+cityBuilder.createNode(NodeDesc{
+    .payload = 10,
+    .geometricError = 16.0f,
+    .bounds = translatedHouseBounds,
+    .childSubtree = houseKey,
+    .childTransform = Transform{housePosition, 1.0f},
+});
+Subtree city = cityBuilder.build();
+const AABB cityBounds = city.bounds();
 
-    for (const frontier::FrontierEntry& entry : result.shared)
-        drawEntry(publishedDatabase, entry);
-    for (const frontier::FrontierEntry& entry : result.currentOnly)
-        drawEntry(publishedDatabase, entry);
-}
+SpatialDatabase world;
+const SubtreeHandle houseDefinition =
+    world.registerSubtree(std::move(house));
+const SubtreeHandle cityDefinition =
+    world.registerSubtree(std::move(city));
+
+const InstanceHandle cityInstance = world.instantiate(NodeDesc{
+    .payload = 1,
+    .geometricError = 64.0f,
+    .bounds = cityBounds,
+    .childSubtree = cityKey,
+});
+world.mountSubtree(cityInstance.rootNode(), cityDefinition);
+
+world.applyUpdates();
+SpatialQuery query;
+SelectionParams selection{.threshold = 1.0f};
+FrontierResultView cut = query.selectFrontier(world, camera, selection);
+
+// An application streamer resolves authored targets from ideal-side handles.
+for (const FrontierEntry& entry : cut.idealOnly)
+    if (world.subtreeTarget(entry.nodeHandle) == houseKey)
+        world.mountSubtree(entry.nodeHandle, houseDefinition);
 ```
 
-`SelectionParams::threshold` is the permitted projected error in pixels.
-`SelectionParams::minPix` optionally culls entire instances whose maximum
-contribution is smaller than that value; zero disables contribution culling.
+`shared + currentOnly` is always a hole-free render frontier.
+`shared + idealOnly` is the frontier the known topology would choose with every
+payload resident. A high-error ideal node with a valid `subtreeTarget()` is a
+topology-streaming request. Other ideal nodes can drive payload IO through
+`markPayloadResident()`.
 
-## Reusable subtree assembly
+## Ownership and handles
 
-`SubtreeBuilder` builds descendants below a mount sentinel. That sentinel is not a
-hierarchy node and a `Subtree` cannot be instantiated by itself. Instantiate a
-renderable `RootNodeDesc` in the TLAS, give it a permanent `SubtreeKey` target,
-then `mount()` the matching subtree beneath `InstanceRef::rootNode()`. Nested
-subtrees mount beneath ordinary renderable expansion nodes. Every resulting
-hierarchy therefore has exactly one valid renderable parent at its root.
+`Subtree` is move-only. `Subtree::fromBytes()` validates and copies a complete
+serialized blob; `Subtree::borrow()` validates without copying; `clone()` makes
+an explicit owned copy. A borrowed blob must outlive the `Subtree` or database
+that owns it.
 
-For example, build detailed house nodes once, give every coarse house proxy in
-a city the same permanent `SubtreeKey`, then call `mount()` as those proxies
-need to refine. The house page bytes are registered once. Each site retains its
-own relative translation/scale, mount handle, bounds overlay, and collection
-state. Repeated keys are deduplicated in the parent's dependency table, so a
-city with many identical houses stores the full house key once.
+The public handles are intentionally distinct:
 
-Fully resident leaf-only placements are traversed as a consecutive batch: the
-house page is resolved once and the query streams compact placement transforms.
-Temporal reuse versions the assembled mount tree at its root, so a city with a
-million house placements still needs one cache dependency rather than a million
-page checks.
+- `SubtreeHandle`: registered immutable definition;
+- `SubtreeInstanceHandle`: one mounted placement;
+- `InstanceHandle`: one permanent TLAS root;
+- `NodeHandle`: one live renderable node.
 
-`splitBelow()` remains useful for choosing physical streaming boundaries inside
-one monolithic authored hierarchy. It is not required to express reuse:
-composition uses `SubtreeBuilder::setExpansion()`.
+All are generation-stamped. Stale streaming completions are harmless: mutating
+operations ignore stale node/instance handles, and mounting returns an invalid
+placement when its parent disappeared. Contract errors—wrong target key,
+mounting below a non-extendable node, or escaping authored bounds—fail through
+`FRONTIER_FATAL`.
 
-## Performance at a glance
+## Query lifecycle
 
-Median wall time per frame, lower is better:
+`SpatialDatabase` is single-writer. Apply mutations, call `applyUpdates()`, then
+run any number of concurrent reads with distinct `SpatialQuery` objects. All
+reads must finish before the next mutation or collection.
 
-| Architecture / CPU | 10k static | 10k + 1k movers | 80k + 4k movers |
-|---|---:|---:|---:|
-| x86-64 — EPYC 9654 | 0.063 ms | 0.129 ms | 0.548 ms |
-| x86-64 — i9-12900K | 0.087 ms | 0.178 ms | 0.882 ms |
-| arm64 — Apple M2 Max | 0.040 ms | 0.073 ms | 0.356 ms |
-| arm64 — Cortex-A72/A53 SBC | 0.261 ms | 1.047 ms | 3.736 ms |
+Each query owns damping, reuse records, scratch, output, statistics, and optional
+mount-retention feedback. Enable the latter with
+`query.setMountUsageEnabled(true)` and pass the query to `collect()` when its
+camera should influence retention.
 
-Each case uses one continuously moving 1080p view over fully resident 85-node
-hierarchies. The 10k database contains 700 assets; the 80k database shares one asset.
-Dynamic cases include transform submission through `MotionGroup`, TLAS updates,
-and `selectFrontier`; the static case measures `selectFrontier` with no object motion.
-
-These are deterministic 600-frame Release benchmarks using scheduler-default
-placement: AVX2 on x86-64 and NEON on arm64. They exclude rendering, streaming
-IO, and other engine work, so treat them as scale indicators rather than frame
-time guarantees. The captures use revision `bf60f39`. See
-[ARCHITECTURE.md](docs/ARCHITECTURE.md) for design analysis, or use
-`run_all_perf.sh` / `run_all_perf.bat` to collect a complete report on another
-machine.
-
-## What selection returns
-
-One traversal returns a `FrontierResultView` over three disjoint, contiguous buffers:
-
-- `shared`: selected in both the current render frontier and fully-resident
-  ideal frontier;
-- `currentOnly`: a resident fallback selected only because some more detailed
-  ideal entries are not resident; and
-- `idealOnly`: selected only by the fully-resident ideal frontier.
-
-Each field is a `std::span<const FrontierEntry>`. The owning storage lives in the
-`SpatialQuery`, retains capacity between queries, and is valid until the next selection
-or reset on that SpatialQuery. Use the explicit owning `FrontierResult` overload only
-when a frontier must outlive the next query. Engines that already own output memory
-can instead use `FrontierResultSink` to write directly into fixed spans.
-
-Render `shared + currentOnly`; inspect the fully-resident frontier as
-`shared + idealOnly`. A high-error leaf on the ideal side is the point where
-the caller may query `SpatialDatabase::detailPage()` and attach the generated detail
-page. The returned `DetailPageRef` combines the root asset with its local page
-id; an invalid reference means the leaf is the finest authored representation.
-There is deliberately no load scheduler or built-in request deduplication: the
-host owns IO priority, budgets, and package identity. Output order is
-traversal-defined, not a priority order.
-
-`FrontierEntry` is 12 bytes: a generation-stamped 64-bit `nodeHandle`, plus a packed
-24-bit stable `instance()` and 8-bit `errorCode()`. Codes below 128 are at or
-below the query threshold; codes at least 128 are above it. Use
-`overThreshold()` for the exact refinement decision and
-`approximateError(threshold)` when a pixel-scale estimate helps prioritize IO.
-Resolve an opaque application payload only when needed with
-`SpatialDatabase::tryGetPayload`; keep renderer entity data in a caller table indexed by
-`instance()`.
-
-Payloads are values, not identities. Duplicates are legal and the `SpatialDatabase`
-never indexes them. Operations use generation-stamped `AssetHandle`,
-`PageHandle`, `NodeHandle`, and `SpatialDatabase::InstanceRef` values. A page collected while an
-asynchronous load is in flight simply makes the returned node handle stale;
-mutations using it become safe no-ops.
-
-## Runtime model
-
-- Authored subtree definitions form a DAG keyed by stable `SubtreeKey` values;
-  runtime `MountHandle` placements form a tree. A top-level `InstanceRef` owns
-  one always-resident renderable root in the TLAS; its optional subtree is the
-  first mounted descendant fragment.
-- Immutable, versioned page blobs hold each BLAS's preorder node arrays and
-  8-lane wide child blocks. A registered root-page asset can be instanced
-  thousands of times while sharing page bytes, residency, and its attachment
-  graph.
-- A dynamic wide TLAS owns renderable root records, their placement, layer
-  masks, coarse frustum and contribution culling, and incremental spawn/remove
-  edits. A root with no mounted subtree is a page-free one-node hierarchy. When
-  a deep hierarchy's root satisfies the view's error threshold, selection emits
-  it before touching the mounted page hierarchy. Only the TLAS's internal BVH
-  nodes are non-renderable.
-- Expansion points connect independently streamed pages. Residency changes
-  propagate complete descendant coverage upward. Selection can therefore skip
-  a missing intermediate proxy when resident descendants cover the visible
-  region, while retaining the nearest resident fallback wherever they do not;
-  the current frontier stays free of holes and parent/child overlap.
-- `setNodeBounds(instance, node, bounds)` creates bounds-only copy-on-write
-  overlays for the affected instance. Refits are queued and published by
-  `applyUpdates`. Group large batches by instance and page when practical so
-  consecutive refits reuse nearby overlay data; submission order does not
-  affect correctness.
-- For a persistent cohort of rigid instances that moves every frame, construct
-  a `SpatialDatabase::MotionGroup` from its `InstanceRef` values and pass its positions
-  to `SpatialDatabase::moveInstances`. Positions retain the group's caller-visible order;
-  the group caches a physical TLAS-friendly order internally and refreshes it
-  automatically after `optimize()`. Use scalar `moveInstance` for occasional
-  or continually changing cohorts.
-- The first TLAS build establishes spatial instance layout and routine updates
-  preserve it. Call `SpatialDatabase::optimize()` only at an occasional safe point after
-  disruptive changes such as a teleport, level transition, or heavy churn. It
-  compacts and restores spatial locality without invalidating public handles.
-- Every camera or shadow cascade owns a `SpatialQuery`. It contains damping, reusable
-  frontier records, traversal scratch, and selection statistics. Reuse is enabled
-  by default and can be disabled with `setReuseEnabled(false)` for highly
-  dynamic workloads.
-- `SpatialQuery::selectFrontier` reads a published `const SpatialDatabase`. Calls may run concurrently
-  when every call has a distinct `SpatialQuery`, optional
-  `PageUsageContext`, and output objects. Mutations and `collect` remain serial
-  and must happen outside that selection phase.
-- `PageUsageContext` is optional per query. It records page-use feedback without
-  touching the SpatialDatabase; `collect` later consumes only the contexts the caller
-  chooses, so a primary camera can influence page retention while shadow
-  cameras do not.
-- An uncached `SpatialQuery` can fan out over visible instances through the host
-  `parallelFor`; its scratch and statistics still remain query-owned, so it has
-  the same threading contract as cached selection.
-
-The current contracts, algorithms, lifecycle rules, and complexity bounds are
-in [frontier_design.md](docs/frontier_design.md).
-
-## Integrating
-
-The repository currently exposes a CMake target rather than an installed
-package:
-
-```cmake
-add_subdirectory(path/to/HLod-tree)
-target_link_libraries(your_target PRIVATE frontier)
-```
-
-Include `frontier/spatial_database.h` for runtime use and `frontier/builder.h` when producing page
-blobs. `FrontierContext` lets an engine provide aligned allocation and a blocking
-`parallelFor`. Define `FRONTIER_FATAL(msg)` before the first Frontier header if the
-default `std::logic_error` policy does not suit the host.
-
-A `FrontierContext` used to allocate a `Page` must outlive that page, including
-after ownership moves into a `SpatialDatabase`. The `user` data referenced by
-`SpatialDatabaseConfig::context` must likewise remain valid until the database is destroyed.
-
-The page blob is the versioned disk representation. `Page::fromBytes` validates
-and copies external bytes into aligned owned storage; `PageView::fromBytes`
-validates borrowed storage, which must outlive the registered asset. The
-current reader accepts page blob version 2.
-
-## Building and testing
-
-CMake 3.24 or newer and a C++20 compiler are required:
+## Building
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build --config Release --parallel
-ctest --test-dir build -C Release --output-on-failure
+cmake --build build
+ctest --test-dir build --output-on-failure
 ```
 
-Run `run_perf_bench.sh` or `run_perf_bench.bat` for a focused Release
-benchmark. Run `run_all_perf.sh <machine-label>` on macOS/Linux or
-`run_all_perf.bat <machine-label>` on Windows to produce a complete,
-self-contained cross-machine report. See [BENCHMARKING.md](docs/BENCHMARKING.md) for
-the datasets, platform behavior, environment overrides, and macOS CPU-counter
-capture.
+Important options are `FRONTIER_BUILD_TESTS`, `FRONTIER_BUILD_BENCH`,
+`FRONTIER_AVX2`, and `FRONTIER_FORCE_SCALAR`.
 
-## SIMD and CI
-
-The packed format always has eight logical lanes. AVX2 processes all eight at
-once; SSE2 and NEON use two four-lane halves; the fallback uses scalar loops.
-
-| Backend | Selected when |
-|---|---|
-| AVX2 + FMA | `FRONTIER_AVX2=ON` on x86-64 |
-| SSE2, with SSE4.1 blends when available | x86 without AVX2 |
-| NEON | 64-bit ARM |
-| scalar | `FRONTIER_FORCE_SCALAR=ON` or unsupported architectures |
-
-CI builds and runs unit and performance tests on Linux, Windows, and macOS;
-x86-64 and arm64; GCC, Clang, MSVC, clang-cl, and AppleClang; and every SIMD
-fallback listed above.
-
-## Documentation map
-
-- [API.md](docs/API.md): public API, examples, ownership, and lifetime rules.
-- [ARCHITECTURE.md](docs/ARCHITECTURE.md): current implementation architecture.
-- [frontier_design.md](docs/frontier_design.md): behavioral invariants and complexity.
-- [BENCHMARKING.md](docs/BENCHMARKING.md): reproducible performance collection and profiling.
-- [HISTORY.md](docs/HISTORY.md): implementation history and experimental evidence.
-- [docs/archive](docs/archive): archived engineering records.
-
-Dependencies: GoogleTest v1.17.0 plus upstream commit `fa8438ae` for the Clang
-21 build fix, and Google Benchmark v1.9.4. The library itself has no runtime
-third-party dependency. Frontier is available under the [MIT License](LICENSE).
+See [API.md](docs/API.md) for the complete workflow,
+[ARCHITECTURE.md](docs/ARCHITECTURE.md) for implementation details, and
+[BENCHMARKING.md](docs/BENCHMARKING.md) for measurement guidance.

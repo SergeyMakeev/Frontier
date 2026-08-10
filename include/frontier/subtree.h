@@ -1,86 +1,131 @@
 #pragma once
-// Logical reusable hierarchy fragments. A Subtree's packed Page contains the
-// real descendants below a mount anchor. The anchor is serialization/build
-// machinery, not a hierarchy node: at runtime the real parent is always a
-// renderable TLAS root or an expansion node in another Subtree.
 
 #include <cstddef>
 #include <cstdint>
 #include <span>
-#include <utility>
-#include <vector>
 
-#include "page.h"
+#include "config.h"
+#include "detail/subtree_data.h"
+#include "node.h"
 
 namespace frontier {
 
 class SpatialDatabase;
 class SubtreeBuilder;
 
-// Stable application/package identity. Runtime handles are deliberately
-// separate: this key survives serialization and database registration.
-struct SubtreeKey
-{
-    uint64_t value = 0;
-
-    bool valid() const { return value != 0; }
-    friend bool operator==(SubtreeKey, SubtreeKey) = default;
-};
-static_assert(sizeof(SubtreeKey) == 8, "subtree key must stay 64 bits");
-
-// Placement of a mounted child in its owner's coordinate system. Frontier's
-// existing transform contract is translation plus positive uniform scale.
-struct SubtreeTransform
-{
-    float4 pos = float4::point(0.0f, 0.0f, 0.0f);
-    float  scale = 1.0f;
-};
-static_assert(sizeof(SubtreeTransform) == 32,
-              "subtree transform layout changed");
-
-// One expansion site in the packed root page. `dependency` indexes the
-// Subtree's deduplicated dependency table, so a million identical placements
-// store the full SubtreeKey only once.
-struct SubtreeExpansion
-{
-    float4   pos = float4::point(0.0f, 0.0f, 0.0f);
-    float    scale = 1.0f;
-    uint32_t nodeIndex = kInvalidIndex;
-    uint32_t dependency = kInvalidIndex;
-
-    SubtreeTransform transform() const { return {pos, scale}; }
-};
-static_assert(sizeof(SubtreeExpansion) == 32,
-              "one authored expansion site must stay 32 bytes");
-
-// Move-only authored component. The first implementation intentionally keeps
-// the physical representation to one packed page; composition supplies
-// arbitrary depth, while Hierarchy/splitBelow remains available for legacy
-// intra-tree paging.
+// A complete immutable, reusable hierarchy fragment. Its implicit parent is
+// not a node in this object: at runtime it is the renderable TLAS root or
+// expansion node passed to mountSubtree(). The same type represents owned and
+// explicitly borrowed serialized storage.
 class Subtree
 {
 public:
     Subtree() = default;
-    Subtree(Subtree&&) noexcept = default;
-    Subtree& operator=(Subtree&&) noexcept = default;
+    ~Subtree() { release(); }
+
+    Subtree(Subtree&& other) noexcept { moveFrom(other); }
+    Subtree& operator=(Subtree&& other) noexcept
+    {
+        if (this != &other)
+        {
+            release();
+            moveFrom(other);
+        }
+        return *this;
+    }
     Subtree(const Subtree&) = delete;
     Subtree& operator=(const Subtree&) = delete;
 
-    bool valid() const { return key_.valid() && page_.valid(); }
-    SubtreeKey key() const { return key_; }
-    PageView page() const { return static_cast<const PageView&>(page_); }
+    // Validate and copy serialized storage.
+    static Subtree fromBytes(
+        const void* blob, size_t bytes,
+        const FrontierContext& context = defaultContext());
 
-    std::span<const SubtreeKey> dependencies() const { return dependencies_; }
-    std::span<const SubtreeExpansion> expansions() const { return expansions_; }
+    // Validate and borrow serialized storage without copying. The storage must
+    // remain alive and suitably aligned until this object, or the database it
+    // is moved into, releases it.
+    static Subtree borrow(const void* blob, size_t bytes);
+
+    Subtree clone(const FrontierContext& context = defaultContext()) const;
+
+    bool valid() const { return parent_ != nullptr; }
+    SubtreeKey key() const { return key_; }
+    uint32_t nodeCount() const { return packedNodeCount_ ? packedNodeCount_ - 1 : 0; }
+    AABB bounds() const { return valid() ? bbox_[0] : AABB::empty(); }
+    const void* data() const { return base_; }
+    size_t byteSize() const { return byteSize_; }
+    std::span<const SubtreeKey> dependencies() const
+    {
+        return {dependencies_, dependencyCount_};
+    }
 
 private:
     friend class SpatialDatabase;
     friend class SubtreeBuilder;
 
+    static Subtree adopt(void* blob, size_t bytes,
+                         const FrontierContext& context);
+    static Subtree fromValidatedBytes(const void* blob, size_t bytes,
+                                      const FrontierContext* owner);
+    static void validate(const void* blob, size_t bytes);
+    void bind(const void* blob, size_t bytes);
+    void release();
+    void moveFrom(Subtree& other) noexcept;
+
+    uint32_t packedNodeCount() const { return packedNodeCount_; }
+    uint32_t wideCount() const { return wideCount_; }
+    uint32_t childCount(uint32_t i) const
+    {
+        return detail::metaChildCount(meta_[i]);
+    }
+    bool isExpansion(uint32_t i) const
+    {
+        return detail::metaIsExpansion(meta_[i]);
+    }
+    uint32_t wideOffset(uint32_t i) const
+    {
+        return detail::metaWideOffset(meta_[i]);
+    }
+    uint32_t wideBlockCount(uint32_t i) const
+    {
+        return (childCount(i) + kWide - 1) / kWide;
+    }
+    uint32_t validLanes(uint32_t block) const
+    {
+        return detail::blockValidLanes(blockMask_[block]);
+    }
+    uint32_t leafLanes(uint32_t block) const
+    {
+        return detail::blockLeafLanes(blockMask_[block]);
+    }
+    detail::WideBoundsRef wideBounds() const
+    {
+        return detail::WideBoundsRef::interleaved(wide_);
+    }
+    std::span<const detail::SubtreeExpansion> expansions() const
+    {
+        return {expansions_, expansionCount_};
+    }
+
+    const uint32_t* parent_ = nullptr;
+    const uint32_t* subtreeSize_ = nullptr;
+    const uint32_t* meta_ = nullptr;
+    const detail::WideBlock* wide_ = nullptr;
+    const uint32_t* blockMask_ = nullptr;
+    const UserPayload* payload_ = nullptr;
+    const AABB* bbox_ = nullptr;
+    const float* geometricError_ = nullptr;
+    const SubtreeKey* dependencies_ = nullptr;
+    const detail::SubtreeExpansion* expansions_ = nullptr;
+
+    const std::byte* base_ = nullptr;
+    uint32_t packedNodeCount_ = 0;
+    uint32_t wideCount_ = 0;
+    uint32_t dependencyCount_ = 0;
+    uint32_t expansionCount_ = 0;
+    size_t byteSize_ = 0;
     SubtreeKey key_{};
-    Page page_;
-    std::vector<SubtreeKey> dependencies_;
-    std::vector<SubtreeExpansion> expansions_; // sorted by packed node index
+    const FrontierContext* context_ = nullptr;
 };
 
 } // namespace frontier

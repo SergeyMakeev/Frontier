@@ -1,45 +1,14 @@
 #pragma once
-// Runtime side of Frontier (see docs/frontier_design.md):
-//  - BLASes: independently rooted renderable hierarchies in immutable pages;
-//    a BLAS may represent anything from one flat object to a city block
-//  - instances of those BLAS roots over a non-renderable dynamic TLAS
-//  - topology streaming (attach/detach pages under expansion points)
-//  - payload residency with incrementally propagated subtree coverage
-//  - single-pass pruned frontier selection, with no required per-node query scratch
-//  - LRU garbage collection of cold pages
-//  - sublinear conservative bounds refit for moving nodes and instances
+// Permanent renderable roots live directly in an 8-wide TLAS. Reusable
+// immutable Subtree definitions mount only beneath those roots or beneath
+// renderable expansion nodes in another mounted Subtree. Single-node objects
+// therefore allocate no hierarchy storage, while deep assemblies share their
+// immutable topology, payload, error, and authored-bound data.
 //
-// EVERYTHING IS SHARED
-// --------------------
-// A page is registered once and instanced many times. Every instance of an
-// asset walks the same bytes AND the same runtime state: one residency array,
-// one attachment graph, one residency state. Ten thousand copies of
-// a tree cost one tree, and a streamer that attaches a page under a shared
-// expansion point attaches it for all ten thousand at once.
-//
-// Deformation does not break that. Bounds are the only part of a page the
-// runtime rewrites, so an instance that is deformed with setNodeBounds gets a
-// private copy-on-write overlay for bounds and keeps sharing topology,
-// payloads, errors, residency and streaming with every other instance. Large
-// page overlays keep modified wide blocks sparse until edits justify a dense
-// copy. There is no "private page" mode: the thing that
-// would actually hurt at scale is ten thousand duplicated *streaming graphs*,
-// not ten thousand duplicated boxes, and duplicating the page duplicates both.
-//
-// THE API IS FULLY HANDLE-BASED — the SpatialDatabase keeps no payload/user-id index or
-// hash map. Handles are the only currency:
-//  - registerAsset returns an AssetHandle; addInstance returns an InstanceRef
-//    containing its root PageHandle, and attachPage returns a PageHandle.
-//    Node handles are composed from a page handle plus the packed page-local
-//    index, which is immutable after build.
-//  - selectFrontier outputs carry a compact NodeHandle wherever the caller might
-//    act on the entry (payload residency or topology expansion).
-//  - the 64-bit UserPayload stays in immutable page data and can be resolved
-//    from a live NodeHandle when the caller needs it; it is not copied into
-//    every frontier entry.
-// A handle dies with its page (detachPage / collect). Stale handles are
-// detected by the generation stamp: mutating calls ignore them, queries
-// report them absent — the normal race between streaming completion and GC.
+// Runtime operations are generation-stamped and handle-based. NodeHandle
+// values come from frontier entries or retained assembly state;
+// SubtreeHandle names registered bytes; SubtreeInstanceHandle names one
+// mounted placement; and InstanceHandle names one permanent TLAS root.
 //
 // SpatialDatabase updates are single-writer. applyUpdates() publishes a stable snapshot;
 // SpatialQuery::selectFrontier then reads only that snapshot and may run concurrently when
@@ -56,7 +25,6 @@
 #include "append_buffer.h"
 #include "config.h"
 #include "math.h"
-#include "page.h"
 #include "subtree.h"
 
 namespace frontier {
@@ -64,18 +32,7 @@ namespace frontier {
 class SpatialDatabase;
 struct QueryScratch;
 
-// Registered BLAS page asset: the unit of storage and sharing, not necessarily
-// one object. Returned by registerAsset().
-struct AssetHandle
-{
-    uint32_t slot = kInvalidIndex;
-    uint32_t generation = 0;
-    bool valid() const { return slot != kInvalidIndex; }
-};
-static_assert(sizeof(AssetHandle) == 8, "AssetHandle must stay 64 bits");
-
-// Registered logical reusable component. Unlike AssetHandle (one physical
-// page), this handle also carries permanent expansion-target metadata.
+// One registered immutable subtree definition.
 struct SubtreeHandle
 {
     uint32_t slot = kInvalidIndex;
@@ -84,36 +41,19 @@ struct SubtreeHandle
 };
 static_assert(sizeof(SubtreeHandle) == 8, "SubtreeHandle must stay 64 bits");
 
-// Unambiguous reference to a generated detail page. Page ids are local to one
-// Hierarchy, so the root asset identifies which hierarchy package owns `page`.
-struct DetailPageRef
-{
-    AssetHandle     rootAsset;
-    HierarchyPageId page = kInvalidHierarchyPage;
-
-    bool valid() const
-    {
-        return rootAsset.valid() && page != kInvalidHierarchyPage;
-    }
-};
-static_assert(sizeof(DetailPageRef) == 12,
-              "detail-page reference must stay 12 bytes");
-
-// Attached page (a "mount"): one placement of an asset in the database. Returned
-// by addInstance/attachPage. Compose node handles with nodeAt(); node indices
-// are page-local, fixed at build time.
-struct PageHandle
+// One mounted placement of a registered subtree definition.
+struct SubtreeInstanceHandle
 {
     uint32_t slot = kInvalidIndex;
     uint32_t generation = 0;
     bool valid() const { return slot != kInvalidIndex; }
 };
-static_assert(sizeof(PageHandle) == 8, "PageHandle must stay 64 bits");
-using MountHandle = PageHandle;
+static_assert(sizeof(SubtreeInstanceHandle) == 8,
+              "SubtreeInstanceHandle must stay 64 bits");
 
-// Resolved node reference, packed into 64 bits. Mounted-page nodes use a
-// 20-bit page slot, a 20-bit page-local index, and a 24-bit generation. The
-// reserved page-slot code tags a TLAS-owned renderable root instead: its other
+// Resolved node reference, packed into 64 bits. Mounted-subtree nodes use a
+// 20-bit placement slot, a 20-bit local index, and a 24-bit generation. The
+// reserved slot code tags a TLAS-owned renderable root instead: its other
 // 44 bits carry a stable 24-bit InstanceId and a 20-bit generation. This keeps
 // FrontierEntry at 12 bytes while making top-level and mounted nodes uniform.
 struct NodeHandle
@@ -177,16 +117,27 @@ struct NodeHandle
 };
 static_assert(sizeof(NodeHandle) == 8, "NodeHandle must stay 64 bits");
 
-inline NodeHandle nodeAt(PageHandle page, uint32_t index)
-{
-    return NodeHandle{page.slot, index, page.generation};
-}
-
 using InstanceId = uint32_t;
 inline constexpr uint32_t kInstanceIdBits = 24;
 inline constexpr InstanceId kInstanceIdMask = (1u << kInstanceIdBits) - 1u;
 inline constexpr InstanceId kInvalidInstanceId = kInstanceIdMask;
 inline constexpr uint8_t kFrontierErrorThreshold = 128;
+
+// One live top-level placement. Every instance owns exactly one permanent,
+// renderable TLAS root, so rootNode() is always valid while the handle is live.
+struct InstanceHandle
+{
+    InstanceId id = kInvalidInstanceId;
+    uint32_t generation = 0;
+
+    bool valid() const { return id != kInvalidInstanceId; }
+    NodeHandle rootNode() const
+    {
+        return valid() ? NodeHandle::tlasRoot(id, generation) : NodeHandle{};
+    }
+};
+static_assert(sizeof(InstanceHandle) == 8,
+              "InstanceHandle must stay 64 bits");
 
 // Threshold-relative logarithmic error. Codes [0, 127] are at or below the
 // selection threshold and [128, 255] are above it. The boundary decision is
@@ -232,8 +183,8 @@ static_assert(sizeof(FrontierEntry) == 12, "FrontierEntry must stay 12 bytes");
 
 // One traversal produces both realities without per-entry tags. The current
 // render frontier is shared + currentOnly. The fully-resident ideal frontier is
-// shared + idealOnly. For a high-error ideal-side leaf, detailPage() reports
-// whether HierarchyBuilder generated a finer page for caller-side streaming.
+// shared + idealOnly. A high-error ideal-side extendable node exposes its
+// authored SubtreeKey through subtreeTarget().
 // Non-owning result of one SpatialQuery selection. The spans remain valid until the
 // next selection or reset on that SpatialQuery, or until the SpatialQuery is destroyed.
 struct FrontierResultView
@@ -335,18 +286,6 @@ struct InstanceDesc
     uint32_t mask = ~0u;
 };
 
-// One renderable node stored directly in the TLAS. It is the permanent,
-// always-resident root of one instance. An optional expansion target permits a
-// reusable Subtree to be mounted beneath it; the Subtree never exists as a
-// top-level instance on its own.
-struct RootNodeDesc
-{
-    UserPayload payload = 0;
-    float       geometricError = 0.0f;
-    AABB        bounds = AABB::empty();
-    SubtreeKey  expansionTarget{};
-};
-
 // ---------------------------------------------------------------------------
 // Output sinks
 //
@@ -436,73 +375,17 @@ struct FrontierResultSink
 struct SelectionStats
 {
     uint64_t instancesVisited = 0;
-    uint64_t pagesVisited = 0;
+    uint64_t subtreesVisited = 0;
     uint64_t nodesVisited = 0;
     uint64_t wideBlocksTested = 0;
     uint64_t lanesSurvived = 0;
-};
-
-// Optional per-camera page-use feedback. Passing one to selectFrontier records the
-// pages that camera needed; omitting it makes selection pay no page-use
-// recording cost. The SpatialDatabase consumes feedback only when collect() is called,
-// so callers choose which cameras influence page retention (for example, the
-// primary camera but not shadow cascades).
-//
-// A context may accumulate observations across many update epochs. Like
-// SpatialQuery, it belongs to one query and must not be used concurrently
-// by two calls; distinct contexts are independent.
-class PageUsageContext
-{
-public:
-    PageUsageContext() = default;
-    PageUsageContext(PageUsageContext&&) noexcept = default;
-    PageUsageContext& operator=(PageUsageContext&&) noexcept = default;
-    PageUsageContext(const PageUsageContext&) = delete;
-    PageUsageContext& operator=(const PageUsageContext&) = delete;
-
-    void   reset();
-    size_t bytes() const;
-
-private:
-    friend class SpatialDatabase;
-
-    struct Rec
-    {
-        static constexpr uint32_t kPending = 1u << 31;
-
-        // Page generations already fit in 24 bits (NodeHandle). The otherwise
-        // unused high bit carries dirty-list membership, cutting this dense
-        // per-page array from 12 bytes to 8.
-        uint32_t generationAndPending = 0;
-        uint32_t lastUsed = 0;
-
-        uint32_t generation() const
-        {
-            return generationAndPending & NodeHandle::kGenerationMask;
-        }
-        bool pending() const { return (generationAndPending & kPending) != 0; }
-        void setGeneration(uint32_t generation)
-        {
-            generationAndPending = generation & NodeHandle::kGenerationMask;
-        }
-        void setPending(bool pending)
-        {
-            if (pending) generationAndPending |= kPending;
-            else generationAndPending &= ~kPending;
-        }
-    };
-    static_assert(sizeof(Rec) == 8, "page-use record must stay 8 bytes");
-
-    const SpatialDatabase*     database_ = nullptr;
-    std::vector<Rec> rec_;
-    std::vector<uint32_t> dirty_;
 };
 
 // Result of one collection pass. freedPayloads refers to SpatialDatabase-owned storage
 // and remains valid until the next collect() call or SpatialDatabase destruction.
 struct CollectResult
 {
-    size_t detachedPages = 0;
+    size_t unmountedSubtrees = 0;
     std::span<const UserPayload> freedPayloads;
 };
 
@@ -569,7 +452,7 @@ struct CollectResult
 // every frame. That is the correct division of labour rather than a
 // limitation: the population is dominated by distant instances, which is where
 // the per-instance fixed cost (resolve the instance, transform the view, touch
-// the root page) was being paid over and over for an answer that never moved.
+// the mounted root) was being paid over and over for an answer that never moved.
 //
 // BUCKETED OUTPUT
 // ---------------
@@ -585,9 +468,9 @@ struct CollectResult
 // threshold classification; do not expect a cached result to reproduce a
 // freshly measured pixel error.
 //
-// Streaming and residency are part of the recorded three-bucket result. Page
-// content versions invalidate a record when any page it depended on changes. Instances
-// that cross more page dependencies than the compact record can hold are
+// Streaming and residency are part of the recorded three-bucket result. Mount
+// content versions invalidate a record when any dependency changes. Instances
+// that cross more dependencies than the compact record can hold are
 // simply re-walked.
 // ---------------------------------------------------------------------------
 
@@ -622,29 +505,27 @@ public:
     bool reuseEnabled() const { return reuseEnabled_; }
     void setReuseEnabled(bool enabled);
 
+    // Track mounted-subtree touches for garbage collection. Disabled by
+    // default, so queries that do not drive retention pay no recording cost.
+    bool mountUsageEnabled() const { return mountUsageEnabled_; }
+    void setMountUsageEnabled(bool enabled);
+    void resetMountUsage();
+
     // Query a snapshot published by SpatialDatabase::applyUpdates(). The SpatialQuery
     // is mutable and must not be used concurrently; any number of distinct queries
     // may read the same const SpatialDatabase concurrently. A query binds to the
     // first database it reads, and reset() releases that binding.
     FrontierResultView selectFrontier(const SpatialDatabase& database, const Camera& camera,
                             const SelectionParams& params);
-    FrontierResultView selectFrontier(const SpatialDatabase& database, const Camera& camera,
-                            const SelectionParams& params, PageUsageContext& usage);
 
     // Advanced zero-copy path: write directly to fixed caller storage.
     void selectFrontier(const SpatialDatabase& database, const Camera& camera,
                    const SelectionParams& params, FrontierResultSink& outResult);
-    void selectFrontier(const SpatialDatabase& database, const Camera& camera,
-                   const SelectionParams& params, PageUsageContext& usage,
-                   FrontierResultSink& outResult);
 
     // Explicit owning-result path for callers that must retain a frontier after the
     // next selection on this SpatialQuery.
     void selectFrontier(const SpatialDatabase& database, const Camera& camera,
                    const SelectionParams& params, FrontierResult& outResult);
-    void selectFrontier(const SpatialDatabase& database, const Camera& camera,
-                   const SelectionParams& params, PageUsageContext& usage,
-                   FrontierResult& outResult);
 
     // Forget everything: the damping window and every record. Call it on a
     // teleport or camera cut. Reuse never *requires* this -- every record
@@ -669,14 +550,14 @@ private:
     // This record is read for every visible instance, indexed by instance id,
     // so it is a random access per instance -- the one new memory stream the
     // cache introduces. It has to be cheaper than the walk it replaces, which
-    // is often already cheap because shared page bytes stay hot. Everything
+    // is often already cheap because shared subtree bytes stay hot. Everything
     // here is therefore either a scalar or absent:
     //  - no camera envelope: validity is a single scalar budget against the
     //    query's accumulated travel (see travel_);
     //  - no per-record k / threshold copies: threshold changes bump epoch_,
     //    while k motion consumes the scalar slope budget below;
-    //  - no page generations: the mounted-tree root contentVersion is bumped
-    //    on descendant mutation and attach, and distinguishes a recycled slot.
+    //  - no placement generations: the mounted-tree root contentVersion is bumped
+    //    on descendant mutation and mount, and distinguishes a recycled slot.
     struct Rec
     {
         // Reusable while positionTravel + kSlope * kTravel has not passed
@@ -690,7 +571,7 @@ private:
         // two-bit dependency count. Dependency count 3 is an escape marker;
         // the low 30 bits then index sparse full-width counts.
         uint32_t counts = 0;
-        // The overwhelmingly common one-page dependency stays inline. A
+        // The overwhelmingly common one-mount dependency stays inline. A
         // second dependency lives in the cold spill array below.
         uint32_t depSlot = 0;
         uint32_t depVersion = 0;
@@ -721,6 +602,33 @@ private:
     };
     static_assert(sizeof(OverflowCounts) == 16,
                   "large-frontier count spill must stay 16 bytes");
+
+    struct MountUseRec
+    {
+        static constexpr uint32_t kPending = 1u << 31;
+        uint32_t generationAndPending = 0;
+        uint32_t lastUsed = 0;
+
+        uint32_t generation() const
+        {
+            return generationAndPending & NodeHandle::kGenerationMask;
+        }
+        bool pending() const
+        {
+            return (generationAndPending & kPending) != 0;
+        }
+        void setGeneration(uint32_t generation)
+        {
+            generationAndPending = generation & NodeHandle::kGenerationMask;
+        }
+        void setPending(bool pending)
+        {
+            if (pending) generationAndPending |= kPending;
+            else generationAndPending &= ~kPending;
+        }
+    };
+    static_assert(sizeof(MountUseRec) == 8,
+                  "mount-use record must stay 8 bytes");
 
     void compact();
 
@@ -763,13 +671,9 @@ private:
     SelectionStats stats_{};
     const SpatialDatabase* database_ = nullptr;
     bool reuseEnabled_ = true;
-
-    // Uncached selection samples whether enough hierarchical TLAS leaves can
-    // terminate at their BLAS root to repay the vector root test. A query that
-    // currently sees mostly refined roots runs the original lean query and
-    // probes periodically so a coherent move back to distance is discovered.
-    bool     rootQueryEnabled_ = true;
-    uint8_t  rootProbeCountdown_ = 0;
+    bool mountUsageEnabled_ = false;
+    std::vector<MountUseRec> mountUse_;
+    std::vector<uint32_t> dirtyMounts_;
 
     // Mutable query scratch. Opaque so traversal
     // implementation details do not become part of the public API.
@@ -840,8 +744,8 @@ public:
     explicit SpatialDatabase(const SpatialDatabaseConfig& config = SpatialDatabaseConfig{});
     ~SpatialDatabase();
 
-    // Non-copyable and non-movable: registered owned pages retain allocator
-    // context pointers, and instances/mounts refer to each other by slot.
+    // Non-copyable and non-movable: definitions retain allocator contexts,
+    // and instances/mounts refer to each other by slot.
     SpatialDatabase(const SpatialDatabase&) = delete;
     SpatialDatabase& operator=(const SpatialDatabase&) = delete;
     SpatialDatabase(SpatialDatabase&&) = delete;
@@ -849,61 +753,20 @@ public:
 
     const SpatialDatabaseConfig& config() const { return config_; }
 
-    // ---- assets ------------------------------------------------------------
-    // Publish a page for sharing. The SpatialDatabase allocates ONE runtime state for
-    // it (residency, attachment links) no matter how many instances name it,
-    // and its root mount stays alive until releaseAsset().
-    //
-    // The borrowed overload does not copy: point it at a memory-mapped bundle
-    // and the page costs nothing but address space. The bytes must outlive
-    // the asset.
-    AssetHandle registerAsset(Page&& page);
-    AssetHandle registerAsset(PageView borrowedPage);
-
-    // Register one assembly component. Its immutable page bytes and dependency
-    // table are stored once no matter how many top-level or nested placements
-    // reference it.
+    // ---- reusable definitions ---------------------------------------------
+    // Publish one complete Subtree blob for reuse by any number of mounted
+    // placements. Ownership or borrowing was chosen when creating Subtree.
     SubtreeHandle registerSubtree(Subtree&& subtree);
     void          releaseSubtree(SubtreeHandle subtree);
     bool          isSubtree(SubtreeHandle subtree) const;
-
-    // Drops the SpatialDatabase's own reference. Contract violation if instances still
-    // reference the asset. Detaches its whole page tree.
-    void   releaseAsset(AssetHandle asset);
-    bool   isAsset(AssetHandle asset) const;
-    size_t assetCount() const { return liveAssets_; }
-
-    // The asset's shared instance-root mount, for composing node handles
-    // (marking residency, attaching children) without a selectFrontier round-trip.
-    // Invalid until addInstance has materialized that root. Mounts created by
-    // attaching the asset elsewhere are independent and returned by attachPage.
-    PageHandle assetRootPage(AssetHandle asset) const;
+    size_t        subtreeCount() const { return liveSubtrees_; }
 
     // ---- database assembly -------------------------------------------------
-    // RootNodeDesc instances own a permanent, always-resident renderable TLAS
-    // root and may have no page at all. Legacy page/asset instances retain a
-    // pinned root page whose renderable roots are likewise implicitly resident.
-    //
-    // InstanceRef carries a generation stamp, like NodeHandle: instance slots
-    // are recycled, and a ref that outlives its instance (remove + later add
+    // Every instance owns a permanent, always-resident renderable TLAS root.
+    // InstanceHandle carries a generation stamp, like NodeHandle: instance slots
+    // are recycled, and a ref that outlives its instance (remove + later instantiate
     // reusing the slot) must not act on the newcomer. Stale refs make
     // moveInstance / removeInstance safe no-ops.
-    struct InstanceRef
-    {
-        InstanceId id = kInvalidInstanceId;
-        uint32_t   generation = 0;
-        PageHandle rootPage;
-        bool valid() const { return id != kInvalidInstanceId; }
-        // Valid for instances created from RootNodeDesc. Legacy page/asset
-        // instances retain rootPage and do not have one unambiguous root node.
-        NodeHandle rootNode() const
-        {
-            return !rootPage.valid() && valid()
-                       ? NodeHandle::tlasRoot(id, generation)
-                       : NodeHandle{};
-        }
-    };
-
     // A persistent cohort whose caller-visible order stays fixed while SpatialDatabase
     // caches the corresponding physical instance order. This is intended for
     // groups that move together every frame. The cache rebuilds automatically
@@ -912,8 +775,8 @@ public:
     {
     public:
         MotionGroup() = default;
-        explicit MotionGroup(std::span<const InstanceRef> instances);
-        void reset(std::span<const InstanceRef> instances);
+        explicit MotionGroup(std::span<const InstanceHandle> instances);
+        void reset(std::span<const InstanceHandle> instances);
         size_t size() const { return instances_.size(); }
 
     private:
@@ -931,7 +794,7 @@ public:
         };
         static_assert(sizeof(Slot) == 8, "motion-group slot must stay 8 bytes");
 
-        AppendBuffer<InstanceRef> instances_;
+        AppendBuffer<InstanceHandle> instances_;
         AppendBuffer<Slot> physicalOrder_;
         uint32_t layoutVersion_ = 0;
         bool physicalOrderValid_ = false;
@@ -940,92 +803,49 @@ public:
     // During initial assembly, additions are accumulated for the first build.
     // Once a TLAS exists, insertion is O(depth) and may allocate a TLAS node
     // when a full leaf splits; it never scans the whole instance population.
-    InstanceRef addInstance(AssetHandle asset, const InstanceDesc& desc);
-    InstanceRef addInstance(AssetHandle asset, float4 pos, float scale = 1.0f);
+    InstanceHandle instantiate(const NodeDesc& root,
+                               const InstanceDesc& desc = {});
 
-    // Instantiate exactly one renderable node in the TLAS. A hierarchy is
-    // assembled by giving that node an expansionTarget and mounting a Subtree
-    // beneath instance.rootNode(). Single-node instances allocate no page or
-    // mount state.
-    InstanceRef instantiate(const RootNodeDesc& root,
-                            const InstanceDesc& desc = {});
-    InstanceRef instantiate(const RootNodeDesc& root, float4 pos,
-                            float scale = 1.0f);
+    void removeInstance(InstanceHandle instance); // no-op if stale
+    void moveInstance(InstanceHandle instance, const Transform& transform);
 
-    // Convenience for one-off content: registers the page as an anonymous
-    // asset owned by the SpatialDatabase and instances it. The asset is freed when its
-    // last instance goes away. Instancing the same tree more than once should
-    // go through registerAsset so the two instances share it.
-    InstanceRef addInstance(Page&& page, const InstanceDesc& desc);
-    InstanceRef addInstance(Page&& page, float4 pos, float scale = 1.0f);
-
-    void removeInstance(InstanceRef ref);                                    // no-op if stale
-    void moveInstance(InstanceRef ref, float4 pos, float scale = 1.0f);      // no-op if stale
-
-    // positions[i] belongs to the InstanceRef at i in the MotionGroup.
+    // positions[i] belongs to the InstanceHandle at i in the MotionGroup.
     // Stale refs are ignored and duplicate refs use the final position.
     void moveInstances(MotionGroup& group,
                        std::span<const float4> positions,
                        float scale = 1.0f);
 
     // ---- topology streaming -------------------------------------------------
-    // An expansion handle comes from a high-error ideal-side FrontierEntry (or is
-    // composed via nodeAt from a known packed expansion index).
-    // attachPage returns an invalid PageHandle if the
-    // expansion handle went stale while the page was being built (its parent
-    // page was detached/collected) — drop the page in that case. It fires
-    // FRONTIER_FATAL only on true contract violations (not an expansion point,
-    // already attached, empty page).
-    //
-    // Attaching under an asset attaches for every instance of it at once —
-    // that is the point, and it is why one streamer no longer does the same
-    // work ten thousand times.
-    //
-    // The child page must fit inside the expansion node's authored bounds.
-    // Growing the owner here would ripple into every instance of the owning
-    // asset, so it is a contract violation rather than a silent refit: write
-    // conservative expansion bounds at build time.
-    PageHandle attachPage(NodeHandle expansionNode, AssetHandle asset);
-    PageHandle attachPage(NodeHandle expansionNode, Page&& page);
+    // An expansion handle normally comes from a high-error ideal-side
+    // FrontierEntry. A stale handle returns an invalid placement, covering the
+    // normal race with collection. True contract violations still fail: the
+    // parent must be extendable, empty, target the same SubtreeKey, and contain
+    // the transformed child bounds.
+    SubtreeInstanceHandle mountSubtree(NodeHandle parent,
+                                       SubtreeHandle subtree);
+    void unmountSubtree(SubtreeInstanceHandle instance);
+    bool isMounted(SubtreeInstanceHandle instance) const;
+    bool hasMountedSubtree(NodeHandle parent) const;
 
-    // Place the permanently referenced child Subtree at this expansion site.
-    // The site's authored relative transform is applied without rewriting the
-    // shared child bytes. A mismatched child key is a contract violation.
-    MountHandle mount(NodeHandle expansionNode, SubtreeHandle subtree);
-    // TLAS roots have no authored containing-Subtree placement, so their mount
-    // transform is supplied as instance data here. For mounted-page expansion
-    // nodes, use the two-argument overload and its authored transform.
-    MountHandle mount(NodeHandle rootNode, SubtreeHandle subtree,
-                      const SubtreeTransform& transform);
-
-    // Stable content target authored on a Subtree expansion site. Invalid for
-    // stale handles and legacy/generated page expansions.
-    SubtreeKey expansionTarget(NodeHandle expansionNode) const;
+    // Stable content target authored on an extendable node. Invalid for stale
+    // handles and for nodes without a child target.
+    SubtreeKey subtreeTarget(NodeHandle parent) const;
 
     // Local-to-top-level-instance transform for the mount containing `node`.
     // The caller composes this with its transform table at entry.instance().
-    bool tryGetNodeTransform(NodeHandle node,
-                             SubtreeTransform& outTransform) const;
-    void       detachPage(NodeHandle expansionNode);   // no-op if stale
-    bool       isAttached(NodeHandle expansionNode) const;
-
-    // Generated HierarchyBuilder pages carry their stable local detail-page id
-    // in the expansion node. The returned root asset scopes that id to one
-    // hierarchy package. Returns an invalid reference for a stale handle, a
-    // non-expansion node, or a manually authored expansion without an id.
-    DetailPageRef detailPage(NodeHandle expansionNode) const;
+    bool tryGetNodeTransform(NodeHandle node, Transform& outTransform) const;
 
     // ---- payload residency --------------------------------------------------
     // Handles come from ideal-side FrontierEntry values. Stale handles are ignored
-    // (the page was collected while the payload was loading); isResident
+    // (the mount was collected while the payload was loading); the query
     // reports false for them. Residency changes incrementally propagate
     // complete-subtree coverage toward the root.
-    void markResident(NodeHandle h);
-    void markNonResident(NodeHandle h);
-    bool isResident(NodeHandle h) const;
+    void markPayloadResident(NodeHandle node);
+    void markPayloadNonResident(NodeHandle node);
+    bool isPayloadResident(NodeHandle node) const;
 
     // Resolve immutable application payload data for a live frontier handle. The
-    // false case is the normal async race with page detach/collection.
+    // false case is the normal async race with unmount/collection.
     bool tryGetPayload(NodeHandle h, UserPayload& outPayload) const;
 
     // ---- motion --------------------------------------------------------------
@@ -1039,28 +859,29 @@ public:
     // of a first move. Stale handles are dropped at flush time via the
     // generation stamps.
     //
-    // The first deformation of a given (instance, page) pair takes a private
-    // bounds overlay; large pages keep wide bounds sparse until edits justify
-    // a dense copy. Everything else about the page stays shared.
-    // Propagation up the ancestor chain promotes overlays as it crosses page
-    // boundaries, so only the pages on the path from the moved node to the
+    // The first deformation of a given (instance, mount) pair takes a private
+    // bounds overlay; large subtrees keep wide bounds sparse until edits
+    // justify a dense copy. Everything else remains shared.
+    // Propagation up the ancestor chain promotes overlays across mount
+    // boundaries, so only the placements on the path from the moved node to the
     // instance root are ever privatised.
     //
     // Performance: submission order is preserved. For large batches, group
-    // calls by instance and page when practical so consecutive refits reuse
+    // calls by instance and mount when practical so consecutive refits reuse
     // nearby overlay data. Ordering is irrelevant to correctness, and SpatialDatabase
     // intentionally does not sort the queue because sorting can cost more
     // than the saved cache misses.
-    void setNodeBounds(InstanceRef inst, NodeHandle h, const AABB& localBounds);
+    void setNodeBounds(InstanceHandle instance, NodeHandle node,
+                       const AABB& localBounds);
 
     // Force pending bounds refits now (conservative grow-only propagation up
-    // the tree, across page boundaries, and into the top-level BVH). Only
+    // the tree, across mount boundaries, and into the top-level BVH). Only
     // needed by callers that read bounds between selections — tools, tests.
     void flushBounds();
 
     // Bounds of one node as this instance sees them: the overlay if it has
-    // one, the shared page otherwise. Flushes pending moves first.
-    AABB nodeBounds(InstanceRef inst, NodeHandle h);
+    // one, the shared authored bounds otherwise. Flushes pending moves first.
+    AABB nodeBounds(InstanceHandle instance, NodeHandle node);
 
     // Publish queued changes and prepare a stable read-only selection
     // snapshot. Call once before a group of selections, even when no database
@@ -1071,7 +892,7 @@ public:
 
     // Force a full quality TLAS rebuild, compact dead dense slots, and restore
     // physical instance/SpatialQuery-record order to TLAS traversal order. Public
-    // InstanceRefs and FrontierEntry::instance() ids remain stable. This is
+    // InstanceHandles and FrontierEntry::instance() ids remain stable. This is
     // intentionally heavier than applyUpdates(): call it at an occasional
     // synchronization point after disruptive database changes (level transition,
     // teleport, loading screen), not as routine per-frame maintenance. It
@@ -1079,23 +900,19 @@ public:
     void optimize();
 
     // ---- garbage collection ----------------------------------------------------
-    // Detaches cold pages from the LRU tail until streamedPageCount() <=
-    // maxAttachedPages (pinned root pages are not counted: they can never be
-    // collected). Only pages untouched for >= minAge frames, with no attached
-    // child pages, and not pinned are eligible. Returns the number of pages
-    // detached together with a non-owning view of payloads whose resident
-    // content became unreachable. Overloads taking page-usage contexts consume
-    // their accumulated feedback before examining the tail; omitted queries do
-    // not influence page retention.
-    CollectResult collect(size_t maxAttachedPages, uint32_t minAge);
-    CollectResult collect(PageUsageContext& usage, size_t maxAttachedPages,
+    // Unmounts cold leaf placements from the LRU tail until the mounted count
+    // is at most maxMountedSubtrees. Only mounts untouched for >= minAge
+    // epochs and without mounted children are eligible. Overloads taking
+    // SpatialQuery consume opt-in mount-usage feedback before collecting.
+    CollectResult collect(size_t maxMountedSubtrees, uint32_t minAge);
+    CollectResult collect(SpatialQuery& query, size_t maxMountedSubtrees,
                           uint32_t minAge);
-    CollectResult collect(std::span<PageUsageContext* const> usage,
-                          size_t maxAttachedPages, uint32_t minAge);
+    CollectResult collect(std::span<SpatialQuery* const> queries,
+                          size_t maxMountedSubtrees, uint32_t minAge);
 
     // ---- introspection -----------------------------------------------------------
-    size_t   attachedPageCount() const { return attachedPages_; }
-    size_t   streamedPageCount() const { return attachedPages_ - pinnedPages_; }
+    size_t mountedSubtreeCount() const { return mountedSubtrees_; }
+    size_t streamedSubtreeCount() const { return mountedSubtrees_; }
     uint32_t frame() const { return frame_; }   // published update epoch
 
     // Number of live copy-on-write bounds overlays, and the bytes they hold.
@@ -1103,8 +920,8 @@ public:
     size_t overlayCount() const { return liveOverlays_; }
     size_t overlayBytes() const;
     // Retained capacity for mount records, transforms, node state, stamps,
-    // and expansion links. Immutable asset blobs are excluded.
-    size_t mountStateBytes() const;
+    // and expansion links. Immutable Subtree blobs are excluded.
+    size_t subtreeInstanceStateBytes() const;
 
     struct TestAccess;   // defined by tests; full access to internals
 
@@ -1125,53 +942,19 @@ private:
     };
     static_assert(sizeof(NodeRef) == 8, "internal node reference must stay 8 bytes");
 
-    // A registered page: one owning-or-borrowing wrapper around the immutable
-    // bytes plus the bookkeeping that keeps them alive. Page's null allocator
-    // marks borrowed storage, so no duplicate PageView is needed here.
-    struct AssetRt
+    struct SubtreeDefinitionRt
     {
-        static constexpr uint32_t kRegistered = 1u << 31;
-
-        Page     page;
-        uint32_t rootMount = kInvalidIndex;
+        Subtree subtree;
         uint32_t generation = 0;
-        // Low 31 bits count PageRt references; the high bit records the
-        // caller's AssetHandle ownership. Page validity is the in-use flag.
-        uint32_t mountRefsAndRegistered = 0;
-        uint32_t instanceRefs = 0;   // Instances rooted at rootMount
-
-        bool inUse() const { return page.valid(); }
-        bool registered() const
-        {
-            return (mountRefsAndRegistered & kRegistered) != 0;
-        }
-        uint32_t mountRefs() const
-        {
-            return mountRefsAndRegistered & ~kRegistered;
-        }
-        void setRegistered(bool registered)
-        {
-            if (registered) mountRefsAndRegistered |= kRegistered;
-            else mountRefsAndRegistered &= ~kRegistered;
-        }
-        void addMountRef() { ++mountRefsAndRegistered; }
-        void removeMountRef() { --mountRefsAndRegistered; }
-    };
-    static_assert(sizeof(AssetRt) == 112, "asset runtime state must stay 112 bytes");
-
-    // Cold logical metadata parallel to assets_. Legacy page assets leave this
-    // empty. Expansion records are sorted by packed node index.
-    struct SubtreeAssetRt
-    {
-        SubtreeKey key{};
-        std::vector<SubtreeKey> dependencies;
-        std::vector<SubtreeExpansion> expansions;
+        uint32_t mountRefs = 0;
         bool rootLeavesOnly = false;
 
-        bool inUse() const { return key.valid(); }
+        bool inUse() const { return subtree.valid(); }
+        void addMountRef() { ++mountRefs; }
+        void removeMountRef() { --mountRefs; }
     };
 
-    // Asset-local slab for per-mount node state. Repeated placements of one
+    // Definition-local slab for per-mount node state. Repeated placements of one
     // definition have the same node count, so geometric slabs remove one heap
     // allocation per placement while retaining independently mutable state.
     struct NodeStatePoolRt
@@ -1193,23 +976,26 @@ private:
         size_t bytes() const;
     };
 
-    // Accumulated page-local -> top-level-instance-local placement, parallel
+    // Accumulated subtree-local -> top-level-instance-local placement, parallel
     // to mount slots. Root mounts are identity.
     struct MountTransformRt
     {
         static constexpr uint32_t kRootLeavesOnly = 1u << 31;
-        static constexpr uint32_t kAssetMask = ~kRootLeavesOnly;
+        static constexpr uint32_t kDefinitionMask = ~kRootLeavesOnly;
 
         float4 pos = float4::point(0.0f, 0.0f, 0.0f);
         float scale = 1.0f;
         float errClamp = FLT_MAX;
         uint32_t generation = 0;
-        uint32_t assetAndFlags = kAssetMask;
+        uint32_t definitionAndFlags = kDefinitionMask;
 
-        uint32_t asset() const { return assetAndFlags & kAssetMask; }
+        uint32_t definition() const
+        {
+            return definitionAndFlags & kDefinitionMask;
+        }
         bool rootLeavesOnly() const
         {
-            return (assetAndFlags & kRootLeavesOnly) != 0;
+            return (definitionAndFlags & kRootLeavesOnly) != 0;
         }
     };
     static_assert(sizeof(MountTransformRt) == 32,
@@ -1219,13 +1005,13 @@ private:
     // SpatialQuery hits validate the mounted-tree root through contentVersion;
     // descendant mutations propagate there. Handles and overlays validate
     // through generation. Keeping these stamps in a compact parallel stream
-    // avoids fetching a 48-byte PageRt record for every visible instance.
-    struct PageStamp
+    // avoids fetching a 48-byte SubtreeInstanceRt for every visible instance.
+    struct MountStamp
     {
         uint32_t contentVersion = 0;
-        // Page generations use 24 bits in NodeHandle. One spare high bit is
+        // Mount generations use 24 bits in NodeHandle. One spare high bit is
         // the live-mount flag, so dependency validation remains two compact
-        // loads and never has to touch PageRt::asset.
+        // loads and never has to touch SubtreeInstanceRt::definition.
         static constexpr uint32_t kInUse = 1u << 31;
         uint32_t generationAndInUse = 0;
 
@@ -1246,20 +1032,18 @@ private:
             else generationAndInUse &= ~kInUse;
         }
     };
-    static_assert(sizeof(PageStamp) == 8, "page stamp must stay 8 bytes");
+    static_assert(sizeof(MountStamp) == 8, "mount stamp must stay 8 bytes");
 
-    // A mount: one placement of an asset's bytes, with the cold mutable state
-    // that placement needs. There is exactly one mount per (asset, attachment
-    // point) no matter how many instances walk it.
-    struct PageRt
+    // One mounted placement of a definition, with its cold mutable state.
+    struct SubtreeInstanceRt
     {
-        uint32_t              asset = kInvalidIndex;
-        // Effective error ceiling for every node in this page: the owning
-        // expansion node's effective error, or FLT_MAX for a root page.
+        uint32_t definition = kInvalidIndex;
+        // Effective error ceiling for every node in this subtree: the owning
+        // expansion node's effective error, or FLT_MAX before mounting.
         //
-        // The per-attachment scalar is folded into the wide error test. It
-        // lets a single immutable page back mounts with different parent
-        // error ceilings without rewriting the page's node data.
+        // The per-mount scalar is folded into the wide error test. It
+        // lets one immutable Subtree back mounts with different parent error
+        // ceilings without rewriting authored node data.
         float                 errClamp = FLT_MAX;
         // Two flag bits plus the covered-child count share one word. Keeping
         // them together removes an allocation and a pointer chase per mount.
@@ -1268,7 +1052,7 @@ private:
         static constexpr uint16_t kCoveredChildShift = 2;
         uint16_t* nodeState = nullptr;
         // LRU links need 20 bits each and the handle generation needs 24.
-        // Packing all three into one word retains generation beside the page
+        // Packing all three into one word retains generation beside the mount
         // data used by an actual walk without growing this cold record.
         static constexpr uint32_t kLruBits = NodeHandle::kSlotBits;
         static constexpr uint64_t kLruMask = NodeHandle::kSlotMask;
@@ -1278,12 +1062,11 @@ private:
             uint64_t(NodeHandle::kInvalidSlot) |
             (uint64_t(NodeHandle::kInvalidSlot) << kLruNextShift);
         uint32_t   lastTouched = 0;           // database frame of last walk touch
-        static constexpr uint32_t kPinned = 1u << 31;
-        uint32_t   attachedChildrenAndPinned = 0;
-        NodeRef    owner;                     // expansion node above; invalid for root pages
+        uint32_t mountedChildren = 0;
+        NodeRef owner;
         // Sparse-pool index; leaf placements never allocate a child array.
         uint32_t expansionLinks = kInvalidIndex;
-        // Root of this mounted page tree. Occupies what was tail padding and
+        // Root of this mounted subtree tree. Occupies what was tail padding and
         // lets cached traversal coalesce every descendant to one exact stamp.
         uint32_t rootSlot = kInvalidIndex;
 
@@ -1317,7 +1100,7 @@ private:
         {
             nodeState[node] -= 1u << kCoveredChildShift;
         }
-        bool inUse() const { return asset != kInvalidIndex; }
+        bool inUse() const { return definition != kInvalidIndex; }
         uint32_t generation() const
         {
             return uint32_t(lruLinksAndGeneration >> kGenerationShift) &
@@ -1360,23 +1143,12 @@ private:
             lruLinksAndGeneration =
                 (lruLinksAndGeneration & ~mask) | encoded;
         }
-        bool pinned() const
-        {
-            return (attachedChildrenAndPinned & kPinned) != 0;
-        }
-        void setPinned(bool pinned)
-        {
-            if (pinned) attachedChildrenAndPinned |= kPinned;
-            else attachedChildrenAndPinned &= ~kPinned;
-        }
-        uint32_t attachedChildPages() const
-        {
-            return attachedChildrenAndPinned & ~kPinned;
-        }
-        void addAttachedChild() { ++attachedChildrenAndPinned; }
-        void removeAttachedChild() { --attachedChildrenAndPinned; }
+        uint32_t mountedChildSubtrees() const { return mountedChildren; }
+        void addMountedChild() { ++mountedChildren; }
+        void removeMountedChild() { --mountedChildren; }
     };
-    static_assert(sizeof(PageRt) == 48, "mounted-page state must stay 48 bytes");
+    static_assert(sizeof(SubtreeInstanceRt) == 48,
+                  "subtree-instance state must stay 48 bytes");
 
     struct ExpansionLinksRt
     {
@@ -1384,19 +1156,19 @@ private:
     };
 
     // Compact mount-wide summary for the shared-only traversal. A mount tree
-    // is fully resident when every payload-bearing node in this page is
-    // resident and every attached child mount is recursively fully resident.
-    // Keeping this parallel avoids growing the already dense PageRt header.
-    struct PageResidency
+    // is fully resident when every payload-bearing node in this subtree is
+    // resident and every mounted child is recursively fully resident.
+    // Keeping this parallel avoids growing the dense mounted-state header.
+    struct MountResidency
     {
         uint32_t residentNodes = 0;
         uint32_t incompleteChildren = 0;
     };
-    static_assert(sizeof(PageResidency) == 8,
-                  "page residency summary must stay 8 bytes");
+    static_assert(sizeof(MountResidency) == 8,
+                  "mount residency summary must stay 8 bytes");
 
     // Copy-on-write bounds for one (instance, mount) pair: the only part of a
-    // page a deformed instance stops sharing. Allocated on that instance's
+    // subtree a deformed instance stops sharing. Allocated on that instance's
     // first setNodeBounds touching the mount, and on any ancestor mount that
     // the resulting growth propagates into.
     struct Overlay
@@ -1407,10 +1179,10 @@ private:
         uint32_t slot = kInvalidIndex;   // mount this shadows
         uint32_t generation = 0;         // that mount's generation when taken
         std::vector<AABB>       bbox;    // nodeCount
-        // Large-page wide bounds begin sparse: a dense block->patch table plus
+        // Large-subtree wide bounds begin sparse: a dense block->patch table plus
         // only the modified blocks. Once a sixteenth of the blocks change,
         // `wide` is materialized and the sparse storage is released. Smaller
-        // pages start dense because their setup/lookup cost outweighs savings.
+        // subtrees start dense because setup/lookup cost outweighs savings.
         std::vector<WideBounds> wide;          // dense after promotion
         std::vector<uint32_t>   widePatch;     // block -> patchedWide index
         std::vector<WideBounds> patchedWide;   // sparse modified blocks
@@ -1443,7 +1215,6 @@ private:
     struct Instance
     {
         static constexpr uint32_t kAlive = 1u << 31;
-        static constexpr uint32_t kTlasRoot = 1u << 30;
         static constexpr uint32_t kZeroErrorRoot = 1u << 29;
         static constexpr uint32_t kOverlayListMask = kInvalidInstanceId;
 
@@ -1453,7 +1224,7 @@ private:
         float    maxErrWorld = 0.0f;
         uint32_t mask = ~0u;
         uint32_t rootSlot = kInvalidIndex;
-        uint32_t generation = 0;   // stamps InstanceRefs; bumped per reuse
+        uint32_t generation = 0;   // stamps InstanceHandles; bumped per reuse
         uint32_t overlayListAndAlive = kOverlayListMask;
         // TLAS node[24] | lane[3] | escaped[1]. Node count is bounded by the
         // same 24-bit population limit as InstanceId.
@@ -1461,15 +1232,6 @@ private:
         uint32_t liveIndex = kInvalidIndex;
 
         bool alive() const { return (overlayListAndAlive & kAlive) != 0; }
-        bool hasTlasRoot() const
-        {
-            return (overlayListAndAlive & kTlasRoot) != 0;
-        }
-        void setTlasRoot(bool value)
-        {
-            if (value) overlayListAndAlive |= kTlasRoot;
-            else overlayListAndAlive &= ~kTlasRoot;
-        }
         bool hasZeroErrorRoot() const
         {
             return (overlayListAndAlive & kZeroErrorRoot) != 0;
@@ -1498,14 +1260,14 @@ private:
                         "SpatialDatabase: exhausted overlay-list index space");
             overlayListAndAlive =
                 (overlayListAndAlive &
-                 (kAlive | kTlasRoot | kZeroErrorRoot)) |
+                 (kAlive | kZeroErrorRoot)) |
                 index;
         }
         void clearOverlayList()
         {
             overlayListAndAlive =
                 (overlayListAndAlive &
-                 (kAlive | kTlasRoot | kZeroErrorRoot)) |
+                 (kAlive | kZeroErrorRoot)) |
                 kOverlayListMask;
         }
 
@@ -1527,8 +1289,8 @@ private:
                   "coupled instance state must stay 80 bytes");
 
     // nullptr when the ref is stale (slot recycled) or invalid.
-    Instance* resolveInstance(InstanceRef ref);
-    InstanceId denseInstanceId(InstanceRef ref) const;
+    Instance* resolveInstance(InstanceHandle instance);
+    InstanceId denseInstanceId(InstanceHandle instance) const;
     InstanceId publicInstanceId(InstanceId dense) const;
     void moveInstanceDense(InstanceId dense, float4 pos, float scale);
     void refreshMotionGroup(MotionGroup& group) const;
@@ -1541,33 +1303,22 @@ private:
     struct alignas(64) TlasNode
     {
         static constexpr uint32_t kValidLaneMask = (1u << kWide) - 1u;
-        static constexpr uint32_t kSingleRootShift = kWide;
-
         WideBounds bounds;
         int32_t    child[kWide];   // >= 0: node index; < 0: instance ~child
-        // Low eight bits are valid lanes. The next eight mark leaf lanes whose
-        // root page has exactly one renderable BLAS root. Packing the flags
-        // here preserves the four-cache-line hot node layout.
+        // Low eight bits mark valid lanes.
         uint32_t   validMask = 0;
         int32_t    parent = -1;
         float8     maxErr{};
         uint32_t   laneMask[kWide]{};// union of lane subtree instance masks
 
         uint32_t validLanes() const { return validMask & kValidLaneMask; }
-        bool singleRoot(uint32_t lane) const
-        {
-            return (validMask & (1u << (kSingleRootShift + lane))) != 0;
-        }
-        void setLeafLane(uint32_t lane, bool hasSingleRoot)
+        void setLeafLane(uint32_t lane)
         {
             validMask |= 1u << lane;
-            if (hasSingleRoot)
-                validMask |= 1u << (kSingleRootShift + lane);
         }
         void clearLane(uint32_t lane)
         {
-            validMask &= ~((1u << lane) |
-                           (1u << (kSingleRootShift + lane)));
+            validMask &= ~(1u << lane);
         }
     };
     static_assert(offsetof(TlasNode, maxErr) == 256,
@@ -1580,30 +1331,27 @@ private:
     // A TLAS hit is a 24-bit dense instance id plus its six-bit plane mask.
     struct VisibleItem
     {
-        static constexpr uint32_t kRootSelected = 1u << 30;
         uint32_t packed = 0;
 
         VisibleItem() = default;
-        VisibleItem(InstanceId instance, uint8_t mask, bool rootSelected = false)
+        VisibleItem(InstanceId instance, uint8_t mask)
             : packed((instance & kInstanceIdMask) |
-                     (uint32_t(mask & kAllPlanes) << kInstanceIdBits) |
-                     (rootSelected ? kRootSelected : 0u))
+                     (uint32_t(mask & kAllPlanes) << kInstanceIdBits))
         {}
         InstanceId instance() const { return packed & kInstanceIdMask; }
         uint8_t mask() const
         {
             return uint8_t((packed >> kInstanceIdBits) & kAllPlanes);
         }
-        bool rootSelected() const { return (packed & kRootSelected) != 0; }
     };
     static_assert(sizeof(VisibleItem) == 4, "visible TLAS hit must stay 4 bytes");
 
-    // One page queued on an instance walk. Dense bounds are resolved when the
-    // page is pushed; sparse overlays carry an index in the existing padding
+    // One subtree queued on an instance walk. Dense bounds are resolved when
+    // it is pushed; sparse overlays carry an index in existing padding
     // and use a separately instantiated inner loop.
     struct WorkItem
     {
-        WideBoundsRef wide;   // shared bounds, or a dense overlay's packed bounds
+        detail::WideBoundsRef wide;
         // slot[20] | plane mask[6] | current[1] | ideal[1]
         uint32_t      state = 0;
         // Sparse overlay index, or kInvalidIndex. This occupies WorkItem's old
@@ -1611,7 +1359,7 @@ private:
         uint32_t      sparseOverlay = kInvalidIndex;
 
         WorkItem() = default;
-        WorkItem(uint32_t slot, WideBoundsRef bounds, uint8_t current,
+        WorkItem(uint32_t slot, detail::WideBoundsRef bounds, uint8_t current,
                  uint8_t ideal, uint8_t mask,
                  uint32_t sparse = kInvalidIndex)
             : wide(bounds),
@@ -1629,7 +1377,7 @@ private:
         bool current() const { return (state & (1u << 26)) != 0; }
         bool ideal() const { return (state & (1u << 27)) != 0; }
     };
-    static_assert(sizeof(WorkItem) == 24, "page work item must stay 24 bytes");
+    static_assert(sizeof(WorkItem) == 24, "subtree work item must stay 24 bytes");
 
     // Node visit carried on the walk's explicit DFS stack; err and planes are
     // computed by the parent's wide test; current/ideal identify which walks
@@ -1684,7 +1432,7 @@ private:
                 result.idealOnly.push(entry);
         }
 
-        std::vector<uint32_t> touched;      // tree dependencies or optional page usage
+        std::vector<uint32_t> touched;      // tree dependencies or optional mount usage
         bool trackTouches = false;
         bool uniqueTouches = false;         // SpatialQuery dependency list
         bool coalesceMountTreeDependencies = false;
@@ -1700,21 +1448,19 @@ private:
     };
 
     // ---- helpers ----
-    // Live PageRt for a handle, or nullptr if the handle is stale/foreign.
-    const PageRt* resolve(NodeHandle h) const;
-    PageRt*       resolve(NodeHandle h)
+    const SubtreeInstanceRt* resolve(NodeHandle h) const;
+    SubtreeInstanceRt* resolve(NodeHandle h)
     {
-        return const_cast<PageRt*>(static_cast<const SpatialDatabase*>(this)->resolve(h));
+        return const_cast<SubtreeInstanceRt*>(
+            static_cast<const SpatialDatabase*>(this)->resolve(h));
     }
     InstanceId resolveTlasRoot(NodeHandle h) const;
 
-    uint32_t allocAsset();
-    uint32_t createAsset(Page&& page, bool registered);
-    void     destroyAssetIfUnused(uint32_t asset);
-    const AssetRt* resolveAsset(AssetHandle h) const;
-    const SubtreeAssetRt* resolveSubtree(SubtreeHandle h) const;
-    const SubtreeExpansion* findSubtreeExpansion(uint32_t asset,
-                                                  uint32_t node) const;
+    uint32_t allocSubtree();
+    void destroySubtree(uint32_t definition);
+    const SubtreeDefinitionRt* resolveSubtree(SubtreeHandle h) const;
+    const detail::SubtreeExpansion* findSubtreeExpansion(
+        uint32_t definition, uint32_t node) const;
     static constexpr uint32_t kMountTreeDependency = 1u << 31;
     uint32_t traversalDependency(uint32_t slot) const;
     void recordTraversalDependency(Worker& worker, uint32_t slot) const;
@@ -1722,25 +1468,28 @@ private:
     bool dependencyMatches(uint32_t dependency, uint32_t version) const;
     void bumpContentVersion(uint32_t slot);
 
-    const PageView& pageView(const PageRt& rt) const
+    const Subtree& subtreeView(const SubtreeInstanceRt& instance) const
     {
-        return assets_[rt.asset].page;
+        return subtrees_[instance.definition].subtree;
     }
 
     uint32_t allocSlot();
-    uint32_t registerPage(uint32_t asset, NodeRef owner, bool pinned);
-    const std::vector<uint32_t>* expansionSlots(const PageRt& page) const;
+    uint32_t registerMount(uint32_t definition, NodeRef owner);
+    const std::vector<uint32_t>* expansionSlots(
+        const SubtreeInstanceRt& instance) const;
     std::vector<uint32_t>& ensureExpansionSlots(uint32_t slot);
-    uint32_t attachedChildSlot(const PageRt& page, uint32_t node) const;
-    void releaseExpansionSlots(PageRt& page);
-    PageHandle attachPageTransformed(NodeHandle expansionNode, uint32_t asset,
-                                     const SubtreeTransform& transform);
-    MountHandle mountTlasRoot(InstanceId dense, SubtreeHandle subtree,
-                              const SubtreeTransform& transform);
-    void     detachSlot(uint32_t slot, AppendBuffer<UserPayload>* freedPayloads);
-    void     detachMountTree(uint32_t rootSlot,
+    uint32_t mountedChildSlot(const SubtreeInstanceRt& instance,
+                               uint32_t node) const;
+    void releaseExpansionSlots(SubtreeInstanceRt& instance);
+    SubtreeInstanceHandle mountTransformed(NodeHandle parent,
+                                           uint32_t definition,
+                                           const Transform& transform);
+    SubtreeInstanceHandle mountTlasRoot(InstanceId dense,
+                                        SubtreeHandle subtree,
+                                        const Transform& transform);
+    void     unmountSlot(uint32_t slot, AppendBuffer<UserPayload>* freedPayloads);
+    void     unmountTree(uint32_t rootSlot,
                              AppendBuffer<UserPayload>* freedPayloads);
-    void     pinRootPayloads(uint32_t slot);
     bool     descendantsCovered(uint32_t slot, uint32_t node) const;
     bool     computeCovered(uint32_t slot, uint32_t node) const;
     void     propagateCoverage(uint32_t slot, uint32_t node);
@@ -1748,8 +1497,8 @@ private:
     void lruUnlink(uint32_t slot);
     void lruPushFront(uint32_t slot);
     void lruTouch(uint32_t slot, uint32_t epoch);
-    void consumePageUsage(PageUsageContext& usage);
-    void consumePageUsage(std::span<PageUsageContext* const> usage);
+    void consumeMountUsage(SpatialQuery& query);
+    void consumeMountUsage(std::span<SpatialQuery* const> queries);
     static FrontierResultSink makeSink(detail::FrontierBuffers& buffers)
     {
         return {Sink<FrontierEntry>(buffers.shared),
@@ -1759,21 +1508,24 @@ private:
 
     // ---- copy-on-write bounds ----
     // Live overlay for (instance, slot), or nullptr. Stale overlays (the
-    // mount was detached and its slot reused) report as absent.
+    // mount was removed and its slot reused) report as absent.
     const Overlay* findOverlay(const Instance& inst, uint32_t slot) const;
     // Same, but takes the copy if it is not there yet. Returns an INDEX, not a
     // reference: taking one overlay can reallocate the pool and invalidate a
-    // reference to another, and refit holds two at a time as it crosses a page
+    // reference to another, and refit holds two at a time as it crosses a mount
     // boundary.
     uint32_t       ensureOverlay(Instance& inst, uint32_t slot);
-    void           initOverlay(Overlay& ov, uint32_t slot, const PageRt& rt);
-    WideBounds&    mutableWideBounds(Overlay& ov, const PageView& page,
+    void initOverlay(Overlay& ov, uint32_t slot,
+                     const SubtreeInstanceRt& instance);
+    WideBounds& mutableWideBounds(Overlay& ov, const Subtree& subtree,
                                      uint32_t block);
     void           freeOverlays(Instance& inst);
     // Effective bounds for a walk of `slot` by `inst`.
-    const AABB*    boundsFor(const Instance& inst, uint32_t slot, const PageRt& rt) const;
-    WideBoundsRef  wideBoundsFor(const Instance& inst, uint32_t slot,
-                                 const PageRt& rt, uint32_t* sparseOverlay) const;
+    const AABB* boundsFor(const Instance& inst, uint32_t slot,
+                          const SubtreeInstanceRt& instance) const;
+    detail::WideBoundsRef wideBoundsFor(
+        const Instance& inst, uint32_t slot,
+        const SubtreeInstanceRt& instance, uint32_t* sparseOverlay) const;
     WorkItem       makeWorkItem(uint32_t slot, const Instance& inst,
                                 uint8_t current, uint8_t ideal,
                                 uint8_t mask) const;
@@ -1781,26 +1533,24 @@ private:
     bool mountBelongsTo(const Instance& inst, uint32_t slot) const;
 
     void applyBoundsChange(InstanceId id, uint32_t slot, uint32_t index, const AABB& box);
-    void patchParentLane(const PageView& pg, AABB* bbox, Overlay& overlay,
+    void patchParentLane(const Subtree& subtree, AABB* bbox, Overlay& overlay,
                          uint32_t index);
     void refreshInstanceBounds(InstanceId id, bool recomputeError);
 
-    InstanceRef addInstanceInternal(uint32_t asset, const InstanceDesc& desc);
-    InstanceRef addTlasRootInstance(const RootNodeDesc& root,
-                                    const InstanceDesc& desc);
+    InstanceHandle addTlasRootInstance(const NodeDesc& root,
+                                       const InstanceDesc& desc);
 
     void markTlasStructuralChange();
     void tlasRebuild(bool reorderInstances);
     int32_t tlasBuildRange(std::vector<uint32_t>& items, int lo, int hi, int32_t parent);
     int  tlasSplit(std::vector<uint32_t>& items, int lo, int hi);
-    void tlasQuery(const Camera& view, float minPix, float rootThreshold,
+    void tlasQuery(const Camera& view, float minPix,
                    std::vector<VisibleItem>& outVisible,
                    std::vector<TlasItem>& stack) const;
-    template<bool UseMask, bool UseMinPix, bool SelectRoots>
-    void tlasQueryImpl(const Camera& view, float minPix, float rootThreshold,
+    template<bool UseMask, bool UseMinPix>
+    void tlasQueryImpl(const Camera& view, float minPix,
                        std::vector<VisibleItem>& outVisible,
                        std::vector<TlasItem>& stack) const;
-    bool instanceHasSingleRoot(InstanceId id) const;
     void recomputeInstanceBounds(InstanceId id, bool recomputeError);
     void tlasOnInstanceMoved(InstanceId id);
     void tlasNoteGrowth(float addedArea);
@@ -1824,12 +1574,8 @@ private:
                                    Worker* dependencyWorker = nullptr) const;
     Camera mountLocalCamera(const Camera& rootLocal, uint32_t slot,
                             uint8_t mask) const;
-    bool pageTreeFullyResident(uint32_t slot) const;
+    bool mountedTreeFullyResident(uint32_t slot) const;
     void propagateFullResidency(uint32_t slot, bool wasFullyResident);
-    void runInstance(uint32_t instIdx, const Camera& view, const SelectionParams& params,
-                     uint8_t mask, bool tryRoot, Worker& w) const;
-    void runFlatInstance(uint32_t instIdx, const Camera& view,
-                         uint8_t mask, Worker& w) const;
     void runTlasFlatInstance(uint32_t instIdx, const Camera& view,
                              uint8_t mask, Worker& w) const;
     void runZeroErrorTlasFlatInstance(uint32_t instIdx, const Camera& view,
@@ -1838,55 +1584,54 @@ private:
                              const SelectionParams& params, uint8_t mask,
                              Worker& w) const;
     template<bool FullyResident>
-    void runPage(const WorkItem& item, const Instance& inst, const Camera& local,
-                 const SelectionParams& params, Worker& w) const;
+    void runSubtree(const WorkItem& item, const Instance& inst,
+                    const Camera& local, const SelectionParams& params,
+                    Worker& w) const;
     template<bool FullyResident, bool SparseOverlay>
-    void runPageImpl(const WorkItem& item, const Instance& inst,
-                     const Camera& local, const SelectionParams& params,
-                     Worker& w) const;
+    void runSubtreeImpl(const WorkItem& item, const Instance& inst,
+                        const Camera& local,
+                        const SelectionParams& params, Worker& w) const;
     template<bool FullyResident, bool SparseOverlay>
-    void wideVisit(const WorkItem& item, const PageView& pg, float errClamp,
+    void wideVisit(const WorkItem& item, const Subtree& subtree, float errClamp,
                    uint32_t gen, InstanceId instance, uint32_t node, uint8_t mask,
                    uint8_t currentKids, uint8_t idealKids,
                    const Camera& local, Worker& w) const;
     void emitMountedRootLeavesInside(const WorkItem& item,
-                                     const PageView& page, float errClamp,
+                                     const Subtree& subtree, float errClamp,
                                      uint32_t generation,
                                      InstanceId instance, float4 qmn,
                                      float4 qmx, float cameraK,
                                      Worker& w) const;
-    void emitMountedLeafBatchInside(const PageRt& owner,
-                                    const PageView& ownerPage,
+    void emitMountedLeafBatchInside(const SubtreeInstanceRt& owner,
+                                    const Subtree& ownerSubtree,
                                     NodeItem first, size_t stackBase,
                                     InstanceId instance,
                                     const Camera& rootLocal,
                                     Worker& w) const;
     void selectFrontierCached(const Camera& camera, const SelectionParams& params,
-                         SpatialQuery& query, PageUsageContext* usage,
+                         SpatialQuery& query, SpatialQuery* usage,
                          FrontierResultSink& outResult) const;
     void selectFrontierUncached(const Camera& camera, const SelectionParams& params,
-                           SpatialQuery& query, PageUsageContext* usage,
+                           SpatialQuery& query, SpatialQuery* usage,
                            FrontierResultSink& outResult) const;
-    void recordPageUsage(PageUsageContext& usage, uint32_t slot) const;
+    void recordMountUsage(SpatialQuery& query, uint32_t slot) const;
 
     // ---- state ----
     SpatialDatabaseConfig config_;
 
-    std::vector<AssetRt>  assets_;
-    std::vector<SubtreeAssetRt> subtreeAssets_;
+    std::vector<SubtreeDefinitionRt> subtrees_;
     std::vector<NodeStatePoolRt> nodeStatePools_;
-    std::vector<uint32_t> freeAssets_;
-    size_t                liveAssets_ = 0;
+    std::vector<uint32_t> freeSubtrees_;
+    size_t liveSubtrees_ = 0;
 
-    std::vector<PageRt>   slots_;
+    std::vector<SubtreeInstanceRt> slots_;
     std::vector<MountTransformRt> mountTransforms_;
-    std::vector<PageStamp> pageStamps_;
-    std::vector<PageResidency> pageResidency_;
+    std::vector<MountStamp> mountStamps_;
+    std::vector<MountResidency> mountResidency_;
     std::vector<ExpansionLinksRt> expansionLinks_;
     std::vector<uint32_t> freeExpansionLinks_;
     std::vector<uint32_t> freeSlots_;
-    size_t                attachedPages_ = 0;
-    size_t                pinnedPages_ = 0;
+    size_t mountedSubtrees_ = 0;
     uint32_t              generationCounter_ = 0;
 
     std::vector<Instance> instances_;
@@ -1894,21 +1639,21 @@ private:
     // targets remain entirely unallocated until one root is extendable.
     std::vector<UserPayload> tlasRootPayloads_;
     std::vector<SubtreeKey> tlasRootTargets_;
-    // Root mount for exact one-node assets, kInvalidIndex otherwise; a cold
+    std::vector<Transform> tlasRootChildTransforms_;
+    // Packed TLAS-root marker for exact one-node instances; a cold
     // high bit also records the common zero-error case. Keeping this as a
     // lazily allocated compact stream lets mixed forests bypass the 64-byte
     // Instance and 256-byte WideBlock records for flat objects. Databases that
     // have never contained a flat instance allocate no stream at all.
     std::vector<uint32_t> instanceFlatSlots_;
     size_t                flatInstanceCount_ = 0;
-    size_t                tlasFlatInstanceCount_ = 0;
     size_t                tlasZeroErrorFlatInstanceCount_ = 0;
     // Cache hits need only this stamp, not the 80-byte Instance record. It is
     // parallel to instances_ and bumped for transform or deformation changes.
     std::vector<uint32_t> instanceFrontierVersions_;
     std::vector<InstanceId> liveInstances_;
     std::vector<uint32_t> freeInstances_;
-    // Public InstanceRef/FrontierEntry ids remain stable while optimize() or the
+    // Public InstanceHandle/FrontierEntry ids remain stable while optimize() or the
     // first non-empty build permutes dense storage into TLAS traversal order.
     std::vector<InstanceId> instanceHandleToDense_;
     std::vector<InstanceId> instanceDenseToHandle_;
@@ -1937,9 +1682,9 @@ private:
     uint32_t lruHead_ = kInvalidIndex, lruTail_ = kInvalidIndex;
     uint32_t frame_ = 0;
     // Submitted bounds in submission order. The generation stamps make
-    // entries self-invalidating: if the page detached (or either slot was
+    // entries self-invalidating: if the subtree was unmounted (or either slot was
     // reused) before the flush, the entry is skipped instead of applying to
-    // the wrong page or the wrong instance.
+    // the wrong subtree or the wrong instance.
     struct PendingMove
     {
         AABB       box;

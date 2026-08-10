@@ -100,7 +100,7 @@ powercfg /getactivescheme >> "%REPORT_DIR%\hardware.txt" 2>&1
     echo.
     echo Real world:
     echo   frontier_bench
-    echo     --benchmark_filter=BM_^(SpatialQuery_Breakdown^|SpatialQuery_MultiQuery^|FlatForest100k^|MixedForest100k^|RootDecisionForest100k^)
+    echo     --benchmark_filter=BM_SubtreeAssembly
     echo     --benchmark_repetitions=5
     echo     --benchmark_report_aggregates_only=true
     echo.
@@ -178,7 +178,7 @@ if not "!RUN_RC!"=="0" goto package
 set "FAILURE_STAGE=real-world-benchmarks"
 echo Running real-world performance suite...
 "%BENCH_EXE%" ^
-    --benchmark_filter="BM_(SpatialQuery_Breakdown|SpatialQuery_MultiQuery|FlatForest100k|MixedForest100k|RootDecisionForest100k)" ^
+    --benchmark_filter="BM_SubtreeAssembly" ^
     --benchmark_repetitions=5 ^
     --benchmark_report_aggregates_only=true ^
     --benchmark_out="%REPORT_DIR%\real_world_perf.json" ^
@@ -247,7 +247,7 @@ for /f "delims=" %%I in ('git -c "safe.directory=%GIT_ROOT%" -C "%ROOT%" status 
     echo.
     echo ## Result files
     echo.
-    echo - real_world_perf.json: end-to-end, real-world-like workloads
+    echo - real_world_perf.json: end-to-end subtree assembly workloads
     echo - machine_perf.json: ALU, SIMD, branch, cache, latency, and bandwidth probes
     echo - arch_kernel_perf.json: focused production-kernel probes with longer sampling
     echo - tests.log: correctness-suite result

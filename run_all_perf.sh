@@ -68,7 +68,7 @@ write_report()
 
 ## Result files
 
-- \`real_world_perf.json\`: end-to-end, real-world-like workloads
+- \`real_world_perf.json\`: end-to-end subtree assembly workloads
 - \`machine_perf.json\`: ALU, SIMD, branch, cache, latency, and bandwidth probes
 - \`arch_kernel_perf.json\`: focused production-kernel probes with longer sampling
 - \`tests.log\`: correctness-suite result
@@ -203,7 +203,7 @@ Correctness:
 
 Real world:
   frontier_bench
-    --benchmark_filter=BM_(SpatialQuery_Breakdown|SpatialQuery_MultiQuery|FlatForest100k|MixedForest100k|RootDecisionForest100k)
+    --benchmark_filter=BM_SubtreeAssembly
     --benchmark_repetitions=5
     --benchmark_report_aggregates_only=true
 
@@ -308,7 +308,7 @@ ctest --test-dir "${BUILD_DIR}" -C Release --output-on-failure 2>&1 |
 failure_stage=real-world-benchmarks
 echo "Running real-world performance suite..."
 "${bench_exe}" \
-    '--benchmark_filter=BM_(SpatialQuery_Breakdown|SpatialQuery_MultiQuery|FlatForest100k|MixedForest100k|RootDecisionForest100k)' \
+    '--benchmark_filter=BM_SubtreeAssembly' \
     --benchmark_repetitions=5 \
     --benchmark_report_aggregates_only=true \
     "--benchmark_out=${report_dir}/real_world_perf.json" \

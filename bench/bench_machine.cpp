@@ -501,7 +501,7 @@ static void runCacheHitValidation(benchmark::State& state)
     for (uint32_t i = 0; i < kRecords; ++i)
     {
         // Five percent of records conservatively miss because their instance
-        // is not wholly inside the frustum; the rest take the common one-page
+        // is not wholly inside the frustum; the rest take the common one-subtree
         // cache-hit path used by the cached forest benchmarks.
         const uint32_t mask = (i % 20u) == 0 ? 1u : 0u;
         visible[i] = i | (mask << 24);
