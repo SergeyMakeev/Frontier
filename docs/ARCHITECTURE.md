@@ -139,6 +139,13 @@ keep that physical order to avoid turning maintenance into a data shuffle.
 slots, performs a quality rebuild, and restores spatial instance/SpatialQuery-record
 locality after disruptive changes such as a teleport or level transition.
 
+Each spatially ordered 80-byte instance record keeps translation/scale beside
+the exact world bound derived from them, along with root-selection and TLAS
+back-pointer state. Compared with separate 32-byte selection and 48-byte TLAS
+streams, this removes parallel-array maintenance and improves transform-heavy
+updates. The tradeoff is a wider stride during uncommon full TLAS rebuilds;
+steady traversal remains effectively unchanged.
+
 `MotionGroup` serves a persistent cohort whose caller-visible order is fixed.
 It caches the corresponding physical order so per-frame transform submission
 touches instance and TLAS state coherently, and refreshes that mapping after a

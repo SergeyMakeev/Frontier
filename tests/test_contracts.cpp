@@ -708,7 +708,6 @@ TEST(Contracts, MemoryBudgets)
     RecordProperty("overlay_bytes", int(TA::overlayBytes()));
     RecordProperty("overlay_list_bytes", int(TA::overlayListBytes()));
     RecordProperty("instance_bytes", int(TA::instanceBytes()));
-    RecordProperty("instance_tlas_bytes", int(TA::instanceTlasBytes()));
     RecordProperty("tlas_node_bytes", int(TA::tlasNodeBytes()));
     RecordProperty("work_item_bytes", int(TA::workItemBytes()));
     RecordProperty("node_item_bytes", int(TA::nodeItemBytes()));
@@ -721,8 +720,7 @@ TEST(Contracts, MemoryBudgets)
     EXPECT_EQ(TA::pageResidencyBytes(), 8u);
     EXPECT_EQ(TA::overlayBytes(), 104u);
     EXPECT_EQ(TA::overlayListBytes(), 24u);
-    EXPECT_EQ(TA::instanceBytes(), 32u);
-    EXPECT_EQ(TA::instanceTlasBytes(), 48u);
+    EXPECT_EQ(TA::instanceBytes(), 80u);
     EXPECT_EQ(TA::tlasNodeBytes(), 320u);
     EXPECT_EQ(TA::workItemBytes(), 24u);
     EXPECT_EQ(TA::nodeItemBytes(), 8u);

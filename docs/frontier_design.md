@@ -537,11 +537,20 @@ ones. No selection may overlap a SpatialDatabase mutation, another `applyUpdates
 
 The top level is an 8-wide dynamic BVH over live placements of independent
 renderable roots, including page-free one-node hierarchies. Parallel root
-records own payload identity; maintenance arrays store world bounds, maximum
-effective error, layer masks, and parent/lane back-pointers separately from the
-selection-path instance record. Internal TLAS BVH nodes have no renderable
-payload and are never selected. A surviving leaf identifies its renderable root
-and optional mounted descendant hierarchy.
+records own payload identity. One spatially ordered 80-byte instance record
+couples translation/scale with its derived exact world bound, maximum effective
+error, layer mask, root state, and parent/lane back-pointer. Internal TLAS BVH
+nodes have no renderable payload and are never selected. A surviving leaf
+identifies its renderable root and optional mounted descendant hierarchy.
+
+An experiment against separate 32-byte selection and 48-byte TLAS streams found
+ordinary traversal neutral, while a balanced 80k-instance workload with 4,000
+moves per frame reduced transform submission by about 7% and the complete frame
+by about 3%. A forced 100k-instance Morton rebuild became about 3% slower because
+its bounds-only scan has the wider record stride. The coupled record is retained
+because motion is a steady-frame operation, full rebuilds are exceptional safe-
+point work, and eliminating the parallel stream also simplifies allocation,
+compaction, and physical reordering.
 
 The first `applyUpdates` builds the configured quality tier before publishing
 the selection snapshot:

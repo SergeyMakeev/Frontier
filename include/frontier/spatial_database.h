@@ -1436,9 +1436,10 @@ private:
     static_assert(sizeof(OverlayList) == 24,
                   "cold overlay-list header must stay 24 bytes");
 
-    // The frontier walk's common per-instance state. Overlay-list headers live in a
-    // cold pool allocated only for deformed instances; the high bit in that
-    // pool index is the live flag. TLAS-only state remains in InstanceTlas.
+    // Instance transform and its derived exact world bound are updated
+    // together, so selection and TLAS-edit state share one spatially ordered
+    // record. Overlay-list headers remain in a cold pool allocated only for
+    // deformed instances.
     struct Instance
     {
         static constexpr uint32_t kAlive = 1u << 31;
@@ -1447,10 +1448,17 @@ private:
         static constexpr uint32_t kOverlayListMask = kInvalidInstanceId;
 
         float4   pos{};
+        AABB     worldBox;
         float    scale = 1.0f;
+        float    maxErrWorld = 0.0f;
+        uint32_t mask = ~0u;
         uint32_t rootSlot = kInvalidIndex;
         uint32_t generation = 0;   // stamps InstanceRefs; bumped per reuse
         uint32_t overlayListAndAlive = kOverlayListMask;
+        // TLAS node[24] | lane[3] | escaped[1]. Node count is bounded by the
+        // same 24-bit population limit as InstanceId.
+        uint32_t tlasPlacement = kInvalidInstanceId;
+        uint32_t liveIndex = kInvalidIndex;
 
         bool alive() const { return (overlayListAndAlive & kAlive) != 0; }
         bool hasTlasRoot() const
@@ -1500,25 +1508,6 @@ private:
                  (kAlive | kTlasRoot | kZeroErrorRoot)) |
                 kOverlayListMask;
         }
-    };
-    static_assert(sizeof(Instance) == 32, "selection-path Instance must stay 32 bytes");
-
-    // State used only while building, editing, or refitting the TLAS. Keeping
-    // it parallel preserves dense indexing without charging the selection loop for
-    // bytes it never reads.
-    struct InstanceTlas
-    {
-        AABB     worldBox;
-        float    maxErrWorld = 0.0f;
-        uint32_t mask = ~0u;
-        // TLAS node[24] | lane[3] | escaped[1]. Node count is bounded by the
-        // same 24-bit population limit as InstanceId; the high bits were
-        // otherwise padding and cold flags.
-        uint32_t tlasPlacement = kInvalidInstanceId;
-        uint32_t liveIndex = kInvalidIndex;
-        // Escape budgeting is population-based: once this instance has grown
-        // beyond its build-time lane, later growth before the next rebuild
-        // must not charge the same leaf again.
 
         uint32_t tlasNode() const { return tlasPlacement & kInstanceIdMask; }
         uint32_t tlasLane() const { return (tlasPlacement >> 24) & 7u; }
@@ -1534,8 +1523,8 @@ private:
             else tlasPlacement &= ~(1u << 27);
         }
     };
-    static_assert(sizeof(InstanceTlas) == 48,
-                   "TLAS instance state must stay 48 bytes");
+    static_assert(sizeof(Instance) == 80,
+                  "coupled instance state must stay 80 bytes");
 
     // nullptr when the ref is stale (slot recycled) or invalid.
     Instance* resolveInstance(InstanceRef ref);
@@ -1901,7 +1890,6 @@ private:
     uint32_t              generationCounter_ = 0;
 
     std::vector<Instance> instances_;
-    std::vector<InstanceTlas> instanceTlas_;
     // Cold root identity streams. Payload exists after the first TLAS root;
     // targets remain entirely unallocated until one root is extendable.
     std::vector<UserPayload> tlasRootPayloads_;
@@ -1915,7 +1903,7 @@ private:
     size_t                flatInstanceCount_ = 0;
     size_t                tlasFlatInstanceCount_ = 0;
     size_t                tlasZeroErrorFlatInstanceCount_ = 0;
-    // Cache hits need only this stamp, not the 32-byte Instance record. It is
+    // Cache hits need only this stamp, not the 80-byte Instance record. It is
     // parallel to instances_ and bumped for transform or deformation changes.
     std::vector<uint32_t> instanceFrontierVersions_;
     std::vector<InstanceId> liveInstances_;

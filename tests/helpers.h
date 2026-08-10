@@ -137,7 +137,6 @@ struct SpatialDatabase::TestAccess
     static size_t overlayBytes() { return sizeof(Overlay); }
     static size_t overlayListBytes() { return sizeof(OverlayList); }
     static size_t instanceBytes() { return sizeof(Instance); }
-    static size_t instanceTlasBytes() { return sizeof(InstanceTlas); }
     static size_t tlasNodeBytes() { return sizeof(TlasNode); }
     static size_t workItemBytes() { return sizeof(WorkItem); }
     static size_t nodeItemBytes() { return sizeof(NodeItem); }
@@ -200,7 +199,7 @@ struct SpatialDatabase::TestAccess
     {
         w.flushBounds();
         const Instance* inst = w.resolveInstance(ref);
-        return inst ? w.instanceTlas_[size_t(inst - w.instances_.data())].worldBox
+        return inst ? w.instances_[size_t(inst - w.instances_.data())].worldBox
                     : AABB::empty();
     }
     // The runtime state a mount holds, which every instance of the asset
@@ -239,10 +238,9 @@ struct SpatialDatabase::TestAccess
         size_t alive = 0;
         for (const SpatialDatabase::Instance& i : w.instances_)
             if (i.alive()) ++alive;
-        if (w.instanceTlas_.size() != w.instances_.size() ||
-            (!w.instanceFlatSlots_.empty() &&
+        if ((!w.instanceFlatSlots_.empty() &&
              w.instanceFlatSlots_.size() != w.instances_.size()))
-            return "instance hot/cold arrays differ in size";
+            return "instance/flat-marker arrays differ in size";
         size_t flat = 0;
         for (uint32_t id = 0; id < uint32_t(w.instances_.size()); ++id)
             if (!w.instanceFlatSlots_.empty() && w.instances_[id].alive() &&
@@ -259,7 +257,7 @@ struct SpatialDatabase::TestAccess
             if (id >= w.instances_.size()) return "dense live list names no instance";
             if (!w.instances_[id].alive()) return "dense live list contains dead instance";
             if (listed[id]++) return "dense live list contains an instance twice";
-            if (w.instanceTlas_[id].liveIndex != dense)
+            if (w.instances_[id].liveIndex != dense)
                 return "dense live-list back-pointer disagrees";
         }
         if (w.tlasRoot_ < 0)
@@ -286,16 +284,15 @@ struct SpatialDatabase::TestAccess
                     const uint32_t id = uint32_t(~n.child[l]);
                     if (id >= w.instances_.size()) return "lane names no instance";
                     const SpatialDatabase::Instance& inst = w.instances_[id];
-                    const SpatialDatabase::InstanceTlas& spatial = w.instanceTlas_[id];
                     if (!inst.alive()) return "dead instance still in the tree";
                     if (seen[id]++) return "instance in the tree twice";
-                    if (spatial.tlasNode() != uint32_t(ni) || spatial.tlasLane() != l)
+                    if (inst.tlasNode() != uint32_t(ni) || inst.tlasLane() != l)
                         return "instance back-pointer disagrees with its lane";
-                    if (!lane.contains(spatial.worldBox))
+                    if (!lane.contains(inst.worldBox))
                         return "lane does not contain its instance";
-                    if ((n.laneMask[l] & spatial.mask) != spatial.mask)
+                    if ((n.laneMask[l] & inst.mask) != inst.mask)
                         return "lane mask drops layers its instance is on";
-                    if (n.maxErr.v[l] < spatial.maxErrWorld)
+                    if (n.maxErr.v[l] < inst.maxErrWorld)
                         return "lane error below its instance's";
                     if (n.singleRoot(l) != w.instanceHasSingleRoot(id))
                         return "lane single-root flag disagrees with its instance";
@@ -355,15 +352,14 @@ struct SpatialDatabase::TestAccess
         {
             const Instance& inst = w.instances_[id];
             if (!inst.alive()) continue;
-            const InstanceTlas& spatial = w.instanceTlas_[id];
             uint8_t mask = kAllPlanes;
-            if (testAabb(spatial.worldBox, view.frustum, mask) == CullState::Outside)
+            if (testAabb(inst.worldBox, view.frustum, mask) == CullState::Outside)
                 continue;
             if (p.minPix > 0.0f)
             {
                 const float e = screenError(
-                    spatial.maxErrWorld, view.k,
-                    distanceToBox(spatial.worldBox, view.queryMin(), view.queryMax()));
+                    inst.maxErrWorld, view.k,
+                    distanceToBox(inst.worldBox, view.queryMin(), view.queryMax()));
                 if (e < p.minPix) continue;
             }
             const Camera local = toLocal(view, inst.pos, inst.scale);
