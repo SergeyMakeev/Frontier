@@ -1,7 +1,8 @@
 # Frontier architecture
 
 This document describes the current implementation. Public workflows are in
-[API.md](API.md); behavioral contracts are in
+the [API guide](API.md), exact signatures are in the
+[API reference](API_REFERENCE.md), and behavioral contracts are in
 [frontier_design.md](frontier_design.md).
 
 ## Spatial structure

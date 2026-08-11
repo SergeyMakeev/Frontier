@@ -1,7 +1,8 @@
 # Frontier design contracts
 
-This document states the behavioral invariants behind the public API. See
-[API.md](API.md) for usage and [ARCHITECTURE.md](ARCHITECTURE.md) for layout.
+This document states the behavioral invariants behind the public API. See the
+[API guide](API.md) for usage, [API reference](API_REFERENCE.md) for exact
+signatures, and [ARCHITECTURE.md](ARCHITECTURE.md) for layout.
 
 ## 1. One real root
 

@@ -3,9 +3,10 @@
 > This is a historical engineering record. Names, measurements, APIs, and
 > implementation details below describe the revision under discussion and may
 > no longer be current. Use [README.md](../README.md) for the overview,
-> [API.md](API.md) for the public API, [ARCHITECTURE.md](ARCHITECTURE.md) for the
-> current implementation, and [frontier_design.md](frontier_design.md) for the current
-> behavioral contract.
+> the [API guide](API.md) for integration, the
+> [API reference](API_REFERENCE.md) for exact signatures,
+> [ARCHITECTURE.md](ARCHITECTURE.md) for the current implementation, and
+> [frontier_design.md](frontier_design.md) for the current behavioral contract.
 
 This document preserves the optimization experiments and measurements that
 shaped the library. It is evidence and rationale, not integration guidance.

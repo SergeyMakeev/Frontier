@@ -137,6 +137,7 @@ ctest --test-dir build --output-on-failure
 Important options are `FRONTIER_BUILD_TESTS`, `FRONTIER_BUILD_BENCH`,
 `FRONTIER_AVX2`, and `FRONTIER_FORCE_SCALAR`.
 
-See [API.md](docs/API.md) for the complete workflow,
+See the progressive [API guide](docs/API.md) for the integration flow, the
+exhaustive [API reference](docs/API_REFERENCE.md) for exact contracts,
 [ARCHITECTURE.md](docs/ARCHITECTURE.md) for implementation details, and
 [BENCHMARKING.md](docs/BENCHMARKING.md) for measurement guidance.
