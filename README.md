@@ -46,14 +46,14 @@ SubtreeBuilder cityBuilder;
 const auto leftHouse = cityBuilder.createNode(NodeDesc{
     .payload = 10,
     .geometricError = 16.0f,
-    .bounds = leftHouseBoundsInCity,
     .mountable = true,
+    .bounds = leftHouseBoundsInCity,
 });
 const auto rightHouse = cityBuilder.createNode(NodeDesc{
     .payload = 11,
     .geometricError = 16.0f,
-    .bounds = rightHouseBoundsInCity,
     .mountable = true,
+    .bounds = rightHouseBoundsInCity,
 });
 const SubtreeHandle city =
     world.registerSubtree(cityBuilder.build());
@@ -61,8 +61,8 @@ const SubtreeHandle city =
 const InstanceHandle cityInstance = world.instantiate(NodeDesc{
     .payload = 1,
     .geometricError = 64.0f,
-    .bounds = cityBounds,
     .mountable = true,
+    .bounds = cityBounds,
 });
 const SubtreeInstanceHandle cityPlacement =
     world.mountSubtree(cityInstance.rootNode(), city);

@@ -32,7 +32,7 @@ SubtreeBuilder::NodeId SubtreeBuilder::createNode(NodeId parent,
                        std::isfinite(node.geometricError),
                    "SubtreeBuilder: invalid geometric error");
     if (parent != kInvalidIndex)
-        FRONTIER_CHECK(!nodes_[parent].mountable,
+        FRONTIER_CHECK(!nodes_[parent].mountable(),
                        "SubtreeBuilder: mountable node must stay a leaf");
 
     BuildNode built;
@@ -40,7 +40,7 @@ SubtreeBuilder::NodeId SubtreeBuilder::createNode(NodeId parent,
     built.payload = node.payload;
     built.geometricError = node.geometricError;
     built.parent = parent;
-    built.mountable = node.mountable;
+    built.setMountable(node.mountable);
     nodes_.push_back(built);
     const NodeId id = NodeId(nodes_.size() - 1);
     if (parent == kInvalidIndex)
@@ -57,9 +57,10 @@ SubtreeBuilder::NodeId SubtreeBuilder::createNode(NodeId parent,
         else
             nodes_[owner.lastChild].nextSibling = id;
         owner.lastChild = id;
-        ++owner.childCount;
-        FRONTIER_CHECK(owner.childCount <= kMaxChildren,
+        const uint32_t childCount = owner.childCount() + 1;
+        FRONTIER_CHECK(childCount <= kMaxChildren,
                        "SubtreeBuilder: fanout exceeds limit");
+        owner.setChildCount(childCount);
     }
     return id;
 }
@@ -118,7 +119,7 @@ SubtreeBytes SubtreeBuilder::build(const FrontierContext& context)
         const uint32_t parentIndex =
             node.parent == kInvalidIndex ? 0 : remap[node.parent];
         const uint32_t packed =
-            emit(parentIndex, node.childCount, node.mountable,
+            emit(parentIndex, node.childCount(), node.mountable(),
                  node.payload, node.bounds, node.geometricError);
         remap[source] = packed;
         siblingScratch.clear();

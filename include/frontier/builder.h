@@ -31,6 +31,9 @@ public:
 private:
     struct BuildNode
     {
+        static constexpr uint32_t kChildCountMask = (1u << 9) - 1;
+        static constexpr uint32_t kMountableBit = 1u << 31;
+
         AABB bounds = AABB::empty();
         UserPayload payload = 0;
         float geometricError = 0.0f;
@@ -38,9 +41,29 @@ private:
         NodeId firstChild = kInvalidIndex;
         NodeId lastChild = kInvalidIndex;
         NodeId nextSibling = kInvalidIndex;
-        uint32_t childCount = 0;
-        bool mountable = false;
+        uint32_t childCountAndFlags = 0;
+
+        uint32_t childCount() const
+        {
+            return childCountAndFlags & kChildCountMask;
+        }
+        void setChildCount(uint32_t count)
+        {
+            childCountAndFlags =
+                (childCountAndFlags & ~kChildCountMask) | count;
+        }
+        bool mountable() const
+        {
+            return (childCountAndFlags & kMountableBit) != 0;
+        }
+        void setMountable(bool value)
+        {
+            if (value) childCountAndFlags |= kMountableBit;
+            else childCountAndFlags &= ~kMountableBit;
+        }
     };
+    static_assert(sizeof(BuildNode) == 64,
+                  "BuildNode flags must fit without alignment padding");
 
     std::vector<BuildNode> nodes_;
     std::vector<NodeId> roots_;

@@ -20,8 +20,8 @@ There is one node descriptor:
 struct NodeDesc {
     UserPayload payload = 0;
     float geometricError = 0.0f;
-    AABB bounds = AABB::empty();
     bool mountable = false;
+    AABB bounds = AABB::empty();
 };
 ```
 
@@ -63,14 +63,14 @@ cityBuilder.reserve(2); // optional node-capacity hint
 cityBuilder.createNode(NodeDesc{
     .payload = leftHouseProxy,
     .geometricError = 16.0f,
-    .bounds = leftHouseBoundsInCity,
     .mountable = true,
+    .bounds = leftHouseBoundsInCity,
 });
 cityBuilder.createNode(NodeDesc{
     .payload = rightHouseProxy,
     .geometricError = 16.0f,
-    .bounds = rightHouseBoundsInCity,
     .mountable = true,
+    .bounds = rightHouseBoundsInCity,
 });
 SubtreeBytes cityBytes = cityBuilder.build();
 ```
@@ -156,8 +156,8 @@ SubtreeHandle city =
 InstanceHandle cityInstance = database.instantiate(NodeDesc{
     .payload = cityProxyPayload,
     .geometricError = 64.0f,
-    .bounds = cityBounds,
     .mountable = true,
+    .bounds = cityBounds,
 }, InstanceDesc{
     .pos = worldPosition,
     .scale = worldScale,

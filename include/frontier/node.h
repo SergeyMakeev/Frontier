@@ -29,8 +29,10 @@ struct NodeDesc
 {
     UserPayload payload = 0;
     float geometricError = 0.0f;
-    AABB bounds = AABB::empty();
     bool mountable = false;
+    AABB bounds = AABB::empty();
 };
+static_assert(sizeof(NodeDesc) == 48,
+              "NodeDesc must use the padding before its aligned bounds");
 
 } // namespace frontier
