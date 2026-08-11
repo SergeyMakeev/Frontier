@@ -10,148 +10,154 @@ Frontier is a C++20 library. The normal public entry points are:
 ## Core model
 
 Every top-level instance is exactly one permanent, renderable node stored in
-the TLAS. A deeper hierarchy is assembled by mounting immutable reusable
-`Subtree` definitions beneath that root or beneath extendable nodes in other
-mounted subtrees.
+the TLAS. Deeper hierarchies are assembled by mounting registered immutable
+definitions beneath that root or beneath mountable leaves in other mounted
+definitions.
 
-There is only one node descriptor:
+There is one node descriptor:
 
 ```cpp
 struct NodeDesc {
     UserPayload payload = 0;
     float geometricError = 0.0f;
     AABB bounds = AABB::empty();
-    SubtreeKey childSubtree{};
-    Transform childTransform{};
+    bool mountable = false;
 };
 ```
 
-`SpatialDatabase::instantiate()` stores a `NodeDesc` as a TLAS root.
-`SubtreeBuilder::createNode()` stores the same descriptor in a reusable
-definition.
+`SpatialDatabase::instantiate()` stores a `NodeDesc` directly in the TLAS.
+`SubtreeBuilder::createNode()` stores the same descriptor in serialized
+definition bytes.
 
 `bounds` and `geometricError` use the containing hierarchy's local units. A
-TLAS-root descriptor is instance-local and its world placement comes from
-`InstanceDesc`; mounted placement comes from `childTransform`. Data authored in
-a `Subtree` remains immutable. `setNodeBounds()` gives one top-level instance a
-copy-on-write runtime bounds overlay instead of rewriting that definition.
+TLAS root is placed in world space by `InstanceDesc`; a mounted definition is
+placed in its parent's coordinate system by the `Transform` passed to
+`mountSubtree()`.
 
-A valid `childSubtree` makes the node extendable. The node remains the
-renderable fallback at that boundary; the referenced definition is mounted
-beneath it when finer topology is needed. An extendable node cannot also have
-locally authored children. `childTransform` places the referenced definition
-in the node's containing coordinate system and is meaningful only when
-`childSubtree` is valid.
+A mountable node is the renderable fallback at an assembly boundary. It must be
+a local leaf. A registered definition may later be mounted beneath it, making
+the definition's direct nodes its children. The runtime stores no authored
+content key or target: the application chooses the definition handle and mount
+transform at assembly time.
 
-A `Subtree` is a descendant forest, not an independently instantiable object.
-Its implicit parent is not a renderable node in the definition. When mounted,
-its direct nodes become children of the real renderable node passed to
-`mountSubtree()`. Definitions are authored independently and composed only
-through `childSubtree` plus `mountSubtree()`; the builder never partitions a
-monolithic hierarchy.
+The serialized bytes contain an internal implicit-parent sentinel so roots and
+nested definitions use one layout. The sentinel is not renderable or publicly
+addressable. When mounted, the real renderable parent is always the TLAS root or
+mountable node supplied by the caller.
 
 ## Authoring reusable definitions
 
-Build each reusable component separately. This example authors one house once
-and makes two city nodes target that same definition:
+Build reusable components independently:
 
 ```cpp
-constexpr SubtreeKey houseKey{0x1001};
-constexpr SubtreeKey cityKey{0x2001};
-
-SubtreeBuilder houseBuilder(houseKey);
+SubtreeBuilder houseBuilder;
 houseBuilder.createNode(NodeDesc{
     .payload = houseDetailPayload,
     .geometricError = 0.0f,
     .bounds = houseLocalBounds,
 });
-Subtree house = houseBuilder.build();
+SubtreeBytes houseBytes = houseBuilder.build();
 
-SubtreeBuilder cityBuilder(cityKey);
-cityBuilder.reserve(2, 2); // optional capacity hint only
+SubtreeBuilder cityBuilder;
+cityBuilder.reserve(2); // optional node-capacity hint
 cityBuilder.createNode(NodeDesc{
     .payload = leftHouseProxy,
     .geometricError = 16.0f,
     .bounds = leftHouseBoundsInCity,
-    .childSubtree = houseKey,
-    .childTransform = Transform{leftHousePosition, 1.0f},
+    .mountable = true,
 });
 cityBuilder.createNode(NodeDesc{
     .payload = rightHouseProxy,
     .geometricError = 16.0f,
     .bounds = rightHouseBoundsInCity,
-    .childSubtree = houseKey,
-    .childTransform = Transform{rightHousePosition, 1.0f},
+    .mountable = true,
 });
-Subtree city = cityBuilder.build();
-const AABB cityBounds = city.bounds();
+SubtreeBytes cityBytes = cityBuilder.build();
 ```
 
 `createNode(desc)` creates a direct child of the implicit parent.
 `createNode(parent, desc)` creates a local child of an earlier builder node.
-Creation order is authoring state only; returned `NodeId` values never become
-runtime handles.
+Returned `NodeId` values exist only while authoring; they are not runtime
+`NodeHandle` values.
 
-`build()` consumes the builder and emits packed preorder, subtree extents,
-8-wide child blocks, conservative ancestor bounds, monotonic errors,
-deduplicated dependency keys, and expansion metadata. Authored child errors
-are clamped to their local parent's error. The builder checks:
+`build()` consumes the builder and emits the traversal-ready serialized byte
+array: packed preorder, subtree extents, 8-wide child blocks, conservative
+ancestor bounds, payloads, mountable bits, and monotonic errors. Authored child
+errors are clamped to their local parent's error. The builder checks:
 
-- a valid, nonzero definition key and at least one renderable node;
+- at least one renderable node;
 - finite, non-negative geometric error;
-- non-empty node bounds;
-- positive finite uniform transforms on expansion nodes;
-- no local children on an extendable node;
-- no direct reference to the definition's own key;
-- at most 511 local children or direct nodes under one implicit parent.
+- a non-empty resulting bound for every node (an interior node may derive an
+  initially empty bound from its children);
+- no local children beneath a mountable node;
+- at most 511 local children or direct nodes beneath one implicit parent.
 
-The bounds of an extendable node must contain the referenced subtree's bounds
-after `childTransform` is applied. That cross-definition condition is checked
-when the child is mounted because the two definitions are authored and
-registered independently.
+The builder does not know which definition will eventually be mounted at a
+mountable node. The runtime therefore checks that the selected definition's
+bounds fit after the caller's mount transform is applied.
 
-## Serialized `Subtree` ownership
+## Serialized bytes and ownership
 
-`Subtree` is move-only and is the complete immutable serialized unit. Its blob
-contains topology, wide bounds, payloads, authored bounds, errors, dependency
-keys, and expansion transforms; there is no sidecar object.
+`SubtreeBytes` is an owning, 64-byte-aligned byte array. The representation
+emitted by `build()` is both the on-disk format and the in-memory traversal
+format; registration does not unpack it into another semantic object.
 
 ```cpp
-Subtree copied = Subtree::fromBytes(data, byteCount, context);
-Subtree mapped = Subtree::borrow(data, byteCount);
-Subtree duplicate = copied.clone(context);
+SubtreeBytes bytes = builder.build();
+writeFile(bytes.bytes());
+
+SubtreeHandle definition =
+    database.registerSubtree(std::move(bytes));
 ```
 
-`fromBytes()` validates and copies. `borrow()` validates without copying, and
-`clone()` is the explicit owned-copy operation. The blob address supplied to
-`fromBytes()` or `borrow()` must be 64-byte aligned. Borrowed bytes must remain
-alive and unchanged until the `Subtree`, or the database it is moved into, is
-destroyed or releases the definition.
+The temporary returned by `builder.build()` can be consumed directly:
 
-Owned blobs use the `FrontierContext` allocator. A custom allocator must honor
-the requested alignment, and the referenced `FrontierContext` object plus its
-callback state must outlive every owned `Subtree` created with it. The process
-default context has static lifetime.
+```cpp
+SubtreeHandle definition = database.registerSubtree(builder.build());
+```
 
-Read-only metadata is exposed through `valid()`, `key()`, `nodeCount()`,
-`bounds()`, `dependencies()`, `data()`, and `byteSize()`. `nodeCount()` excludes
-the internal implicit-parent record.
+To load serialized data, allocate the final aligned array and read into it:
+
+```cpp
+SubtreeBytes bytes(fileSize, context);
+readFile(bytes.bytes());
+SubtreeHandle definition =
+    database.registerSubtree(std::move(bytes));
+```
+
+The relevant array operations are `data()`, `size()`, `empty()`, and `bytes()`.
+`SubtreeBytes` can be explicitly copied when an application really wants a
+second byte array, but registration has one ownership contract only:
+
+```cpp
+SubtreeHandle registerSubtree(SubtreeBytes&& bytes);
+```
+
+A named array therefore requires `std::move`. Registration validates the
+header, version, size, alignment, layout offsets, and sentinel, then moves the
+existing allocation in O(1). There are no copy-registration or borrowed-storage
+variants. Registering identical bytes twice is legal and returns independent
+handles; content deduplication is application policy.
+
+`SubtreeBytes` copies its `FrontierContext` callbacks by value. A custom
+allocator must honor the requested alignment, and the state referenced by
+`context.user` must outlive every byte array or registered definition using it.
 
 ## Registration and top-level instances
 
 ```cpp
 SpatialDatabase database;
 
-SubtreeHandle houseDefinition =
-    database.registerSubtree(std::move(house));
-SubtreeHandle cityDefinition =
-    database.registerSubtree(std::move(city));
+SubtreeHandle house =
+    database.registerSubtree(std::move(houseBytes));
+SubtreeHandle city =
+    database.registerSubtree(std::move(cityBytes));
 
 InstanceHandle cityInstance = database.instantiate(NodeDesc{
     .payload = cityProxyPayload,
     .geometricError = 64.0f,
     .bounds = cityBounds,
-    .childSubtree = cityKey,
+    .mountable = true,
 }, InstanceDesc{
     .pos = worldPosition,
     .scale = worldScale,
@@ -159,72 +165,68 @@ InstanceHandle cityInstance = database.instantiate(NodeDesc{
 });
 
 SubtreeInstanceHandle cityPlacement =
-    database.mountSubtree(cityInstance.rootNode(), cityDefinition);
+    database.mountSubtree(cityInstance.rootNode(), city);
 ```
 
-`registerSubtree()` moves one owned or borrowed definition into the database.
-Every live definition must have a unique `SubtreeKey`; duplicate registration
-is a contract violation. Registration order does not need to follow dependency
-order.
-
-`instantiate()` creates only the permanent TLAS node. If its `childSubtree` is
-invalid, the entire object lives in the TLAS and allocates no subtree or mount
-state. `InstanceDesc::pos` and `scale` place its local bounds in world space;
-`mask` is ANDed with `Camera::viewMask` for top-level layer culling.
+`instantiate()` creates only the permanent TLAS node. With `mountable == false`,
+a one-node object lives entirely in the TLAS and allocates no definition or
+mount state. `InstanceDesc::pos` and `scale` place its local bounds in world
+space; `mask` is ANDed with `Camera::viewMask` for top-level layer culling.
 
 `removeInstance()` removes the permanent root and recursively unmounts
-everything below it. `moveInstance()` changes its translation and positive
+everything beneath it. `moveInstance()` changes its translation and positive
 uniform scale. Both ignore stale `InstanceHandle` values.
 
 ## Mounting and topology streaming
 
-`mountSubtree(parent, definition)` accepts either an extendable TLAS root or an
-extendable node in a mounted subtree. It checks that:
+```cpp
+SubtreeInstanceHandle mountSubtree(
+    NodeHandle parent,
+    SubtreeHandle definition,
+    const Transform& transform = {});
+```
 
-- the parent is live, extendable, and does not already have a mounted child;
-- the registered definition's key matches the parent's `childSubtree`;
-- the transformed child bounds fit inside the parent's authored bounds;
-- the authored transform is finite and has positive uniform scale.
+The parent may be a mountable TLAS root or a mountable leaf in an existing
+placement. The operation checks that:
 
-A nested parent's `childTransform` is used automatically. Transforms accumulate
-across mount boundaries without rewriting shared definition bytes. A stale
-parent handle, which is an expected streaming race, returns an invalid
-`SubtreeInstanceHandle`. An invalid or released definition handle is a contract
-error. Mounted child errors receive the parent's effective error as a runtime
-ceiling; shared authored errors are not rewritten.
+- the definition handle is live;
+- the parent is live, mountable, and has no mounted child;
+- the transform is finite and has positive uniform scale;
+- the transformed definition bounds fit inside the parent's authored or
+  overlaid bounds.
 
-Use `hasMountedSubtree(node)` to suppress duplicate requests and
-`subtreeTarget(node)` to obtain the stable authored key. `subtreeTarget()`
-returns an invalid key for stale or non-extendable handles.
+Transforms accumulate across mount boundaries without rewriting registered
+bytes. A stale parent, which is an expected streaming race, returns an invalid
+`SubtreeInstanceHandle`. Invalid definition handles and invalid live topology
+are contract errors. Mounted child errors receive the parent's effective error
+as a runtime ceiling; shared authored errors are never rewritten.
 
-`unmountSubtree(placement)` recursively removes that placement and its mounted
-descendants; a stale placement is a no-op. Removing an instance does the same
-for its root placement. `releaseSubtree()` requires zero live placements and
-otherwise reports a contract violation. `isSubtree()` and `isMounted()` test
-generation-stamped handles.
+Use `hasMountedSubtree(parent)` to suppress duplicate requests.
+`unmountSubtree(placement)` recursively removes a placement and its mounted
+descendants; a stale placement is a no-op. `releaseSubtree()` requires zero live
+placements. `isSubtree()` and `isMounted()` validate generation-stamped handles.
 
-The topology-demand loop must examine both buckets of the ideal cut. A missing
-high-error expansion can be in `shared` when its proxy is already resident, or
-in `idealOnly` when the current cut is using another fallback:
+Definition lookup is deliberately outside Frontier. An application can use its
+own asset graph, payload metadata, or retained assembly records to map a
+mountable `NodeHandle` to `(SubtreeHandle, Transform)`. A streaming loop usually
+examines both ideal buckets because an already-resident proxy can be in
+`shared`, while another fallback can put it in `idealOnly`:
 
 ```cpp
 auto requestIdeal = [&](std::span<const FrontierEntry> entries) {
     for (const FrontierEntry& entry : entries) {
         if (!database.isPayloadResident(entry.nodeHandle))
-            requestPayload(entry.nodeHandle); // mark resident after IO completes
+            requestPayload(entry.nodeHandle);
 
-        if (!entry.overThreshold())
+        if (!entry.overThreshold() ||
+            database.hasMountedSubtree(entry.nodeHandle))
             continue;
 
-        const SubtreeKey target = database.subtreeTarget(entry.nodeHandle);
-        if (target.valid() &&
-            !database.hasMountedSubtree(entry.nodeHandle)) {
-            const SubtreeHandle definition = findRegisteredDefinition(target);
-            if (definition.valid())
-                database.mountSubtree(entry.nodeHandle, definition);
-            else
-                requestSubtree(target, entry.nodeHandle);
-        }
+        MountRequest request = applicationMountRequest(entry.nodeHandle);
+        if (request.definition.valid())
+            database.mountSubtree(entry.nodeHandle,
+                                  request.definition,
+                                  request.transform);
     }
 };
 
@@ -232,14 +234,14 @@ requestIdeal(cut.shared);
 requestIdeal(cut.idealOnly);
 ```
 
-`requestPayload`, `findRegisteredDefinition`, and `requestSubtree` above are
-application policy hooks, not Frontier functions. An asynchronous subtree
-completion registers the definition once and attempts each retained parent
-handle; `mountSubtree()` safely rejects any parent that became stale meanwhile.
+The application hook must return a valid definition only for authored
+mountable nodes. Asynchronous completions retain the parent `NodeHandle` and
+attempt the mount when bytes are registered; a parent removed meanwhile is
+safely rejected as stale.
 
-Call `applyUpdates()` after these mutations and before the next group of
-queries. `UserPayload` is application data, not node identity; duplicate values
-are valid. Resolve a live handle with `tryGetPayload()`.
+Call `applyUpdates()` after mutations and before the next query group.
+`UserPayload` is application data, not node identity; duplicate values are
+valid. Resolve a live handle with `tryGetPayload()`.
 
 ## Frontier selection and output
 
@@ -301,8 +303,8 @@ TLAS-root payloads are permanent and always resident. Mounted nodes begin
 non-resident:
 
 ```cpp
-database.markPayloadResident(node);     // after upload completes
-database.markPayloadNonResident(node);  // before unloading
+database.markPayloadResident(node);
+database.markPayloadNonResident(node);
 bool ready = database.isPayloadResident(node);
 ```
 
@@ -346,7 +348,7 @@ positive uniform scale. `MotionGroup` retains a caller-ordered cohort;
 `moveInstances(group, positions, scale)` updates its positions using one shared
 scale while caching the database's current physical order.
 
-`tryGetNodeTransform(node, out)` maps the containing subtree definition's local
+`tryGetNodeTransform(node, out)` maps the containing definition's local
 coordinates into top-level instance-local space. It returns identity for a TLAS
 root and `false` for a stale node. The application composes it with the
 top-level transform indexed by `FrontierEntry::instance()`.
@@ -354,22 +356,22 @@ top-level transform indexed by `FrontierEntry::instance()`.
 `setNodeBounds(instance, node, bounds)` queues a runtime local-bound change for
 one top-level instance. A TLAS-root bound is instance-local; a mounted-node
 bound uses its definition's local coordinates. The first edit to an
-`(instance, mount)` pair creates a private bounds overlay. Payloads, errors,
+`(instance, placement)` pair creates a private bounds overlay. Payloads, errors,
 topology, residency, and other instances remain shared. Large wide-bound arrays
 stay sparse until edits justify promotion.
 
 `flushBounds()` applies queued changes immediately. `applyUpdates()` also
 flushes them. The submitted node bound is exact, while ancestor propagation is
-conservative grow-only. `nodeBounds()` first flushes all pending bound edits and
-then returns the effective authored or overlaid bound for that instance.
-`overlayCount()` and `overlayBytes()` expose retained overlay cost.
+conservative grow-only. `nodeBounds()` returns the effective authored or
+overlaid bound for that instance. `overlayCount()` and `overlayBytes()` expose
+retained overlay cost.
 
 ## Configuration and host integration
 
 `FrontierContext` provides aligned allocation callbacks plus an optional
-blocking `parallelFor` and its maximum `workerCount`. `SubtreeBuilder` and owned
-`Subtree` factories use its allocator. A `SpatialDatabaseConfig` copies its
-context and controls:
+blocking `parallelFor` and its maximum `workerCount`. `SubtreeBuilder` and
+`SubtreeBytes` use its allocator. A `SpatialDatabaseConfig` copies its context
+and controls:
 
 - `tlasQuality`: `Morton`, `Median`, or `BinnedSAH`;
 - `tlasTraversalCost` and `tlasIntersectCost` for SAH builds;
@@ -377,8 +379,8 @@ context and controls:
 - `parallelInstanceThreshold` for uncached selection (`0` disables it).
 
 `parallelFor` must not return until every requested task completes. Parallel
-selection also requires `workerCount > 1`; results remain deterministic.
-The database's effective copied configuration is available through `config()`.
+selection also requires `workerCount > 1`; results remain deterministic. The
+database's effective copied configuration is available through `config()`.
 
 Contract violations route through `FRONTIER_FATAL`, which throws
 `std::logic_error` by default. Exception-free hosts can define it before
@@ -402,15 +404,15 @@ instance handles and frontier instance ids remain stable.
 
 | Handle | Names | Becomes stale when |
 |---|---|---|
-| `SubtreeHandle` | registered immutable definition | `releaseSubtree()` |
+| `SubtreeHandle` | registered immutable byte array | `releaseSubtree()` |
 | `SubtreeInstanceHandle` | one mounted placement | unmount, collection, or owning instance removal |
 | `InstanceHandle` | one permanent TLAS root | `removeInstance()` |
 | `NodeHandle` | one TLAS root or mounted node | root removal or containing placement removal |
 
 Slots can be reused, but generation stamps prevent old handles from acting on
-new occupants. Expected races use stale-safe behavior described above; wrong
-keys, invalid live topology, bounds escapes, and illegal lifetime operations
-are contract violations.
+new occupants. Expected races use stale-safe behavior described above; invalid
+live topology, bounds escapes, and illegal lifetime operations are contract
+violations.
 
 Database accounting is available through `subtreeCount()`,
 `mountedSubtreeCount()` (`streamedSubtreeCount()` is the same count), `frame()`,
@@ -420,7 +422,7 @@ Database accounting is available through `subtreeCount()`,
 
 - transforms support translation plus positive uniform scale;
 - one authored node has at most 511 local children;
-- mounted placement slots and subtree-local node indices use 20 bits;
+- mounted placement slots and definition-local node indices use 20 bits;
 - mounted-node generations use 24 bits; TLAS-root generations use 20 bits;
 - public instance ids use 24 bits;
 - rendering, asynchronous IO, payload interpretation, content lookup, and

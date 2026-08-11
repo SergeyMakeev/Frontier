@@ -1,7 +1,7 @@
 #pragma once
 // Permanent renderable roots live directly in an 8-wide TLAS. Reusable
-// immutable Subtree definitions mount only beneath those roots or beneath
-// renderable expansion nodes in another mounted Subtree. Single-node objects
+// immutable subtree definitions mount only beneath those roots or beneath
+// renderable mountable nodes in another mounted subtree. Single-node objects
 // therefore allocate no hierarchy storage, while deep assemblies share their
 // immutable topology, payload, error, and authored-bound data.
 //
@@ -24,7 +24,9 @@
 
 #include "append_buffer.h"
 #include "config.h"
+#include "detail/subtree_data.h"
 #include "math.h"
+#include "node.h"
 #include "subtree.h"
 
 namespace frontier {
@@ -183,8 +185,8 @@ static_assert(sizeof(FrontierEntry) == 12, "FrontierEntry must stay 12 bytes");
 
 // One traversal produces both realities without per-entry tags. The current
 // render frontier is shared + currentOnly. The fully-resident ideal frontier is
-// shared + idealOnly. A high-error ideal-side extendable node exposes its
-// authored SubtreeKey through subtreeTarget().
+// shared + idealOnly. A high-error ideal-side mountable node can be used
+// directly as the parent in mountSubtree().
 // Non-owning result of one SpatialQuery selection. The spans remain valid until the
 // next selection or reset on that SpatialQuery, or until the SpatialQuery is destroyed.
 struct FrontierResultView
@@ -744,8 +746,8 @@ public:
     explicit SpatialDatabase(const SpatialDatabaseConfig& config = SpatialDatabaseConfig{});
     ~SpatialDatabase();
 
-    // Non-copyable and non-movable: definitions retain allocator contexts,
-    // and instances/mounts refer to each other by slot.
+    // Non-copyable and non-movable: instances/mounts refer to each other by
+    // slot and registered byte arrays retain their allocation contexts.
     SpatialDatabase(const SpatialDatabase&) = delete;
     SpatialDatabase& operator=(const SpatialDatabase&) = delete;
     SpatialDatabase(SpatialDatabase&&) = delete;
@@ -754,9 +756,10 @@ public:
     const SpatialDatabaseConfig& config() const { return config_; }
 
     // ---- reusable definitions ---------------------------------------------
-    // Publish one complete Subtree blob for reuse by any number of mounted
-    // placements. Ownership or borrowing was chosen when creating Subtree.
-    SubtreeHandle registerSubtree(Subtree&& subtree);
+    // Consume one traversal-ready serialized byte array for reuse by any
+    // number of mounted placements. Registration validates and moves the
+    // allocation without deserializing or copying it.
+    SubtreeHandle registerSubtree(SubtreeBytes&& bytes);
     void          releaseSubtree(SubtreeHandle subtree);
     bool          isSubtree(SubtreeHandle subtree) const;
     size_t        subtreeCount() const { return liveSubtrees_; }
@@ -816,20 +819,17 @@ public:
                        float scale = 1.0f);
 
     // ---- topology streaming -------------------------------------------------
-    // An expansion handle normally comes from a high-error ideal-side
+    // A mount-point handle normally comes from a high-error ideal-side
     // FrontierEntry. A stale handle returns an invalid placement, covering the
     // normal race with collection. True contract violations still fail: the
-    // parent must be extendable, empty, target the same SubtreeKey, and contain
-    // the transformed child bounds.
+    // parent must be mountable, empty, and contain the transformed child
+    // bounds.
     SubtreeInstanceHandle mountSubtree(NodeHandle parent,
-                                       SubtreeHandle subtree);
+                                       SubtreeHandle subtree,
+                                       const Transform& transform = {});
     void unmountSubtree(SubtreeInstanceHandle instance);
     bool isMounted(SubtreeInstanceHandle instance) const;
     bool hasMountedSubtree(NodeHandle parent) const;
-
-    // Stable content target authored on an extendable node. Invalid for stale
-    // handles and for nodes without a child target.
-    SubtreeKey subtreeTarget(NodeHandle parent) const;
 
     // Local-to-top-level-instance transform for the mount containing `node`.
     // The caller composes this with its transform table at entry.instance().
@@ -920,7 +920,7 @@ public:
     size_t overlayCount() const { return liveOverlays_; }
     size_t overlayBytes() const;
     // Retained capacity for mount records, transforms, node state, stamps,
-    // and expansion links. Immutable Subtree blobs are excluded.
+    // and mount links. Immutable subtree byte arrays are excluded.
     size_t subtreeInstanceStateBytes() const;
 
     struct TestAccess;   // defined by tests; full access to internals
@@ -944,12 +944,13 @@ private:
 
     struct SubtreeDefinitionRt
     {
-        Subtree subtree;
+        SubtreeBytes bytes;
+        detail::SubtreeView view;
         uint32_t generation = 0;
         uint32_t mountRefs = 0;
         bool rootLeavesOnly = false;
 
-        bool inUse() const { return subtree.valid(); }
+        bool inUse() const { return !bytes.empty(); }
         void addMountRef() { ++mountRefs; }
         void removeMountRef() { --mountRefs; }
     };
@@ -1039,10 +1040,10 @@ private:
     {
         uint32_t definition = kInvalidIndex;
         // Effective error ceiling for every node in this subtree: the owning
-        // expansion node's effective error, or FLT_MAX before mounting.
+        // mount point's effective error, or FLT_MAX before mounting.
         //
         // The per-mount scalar is folded into the wide error test. It
-        // lets one immutable Subtree back mounts with different parent error
+        // lets one immutable definition back mounts with different parent error
         // ceilings without rewriting authored node data.
         float                 errClamp = FLT_MAX;
         // Two flag bits plus the covered-child count share one word. Keeping
@@ -1065,7 +1066,7 @@ private:
         uint32_t mountedChildren = 0;
         NodeRef owner;
         // Sparse-pool index; leaf placements never allocate a child array.
-        uint32_t expansionLinks = kInvalidIndex;
+        uint32_t mountLinks = kInvalidIndex;
         // Root of this mounted subtree tree. Occupies what was tail padding and
         // lets cached traversal coalesce every descendant to one exact stamp.
         uint32_t rootSlot = kInvalidIndex;
@@ -1150,7 +1151,7 @@ private:
     static_assert(sizeof(SubtreeInstanceRt) == 48,
                   "subtree-instance state must stay 48 bytes");
 
-    struct ExpansionLinksRt
+    struct MountLinksRt
     {
         std::vector<uint32_t> slots;
     };
@@ -1215,6 +1216,7 @@ private:
     struct Instance
     {
         static constexpr uint32_t kAlive = 1u << 31;
+        static constexpr uint32_t kMountableRoot = 1u << 30;
         static constexpr uint32_t kZeroErrorRoot = 1u << 29;
         static constexpr uint32_t kOverlayListMask = kInvalidInstanceId;
 
@@ -1232,6 +1234,15 @@ private:
         uint32_t liveIndex = kInvalidIndex;
 
         bool alive() const { return (overlayListAndAlive & kAlive) != 0; }
+        bool hasMountableRoot() const
+        {
+            return (overlayListAndAlive & kMountableRoot) != 0;
+        }
+        void setMountableRoot(bool value)
+        {
+            if (value) overlayListAndAlive |= kMountableRoot;
+            else overlayListAndAlive &= ~kMountableRoot;
+        }
         bool hasZeroErrorRoot() const
         {
             return (overlayListAndAlive & kZeroErrorRoot) != 0;
@@ -1260,14 +1271,14 @@ private:
                         "SpatialDatabase: exhausted overlay-list index space");
             overlayListAndAlive =
                 (overlayListAndAlive &
-                 (kAlive | kZeroErrorRoot)) |
+                 (kAlive | kMountableRoot | kZeroErrorRoot)) |
                 index;
         }
         void clearOverlayList()
         {
             overlayListAndAlive =
                 (overlayListAndAlive &
-                 (kAlive | kZeroErrorRoot)) |
+                 (kAlive | kMountableRoot | kZeroErrorRoot)) |
                 kOverlayListMask;
         }
 
@@ -1459,8 +1470,6 @@ private:
     uint32_t allocSubtree();
     void destroySubtree(uint32_t definition);
     const SubtreeDefinitionRt* resolveSubtree(SubtreeHandle h) const;
-    const detail::SubtreeExpansion* findSubtreeExpansion(
-        uint32_t definition, uint32_t node) const;
     static constexpr uint32_t kMountTreeDependency = 1u << 31;
     uint32_t traversalDependency(uint32_t slot) const;
     void recordTraversalDependency(Worker& worker, uint32_t slot) const;
@@ -1468,19 +1477,20 @@ private:
     bool dependencyMatches(uint32_t dependency, uint32_t version) const;
     void bumpContentVersion(uint32_t slot);
 
-    const Subtree& subtreeView(const SubtreeInstanceRt& instance) const
+    const detail::SubtreeView& subtreeView(
+        const SubtreeInstanceRt& instance) const
     {
-        return subtrees_[instance.definition].subtree;
+        return subtrees_[instance.definition].view;
     }
 
     uint32_t allocSlot();
     uint32_t registerMount(uint32_t definition, NodeRef owner);
-    const std::vector<uint32_t>* expansionSlots(
+    const std::vector<uint32_t>* mountedChildSlots(
         const SubtreeInstanceRt& instance) const;
-    std::vector<uint32_t>& ensureExpansionSlots(uint32_t slot);
+    std::vector<uint32_t>& ensureMountedChildSlots(uint32_t slot);
     uint32_t mountedChildSlot(const SubtreeInstanceRt& instance,
                                uint32_t node) const;
-    void releaseExpansionSlots(SubtreeInstanceRt& instance);
+    void releaseMountedChildSlots(SubtreeInstanceRt& instance);
     SubtreeInstanceHandle mountTransformed(NodeHandle parent,
                                            uint32_t definition,
                                            const Transform& transform);
@@ -1517,7 +1527,7 @@ private:
     uint32_t       ensureOverlay(Instance& inst, uint32_t slot);
     void initOverlay(Overlay& ov, uint32_t slot,
                      const SubtreeInstanceRt& instance);
-    WideBounds& mutableWideBounds(Overlay& ov, const Subtree& subtree,
+    WideBounds& mutableWideBounds(Overlay& ov, const detail::SubtreeView& subtree,
                                      uint32_t block);
     void           freeOverlays(Instance& inst);
     // Effective bounds for a walk of `slot` by `inst`.
@@ -1533,7 +1543,8 @@ private:
     bool mountBelongsTo(const Instance& inst, uint32_t slot) const;
 
     void applyBoundsChange(InstanceId id, uint32_t slot, uint32_t index, const AABB& box);
-    void patchParentLane(const Subtree& subtree, AABB* bbox, Overlay& overlay,
+    void patchParentLane(const detail::SubtreeView& subtree, AABB* bbox,
+                         Overlay& overlay,
                          uint32_t index);
     void refreshInstanceBounds(InstanceId id, bool recomputeError);
 
@@ -1592,18 +1603,20 @@ private:
                         const Camera& local,
                         const SelectionParams& params, Worker& w) const;
     template<bool FullyResident, bool SparseOverlay>
-    void wideVisit(const WorkItem& item, const Subtree& subtree, float errClamp,
+    void wideVisit(const WorkItem& item, const detail::SubtreeView& subtree,
+                   float errClamp,
                    uint32_t gen, InstanceId instance, uint32_t node, uint8_t mask,
                    uint8_t currentKids, uint8_t idealKids,
                    const Camera& local, Worker& w) const;
     void emitMountedRootLeavesInside(const WorkItem& item,
-                                     const Subtree& subtree, float errClamp,
+                                     const detail::SubtreeView& subtree,
+                                     float errClamp,
                                      uint32_t generation,
                                      InstanceId instance, float4 qmn,
                                      float4 qmx, float cameraK,
                                      Worker& w) const;
     void emitMountedLeafBatchInside(const SubtreeInstanceRt& owner,
-                                    const Subtree& ownerSubtree,
+                                    const detail::SubtreeView& ownerSubtree,
                                     NodeItem first, size_t stackBase,
                                     InstanceId instance,
                                     const Camera& rootLocal,
@@ -1628,18 +1641,15 @@ private:
     std::vector<MountTransformRt> mountTransforms_;
     std::vector<MountStamp> mountStamps_;
     std::vector<MountResidency> mountResidency_;
-    std::vector<ExpansionLinksRt> expansionLinks_;
-    std::vector<uint32_t> freeExpansionLinks_;
+    std::vector<MountLinksRt> mountLinks_;
+    std::vector<uint32_t> freeMountLinks_;
     std::vector<uint32_t> freeSlots_;
     size_t mountedSubtrees_ = 0;
     uint32_t              generationCounter_ = 0;
 
     std::vector<Instance> instances_;
-    // Cold root identity streams. Payload exists after the first TLAS root;
-    // targets remain entirely unallocated until one root is extendable.
+    // Cold root identity stream. Payload exists after the first TLAS root.
     std::vector<UserPayload> tlasRootPayloads_;
-    std::vector<SubtreeKey> tlasRootTargets_;
-    std::vector<Transform> tlasRootChildTransforms_;
     // Packed TLAS-root marker for exact one-node instances; a cold
     // high bit also records the common zero-error case. Keeping this as a
     // lazily allocated compact stream lets mixed forests bypass the 64-byte

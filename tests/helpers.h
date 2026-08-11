@@ -19,7 +19,7 @@ struct SpatialDatabase::TestAccess
         {
             const SubtreeInstanceRt& instance = database.slots_[slot];
             if (!instance.inUse()) continue;
-            const Subtree& subtree = database.subtreeView(instance);
+            const detail::SubtreeView& subtree = database.subtreeView(instance);
             for (uint32_t node = 1; node <= subtree.nodeCount(); ++node)
             {
                 NodeHandle handle{slot, node,
@@ -57,7 +57,7 @@ struct SpatialDatabase::TestAccess
             const SubtreeInstanceRt& root =
                 database.slots_[instance.rootSlot];
             if (!root.owner.isTlasRoot() || root.owner.index != dense) continue;
-            const Subtree& subtree = database.subtreeView(instance);
+            const detail::SubtreeView& subtree = database.subtreeView(instance);
             for (uint32_t node = 1; node <= subtree.nodeCount(); ++node)
             {
                 NodeHandle handle{slot, node,
@@ -80,6 +80,13 @@ struct SpatialDatabase::TestAccess
     }
 
     static size_t definitionBytes() { return sizeof(SubtreeDefinitionRt); }
+    static const void* definitionData(const SpatialDatabase& database,
+                                      SubtreeHandle handle)
+    {
+        const SubtreeDefinitionRt* definition =
+            database.resolveSubtree(handle);
+        return definition ? definition->bytes.data() : nullptr;
+    }
     static size_t mountedStateBytes() { return sizeof(SubtreeInstanceRt); }
     static size_t mountStampBytes() { return sizeof(MountStamp); }
     static size_t mountResidencyBytes() { return sizeof(MountResidency); }
@@ -134,22 +141,21 @@ inline AABB box(float half = 1.0f,
 }
 
 inline NodeDesc node(UserPayload payload, float error, const AABB& bounds,
-                     SubtreeKey child = {}, Transform transform = {})
+                     bool mountable = false)
 {
     NodeDesc result;
     result.payload = payload;
     result.geometricError = error;
     result.bounds = bounds;
-    result.childSubtree = child;
-    result.childTransform = transform;
+    result.mountable = mountable;
     return result;
 }
 
-inline Subtree makeLodSubtree(SubtreeKey key, UserPayload coarse = 10,
-                              UserPayload left = 11,
-                              UserPayload right = 12)
+inline SubtreeBytes makeLodSubtree(UserPayload coarse = 10,
+                                   UserPayload left = 11,
+                                   UserPayload right = 12)
 {
-    SubtreeBuilder builder(key);
+    SubtreeBuilder builder;
     const auto root = builder.createNode(node(coarse, 16.0f, box(4.0f)));
     builder.createNode(root, node(left, 0.0f,
                                   box(1.0f, float4::point(-2, 0, 0))));
@@ -158,26 +164,24 @@ inline Subtree makeLodSubtree(SubtreeKey key, UserPayload coarse = 10,
     return builder.build();
 }
 
-inline Subtree makeLeafSubtree(SubtreeKey key, UserPayload payload,
-                               float half = 1.0f)
+inline SubtreeBytes makeLeafSubtree(UserPayload payload, float half = 1.0f)
 {
-    SubtreeBuilder builder(key);
+    SubtreeBuilder builder;
     builder.createNode(node(payload, 0.0f, box(half)));
     return builder.build();
 }
 
 inline InstanceHandle instantiateFor(SpatialDatabase& database,
                                      SubtreeHandle subtree,
-                                     SubtreeKey key,
                                      const AABB& bounds,
                                      float error = 64.0f,
                                      InstanceDesc desc = {},
-                                     Transform childTransform = {})
+                                     Transform mountTransform = {})
 {
     const InstanceHandle instance = database.instantiate(
-        node(1, error, bounds, key, childTransform), desc);
+        node(1, error, bounds, true), desc);
     const SubtreeInstanceHandle mounted =
-        database.mountSubtree(instance.rootNode(), subtree);
+        database.mountSubtree(instance.rootNode(), subtree, mountTransform);
     if (!mounted.valid()) throw std::logic_error("root mount failed");
     return instance;
 }

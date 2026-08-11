@@ -1,6 +1,9 @@
 #include "frontier/subtree.h"
 
+#include <cstdint>
 #include <cstring>
+
+#include "frontier/detail/subtree_data.h"
 
 namespace frontier {
 namespace {
@@ -20,13 +23,10 @@ struct Layout
     uint32_t subtreeSize = 0;
     uint32_t meta = 0;
     uint32_t error = 0;
-    uint32_t dependencies = 0;
-    uint32_t expansions = 0;
     uint32_t totalBytes = 0;
 };
 
-Layout computeLayout(uint32_t nodeCount, uint32_t wideCount,
-                     uint32_t dependencyCount, uint32_t expansionCount)
+Layout computeLayout(uint32_t nodeCount, uint32_t wideCount)
 {
     using namespace detail;
     Layout layout;
@@ -58,59 +58,109 @@ Layout computeLayout(uint32_t nodeCount, uint32_t wideCount,
     layout.error = uint32_t(offset);
     offset += size_t(nodeCount) * sizeof(float);
 
-    offset = alignUp(offset, alignof(SubtreeKey));
-    layout.dependencies = uint32_t(offset);
-    offset += size_t(dependencyCount) * sizeof(SubtreeKey);
-
-    offset = alignUp(offset, alignof(SubtreeExpansion));
-    layout.expansions = uint32_t(offset);
-    offset += size_t(expansionCount) * sizeof(SubtreeExpansion);
-
     layout.totalBytes = uint32_t(alignUp(offset, kSubtreeAlign));
     return layout;
 }
 
 } // namespace
 
-namespace detail {
-
-size_t subtreeBlobBytes(uint32_t nodeCount, uint32_t wideCount,
-                        uint32_t dependencyCount, uint32_t expansionCount)
+SubtreeBytes::SubtreeBytes(size_t size, const FrontierContext& context)
+    : size_(size), context_(context)
 {
-    return computeLayout(nodeCount, wideCount, dependencyCount,
-                         expansionCount)
-        .totalBytes;
+    if (size == 0) return;
+    FRONTIER_CHECK(context_.alloc != nullptr && context_.free != nullptr,
+                   "SubtreeBytes: allocator callbacks are required");
+    data_ = static_cast<std::byte*>(
+        context_.alloc(size, kSubtreeByteAlignment, context_.user));
+    FRONTIER_CHECK(data_ != nullptr, "SubtreeBytes: allocation failed");
+    if ((reinterpret_cast<uintptr_t>(data_) &
+         (kSubtreeByteAlignment - 1)) != 0)
+    {
+        context_.free(data_, context_.user);
+        data_ = nullptr;
+        size_ = 0;
+        FRONTIER_CHECK(false,
+                       "SubtreeBytes: allocator returned insufficiently aligned storage");
+    }
 }
 
-} // namespace detail
-
-void Subtree::validate(const void* blob, size_t bytes)
+SubtreeBytes::SubtreeBytes(const SubtreeBytes& other)
+    : SubtreeBytes(other.size_, other.context_)
 {
-    using namespace detail;
-    FRONTIER_CHECK(blob != nullptr, "Subtree::fromBytes: null blob");
-    FRONTIER_CHECK(bytes >= sizeof(SubtreeHeader),
-                   "Subtree::fromBytes: truncated header");
+    if (size_) std::memcpy(data_, other.data_, size_);
+}
+
+SubtreeBytes& SubtreeBytes::operator=(const SubtreeBytes& other)
+{
+    if (this != &other)
+    {
+        SubtreeBytes copy(other);
+        *this = std::move(copy);
+    }
+    return *this;
+}
+
+SubtreeBytes& SubtreeBytes::operator=(SubtreeBytes&& other) noexcept
+{
+    if (this != &other)
+    {
+        release();
+        moveFrom(other);
+    }
+    return *this;
+}
+
+void SubtreeBytes::release()
+{
+    if (data_) context_.free(data_, context_.user);
+    data_ = nullptr;
+    size_ = 0;
+}
+
+void SubtreeBytes::moveFrom(SubtreeBytes& other) noexcept
+{
+    data_ = other.data_;
+    size_ = other.size_;
+    context_ = other.context_;
+    other.data_ = nullptr;
+    other.size_ = 0;
+}
+
+namespace detail {
+
+size_t subtreeBlobBytes(uint32_t nodeCount, uint32_t wideCount)
+{
+    return computeLayout(nodeCount, wideCount).totalBytes;
+}
+
+void validateSubtreeBytes(const SubtreeBytes& bytes)
+{
+    FRONTIER_CHECK(bytes.data() != nullptr,
+                   "registerSubtree: empty byte array");
+    FRONTIER_CHECK(bytes.size() >= sizeof(SubtreeHeader),
+                   "registerSubtree: truncated header");
     FRONTIER_CHECK(
-        (reinterpret_cast<uintptr_t>(blob) & (kSubtreeAlign - 1)) == 0,
-        "Subtree::fromBytes: blob is not sufficiently aligned");
+        (reinterpret_cast<uintptr_t>(bytes.data()) & (kSubtreeAlign - 1)) == 0,
+        "registerSubtree: byte array is not sufficiently aligned");
 
-    const auto* header = static_cast<const SubtreeHeader*>(blob);
+    const auto* header = reinterpret_cast<const SubtreeHeader*>(bytes.data());
     FRONTIER_CHECK(header->magic == kSubtreeMagic,
-                   "Subtree::fromBytes: bad magic or byte order");
+                   "registerSubtree: bad magic or byte order");
     FRONTIER_CHECK(header->version == kSubtreeVersion,
-                   "Subtree::fromBytes: format version mismatch");
+                   "registerSubtree: format version mismatch");
     FRONTIER_CHECK(header->headerBytes == sizeof(SubtreeHeader),
-                   "Subtree::fromBytes: header size mismatch");
+                   "registerSubtree: header size mismatch");
     FRONTIER_CHECK(header->nodeCount > 1,
-                   "Subtree::fromBytes: subtree has no renderable nodes");
-    FRONTIER_CHECK(header->key != 0,
-                   "Subtree::fromBytes: invalid subtree key");
-    FRONTIER_CHECK(header->totalBytes <= bytes,
-                   "Subtree::fromBytes: truncated blob");
+                   "registerSubtree: subtree has no renderable nodes");
+    FRONTIER_CHECK(header->nodeCount <= kMaxSubtreeNodes,
+                   "registerSubtree: node count exceeds handle index space");
+    FRONTIER_CHECK(header->wideCount > 0 &&
+                       header->wideCount < header->nodeCount,
+                   "registerSubtree: invalid wide-block count");
+    FRONTIER_CHECK(header->totalBytes == bytes.size(),
+                   "registerSubtree: byte-array size mismatch");
 
-    const Layout layout =
-        computeLayout(header->nodeCount, header->wideCount,
-                      header->dependencyCount, header->expansionCount);
+    const Layout layout = computeLayout(header->nodeCount, header->wideCount);
     FRONTIER_CHECK(
         layout.totalBytes == header->totalBytes &&
             layout.wide == header->wideOffset &&
@@ -120,122 +170,35 @@ void Subtree::validate(const void* blob, size_t bytes)
             layout.parent == header->parentOffset &&
             layout.subtreeSize == header->subtreeSizeOffset &&
             layout.meta == header->metaOffset &&
-            layout.error == header->errorOffset &&
-            layout.dependencies == header->dependencyOffset &&
-            layout.expansions == header->expansionOffset,
-        "Subtree::fromBytes: offsets inconsistent with subtree shape");
+            layout.error == header->errorOffset,
+        "registerSubtree: offsets inconsistent with subtree shape");
 
-    const auto* bytesBase = static_cast<const std::byte*>(blob);
     const auto* payload = reinterpret_cast<const UserPayload*>(
-        bytesBase + header->payloadOffset);
+        bytes.data() + header->payloadOffset);
     FRONTIER_CHECK(payload[0] == kSentinelPayload,
-                   "Subtree::fromBytes: missing implicit-parent sentinel");
+                   "registerSubtree: missing implicit-parent sentinel");
 }
 
-void Subtree::bind(const void* blob, size_t bytes)
+SubtreeView viewSubtreeBytes(const SubtreeBytes& bytes)
 {
-    using namespace detail;
-    const auto* bytesBase = static_cast<const std::byte*>(blob);
-    const auto* header = reinterpret_cast<const SubtreeHeader*>(blob);
-
-    base_ = bytesBase;
-    byteSize_ = bytes;
-    packedNodeCount_ = header->nodeCount;
-    wideCount_ = header->wideCount;
-    dependencyCount_ = header->dependencyCount;
-    expansionCount_ = header->expansionCount;
-    key_ = SubtreeKey{header->key};
-    wide_ = reinterpret_cast<const WideBlock*>(bytesBase + header->wideOffset);
-    blockMask_ = reinterpret_cast<const uint32_t*>(bytesBase + header->maskOffset);
-    bbox_ = reinterpret_cast<const AABB*>(bytesBase + header->bboxOffset);
-    payload_ = reinterpret_cast<const UserPayload*>(bytesBase + header->payloadOffset);
-    parent_ = reinterpret_cast<const uint32_t*>(bytesBase + header->parentOffset);
-    subtreeSize_ = reinterpret_cast<const uint32_t*>(
-        bytesBase + header->subtreeSizeOffset);
-    meta_ = reinterpret_cast<const uint32_t*>(bytesBase + header->metaOffset);
-    geometricError_ = reinterpret_cast<const float*>(bytesBase + header->errorOffset);
-    dependencies_ = reinterpret_cast<const SubtreeKey*>(
-        bytesBase + header->dependencyOffset);
-    expansions_ = reinterpret_cast<const SubtreeExpansion*>(
-        bytesBase + header->expansionOffset);
+    const auto* base = bytes.data();
+    const auto* header = reinterpret_cast<const SubtreeHeader*>(base);
+    SubtreeView view;
+    view.byteSize_ = bytes.size();
+    view.packedNodeCount_ = header->nodeCount;
+    view.wideCount_ = header->wideCount;
+    view.wide_ = reinterpret_cast<const WideBlock*>(base + header->wideOffset);
+    view.blockMask_ = reinterpret_cast<const uint32_t*>(base + header->maskOffset);
+    view.bbox_ = reinterpret_cast<const AABB*>(base + header->bboxOffset);
+    view.payload_ = reinterpret_cast<const UserPayload*>(base + header->payloadOffset);
+    view.parent_ = reinterpret_cast<const uint32_t*>(base + header->parentOffset);
+    view.subtreeSize_ = reinterpret_cast<const uint32_t*>(
+        base + header->subtreeSizeOffset);
+    view.meta_ = reinterpret_cast<const uint32_t*>(base + header->metaOffset);
+    view.geometricError_ = reinterpret_cast<const float*>(
+        base + header->errorOffset);
+    return view;
 }
 
-Subtree Subtree::fromValidatedBytes(const void* blob, size_t bytes,
-                                    const FrontierContext* owner)
-{
-    Subtree subtree;
-    subtree.bind(blob, bytes);
-    subtree.context_ = owner;
-    return subtree;
-}
-
-Subtree Subtree::adopt(void* blob, size_t bytes,
-                       const FrontierContext& context)
-{
-    validate(blob, bytes);
-    return fromValidatedBytes(blob, bytes, &context);
-}
-
-Subtree Subtree::fromBytes(const void* blob, size_t bytes,
-                           const FrontierContext& context)
-{
-    validate(blob, bytes);
-    const auto* header = static_cast<const detail::SubtreeHeader*>(blob);
-    void* copy = context.alloc(header->totalBytes, detail::kSubtreeAlign,
-                               context.user);
-    FRONTIER_CHECK(copy != nullptr, "Subtree::fromBytes: allocation failed");
-    std::memcpy(copy, blob, header->totalBytes);
-    return fromValidatedBytes(copy, header->totalBytes, &context);
-}
-
-Subtree Subtree::borrow(const void* blob, size_t bytes)
-{
-    validate(blob, bytes);
-    const auto* header = static_cast<const detail::SubtreeHeader*>(blob);
-    return fromValidatedBytes(blob, header->totalBytes, nullptr);
-}
-
-Subtree Subtree::clone(const FrontierContext& context) const
-{
-    if (!valid()) return {};
-    void* copy = context.alloc(byteSize_, detail::kSubtreeAlign, context.user);
-    FRONTIER_CHECK(copy != nullptr, "Subtree::clone: allocation failed");
-    std::memcpy(copy, base_, byteSize_);
-    return fromValidatedBytes(copy, byteSize_, &context);
-}
-
-void Subtree::release()
-{
-    if (base_ && context_)
-        context_->free(const_cast<std::byte*>(base_), context_->user);
-
-    parent_ = nullptr;
-    subtreeSize_ = nullptr;
-    meta_ = nullptr;
-    wide_ = nullptr;
-    blockMask_ = nullptr;
-    payload_ = nullptr;
-    bbox_ = nullptr;
-    geometricError_ = nullptr;
-    dependencies_ = nullptr;
-    expansions_ = nullptr;
-    base_ = nullptr;
-    packedNodeCount_ = 0;
-    wideCount_ = 0;
-    dependencyCount_ = 0;
-    expansionCount_ = 0;
-    byteSize_ = 0;
-    key_ = {};
-    context_ = nullptr;
-}
-
-void Subtree::moveFrom(Subtree& other) noexcept
-{
-    if (!other.valid()) return;
-    bind(other.base_, other.byteSize_);
-    context_ = other.context_;
-    other.context_ = nullptr;
-    other.release();
-}
-
+} // namespace detail
 } // namespace frontier

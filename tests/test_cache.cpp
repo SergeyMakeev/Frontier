@@ -25,10 +25,9 @@ TEST(QueryCache, ReusesStableFrontiers)
 
 TEST(QueryCache, MountedStateMutationInvalidatesRecordedCut)
 {
-    const SubtreeKey key{801};
     SpatialDatabase database;
-    SubtreeHandle subtree = database.registerSubtree(makeLodSubtree(key));
-    instantiateFor(database, subtree, key, box(5.0f));
+    SubtreeHandle subtree = database.registerSubtree(makeLodSubtree());
+    instantiateFor(database, subtree, box(5.0f));
     database.applyUpdates();
 
     SpatialQuery query;

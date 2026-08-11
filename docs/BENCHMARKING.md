@@ -38,10 +38,10 @@ build/bench/frontier_bench \
   --benchmark_out_format=json
 ```
 
-The repository retains the API migration comparison in:
+The repository retains the keyless serialized-bytes API comparison in:
 
-- `bench_results/subtree_api_before.json`
-- `bench_results/subtree_api_after.json`
+- `bench_results/bytes_api_before.json`
+- `bench_results/bytes_api_after.json`
 
 ## Machine characterization
 

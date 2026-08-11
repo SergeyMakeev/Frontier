@@ -13,16 +13,16 @@
 #include <cstdlib>
 
 #define FRONTIER_VERSION_MAJOR 0
-#define FRONTIER_VERSION_MINOR 6
+#define FRONTIER_VERSION_MINOR 7
 #define FRONTIER_VERSION_PATCH 0
-#define FRONTIER_VERSION_STRING "0.6.0"
+#define FRONTIER_VERSION_STRING "0.7.0"
 
 // ---------------------------------------------------------------------------
 // Diagnostics
 //
 // FRONTIER_FATAL fires on a TRUE CONTRACT VIOLATION only — a caller bug that no
-// correct program can trigger (mounting on a node that is not an expansion
-// point or submitting non-finite bounds). It must not
+// correct program can trigger (mounting on a node that is not mountable or
+// submitting non-finite bounds). It must not
 // return.
 //
 // Expected runtime races are NOT fatal and never route here: a handle that
@@ -62,7 +62,7 @@ namespace frontier {
 // ---------------------------------------------------------------------------
 // Host context: subtree-blob allocation and optional task parallelism.
 //
-// SubtreeBuilder and owned Subtree factories use alloc/free.
+// SubtreeBuilder and SubtreeBytes use alloc/free.
 // SpatialDatabase uses the blocking parallelFor callback and workerCount for an enabled
 // uncached parallel selection. Other retained runtime storage is library-owned.
 // ---------------------------------------------------------------------------

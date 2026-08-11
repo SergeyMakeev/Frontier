@@ -2,8 +2,7 @@
 
 #include <array>
 #include <cstddef>
-#include <cstring>
-#include <vector>
+#include <utility>
 
 #include "helpers.h"
 
@@ -12,47 +11,45 @@ using namespace frontiertest;
 
 TEST(Contracts, SerializedSubtreeRejectsCorruption)
 {
-    Subtree source = makeLeafSubtree(SubtreeKey{901}, 7);
-    std::vector<std::byte> bytes(source.byteSize());
-    std::memcpy(bytes.data(), source.data(), source.byteSize());
-    bytes[0] ^= std::byte{0xff};
-    EXPECT_THROW(Subtree::fromBytes(bytes.data(), bytes.size()),
-                 std::logic_error);
+    SubtreeBytes bytes = makeLeafSubtree(7);
+    bytes.data()[0] ^= std::byte{0xff};
+    SpatialDatabase database;
+    EXPECT_THROW(database.registerSubtree(std::move(bytes)), std::logic_error);
 }
 
-TEST(Contracts, DuplicateKeysAreRejected)
+TEST(Contracts, DefinitionsHaveHandleIdentityNotContentKeys)
 {
     SpatialDatabase database;
-    database.registerSubtree(makeLeafSubtree(SubtreeKey{902}, 1));
-    EXPECT_THROW(
-        database.registerSubtree(makeLeafSubtree(SubtreeKey{902}, 2)),
-        std::logic_error);
+    SubtreeHandle first = database.registerSubtree(makeLeafSubtree(1));
+    SubtreeHandle second = database.registerSubtree(makeLeafSubtree(1));
+    EXPECT_NE(first.slot, second.slot);
 }
 
 TEST(Contracts, DefinitionCannotBeReleasedWhileMounted)
 {
     SpatialDatabase database;
-    const SubtreeKey key{903};
     SubtreeHandle subtree = database.registerSubtree(
-        makeLeafSubtree(key, 1));
-    InstanceHandle instance = instantiateFor(database, subtree, key, box(2));
+        makeLeafSubtree(1));
+    InstanceHandle instance = instantiateFor(database, subtree, box(2));
     EXPECT_THROW(database.releaseSubtree(subtree), std::logic_error);
     database.removeInstance(instance);
     database.releaseSubtree(subtree);
     EXPECT_FALSE(database.isSubtree(subtree));
 }
 
-TEST(Contracts, OnlyExtendableNodesAcceptMounts)
+TEST(Contracts, OnlyMountableNodesAcceptMounts)
 {
     SpatialDatabase database;
-    const SubtreeKey parentKey{904};
-    const SubtreeKey childKey{905};
     SubtreeHandle parent = database.registerSubtree(
-        makeLeafSubtree(parentKey, 10));
+        makeLeafSubtree(10));
     SubtreeHandle child = database.registerSubtree(
-        makeLeafSubtree(childKey, 20));
-    instantiateFor(database, parent, parentKey, box(2));
+        makeLeafSubtree(20));
+    instantiateFor(database, parent, box(2));
     EXPECT_THROW(database.mountSubtree(handleOf(database, 10), child),
+                 std::logic_error);
+
+    InstanceHandle flatRoot = database.instantiate(node(30, 4.0f, box(2)));
+    EXPECT_THROW(database.mountSubtree(flatRoot.rootNode(), child),
                  std::logic_error);
 }
 

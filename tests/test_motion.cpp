@@ -23,13 +23,12 @@ TEST(Motion, MovesTlasOwnedNodeWithoutSubtreeState)
 
 TEST(Motion, NodeBoundsUseCopyOnWritePerTopLevelInstance)
 {
-    const SubtreeKey key{701};
     SpatialDatabase database;
-    SubtreeHandle subtree = database.registerSubtree(makeLodSubtree(key));
-    InstanceHandle first = instantiateFor(database, subtree, key, box(5.0f));
+    SubtreeHandle subtree = database.registerSubtree(makeLodSubtree());
+    InstanceHandle first = instantiateFor(database, subtree, box(5.0f));
     InstanceDesc shifted;
     shifted.pos = float4::point(100, 0, 0);
-    InstanceHandle second = instantiateFor(database, subtree, key, box(5.0f),
+    InstanceHandle second = instantiateFor(database, subtree, box(5.0f),
                                            64.0f, shifted);
 
     NodeHandle firstLeaf = TestAccess::requireNode(database, first, 11);
@@ -47,21 +46,19 @@ TEST(Motion, NodeBoundsUseCopyOnWritePerTopLevelInstance)
 
 TEST(Motion, MountedTransformsCompose)
 {
-    const SubtreeKey detailKey{702};
-    const SubtreeKey parentKey{703};
     SpatialDatabase database;
     SubtreeHandle detail = database.registerSubtree(
-        makeLeafSubtree(detailKey, 30));
-    SubtreeBuilder parentBuilder(parentKey);
+        makeLeafSubtree(30));
+    SubtreeBuilder parentBuilder;
     parentBuilder.createNode(node(
-        20, 8.0f, box(2.0f, float4::point(5, 0, 0)), detailKey,
-        Transform{float4::point(5, 0, 0), 2.0f}));
+        20, 8.0f, box(2.0f, float4::point(5, 0, 0)), true));
     SubtreeHandle parent = database.registerSubtree(parentBuilder.build());
 
     Transform parentTransform{float4::point(10, 0, 0), 3.0f};
-    instantiateFor(database, parent, parentKey, box(40.0f), 64.0f, {},
+    instantiateFor(database, parent, box(40.0f), 64.0f, {},
                    parentTransform);
-    database.mountSubtree(handleOf(database, 20), detail);
+    database.mountSubtree(handleOf(database, 20), detail,
+        Transform{float4::point(5, 0, 0), 2.0f});
 
     Transform transform;
     ASSERT_TRUE(database.tryGetNodeTransform(handleOf(database, 30), transform));

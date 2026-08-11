@@ -40,22 +40,18 @@ std::unique_ptr<AssemblyScene> buildScene(bool assembled, uint32_t count,
     auto scene = std::make_unique<AssemblyScene>();
     const uint32_t side =
         uint32_t(std::ceil(std::sqrt(double(count))));
-    constexpr SubtreeKey houseKey{0xB001};
-    constexpr SubtreeKey cityKey{0xC001};
-
-    SubtreeBuilder cityBuilder(cityKey);
-    cityBuilder.reserve(assembled ? count : count * (kDetailCount + 1),
-                        assembled ? count : 0);
+    SubtreeBuilder cityBuilder;
+    cityBuilder.reserve(assembled ? count : count * (kDetailCount + 1));
     SubtreeHandle houseHandle;
     if (assembled)
     {
-        SubtreeBuilder houseBuilder(houseKey);
+        SubtreeBuilder houseBuilder;
         houseBuilder.reserve(kDetailCount);
         for (uint32_t detail = 0; detail < kDetailCount; ++detail)
             houseBuilder.createNode(
                 node(1000 + detail, 0.0f, detailBounds(detail)));
-        Subtree house = houseBuilder.build();
-        scene->immutableBytes += house.byteSize();
+        SubtreeBytes house = houseBuilder.build();
+        scene->immutableBytes += house.size();
         houseHandle = scene->world.registerSubtree(std::move(house));
 
         for (uint32_t i = 0; i < count; ++i)
@@ -64,7 +60,7 @@ std::unique_ptr<AssemblyScene> buildScene(bool assembled, uint32_t count,
             cityBuilder.createNode(node(
                 10 + i, 16.0f,
                 AABB::fromCenterExtent(position, float4::vec(4, 2, 2)),
-                houseKey, Transform{position, 1.0f}));
+                true));
         }
     }
     else
@@ -83,13 +79,13 @@ std::unique_ptr<AssemblyScene> buildScene(bool assembled, uint32_t count,
         }
     }
 
-    Subtree city = cityBuilder.build();
-    const AABB cityBounds = city.bounds();
-    scene->immutableBytes += city.byteSize();
+    SubtreeBytes city = cityBuilder.build();
+    const AABB cityBounds = detail::viewSubtreeBytes(city).bounds();
+    scene->immutableBytes += city.size();
     const SubtreeHandle cityHandle =
         scene->world.registerSubtree(std::move(city));
     const InstanceHandle instance = scene->world.instantiate(
-        node(1, 64.0f, cityBounds, cityKey));
+        node(1, 64.0f, cityBounds, true));
     const SubtreeInstanceHandle cityMount =
         scene->world.mountSubtree(instance.rootNode(), cityHandle);
 
@@ -97,7 +93,8 @@ std::unique_ptr<AssemblyScene> buildScene(bool assembled, uint32_t count,
         for (uint32_t i = 0; i < count; ++i)
             scene->world.mountSubtree(
                 TestAccess::nodeAt(scene->world, cityMount, i + 1),
-                houseHandle);
+                houseHandle,
+                Transform{housePosition(i, side), 1.0f});
 
     if (makeResident)
         TestAccess::markAllPayloadsResident(scene->world);

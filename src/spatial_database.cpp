@@ -9,12 +9,12 @@
 namespace frontier {
 
 using detail::MutWideBoundsRef;
-using detail::SubtreeExpansion;
+using detail::SubtreeView;
 using detail::WideBlock;
 using detail::WideBoundsRef;
 using detail::blockLeafLanes;
 using detail::blockValidLanes;
-using detail::metaIsExpansion;
+using detail::metaIsMountable;
 
 #ifdef FRONTIER_STATS
   #define FRONTIER_STAT(w, field, n) ((w).stats.field += (n))
@@ -235,20 +235,6 @@ SpatialDatabase::resolveSubtree(SubtreeHandle h) const
                : nullptr;
 }
 
-const SubtreeExpansion* SpatialDatabase::findSubtreeExpansion(uint32_t definition,
-                                                               uint32_t node) const
-{
-    if (definition >= subtrees_.size()) return nullptr;
-    const std::span<const SubtreeExpansion> expansions =
-        subtrees_[definition].subtree.expansions();
-    const auto it = std::lower_bound(
-        expansions.begin(), expansions.end(), node,
-        [](const SubtreeExpansion& expansion, uint32_t packedNode) {
-            return expansion.nodeIndex < packedNode;
-        });
-    return it != expansions.end() && it->nodeIndex == node ? &*it : nullptr;
-}
-
 uint32_t SpatialDatabase::traversalDependency(uint32_t slot) const
 {
     return kMountTreeDependency | slots_[slot].rootSlot;
@@ -374,37 +360,22 @@ void SpatialDatabase::destroySubtree(uint32_t definition)
     --liveSubtrees_;
 }
 
-SubtreeHandle SpatialDatabase::registerSubtree(Subtree&& subtree)
+SubtreeHandle SpatialDatabase::registerSubtree(SubtreeBytes&& bytes)
 {
-    FRONTIER_CHECK(subtree.valid(),
-                   "SpatialDatabase::registerSubtree: invalid subtree");
-    for (const SubtreeDefinitionRt& existing : subtrees_)
-        FRONTIER_CHECK(!existing.inUse() ||
-                           existing.subtree.key() != subtree.key(),
-                       "SpatialDatabase::registerSubtree: duplicate subtree key");
-
-    const uint32_t nodeCount = subtree.packedNodeCount();
-    for (const SubtreeExpansion& expansion : subtree.expansions())
-    {
-        FRONTIER_CHECK(expansion.nodeIndex > 0 &&
-                           expansion.nodeIndex < nodeCount,
-                       "SpatialDatabase::registerSubtree: invalid expansion node");
-        FRONTIER_CHECK(expansion.dependency < subtree.dependencies().size(),
-                       "SpatialDatabase::registerSubtree: invalid dependency index");
-        FRONTIER_CHECK(subtree.isExpansion(expansion.nodeIndex),
-                       "SpatialDatabase::registerSubtree: expansion metadata mismatch");
-    }
+    detail::validateSubtreeBytes(bytes);
+    const SubtreeView view = detail::viewSubtreeBytes(bytes);
 
     const uint32_t definition = allocSubtree();
     SubtreeDefinitionRt& runtime = subtrees_[definition];
     runtime = SubtreeDefinitionRt{};
-    runtime.subtree = std::move(subtree);
+    runtime.bytes = std::move(bytes);
+    runtime.view = view;
     runtime.generation = ++generationCounter_;
     runtime.rootLeavesOnly = true;
-    const uint32_t firstBlock = runtime.subtree.wideOffset(0);
-    for (uint32_t b = 0; b < runtime.subtree.wideBlockCount(0); ++b)
+    const uint32_t firstBlock = runtime.view.wideOffset(0);
+    for (uint32_t b = 0; b < runtime.view.wideBlockCount(0); ++b)
     {
-        const uint32_t lanes = runtime.subtree.blockMask_[firstBlock + b];
+        const uint32_t lanes = runtime.view.blockMask_[firstBlock + b];
         if (detail::blockValidLanes(lanes) != detail::blockLeafLanes(lanes))
         {
             runtime.rootLeavesOnly = false;
@@ -448,49 +419,49 @@ uint32_t SpatialDatabase::allocSlot()
 }
 
 const std::vector<uint32_t>*
-SpatialDatabase::expansionSlots(const SubtreeInstanceRt& instance) const
+SpatialDatabase::mountedChildSlots(const SubtreeInstanceRt& instance) const
 {
-    return instance.expansionLinks == kInvalidIndex
+    return instance.mountLinks == kInvalidIndex
                ? nullptr
-               : &expansionLinks_[instance.expansionLinks].slots;
+               : &mountLinks_[instance.mountLinks].slots;
 }
 
-std::vector<uint32_t>& SpatialDatabase::ensureExpansionSlots(uint32_t slot)
+std::vector<uint32_t>& SpatialDatabase::ensureMountedChildSlots(uint32_t slot)
 {
     SubtreeInstanceRt& instance = slots_[slot];
-    if (instance.expansionLinks == kInvalidIndex)
+    if (instance.mountLinks == kInvalidIndex)
     {
         uint32_t index;
-        if (!freeExpansionLinks_.empty())
+        if (!freeMountLinks_.empty())
         {
-            index = freeExpansionLinks_.back();
-            freeExpansionLinks_.pop_back();
+            index = freeMountLinks_.back();
+            freeMountLinks_.pop_back();
         }
         else
         {
-            expansionLinks_.emplace_back();
-            index = uint32_t(expansionLinks_.size() - 1);
+            mountLinks_.emplace_back();
+            index = uint32_t(mountLinks_.size() - 1);
         }
-        instance.expansionLinks = index;
-        expansionLinks_[index].slots.assign(
+        instance.mountLinks = index;
+        mountLinks_[index].slots.assign(
             subtreeView(instance).packedNodeCount(), kInvalidIndex);
     }
-    return expansionLinks_[instance.expansionLinks].slots;
+    return mountLinks_[instance.mountLinks].slots;
 }
 
 uint32_t SpatialDatabase::mountedChildSlot(const SubtreeInstanceRt& instance,
                                              uint32_t node) const
 {
-    const std::vector<uint32_t>* links = expansionSlots(instance);
+    const std::vector<uint32_t>* links = mountedChildSlots(instance);
     return links ? (*links)[node] : kInvalidIndex;
 }
 
-void SpatialDatabase::releaseExpansionSlots(SubtreeInstanceRt& instance)
+void SpatialDatabase::releaseMountedChildSlots(SubtreeInstanceRt& instance)
 {
-    if (instance.expansionLinks == kInvalidIndex) return;
-    expansionLinks_[instance.expansionLinks].slots.clear();
-    freeExpansionLinks_.push_back(instance.expansionLinks);
-    instance.expansionLinks = kInvalidIndex;
+    if (instance.mountLinks == kInvalidIndex) return;
+    mountLinks_[instance.mountLinks].slots.clear();
+    freeMountLinks_.push_back(instance.mountLinks);
+    instance.mountLinks = kInvalidIndex;
 }
 
 uint32_t SpatialDatabase::registerMount(uint32_t definition, NodeRef owner)
@@ -503,13 +474,13 @@ uint32_t SpatialDatabase::registerMount(uint32_t definition, NodeRef owner)
     mountTransforms_[slot] = MountTransformRt{};
 
     FRONTIER_CHECK(
-        defined.subtree.packedNodeCount() <= (1u << NodeHandle::kIndexBits),
+        defined.view.packedNodeCount() <= detail::kMaxSubtreeNodes,
         "SpatialDatabase: subtree exceeds node-handle index space");
     instance.definition = definition;
     instance.errClamp = FLT_MAX;
     instance.nodeState = nodeStatePools_[definition].acquire(
-        defined.subtree.packedNodeCount());
-    instance.expansionLinks = kInvalidIndex;
+        defined.view.packedNodeCount());
+    instance.mountLinks = kInvalidIndex;
     const uint32_t generation = nextMountGeneration(stamp.generation());
     stamp.setGeneration(generation);
     instance.setGeneration(generation);
@@ -533,7 +504,7 @@ uint32_t SpatialDatabase::registerMount(uint32_t definition, NodeRef owner)
 }
 
 SubtreeInstanceHandle SpatialDatabase::mountTransformed(
-    NodeHandle expansionNode, uint32_t definition,
+    NodeHandle parentNode, uint32_t definition,
     const Transform& transform)
 {
     FRONTIER_CHECK(definition < subtrees_.size() &&
@@ -545,33 +516,33 @@ SubtreeInstanceHandle SpatialDatabase::mountTransformed(
                        std::isfinite(transform.pos.z),
                    "SpatialDatabase: invalid mount transform");
 
-    // Stale expansion handle: the parent mount was unmounted/collected while
+    // Stale parent handle: the parent mount was unmounted/collected while
     // this subtree was being streamed. Normal race: reject quietly.
-    if (!resolve(expansionNode)) return {};
+    if (!resolve(parentNode)) return {};
 
-    const NodeRef owner{expansionNode.slot(), expansionNode.index()};
+    const NodeRef owner{parentNode.slot(), parentNode.index()};
     {
         const SubtreeInstanceRt& ownerRt = slots_[owner.slot];
-        FRONTIER_CHECK(subtreeView(ownerRt).isExpansion(owner.index),
-                   "SpatialDatabase::mountSubtree: parent is not extendable");
+        FRONTIER_CHECK(subtreeView(ownerRt).isMountable(owner.index),
+                   "SpatialDatabase::mountSubtree: parent is not mountable");
         FRONTIER_CHECK(mountedChildSlot(ownerRt, owner.index) == kInvalidIndex,
                    "SpatialDatabase::mountSubtree: already mounted");
     }
 
     // (C) across the boundary: the owner must contain the subtree's content.
     // Growing the owner here is not an option — its bytes back every instance
-    // definition. Author expansion bounds that contain what attaches.
-    const AABB childBounds = toWorld(subtrees_[definition].subtree.bounds(),
+    // definition. Author mount-point bounds that contain what attaches.
+    const AABB childBounds = toWorld(subtrees_[definition].view.bounds(),
                                      transform.pos, transform.scale);
     FRONTIER_CHECK(subtreeView(slots_[owner.slot]).bbox_[owner.index].contains(
                    childBounds),
-               "SpatialDatabase: the mounted subtree escapes the expansion node's "
-               "authored bounds — author conservative expansion bounds at build time");
+               "SpatialDatabase: the mounted subtree escapes the mount point's "
+               "authored bounds — author conservative bounds at build time");
 
     // (D) across the boundary: the child subtree's effective error ceiling is
-    // the owner expansion node's own effective error. Carried as a scalar and
+    // the owner mount point's own effective error. Carried as a scalar and
     // folded into the wide test, so immutable bytes are never touched. The
-    // same definition can hang under many expansion points, each with
+    // same definition can hang under many mount points, each with
     // its own ceiling, and mounting stays O(1) instead of O(nodeCount).
     const float childClamp =
         std::min(subtreeView(slots_[owner.slot]).geometricError_[owner.index],
@@ -592,7 +563,7 @@ SubtreeInstanceHandle SpatialDatabase::mountTransformed(
 
     SubtreeInstanceRt& ort = slots_[owner.slot];
     const bool ownerWasFullyResident = mountedTreeFullyResident(owner.slot);
-    ensureExpansionSlots(owner.slot)[owner.index] = slot;
+    ensureMountedChildSlots(owner.slot)[owner.index] = slot;
     ort.addMountedChild();
     ++mountResidency_[owner.slot].incompleteChildren;
     propagateFullResidency(owner.slot, ownerWasFullyResident);
@@ -602,36 +573,20 @@ SubtreeInstanceHandle SpatialDatabase::mountTransformed(
 }
 
 SubtreeInstanceHandle SpatialDatabase::mountSubtree(
-    NodeHandle expansionNode, SubtreeHandle subtreeHandle)
+    NodeHandle parentNode, SubtreeHandle subtreeHandle,
+    const Transform& transform)
 {
     const SubtreeDefinitionRt* child = resolveSubtree(subtreeHandle);
     FRONTIER_CHECK(child != nullptr,
                    "SpatialDatabase::mount: invalid or released subtree");
 
-    const InstanceId root = resolveTlasRoot(expansionNode);
+    const InstanceId root = resolveTlasRoot(parentNode);
     if (root != kInvalidInstanceId)
-    {
-        const Transform transform = tlasRootChildTransforms_.empty()
-                                        ? Transform{}
-                                        : tlasRootChildTransforms_[root];
         return mountTlasRoot(root, subtreeHandle, transform);
-    }
 
-    const SubtreeInstanceRt* owner = resolve(expansionNode);
+    const SubtreeInstanceRt* owner = resolve(parentNode);
     if (!owner) return {};
-    const SubtreeExpansion* expansion =
-        findSubtreeExpansion(owner->definition, expansionNode.index());
-    FRONTIER_CHECK(expansion != nullptr,
-                   "SpatialDatabase::mount: expansion has no subtree target");
-    const Subtree& parent = subtrees_[owner->definition].subtree;
-    FRONTIER_CHECK(expansion->dependency < parent.dependencies().size(),
-                   "SpatialDatabase::mount: invalid authored dependency");
-    FRONTIER_CHECK(parent.dependencies()[expansion->dependency] ==
-                       child->subtree.key(),
-                   "SpatialDatabase::mount: subtree key does not match expansion target");
-
-    return mountTransformed(expansionNode, subtreeHandle.slot,
-                            expansion->transform());
+    return mountTransformed(parentNode, subtreeHandle.slot, transform);
 }
 
 SubtreeInstanceHandle SpatialDatabase::mountTlasRoot(
@@ -644,25 +599,19 @@ SubtreeInstanceHandle SpatialDatabase::mountTlasRoot(
                        std::isfinite(transform.pos.z),
                    "SpatialDatabase::mount: invalid mount transform");
     Instance& inst = instances_[dense];
+    FRONTIER_CHECK(inst.hasMountableRoot(),
+                   "SpatialDatabase::mountSubtree: TLAS root is not mountable");
     FRONTIER_CHECK(inst.rootSlot == kInvalidIndex,
                    "SpatialDatabase::mountSubtree: already mounted");
 
     const SubtreeDefinitionRt* child = resolveSubtree(subtreeHandle);
     FRONTIER_CHECK(child != nullptr,
                    "SpatialDatabase::mount: invalid or released subtree");
-    const SubtreeKey target = tlasRootTargets_.empty()
-                                  ? SubtreeKey{}
-                                  : tlasRootTargets_[dense];
-    FRONTIER_CHECK(target.valid(),
-                   "SpatialDatabase::mount: root has no subtree target");
-    FRONTIER_CHECK(target == child->subtree.key(),
-                   "SpatialDatabase::mount: subtree key does not match expansion target");
-
     const float invInstanceScale = 1.0f / inst.scale;
     const AABB rootLocal = AABB::fromMinMax(
         (inst.worldBox.mn - inst.pos) * invInstanceScale,
         (inst.worldBox.mx - inst.pos) * invInstanceScale);
-    const AABB childBounds = toWorld(child->subtree.bounds(),
+    const AABB childBounds = toWorld(child->view.bounds(),
                                      transform.pos, transform.scale);
     FRONTIER_CHECK(rootLocal.contains(childBounds),
                    "SpatialDatabase::mount: mounted subtree escapes the TLAS root's "
@@ -681,23 +630,6 @@ SubtreeInstanceHandle SpatialDatabase::mountTlasRoot(
     inst.rootSlot = slot;
     instanceFrontierVersions_[dense] = ++generationCounter_;
     return SubtreeInstanceHandle{slot, mountStamps_[slot].generation()};
-}
-
-SubtreeKey SpatialDatabase::subtreeTarget(NodeHandle expansionNode) const
-{
-    const InstanceId root = resolveTlasRoot(expansionNode);
-    if (root != kInvalidInstanceId)
-        return tlasRootTargets_.empty() ? SubtreeKey{}
-                                        : tlasRootTargets_[root];
-    const SubtreeInstanceRt* owner = resolve(expansionNode);
-    if (!owner) return {};
-    const SubtreeExpansion* expansion =
-        findSubtreeExpansion(owner->definition, expansionNode.index());
-    if (!expansion) return {};
-    const Subtree& parent = subtrees_[owner->definition].subtree;
-    return expansion->dependency < parent.dependencies().size()
-               ? parent.dependencies()[expansion->dependency]
-               : SubtreeKey{};
 }
 
 bool SpatialDatabase::tryGetNodeTransform(
@@ -728,13 +660,13 @@ bool SpatialDatabase::isMounted(SubtreeInstanceHandle handle) const
            mountStamps_[handle.slot].generation() == handle.generation;
 }
 
-bool SpatialDatabase::hasMountedSubtree(NodeHandle expansionNode) const
+bool SpatialDatabase::hasMountedSubtree(NodeHandle parentNode) const
 {
-    const InstanceId root = resolveTlasRoot(expansionNode);
+    const InstanceId root = resolveTlasRoot(parentNode);
     if (root != kInvalidInstanceId)
         return instances_[root].rootSlot != kInvalidIndex;
-    const SubtreeInstanceRt* rt = resolve(expansionNode);
-    return rt && mountedChildSlot(*rt, expansionNode.index()) != kInvalidIndex;
+    const SubtreeInstanceRt* rt = resolve(parentNode);
+    return rt && mountedChildSlot(*rt, parentNode.index()) != kInvalidIndex;
 }
 
 void SpatialDatabase::unmountSlot(uint32_t slot, AppendBuffer<UserPayload>* freedPayloads)
@@ -754,7 +686,7 @@ void SpatialDatabase::unmountSlot(uint32_t slot, AppendBuffer<UserPayload>* free
                        "SpatialDatabase: mount residency summary underflow");
             --mountResidency_[rt.owner.slot].incompleteChildren;
         }
-        ensureExpansionSlots(rt.owner.slot)[rt.owner.index] = kInvalidIndex;
+        ensureMountedChildSlots(rt.owner.slot)[rt.owner.index] = kInvalidIndex;
         ownerRt.removeMountedChild();
         propagateFullResidency(rt.owner.slot, ownerWasFullyResident);
         bumpContentVersion(rt.owner.slot);   // it collapses to a leaf
@@ -773,7 +705,7 @@ void SpatialDatabase::unmountSlot(uint32_t slot, AppendBuffer<UserPayload>* free
     lruUnlink(slot);
     const uint32_t definition = rt.definition;
     const uint32_t generation = rt.generation();
-    releaseExpansionSlots(rt);
+    releaseMountedChildSlots(rt);
     nodeStatePools_[definition].release(rt.nodeState);
     rt = SubtreeInstanceRt{};
     rt.setGeneration(generation);
@@ -789,13 +721,13 @@ void SpatialDatabase::unmountTree(uint32_t rootSlot,
                             AppendBuffer<UserPayload>* freedPayloads)
 {
     if (rootSlot == kInvalidIndex || !slots_[rootSlot].inUse()) return;
-    // Collect the mounted tree from its root through expansion links, then
+    // Collect the mounted tree from its root through mount links, then
     // unmount bottom-up. O(this mounted tree), independent of database size.
     std::vector<uint32_t> order;
     order.push_back(rootSlot);
     for (size_t k = 0; k < order.size(); ++k)
         if (const std::vector<uint32_t>* links =
-                expansionSlots(slots_[order[k]]))
+                mountedChildSlots(slots_[order[k]]))
             for (const uint32_t child : *links)
                 if (child != kInvalidIndex) order.push_back(child);
     for (size_t k = order.size(); k-- > 0;) unmountSlot(order[k], freedPayloads);
@@ -840,7 +772,7 @@ void SpatialDatabase::propagateFullResidency(uint32_t slot, bool wasFullyResiden
 bool SpatialDatabase::descendantsCovered(uint32_t slot, uint32_t node) const
 {
     const SubtreeInstanceRt& rt = slots_[slot];
-    if (node != 0 && subtreeView(rt).isExpansion(node))
+    if (node != 0 && subtreeView(rt).isMountable(node))
     {
         const uint32_t child = mountedChildSlot(rt, node);
         return child != kInvalidIndex && slots_[child].inUse() &&
@@ -979,7 +911,6 @@ InstanceHandle SpatialDatabase::addTlasRootInstance(
                        "SpatialDatabase: exhausted the 24-bit InstanceId space");
         instances_.emplace_back();
         if (!tlasRootPayloads_.empty()) tlasRootPayloads_.emplace_back();
-        if (!tlasRootTargets_.empty()) tlasRootTargets_.emplace_back();
         instanceFrontierVersions_.emplace_back();
         instanceDenseToHandle_.push_back(kInvalidInstanceId);
         id = InstanceId(instances_.size() - 1);
@@ -1002,19 +933,13 @@ InstanceHandle SpatialDatabase::addTlasRootInstance(
     instanceDenseToHandle_[id] = handle;
     if (tlasRootPayloads_.size() < instances_.size())
         tlasRootPayloads_.resize(instances_.size());
-    if (tlasRootTargets_.size() < instances_.size())
-        tlasRootTargets_.resize(instances_.size());
-    if (tlasRootChildTransforms_.size() < instances_.size())
-        tlasRootChildTransforms_.resize(instances_.size());
-
     Instance& inst = instances_[id];
     inst = Instance{};
     tlasRootPayloads_[id] = root.payload;
-    tlasRootTargets_[id] = root.childSubtree;
-    tlasRootChildTransforms_[id] = root.childTransform;
     inst.pos = desc.pos;
     inst.scale = desc.scale;
     inst.rootSlot = kInvalidIndex;
+    inst.setMountableRoot(root.mountable);
     inst.setZeroErrorRoot(!(root.geometricError > 0.0f));
     inst.setAlive(true);
     do
@@ -1030,7 +955,7 @@ InstanceHandle SpatialDatabase::addTlasRootInstance(
     if (!instanceFlatSlots_.empty())
         if (instanceFlatSlots_.size() < instances_.size())
             instanceFlatSlots_.resize(instances_.size(), kInvalidIndex);
-    if (!root.childSubtree.valid())
+    if (!root.mountable)
     {
         if (instanceFlatSlots_.empty())
             instanceFlatSlots_.resize(instances_.size(), kInvalidIndex);
@@ -1157,9 +1082,6 @@ void SpatialDatabase::removeInstance(InstanceHandle ref)
     markTlasStructuralChange();
 
     tlasRootPayloads_[id] = 0;
-    if (!tlasRootTargets_.empty()) tlasRootTargets_[id] = {};
-    if (!tlasRootChildTransforms_.empty())
-        tlasRootChildTransforms_[id] = {};
 }
 
 void SpatialDatabase::moveInstance(InstanceHandle ref,
@@ -1282,7 +1204,7 @@ const SpatialDatabase::Overlay* SpatialDatabase::findOverlay(const Instance& ins
 void SpatialDatabase::initOverlay(Overlay& ov, uint32_t slot,
                                   const SubtreeInstanceRt& rt)
 {
-    const Subtree& pg = subtreeView(rt);
+    const SubtreeView& pg = subtreeView(rt);
     ov.generation = mountStamps_[slot].generation();
     ov.bbox.assign(pg.bbox_, pg.bbox_ + pg.packedNodeCount());
     if (pg.wideCount() >= Overlay::kSparseWideMinBlocks)
@@ -1301,7 +1223,8 @@ void SpatialDatabase::initOverlay(Overlay& ov, uint32_t slot,
     }
 }
 
-WideBounds& SpatialDatabase::mutableWideBounds(Overlay& ov, const Subtree& pg,
+WideBounds& SpatialDatabase::mutableWideBounds(Overlay& ov,
+                                                const SubtreeView& pg,
                                      uint32_t block)
 {
     if (!ov.sparseWide()) return ov.wide[block];
@@ -1496,12 +1419,12 @@ size_t SpatialDatabase::subtreeInstanceStateBytes() const
                    mountStamps_.capacity() * sizeof(MountStamp) +
                    mountResidency_.capacity() * sizeof(MountResidency) +
                    freeSlots_.capacity() * sizeof(uint32_t) +
-                   expansionLinks_.capacity() * sizeof(ExpansionLinksRt) +
-                   freeExpansionLinks_.capacity() * sizeof(uint32_t);
+                   mountLinks_.capacity() * sizeof(MountLinksRt) +
+                   freeMountLinks_.capacity() * sizeof(uint32_t);
     bytes += nodeStatePools_.capacity() * sizeof(NodeStatePoolRt);
     for (const NodeStatePoolRt& pool : nodeStatePools_)
         bytes += pool.bytes();
-    for (const ExpansionLinksRt& links : expansionLinks_)
+    for (const MountLinksRt& links : mountLinks_)
         bytes += links.slots.capacity() * sizeof(uint32_t);
     return bytes;
 }
@@ -1612,7 +1535,7 @@ void SpatialDatabase::applyBoundsChange(InstanceId id, uint32_t slot, uint32_t i
         // this subtree only. Crossing a boundary below promotes
         // the owner too, so exactly the ancestor path is privatised.
         const uint32_t oi = ensureOverlay(instances_[id], curSlot);
-        const Subtree& pg = subtreeView(slots_[curSlot]);
+        const SubtreeView& pg = subtreeView(slots_[curSlot]);
         Overlay& overlay = overlays_[oi];
         AABB* bbox = overlay.bbox.data();
 
@@ -1659,11 +1582,11 @@ void SpatialDatabase::applyBoundsChange(InstanceId id, uint32_t slot, uint32_t i
             refreshInstanceBounds(id, false);
             return;
         }
-        const MountTransformRt childTransform = mountTransforms_[curSlot];
+        const MountTransformRt mountedTransform = mountTransforms_[curSlot];
         const MountTransformRt parentTransform = mountTransforms_[owner.slot];
-        const float relativeScale = childTransform.scale / parentTransform.scale;
+        const float relativeScale = mountedTransform.scale / parentTransform.scale;
         float4 relativePos =
-            (childTransform.pos - parentTransform.pos) / parentTransform.scale;
+            (mountedTransform.pos - parentTransform.pos) / parentTransform.scale;
         relativePos.w = 1.0f;
         curBox = toWorld(bbox[0], relativePos, relativeScale);
         curSlot = owner.slot;
@@ -1675,7 +1598,8 @@ void SpatialDatabase::applyBoundsChange(InstanceId id, uint32_t slot, uint32_t i
 // Update a node's lane in its parent's wide block (the hot mirror of bbox).
 // Which lane holds the node is immutable authored data, so it is read from
 // the shared subtree; only the box is written into the instance overlay.
-void SpatialDatabase::patchParentLane(const Subtree& pg, AABB* bbox, Overlay& overlay,
+void SpatialDatabase::patchParentLane(const SubtreeView& pg, AABB* bbox,
+                                      Overlay& overlay,
                             uint32_t index)
 {
     const uint32_t p = pg.parent_[index];
@@ -2294,14 +2218,6 @@ void SpatialDatabase::reorderInstancesByTlas()
     std::vector<UserPayload> newTlasRootPayloads;
     const bool hadTlasRootPayloads = !tlasRootPayloads_.empty();
     if (hadTlasRootPayloads) newTlasRootPayloads.resize(liveCount);
-    std::vector<SubtreeKey> newTlasRootTargets;
-    const bool hadTlasRootTargets = !tlasRootTargets_.empty();
-    if (hadTlasRootTargets) newTlasRootTargets.resize(liveCount);
-    std::vector<Transform> newTlasRootChildTransforms;
-    const bool hadTlasRootChildTransforms =
-        !tlasRootChildTransforms_.empty();
-    if (hadTlasRootChildTransforms)
-        newTlasRootChildTransforms.resize(liveCount);
     std::vector<uint32_t> newFrontierVersions(liveCount);
     std::vector<InstanceId> newDenseToHandle(liveCount, kInvalidInstanceId);
     std::vector<uint32_t> newFlat;
@@ -2314,11 +2230,6 @@ void SpatialDatabase::reorderInstancesByTlas()
         newInstances[next] = std::move(instances_[old]);
         if (hadTlasRootPayloads)
             newTlasRootPayloads[next] = tlasRootPayloads_[old];
-        if (hadTlasRootTargets)
-            newTlasRootTargets[next] = tlasRootTargets_[old];
-        if (hadTlasRootChildTransforms)
-            newTlasRootChildTransforms[next] =
-                tlasRootChildTransforms_[old];
         newFrontierVersions[next] = instanceFrontierVersions_[old];
         newDenseToHandle[next] = instanceDenseToHandle_[old];
         if (hadFlatStream) newFlat[next] = instanceFlatSlots_[old];
@@ -2328,10 +2239,6 @@ void SpatialDatabase::reorderInstancesByTlas()
     instances_.swap(newInstances);
     if (hadTlasRootPayloads)
         tlasRootPayloads_.swap(newTlasRootPayloads);
-    if (hadTlasRootTargets)
-        tlasRootTargets_.swap(newTlasRootTargets);
-    if (hadTlasRootChildTransforms)
-        tlasRootChildTransforms_.swap(newTlasRootChildTransforms);
     instanceFrontierVersions_.swap(newFrontierVersions);
     instanceDenseToHandle_.swap(newDenseToHandle);
     if (hadFlatStream) instanceFlatSlots_.swap(newFlat);
@@ -2717,7 +2624,7 @@ CollectResult SpatialDatabase::collect(std::span<SpatialQuery* const> queries,
 // One SIMD issue per kWide children: masked tri-state frustum, distance and
 // screen error, lanes = children. Surviving PLAIN LEAVES are emitted right
 // here (they are in both cuts by definition — no visit, no metadata reads);
-// surviving interior/expansion nodes go onto the DFS stack with their err and
+// surviving interior/mountable nodes go onto the DFS stack with their err and
 // narrowed plane mask carried along.
 //
 // Normal and dense-overlay bounds come through item.wide without a per-block
@@ -2725,7 +2632,7 @@ CollectResult SpatialDatabase::collect(std::span<SpatialQuery* const> queries,
 // template dispatch happens once per subtree rather than once per block.
 template<bool FullyResident, bool SparseOverlay>
 void SpatialDatabase::wideVisit(
-    const WorkItem& item, const Subtree& pg, float errClamp, uint32_t gen,
+    const WorkItem& item, const SubtreeView& pg, float errClamp, uint32_t gen,
     InstanceId instance, uint32_t node, uint8_t mask, uint8_t currentKids,
     uint8_t idealKids, const Camera& local, Worker& w) const
 {
@@ -2823,7 +2730,7 @@ void SpatialDatabase::wideVisit(
 }
 
 void SpatialDatabase::emitMountedRootLeavesInside(
-    const WorkItem& item, const Subtree& subtree, float errClamp,
+    const WorkItem& item, const SubtreeView& subtree, float errClamp,
     uint32_t generation, InstanceId instance, float4 qmn, float4 qmx,
     float cameraK, Worker& w) const
 {
@@ -2855,17 +2762,18 @@ void SpatialDatabase::emitMountedRootLeavesInside(
 }
 
 void SpatialDatabase::emitMountedLeafBatchInside(
-    const SubtreeInstanceRt& owner, const Subtree& ownerSubtree, NodeItem current,
+    const SubtreeInstanceRt& owner, const SubtreeView& ownerSubtree,
+    NodeItem current,
     size_t stackBase, InstanceId instance, const Camera& rootLocal,
     Worker& w) const
 {
     const std::vector<uint32_t>& ownerLinks =
-        expansionLinks_[owner.expansionLinks].slots;
+        mountLinks_[owner.mountLinks].slots;
     uint32_t childSlot = ownerLinks[current.node()];
     const uint32_t childDefinition = mountTransforms_[childSlot].definition();
-    const Subtree& childSubtree = subtrees_[childDefinition].subtree;
-    const uint32_t childCount = childSubtree.childCount(0);
-    const uint32_t firstBlock = childSubtree.wideOffset(0);
+    const SubtreeView& childView = subtrees_[childDefinition].view;
+    const uint32_t childCount = childView.childCount(0);
+    const uint32_t firstBlock = childView.wideOffset(0);
     const float4 rootQmn = rootLocal.queryMin();
     const float4 rootQmx = rootLocal.queryMax();
     // Cached traversal needs one exact root stamp. Mount-usage traversal still
@@ -2888,9 +2796,9 @@ void SpatialDatabase::emitMountedLeafBatchInside(
         for (uint32_t base = 0; base < childCount;
              base += kWide, ++block)
         {
-            const WideBlock& children = childSubtree.wide_[block];
+            const WideBlock& children = childView.wide_[block];
             const uint32_t lanes =
-                blockValidLanes(childSubtree.blockMask_[block]);
+                blockValidLanes(childView.blockMask_[block]);
             FRONTIER_STAT(w, wideBlocksTested, 1);
             FRONTIER_STAT(w, lanesSurvived,
                           uint64_t(std::popcount(lanes)));
@@ -2916,7 +2824,7 @@ void SpatialDatabase::emitMountedLeafBatchInside(
         if (w.nodeStack.size() <= stackBase) return;
         const NodeItem next = w.nodeStack.back();
         if (!(next.err > w.bar) || next.planes() != 0 ||
-            !metaIsExpansion(ownerSubtree.meta_[next.node()]))
+            !metaIsMountable(ownerSubtree.meta_[next.node()]))
             return;
         const uint32_t nextSlot = ownerLinks[next.node()];
         if (nextSlot == kInvalidIndex) return;
@@ -2946,7 +2854,7 @@ bool SpatialDatabase::visibleDescendantsCovered(uint32_t slot, uint32_t node, ui
     if (mask == 0) return false;
 
     const SubtreeInstanceRt* rt = &slots_[slot];
-    if (node != 0 && subtreeView(*rt).isExpansion(node))
+    if (node != 0 && subtreeView(*rt).isMountable(node))
     {
         const uint32_t child = mountedChildSlot(*rt, node);
         if (child == kInvalidIndex) return false;
@@ -2958,7 +2866,7 @@ bool SpatialDatabase::visibleDescendantsCovered(uint32_t slot, uint32_t node, ui
     }
 
     const Camera local = mountLocalCamera(rootLocal, slot, mask);
-    const Subtree& subtree = subtreeView(*rt);
+    const SubtreeView& subtree = subtreeView(*rt);
     const uint32_t count = subtree.childCount(node);
     if (count == 0) return false;
     const AABB* bounds = boundsFor(inst, slot, *rt);
@@ -3001,7 +2909,7 @@ void SpatialDatabase::runSubtreeImpl(const WorkItem& item,
     recordTraversalDependency(w, item.slot());
 
     FRONTIER_STAT(w, subtreesVisited, 1);
-    const Subtree& pg = subtreeView(rt);
+    const SubtreeView& pg = subtreeView(rt);
     const uint32_t gen = rt.generation();
     const InstanceId instance =
         publicInstanceId(InstanceId(&inst - instances_.data()));
@@ -3029,11 +2937,11 @@ void SpatialDatabase::runSubtreeImpl(const WorkItem& item,
         {
             if (e.err > bar && e.planes() == 0 &&
                 !inst.hasOverlayList() &&
-                metaIsExpansion(pg.meta_[i]) &&
-                rt.expansionLinks != kInvalidIndex)
+                metaIsMountable(pg.meta_[i]) &&
+                rt.mountLinks != kInvalidIndex)
             {
                 const uint32_t childSlot =
-                    expansionLinks_[rt.expansionLinks].slots[i];
+                    mountLinks_[rt.mountLinks].slots[i];
                 if (childSlot != kInvalidIndex &&
                     mountTransforms_[childSlot].rootLeavesOnly())
                 {
@@ -3050,7 +2958,7 @@ void SpatialDatabase::runSubtreeImpl(const WorkItem& item,
                 continue;
             }
 
-            const bool exp = metaIsExpansion(pg.meta_[i]);
+            const bool exp = metaIsMountable(pg.meta_[i]);
             const uint32_t childSlot =
                 exp ? mountedChildSlot(rt, i) : kInvalidIndex;
             if (exp)
@@ -3068,10 +2976,10 @@ void SpatialDatabase::runSubtreeImpl(const WorkItem& item,
                     if (directLeaves)
                     {
                         recordTraversalDependency(w, childSlot);
-                        const Subtree& childSubtree =
-                            subtrees_[childMount.definition()].subtree;
+                        const SubtreeView& childView =
+                            subtrees_[childMount.definition()].view;
                         const WorkItem childItem{
-                            childSlot, childSubtree.wideBounds(), 1, 1,
+                            childSlot, childView.wideBounds(), 1, 1,
                             e.planes()};
                         FRONTIER_STAT(w, subtreesVisited, 1);
                         if (e.planes() == 0)
@@ -3084,7 +2992,7 @@ void SpatialDatabase::runSubtreeImpl(const WorkItem& item,
                             const float4 qmx =
                                 (rootLocal.queryMax() - transform.pos) * invScale;
                             emitMountedRootLeavesInside(
-                                childItem, childSubtree, childMount.errClamp,
+                                childItem, childView, childMount.errClamp,
                                 childMount.generation, instance, qmn, qmx,
                                 rootLocal.k, w);
                         }
@@ -3093,7 +3001,7 @@ void SpatialDatabase::runSubtreeImpl(const WorkItem& item,
                             const Camera childLocal = mountLocalCamera(
                                 rootLocal, childSlot, e.planes());
                             wideVisit<true, false>(
-                                childItem, childSubtree, childMount.errClamp,
+                                childItem, childView, childMount.errClamp,
                                 childMount.generation, instance, 0,
                                 e.planes(), 1, 1, childLocal, w);
                         }
@@ -3143,7 +3051,7 @@ void SpatialDatabase::runSubtreeImpl(const WorkItem& item,
             }
 
             const uint32_t m = pg.meta_[i];
-            const bool exp = metaIsExpansion(m);
+            const bool exp = metaIsMountable(m);
 
             const uint32_t childSlot =
                 exp ? mountedChildSlot(rt, i) : kInvalidIndex;
@@ -3151,7 +3059,7 @@ void SpatialDatabase::runSubtreeImpl(const WorkItem& item,
             if (ideal && e.err > bar && exp && childSlot == kInvalidIndex)
             {
                 FRONTIER_CHECK(!current || rt.isResident(i),
-                           "SpatialQuery::selectFrontier: non-resident current expansion proxy");
+                           "SpatialQuery::selectFrontier: non-resident current mount proxy");
                 const FrontierEntry entry =
                     makeFrontierEntry(here, e.err, bar, w.barInv, instance);
                 w.emit(entry, current, true);
@@ -3180,7 +3088,7 @@ void SpatialDatabase::runSubtreeImpl(const WorkItem& item,
             if (exp)
             {
                 FRONTIER_CHECK(childSlot != kInvalidIndex,
-                           "SpatialQuery::selectFrontier: uncovered expansion subtree");
+                           "SpatialQuery::selectFrontier: uncovered mounted subtree");
                 w.work.push_back(makeWorkItem(
                     childSlot, inst, nextCurrent, nextIdeal, e.planes()));
             }
@@ -3390,7 +3298,7 @@ void SpatialDatabase::selectFrontierUncached(const Camera& camera, const Selecti
                     if (next.rootSlot != kInvalidIndex)
                     {
                         const SubtreeInstanceRt& nrt = slots_[next.rootSlot];
-                        const Subtree& nextSubtree = subtreeView(nrt);
+                        const SubtreeView& nextSubtree = subtreeView(nrt);
                         FRONTIER_PREFETCH(nextSubtree.wide_);
                         FRONTIER_PREFETCH(nextSubtree.meta_);
                         FRONTIER_PREFETCH(nextSubtree.payload_);
@@ -3422,7 +3330,7 @@ void SpatialDatabase::selectFrontierUncached(const Camera& camera, const Selecti
                         if (next.rootSlot != kInvalidIndex)
                         {
                             const SubtreeInstanceRt& nrt = slots_[next.rootSlot];
-                            const Subtree& nextSubtree = subtreeView(nrt);
+                            const SubtreeView& nextSubtree = subtreeView(nrt);
                             FRONTIER_PREFETCH(nextSubtree.wide_);
                             FRONTIER_PREFETCH(nextSubtree.meta_);
                             FRONTIER_PREFETCH(nextSubtree.payload_);

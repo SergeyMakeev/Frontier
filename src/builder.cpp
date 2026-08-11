@@ -5,24 +5,14 @@
 #include <cmath>
 #include <cstring>
 
+#include "frontier/detail/subtree_data.h"
+
 namespace frontier {
-namespace {
 
-bool finiteTransform(const Transform& transform)
-{
-    return transform.scale > 0.0f && std::isfinite(transform.scale) &&
-           std::isfinite(transform.pos.x) &&
-           std::isfinite(transform.pos.y) &&
-           std::isfinite(transform.pos.z);
-}
-
-} // namespace
-
-void SubtreeBuilder::reserve(uint32_t nodeCount, uint32_t expansionCount)
+void SubtreeBuilder::reserve(uint32_t nodeCount)
 {
     FRONTIER_CHECK(!built_, "SubtreeBuilder: builder already consumed");
     nodes_.reserve(nodeCount);
-    expansions_.reserve(expansionCount);
     roots_.reserve(std::min(nodeCount, detail::kMaxChildren));
 }
 
@@ -36,34 +26,21 @@ SubtreeBuilder::NodeId SubtreeBuilder::createNode(NodeId parent,
 {
     using namespace detail;
     FRONTIER_CHECK(!built_, "SubtreeBuilder: builder already consumed");
-    FRONTIER_CHECK(key_.valid(), "SubtreeBuilder: invalid subtree key");
     FRONTIER_CHECK(parent == kInvalidIndex || parent < nodes_.size(),
                    "SubtreeBuilder: invalid parent");
     FRONTIER_CHECK(node.geometricError >= 0.0f &&
                        std::isfinite(node.geometricError),
                    "SubtreeBuilder: invalid geometric error");
-    if (node.childSubtree.valid())
-    {
-        FRONTIER_CHECK(node.childSubtree != key_,
-                       "SubtreeBuilder: direct self-expansion is invalid");
-        FRONTIER_CHECK(finiteTransform(node.childTransform),
-                       "SubtreeBuilder: invalid child transform");
-    }
     if (parent != kInvalidIndex)
-        FRONTIER_CHECK(nodes_[parent].expansion == kInvalidIndex,
-                       "SubtreeBuilder: expansion point must stay a leaf");
+        FRONTIER_CHECK(!nodes_[parent].mountable,
+                       "SubtreeBuilder: mountable node must stay a leaf");
 
     BuildNode built;
     built.bounds = node.bounds;
     built.payload = node.payload;
     built.geometricError = node.geometricError;
     built.parent = parent;
-    if (node.childSubtree.valid())
-    {
-        built.expansion = uint32_t(expansions_.size());
-        expansions_.push_back(
-            BuildExpansion{node.childSubtree, node.childTransform});
-    }
+    built.mountable = node.mountable;
     nodes_.push_back(built);
     const NodeId id = NodeId(nodes_.size() - 1);
     if (parent == kInvalidIndex)
@@ -87,12 +64,11 @@ SubtreeBuilder::NodeId SubtreeBuilder::createNode(NodeId parent,
     return id;
 }
 
-Subtree SubtreeBuilder::build(const FrontierContext& context)
+SubtreeBytes SubtreeBuilder::build(const FrontierContext& context)
 {
     using namespace detail;
     FRONTIER_CHECK(!built_, "SubtreeBuilder: builder already consumed");
     built_ = true;
-    FRONTIER_CHECK(key_.valid(), "SubtreeBuilder: invalid subtree key");
     FRONTIER_CHECK(!roots_.empty(), "SubtreeBuilder: subtree has no nodes");
 
     const uint32_t total = uint32_t(nodes_.size()) + 1;
@@ -104,8 +80,6 @@ Subtree SubtreeBuilder::build(const FrontierContext& context)
     std::vector<float> geometricError;
     std::vector<WideBlock> wide;
     std::vector<uint32_t> blockMask;
-    std::vector<SubtreeKey> dependencies;
-    std::vector<SubtreeExpansion> expansions;
 
     parent.reserve(total);
     subtreeSize.reserve(total);
@@ -115,12 +89,12 @@ Subtree SubtreeBuilder::build(const FrontierContext& context)
     geometricError.reserve(total);
 
     const auto emit = [&](uint32_t parentIndex, uint32_t childCount,
-                          bool expansion, UserPayload nodePayload,
+                          bool mountable, UserPayload nodePayload,
                           const AABB& nodeBounds, float error) -> uint32_t
     {
         parent.push_back(parentIndex);
         subtreeSize.push_back(1);
-        meta.push_back(childCount | (expansion ? kMetaExpansion : 0u));
+        meta.push_back(childCount | (mountable ? kMetaMountable : 0u));
         payload.push_back(nodePayload);
         bbox.push_back(nodeBounds);
         geometricError.push_back(error);
@@ -129,14 +103,6 @@ Subtree SubtreeBuilder::build(const FrontierContext& context)
 
     emit(0, uint32_t(roots_.size()), false, kSentinelPayload, AABB::empty(),
          FLT_MAX);
-
-    const auto dependencyIndex = [&](SubtreeKey target) -> uint32_t
-    {
-        for (uint32_t i = 0; i < dependencies.size(); ++i)
-            if (dependencies[i] == target) return i;
-        dependencies.push_back(target);
-        return uint32_t(dependencies.size() - 1);
-    };
 
     std::vector<uint32_t> remap(nodes_.size(), kInvalidIndex);
     std::vector<uint32_t> stack;
@@ -149,22 +115,12 @@ Subtree SubtreeBuilder::build(const FrontierContext& context)
         const uint32_t source = stack.back();
         stack.pop_back();
         const BuildNode& node = nodes_[source];
-        const bool expansion = node.expansion != kInvalidIndex;
         const uint32_t parentIndex =
             node.parent == kInvalidIndex ? 0 : remap[node.parent];
         const uint32_t packed =
-            emit(parentIndex, node.childCount, expansion,
+            emit(parentIndex, node.childCount, node.mountable,
                  node.payload, node.bounds, node.geometricError);
         remap[source] = packed;
-        if (expansion)
-        {
-            const BuildExpansion& authored = expansions_[node.expansion];
-            expansions.push_back(SubtreeExpansion{
-                authored.transform.pos,
-                authored.transform.scale,
-                packed,
-                dependencyIndex(authored.target)});
-        }
         siblingScratch.clear();
         for (NodeId child = node.firstChild; child != kInvalidIndex;
              child = nodes_[child].nextSibling)
@@ -231,7 +187,7 @@ Subtree SubtreeBuilder::build(const FrontierContext& context)
                 block.child[lane] = childIndex;
                 valid |= 1u << lane;
                 if (metaChildCount(meta[childIndex]) == 0 &&
-                    !metaIsExpansion(meta[childIndex]))
+                    !metaIsMountable(meta[childIndex]))
                     leaf |= 1u << lane;
             }
             wide.push_back(block);
@@ -251,30 +207,23 @@ Subtree SubtreeBuilder::build(const FrontierContext& context)
         FRONTIER_CHECK(geometricError[i] <= geometricError[parent[i]],
                        "SubtreeBuilder: error monotonicity violated");
         FRONTIER_CHECK(metaChildCount(meta[i]) == 0 ||
-                           !metaIsExpansion(meta[i]),
+                           !metaIsMountable(meta[i]),
                        "SubtreeBuilder: local and mounted children conflict");
     }
 
     const uint32_t wideCount = uint32_t(wide.size());
-    const size_t bytes = subtreeBlobBytes(
-        total, wideCount, uint32_t(dependencies.size()),
-        uint32_t(expansions.size()));
-    void* blob =
-        context.alloc(bytes, kSubtreeAlign, context.user);
-    FRONTIER_CHECK(blob != nullptr, "SubtreeBuilder: allocation failed");
-    std::memset(blob, 0, bytes);
+    const size_t byteCount = subtreeBlobBytes(total, wideCount);
+    SubtreeBytes bytes(byteCount, context);
+    std::memset(bytes.data(), 0, byteCount);
 
-    auto* base = static_cast<std::byte*>(blob);
+    auto* base = bytes.data();
     auto* header = reinterpret_cast<SubtreeHeader*>(base);
     header->magic = kSubtreeMagic;
     header->version = kSubtreeVersion;
     header->headerBytes = uint16_t(sizeof(SubtreeHeader));
-    header->totalBytes = uint32_t(bytes);
+    header->totalBytes = uint32_t(byteCount);
     header->nodeCount = total;
     header->wideCount = wideCount;
-    header->dependencyCount = uint32_t(dependencies.size());
-    header->expansionCount = uint32_t(expansions.size());
-    header->key = key_.value;
 
     size_t offset = sizeof(SubtreeHeader);
     const auto place = [&](uint32_t& destination, size_t alignment,
@@ -301,12 +250,8 @@ Subtree SubtreeBuilder::build(const FrontierContext& context)
           meta.data());
     place(header->errorOffset, alignof(float), total, sizeof(float),
           geometricError.data());
-    place(header->dependencyOffset, alignof(SubtreeKey), dependencies.size(),
-          sizeof(SubtreeKey), dependencies.data());
-    place(header->expansionOffset, alignof(SubtreeExpansion), expansions.size(),
-          sizeof(SubtreeExpansion), expansions.data());
 
-    return Subtree::adopt(blob, bytes, context);
+    return bytes;
 }
 
 } // namespace frontier

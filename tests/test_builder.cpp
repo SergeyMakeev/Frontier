@@ -1,81 +1,80 @@
 #include <gtest/gtest.h>
 
 #include <cstddef>
-#include <vector>
+#include <cstring>
+#include <utility>
 
+#include "frontier/detail/subtree_data.h"
 #include "helpers.h"
 
 using namespace frontier;
 using namespace frontiertest;
 
-TEST(SubtreeBuilder, BuildsCompleteSerializableBlob)
+TEST(SubtreeBuilder, BuildsTraversalReadySerializableBytes)
 {
-    const SubtreeKey houseKey{101};
-    const SubtreeKey detailKey{102};
-    SubtreeBuilder builder(houseKey);
+    SubtreeBuilder builder;
     const auto coarse = builder.createNode(node(10, 32.0f, box(5.0f)));
     builder.createNode(coarse, node(11, 0.0f, box(2.0f,
                                                    float4::point(-2, 0, 0))));
     builder.createNode(coarse, node(12, 8.0f, box(2.0f,
                                                    float4::point(2, 0, 0)),
-                                     detailKey,
-                                     Transform{float4::point(2, 0, 0), 0.5f}));
+                                     true));
 
-    Subtree subtree = builder.build();
-    ASSERT_TRUE(subtree.valid());
-    EXPECT_EQ(subtree.key(), houseKey);
-    EXPECT_EQ(subtree.nodeCount(), 3u);
-    ASSERT_EQ(subtree.dependencies().size(), 1u);
-    EXPECT_EQ(subtree.dependencies()[0], detailKey);
-    EXPECT_TRUE(subtree.bounds().contains(box(5.0f)));
+    SubtreeBytes bytes = builder.build();
+    ASSERT_FALSE(bytes.empty());
+    EXPECT_EQ(reinterpret_cast<uintptr_t>(bytes.data()) %
+                  kSubtreeByteAlignment,
+              0u);
+    detail::validateSubtreeBytes(bytes);
+    const detail::SubtreeView view = detail::viewSubtreeBytes(bytes);
+    EXPECT_EQ(view.nodeCount(), 3u);
+    EXPECT_TRUE(view.isMountable(3));
+    EXPECT_TRUE(view.bounds().contains(box(5.0f)));
 
-    Subtree copy = Subtree::fromBytes(subtree.data(), subtree.byteSize());
-    EXPECT_EQ(copy.key(), houseKey);
-    EXPECT_EQ(copy.nodeCount(), subtree.nodeCount());
-    EXPECT_EQ(copy.byteSize(), subtree.byteSize());
+    SubtreeBytes copy = bytes;
+    EXPECT_NE(copy.data(), bytes.data());
+    EXPECT_EQ(copy.size(), bytes.size());
+    EXPECT_EQ(std::memcmp(copy.data(), bytes.data(), bytes.size()), 0);
 
-    Subtree clone = subtree.clone();
-    EXPECT_NE(clone.data(), subtree.data());
-    EXPECT_EQ(clone.byteSize(), subtree.byteSize());
-
-    Subtree borrowed = Subtree::borrow(subtree.data(), subtree.byteSize());
-    EXPECT_EQ(borrowed.data(), subtree.data());
-    EXPECT_EQ(borrowed.key(), houseKey);
+    SpatialDatabase database;
+    const size_t byteCount = bytes.size();
+    const void* allocation = bytes.data();
+    SubtreeHandle handle = database.registerSubtree(std::move(bytes));
+    EXPECT_TRUE(handle.valid());
+    EXPECT_TRUE(bytes.empty());
+    EXPECT_EQ(TestAccess::definitionData(database, handle), allocation);
+    EXPECT_EQ(copy.size(), byteCount);
 }
 
 TEST(SubtreeBuilder, RejectsMixedLocalAndMountedChildren)
 {
-    SubtreeBuilder builder(SubtreeKey{200});
-    const auto expansion = builder.createNode(
-        node(1, 8.0f, box(), SubtreeKey{201}));
-    EXPECT_THROW(builder.createNode(expansion, node(2, 0.0f, box(0.5f))),
+    SubtreeBuilder builder;
+    const auto mountable = builder.createNode(node(1, 8.0f, box(), true));
+    EXPECT_THROW(builder.createNode(mountable, node(2, 0.0f, box(0.5f))),
                  std::logic_error);
 }
 
 TEST(Assembly, ReusesOneHouseDefinitionAtManyCityNodes)
 {
-    const SubtreeKey houseKey{301};
-    const SubtreeKey cityKey{302};
     SpatialDatabase database;
 
     SubtreeHandle house = database.registerSubtree(
-        makeLeafSubtree(houseKey, 100, 1.0f));
+        makeLeafSubtree(100, 1.0f));
 
-    SubtreeBuilder cityBuilder(cityKey);
+    SubtreeBuilder cityBuilder;
     cityBuilder.createNode(node(
-        10, 8.0f, box(1.0f, float4::point(-3, 0, 0)), houseKey,
-        Transform{float4::point(-3, 0, 0), 1.0f}));
+        10, 8.0f, box(1.0f, float4::point(-3, 0, 0)), true));
     cityBuilder.createNode(node(
-        11, 8.0f, box(1.0f, float4::point(3, 0, 0)), houseKey,
-        Transform{float4::point(3, 0, 0), 1.0f}));
+        11, 8.0f, box(1.0f, float4::point(3, 0, 0)), true));
     SubtreeHandle city = database.registerSubtree(cityBuilder.build());
 
-    const InstanceHandle instance = instantiateFor(
-        database, city, cityKey, box(8.0f));
-    const SubtreeInstanceHandle left =
-        database.mountSubtree(handleOf(database, 10), house);
-    const SubtreeInstanceHandle right =
-        database.mountSubtree(handleOf(database, 11), house);
+    const InstanceHandle instance = instantiateFor(database, city, box(8.0f));
+    const SubtreeInstanceHandle left = database.mountSubtree(
+        handleOf(database, 10), house,
+        Transform{float4::point(-3, 0, 0), 1.0f});
+    const SubtreeInstanceHandle right = database.mountSubtree(
+        handleOf(database, 11), house,
+        Transform{float4::point(3, 0, 0), 1.0f});
 
     EXPECT_TRUE(left.valid());
     EXPECT_TRUE(right.valid());
@@ -85,26 +84,19 @@ TEST(Assembly, ReusesOneHouseDefinitionAtManyCityNodes)
     EXPECT_TRUE(database.hasMountedSubtree(instance.rootNode()));
 
     Transform leftTransform;
-    Transform rightTransform;
-    ASSERT_TRUE(database.tryGetNodeTransform(handleOf(database, 100),
-                                             leftTransform));
-    // Duplicate payloads deliberately have no identity semantics. The mount
-    // handles remain distinct and both point at the same registered bytes.
-    EXPECT_TRUE(database.isMounted(left));
+    ASSERT_TRUE(database.tryGetNodeTransform(
+        TestAccess::nodeAt(database, left, 1), leftTransform));
+    EXPECT_FLOAT_EQ(leftTransform.pos.x, -3.0f);
     EXPECT_TRUE(database.isMounted(right));
 }
 
-TEST(Assembly, RequiresAuthoredTargetToMatch)
+TEST(Assembly, MountTargetIsChosenByHandleAtAssemblyTime)
 {
     SpatialDatabase database;
-    const SubtreeKey expected{401};
-    const SubtreeKey wrong{402};
-    SubtreeHandle subtree = database.registerSubtree(
-        makeLeafSubtree(wrong, 2));
+    SubtreeHandle subtree = database.registerSubtree(makeLeafSubtree(2));
     InstanceHandle instance = database.instantiate(
-        node(1, 16.0f, box(4.0f), expected));
-    EXPECT_THROW(database.mountSubtree(instance.rootNode(), subtree),
-                 std::logic_error);
+        node(1, 16.0f, box(4.0f), true));
+    EXPECT_TRUE(database.mountSubtree(instance.rootNode(), subtree).valid());
 }
 
 TEST(Assembly, SingleNodeLivesOnlyInTlas)

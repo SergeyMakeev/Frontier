@@ -14,9 +14,8 @@ struct Scene
 
     Scene()
     {
-        const SubtreeKey key{501};
-        SubtreeHandle subtree = database.registerSubtree(makeLodSubtree(key));
-        instance = instantiateFor(database, subtree, key, box(5.0f), 64.0f);
+        SubtreeHandle subtree = database.registerSubtree(makeLodSubtree());
+        instance = instantiateFor(database, subtree, box(5.0f), 64.0f);
     }
 };
 
@@ -70,14 +69,13 @@ TEST(Frontier, DistantInstanceSelectsTlasRootWithoutWalkingSubtree)
 TEST(Frontier, PayloadValuesAreDataNotIdentity)
 {
     SpatialDatabase database;
-    const SubtreeKey key{502};
-    SubtreeBuilder builder(key);
+    SubtreeBuilder builder;
     builder.createNode(node(77, 0.0f, box(1.0f,
                                            float4::point(-2, 0, 0))));
     builder.createNode(node(77, 0.0f, box(1.0f,
                                            float4::point(2, 0, 0))));
     SubtreeHandle subtree = database.registerSubtree(builder.build());
-    instantiateFor(database, subtree, key, box(4.0f), 64.0f);
+    instantiateFor(database, subtree, box(4.0f), 64.0f);
 
     SpatialQuery query;
     SelectionParams params;

@@ -12,12 +12,12 @@ streams. Internal TLAS nodes contain wide bounds, maximum error, layer masks,
 child references, and a flag indicating whether a hierarchical root can be
 tested directly.
 
-Each mounted `Subtree` is a BLAS fragment below one renderable parent. A
+Each mounted definition is a BLAS fragment below one renderable parent. A
 definition can have several direct roots because the parent is external. A
 definition reference is immutable content-DAG data; a `SubtreeInstanceRt` is a
 single placement in one runtime tree.
 
-## Serialized subtree blob
+## Serialized definition bytes
 
 `SubtreeBuilder` emits one aligned, versioned allocation with:
 
@@ -26,15 +26,17 @@ single placement in one runtime tree.
 - valid/leaf lane masks;
 - authored bounds and payload arrays;
 - parent, contiguous-subtree-size, and packed metadata arrays;
-- geometric errors;
-- deduplicated `SubtreeKey` dependencies;
-- fixed-size expansion records containing transform, packed node, and
-  dependency index.
+- geometric errors.
 
-The public `Subtree` object is a move-only bound view plus optional allocator
-ownership. Owned and borrowed blobs use the same type and runtime layout.
-Registration moves that object into a cold `SubtreeDefinitionRt` and creates a
-definition-local geometric slab allocator for per-placement node state.
+Mountability is one bit in packed node metadata. Definition targets and
+transforms are deliberately absent: they are supplied when a handle is mounted.
+
+The public `SubtreeBytes` type owns the aligned array and a copied allocator
+context. Registration validates and O(1)-moves that allocation into a cold
+`SubtreeDefinitionRt`; an internal pointer-only `SubtreeView` binds traversal
+streams directly over the same bytes. No deserialized copy or public semantic
+definition object exists. Registration also creates a definition-local
+geometric slab allocator for per-placement node state.
 
 ## Mounted placement state
 
@@ -45,10 +47,10 @@ The placement hot/cold split is:
 | `MountTransformRt` | 32 B | accumulated translation/scale, error clamp, generation, definition id, root-leaf flag |
 | `MountStamp` | 8 B | content version, generation, live flag |
 | `MountResidency` | 8 B | resident-node count, incomplete-child count |
-| `SubtreeInstanceRt` | 48 B | definition, node-state pointer, LRU, owner, expansion links, mounted-tree root |
+| `SubtreeInstanceRt` | 48 B | definition, node-state pointer, LRU, owner, mount links, mounted-tree root |
 | node state | 2 B/node | resident/covered flags and covered-child count |
 
-Expansion-link arrays are allocated only for placements that gain mounted
+Mount-link arrays are allocated only for placements that gain mounted
 children. Node-state blocks come from definition-local geometric slabs, avoiding
 one heap allocation per placement.
 
@@ -130,14 +132,15 @@ After publication, distinct queries may read concurrently until the next write.
 ## Memory and performance result
 
 The city/house benchmark compares 400 houses with eight fully refined detail
-nodes each. On the reference machine, the assembled representation occupies
-about 104.3 KiB versus 318.6 KiB flattened (67% less), while raw traversal is
-about 10.6 us versus 11.7 us and construction about 79.5 us versus 179.3 us.
-Warm cached traversal is effectively representation-independent (~0.7 us).
+nodes each. With the keyless bytes API, the assembled representation occupies
+91.8 KiB versus 318.6 KiB flattened (71% less). Median raw traversal is 10.8 us
+versus 11.8 us, construction is 63.2 us versus 206 us, and warm cached
+traversal is approximately 0.7 us for both.
 
-Against the pre-cleanup assembled API, the same 400-house case is 0.9% faster
-in raw traversal and 27% faster to construct. Cached traversal and total memory
-remain effectively unchanged (within 1% and 0.2%, respectively).
+Against the immediately preceding keyed assembly API, assembled memory fell
+from 104.3 KiB to 91.8 KiB (12.0%), construction fell from 80.5 us to 63.2 us
+(21.5%), and raw traversal improved about 2.0%. Cached traversal moved by less
+than 1%, which is measurement noise at this scale.
 
-The benchmark JSON is retained under `bench_results/subtree_api_after.json`;
-the pre-change comparison is `subtree_api_before.json`.
+The comparison is retained under `bench_results/bytes_api_before.json` and
+`bench_results/bytes_api_after.json`.

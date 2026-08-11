@@ -1,7 +1,7 @@
 # Frontier
 
 Frontier is a C++20 hierarchical-LOD selection library. It maintains a dynamic
-8-wide top-level acceleration structure (TLAS), streams reusable hierarchy
+8-wide top-level acceleration structure (TLAS), mounts reusable hierarchy
 fragments, tracks payload residency, and returns both the renderable current cut
 and the fully available ideal cut.
 
@@ -9,18 +9,19 @@ The data model is deliberately small:
 
 - Every top-level instance is one permanent, renderable node stored directly in
   the TLAS.
-- A `Subtree` is one immutable reusable descendant forest. Its parent is not
-  stored in the blob.
-- A subtree can only be mounted beneath a renderable TLAS root or an extendable
-  node in another mounted subtree.
-- `NodeDesc` describes both TLAS roots and authored subtree nodes.
-- transforms belong to instances and mounts; immutable payload, error, and
-  authored bounds remain in the reusable subtree blob; runtime bound changes
-  use copy-on-write overlays.
+- `SubtreeBuilder::build()` produces an aligned serialized byte array. There is
+  no public semantic subtree object and no content key.
+- `registerSubtree(SubtreeBytes&&)` consumes that array without copying it and
+  returns its opaque definition handle.
+- A definition can only be mounted beneath a renderable TLAS root or a
+  `mountable` leaf in another mounted definition.
+- Transforms belong to instances and mounts. Immutable payload, error, and
+  authored bounds remain in registered bytes; runtime bound changes use
+  copy-on-write overlays.
 
-This makes a one-node object exceptionally cheap: it has no subtree definition
-or mount state. Deep assemblies remain composable—a city subtree can contain a
-million extendable house nodes that all target the same house definition.
+This makes a one-node object exceptionally cheap: it has no definition bytes or
+mount state. Deep assemblies remain composable—a city definition can contain a
+million mountable house nodes, all populated from the same house handle.
 
 ## Example
 
@@ -30,78 +31,89 @@ million extendable house nodes that all target the same house definition.
 
 using namespace frontier;
 
-constexpr SubtreeKey houseKey{0x1001};
-constexpr SubtreeKey cityKey{0x2001};
-
-SubtreeBuilder houseBuilder(houseKey);
+SubtreeBuilder houseBuilder;
 houseBuilder.createNode(NodeDesc{
     .payload = 100,
     .geometricError = 0.0f,
-    .bounds = houseBounds,
+    .bounds = houseLocalBounds,
 });
-Subtree house = houseBuilder.build();
-
-SubtreeBuilder cityBuilder(cityKey);
-cityBuilder.createNode(NodeDesc{
-    .payload = 10,
-    .geometricError = 16.0f,
-    .bounds = translatedHouseBounds,
-    .childSubtree = houseKey,
-    .childTransform = Transform{housePosition, 1.0f},
-});
-Subtree city = cityBuilder.build();
-const AABB cityBounds = city.bounds();
 
 SpatialDatabase world;
-const SubtreeHandle houseDefinition =
-    world.registerSubtree(std::move(house));
-const SubtreeHandle cityDefinition =
-    world.registerSubtree(std::move(city));
+const SubtreeHandle house =
+    world.registerSubtree(houseBuilder.build());
+
+SubtreeBuilder cityBuilder;
+const auto leftHouse = cityBuilder.createNode(NodeDesc{
+    .payload = 10,
+    .geometricError = 16.0f,
+    .bounds = leftHouseBoundsInCity,
+    .mountable = true,
+});
+const auto rightHouse = cityBuilder.createNode(NodeDesc{
+    .payload = 11,
+    .geometricError = 16.0f,
+    .bounds = rightHouseBoundsInCity,
+    .mountable = true,
+});
+const SubtreeHandle city =
+    world.registerSubtree(cityBuilder.build());
 
 const InstanceHandle cityInstance = world.instantiate(NodeDesc{
     .payload = 1,
     .geometricError = 64.0f,
     .bounds = cityBounds,
-    .childSubtree = cityKey,
+    .mountable = true,
 });
-world.mountSubtree(cityInstance.rootNode(), cityDefinition);
+const SubtreeInstanceHandle cityPlacement =
+    world.mountSubtree(cityInstance.rootNode(), city);
 
-world.applyUpdates();
-SpatialQuery query;
-SelectionParams selection{.threshold = 1.0f};
-FrontierResultView cut = query.selectFrontier(world, camera, selection);
-
-// An application streamer resolves authored targets from ideal-side handles.
-for (const FrontierEntry& entry : cut.idealOnly)
-    if (world.subtreeTarget(entry.nodeHandle) == houseKey)
-        world.mountSubtree(entry.nodeHandle, houseDefinition);
+NodeHandle leftHouseNode = /* retained from frontier/application state */;
+NodeHandle rightHouseNode = /* retained from frontier/application state */;
+world.mountSubtree(leftHouseNode, house,
+                   Transform{leftHousePosition, 1.0f});
+world.mountSubtree(rightHouseNode, house,
+                   Transform{rightHousePosition, 1.0f});
 ```
 
+Runtime `NodeHandle` values normally come from frontier results or retained
+assembly state; builder `NodeId` values are authoring-local and are not runtime
+handles.
+
 `shared + currentOnly` is always a hole-free render frontier.
-`shared + idealOnly` is the frontier the known topology would choose with every
-payload resident. A high-error ideal node with a valid `subtreeTarget()` is a
-topology-streaming request. Other ideal nodes can drive payload IO through
-`markPayloadResident()`.
+`shared + idealOnly` is the frontier the mounted topology would choose with
+every payload resident. Applications decide which definition handle belongs at
+each mountable node; Frontier deliberately stores no content lookup key.
 
-## Ownership and handles
+## Bytes, ownership, and handles
 
-`Subtree` is move-only. `Subtree::fromBytes()` validates and copies a complete
-serialized blob; `Subtree::borrow()` validates without copying; `clone()` makes
-an explicit owned copy. A borrowed blob must outlive the `Subtree` or database
-that owns it.
+`SubtreeBytes` is an owning, 64-byte-aligned byte array. The bytes emitted by
+the builder are the traversal representation and serialization format. They can
+be written directly to disk, or passed directly to registration. A named array
+requires an explicit move:
+
+```cpp
+SubtreeBytes bytes = builder.build();
+save(bytes.bytes());
+SubtreeHandle definition = world.registerSubtree(std::move(bytes));
+```
+
+To load saved data, allocate `SubtreeBytes(fileSize, context)`, read into
+`bytes()`, then move it into `registerSubtree()`. Registration validates and
+takes over the existing allocation; there are no copy and borrowed registration
+variants.
 
 The public handles are intentionally distinct:
 
-- `SubtreeHandle`: registered immutable definition;
+- `SubtreeHandle`: registered immutable bytes;
 - `SubtreeInstanceHandle`: one mounted placement;
 - `InstanceHandle`: one permanent TLAS root;
 - `NodeHandle`: one live renderable node.
 
 All are generation-stamped. Stale streaming completions are harmless: mutating
 operations ignore stale node/instance handles, and mounting returns an invalid
-placement when its parent disappeared. Contract errors—wrong target key,
-mounting below a non-extendable node, or escaping authored bounds—fail through
-`FRONTIER_FATAL`.
+placement when its parent disappeared. Invalid live topology, mounting below a
+non-mountable node, duplicate children, invalid transforms, and bounds escapes
+are contract errors routed through `FRONTIER_FATAL`.
 
 ## Query lifecycle
 
