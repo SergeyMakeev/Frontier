@@ -21,6 +21,42 @@ struct Transform
 };
 static_assert(sizeof(Transform) == 32, "transform layout changed");
 
+// Exact six-float bounds storage for cold authoring data. Runtime traversal
+// keeps using the SIMD-friendly AABB and WideBounds representations.
+struct ScalarAABB
+{
+    struct XYZ
+    {
+        float x;
+        float y;
+        float z;
+    };
+
+    XYZ mn = {FLT_MAX, FLT_MAX, FLT_MAX};
+    XYZ mx = {-FLT_MAX, -FLT_MAX, -FLT_MAX};
+
+    ScalarAABB() = default;
+    ScalarAABB(const AABB& bounds) noexcept { *this = bounds; }
+
+    ScalarAABB& operator=(const AABB& bounds) noexcept
+    {
+        mn = {bounds.mn.x, bounds.mn.y, bounds.mn.z};
+        mx = {bounds.mx.x, bounds.mx.y, bounds.mx.z};
+        return *this;
+    }
+
+    AABB toAABB() const noexcept
+    {
+        return AABB::fromMinMax(float4::point(mn.x, mn.y, mn.z),
+                                float4::point(mx.x, mx.y, mx.z));
+    }
+
+    operator AABB() const noexcept { return toAABB(); }
+    bool isEmpty() const noexcept { return mn.x > mx.x; }
+};
+static_assert(sizeof(ScalarAABB) == 24,
+              "ScalarAABB must contain exactly six floats");
+
 // One renderable LOD choice. The same descriptor is used for a TLAS-owned root
 // and for nodes authored into serialized subtree bytes. A mountable authored
 // node must remain a leaf; its child definition and placement are supplied
@@ -30,9 +66,9 @@ struct NodeDesc
     UserPayload payload = 0;
     float geometricError = 0.0f;
     bool mountable = false;
-    AABB bounds = AABB::empty();
+    ScalarAABB bounds = AABB::empty();
 };
-static_assert(sizeof(NodeDesc) == 48,
-              "NodeDesc must use the padding before its aligned bounds");
+static_assert(sizeof(NodeDesc) == 40,
+              "NodeDesc must stay at five eight-byte words");
 
 } // namespace frontier

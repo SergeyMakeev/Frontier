@@ -34,7 +34,6 @@ private:
         static constexpr uint32_t kChildCountMask = (1u << 9) - 1;
         static constexpr uint32_t kMountableBit = 1u << 31;
 
-        AABB bounds = AABB::empty();
         UserPayload payload = 0;
         float geometricError = 0.0f;
         NodeId parent = kInvalidIndex;
@@ -42,6 +41,7 @@ private:
         NodeId lastChild = kInvalidIndex;
         NodeId nextSibling = kInvalidIndex;
         uint32_t childCountAndFlags = 0;
+        ScalarAABB bounds = AABB::empty();
 
         uint32_t childCount() const
         {
@@ -62,8 +62,8 @@ private:
             else childCountAndFlags &= ~kMountableBit;
         }
     };
-    static_assert(sizeof(BuildNode) == 64,
-                  "BuildNode flags must fit without alignment padding");
+    static_assert(sizeof(BuildNode) == 56,
+                  "BuildNode must stay at seven eight-byte words");
 
     std::vector<BuildNode> nodes_;
     std::vector<NodeId> roots_;

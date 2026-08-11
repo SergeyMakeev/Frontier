@@ -120,7 +120,7 @@ SubtreeBytes SubtreeBuilder::build(const FrontierContext& context)
             node.parent == kInvalidIndex ? 0 : remap[node.parent];
         const uint32_t packed =
             emit(parentIndex, node.childCount(), node.mountable(),
-                 node.payload, node.bounds, node.geometricError);
+                 node.payload, node.bounds.toAABB(), node.geometricError);
         remap[source] = packed;
         siblingScratch.clear();
         for (NodeId child = node.firstChild; child != kInvalidIndex;

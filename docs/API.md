@@ -17,17 +17,26 @@ definitions.
 There is one node descriptor:
 
 ```cpp
+// Exact six-float authoring storage; accepts and converts to AABB.
+struct ScalarAABB { /* min.xyz, max.xyz */ };
+
 struct NodeDesc {
     UserPayload payload = 0;
     float geometricError = 0.0f;
     bool mountable = false;
-    AABB bounds = AABB::empty();
+    ScalarAABB bounds = AABB::empty();
 };
 ```
 
-`SpatialDatabase::instantiate()` stores a `NodeDesc` directly in the TLAS.
-`SubtreeBuilder::createNode()` stores the same descriptor in serialized
-definition bytes.
+`ScalarAABB` stores the six bound coordinates without quantization or the two
+unused `float4::w` lanes. Existing aggregate initialization remains unchanged:
+an `AABB` can be assigned to `bounds`, and `bounds` converts back to `AABB`
+when needed. This keeps `NodeDesc` at 40 bytes while runtime traversal retains
+its SIMD-friendly bounds representations.
+
+`SpatialDatabase::instantiate()` copies a `NodeDesc` into the TLAS root state.
+`SubtreeBuilder::createNode()` copies it into temporary authoring state;
+`build()` emits the normal traversal-ready serialized representation.
 
 `bounds` and `geometricError` use the containing hierarchy's local units. A
 TLAS root is placed in world space by `InstanceDesc`; a mounted definition is

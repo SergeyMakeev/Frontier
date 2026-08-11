@@ -890,13 +890,14 @@ InstanceHandle SpatialDatabase::addTlasRootInstance(
     FRONTIER_CHECK(root.geometricError >= 0.0f &&
                        std::isfinite(root.geometricError),
                    "SpatialDatabase::instantiate: invalid geometric error");
-    FRONTIER_CHECK(!root.bounds.isEmpty() &&
-                       std::isfinite(root.bounds.mn.x) &&
-                       std::isfinite(root.bounds.mn.y) &&
-                       std::isfinite(root.bounds.mn.z) &&
-                       std::isfinite(root.bounds.mx.x) &&
-                       std::isfinite(root.bounds.mx.y) &&
-                       std::isfinite(root.bounds.mx.z),
+    const AABB rootBounds = root.bounds;
+    FRONTIER_CHECK(!rootBounds.isEmpty() &&
+                       std::isfinite(rootBounds.mn.x) &&
+                       std::isfinite(rootBounds.mn.y) &&
+                       std::isfinite(rootBounds.mn.z) &&
+                       std::isfinite(rootBounds.mx.x) &&
+                       std::isfinite(rootBounds.mx.y) &&
+                       std::isfinite(rootBounds.mx.z),
                    "SpatialDatabase::instantiate: empty or non-finite root bounds");
 
     InstanceId id;
@@ -947,7 +948,7 @@ InstanceHandle SpatialDatabase::addTlasRootInstance(
     while ((inst.generation & NodeHandle::kTlasGenerationMask) == 0 ||
            NodeHandle::tlasRoot(handle, inst.generation).hi == kInvalidIndex);
     inst.mask = desc.mask;
-    inst.worldBox = toWorld(root.bounds, desc.pos, desc.scale);
+    inst.worldBox = toWorld(rootBounds, desc.pos, desc.scale);
     inst.maxErrWorld = root.geometricError * desc.scale;
     instanceFrontierVersions_[id] = ++generationCounter_;
     inst.liveIndex = uint32_t(liveInstances_.size());

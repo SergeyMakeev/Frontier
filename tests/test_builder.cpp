@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <bit>
 #include <cstddef>
 #include <cstring>
 #include <utility>
@@ -9,6 +10,45 @@
 
 using namespace frontier;
 using namespace frontiertest;
+
+TEST(NodeDesc, ScalarBoundsRoundTripExactly)
+{
+    EXPECT_EQ(sizeof(ScalarAABB), 24u);
+    EXPECT_EQ(alignof(ScalarAABB), alignof(float));
+    EXPECT_EQ(sizeof(NodeDesc), 40u);
+    EXPECT_EQ(alignof(NodeDesc), alignof(UserPayload));
+
+    const AABB source = AABB::fromMinMax(
+        float4::point(-0.0f, -12345.625f, 1.0e-20f),
+        float4::point(98765.5f, 0.0f, 1.0e20f));
+    const NodeDesc desc{
+        .payload = 0xfedcba9876543210ull,
+        .geometricError = 7.25f,
+        .mountable = true,
+        .bounds = source,
+    };
+    const AABB decoded = desc.bounds;
+
+    const auto expectSameBits = [](float actual, float expected)
+    {
+        EXPECT_EQ(std::bit_cast<uint32_t>(actual),
+                  std::bit_cast<uint32_t>(expected));
+    };
+    expectSameBits(decoded.mn.x, source.mn.x);
+    expectSameBits(decoded.mn.y, source.mn.y);
+    expectSameBits(decoded.mn.z, source.mn.z);
+    expectSameBits(decoded.mx.x, source.mx.x);
+    expectSameBits(decoded.mx.y, source.mx.y);
+    expectSameBits(decoded.mx.z, source.mx.z);
+    EXPECT_EQ(desc.payload, 0xfedcba9876543210ull);
+    EXPECT_FLOAT_EQ(desc.geometricError, 7.25f);
+    EXPECT_TRUE(desc.mountable);
+
+    ScalarAABB empty;
+    EXPECT_TRUE(empty.isEmpty());
+    const AABB decodedEmpty = empty;
+    EXPECT_TRUE(decodedEmpty.isEmpty());
+}
 
 TEST(SubtreeBuilder, BuildsTraversalReadySerializableBytes)
 {

@@ -176,3 +176,38 @@ BENCHMARK(BM_SubtreeAssembly_ConstructCost)
     ->Args({0, 400})->Args({1, 400})
     ->ArgNames({"assembled", "houses"})
     ->Unit(benchmark::kMicrosecond);
+
+static void BM_SubtreeBuilder_ConstructCost(benchmark::State& state)
+{
+    const bool assembled = state.range(0) != 0;
+    const uint32_t count = uint32_t(state.range(1));
+    const uint32_t side =
+        uint32_t(std::ceil(std::sqrt(double(count))));
+    for (auto _ : state)
+    {
+        SubtreeBuilder builder;
+        builder.reserve(assembled ? count : count * (kDetailCount + 1));
+        for (uint32_t i = 0; i < count; ++i)
+        {
+            const float4 position = housePosition(i, side);
+            const auto proxy = builder.createNode(node(
+                10 + i, 16.0f,
+                AABB::fromCenterExtent(position, float4::vec(4, 2, 2)),
+                assembled));
+            if (!assembled)
+                for (uint32_t detail = 0; detail < kDetailCount; ++detail)
+                    builder.createNode(
+                        proxy,
+                        node(1000 + detail, 0.0f,
+                             toWorld(detailBounds(detail), position, 1.0f)));
+        }
+        SubtreeBytes bytes = builder.build();
+        benchmark::DoNotOptimize(bytes.data());
+        benchmark::DoNotOptimize(bytes.size());
+    }
+}
+
+BENCHMARK(BM_SubtreeBuilder_ConstructCost)
+    ->Args({0, 400})->Args({1, 400})
+    ->ArgNames({"assembled", "houses"})
+    ->Unit(benchmark::kMicrosecond);
