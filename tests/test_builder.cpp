@@ -17,6 +17,8 @@ TEST(NodeDesc, ScalarBoundsRoundTripExactly)
     EXPECT_EQ(alignof(ScalarAABB), alignof(float));
     EXPECT_EQ(sizeof(NodeDesc), 40u);
     EXPECT_EQ(alignof(NodeDesc), alignof(UserPayload));
+    EXPECT_EQ(offsetof(NodeDesc, flags), 12u);
+    EXPECT_EQ(offsetof(NodeDesc, bounds), 16u);
 
     const AABB source = AABB::fromMinMax(
         float4::point(-0.0f, -12345.625f, 1.0e-20f),
@@ -24,7 +26,7 @@ TEST(NodeDesc, ScalarBoundsRoundTripExactly)
     const NodeDesc desc{
         .payload = 0xfedcba9876543210ull,
         .geometricError = 7.25f,
-        .mountable = true,
+        .flags = NodeDesc::FlagMountable,
         .bounds = source,
     };
     const AABB decoded = desc.bounds;
@@ -42,7 +44,8 @@ TEST(NodeDesc, ScalarBoundsRoundTripExactly)
     expectSameBits(decoded.mx.z, source.mx.z);
     EXPECT_EQ(desc.payload, 0xfedcba9876543210ull);
     EXPECT_FLOAT_EQ(desc.geometricError, 7.25f);
-    EXPECT_TRUE(desc.mountable);
+    EXPECT_EQ(desc.flags, NodeDesc::FlagMountable);
+    EXPECT_TRUE(desc.isMountable());
 
     ScalarAABB empty;
     EXPECT_TRUE(empty.isEmpty());

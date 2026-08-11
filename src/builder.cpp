@@ -40,7 +40,7 @@ SubtreeBuilder::NodeId SubtreeBuilder::createNode(NodeId parent,
     built.payload = node.payload;
     built.geometricError = node.geometricError;
     built.parent = parent;
-    built.setMountable(node.mountable);
+    built.setMountable(node.isMountable());
     nodes_.push_back(built);
     const NodeId id = NodeId(nodes_.size() - 1);
     if (parent == kInvalidIndex)

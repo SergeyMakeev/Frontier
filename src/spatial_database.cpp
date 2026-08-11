@@ -940,7 +940,7 @@ InstanceHandle SpatialDatabase::addTlasRootInstance(
     inst.pos = desc.pos;
     inst.scale = desc.scale;
     inst.rootSlot = kInvalidIndex;
-    inst.setMountableRoot(root.mountable);
+    inst.setMountableRoot(root.isMountable());
     inst.setZeroErrorRoot(!(root.geometricError > 0.0f));
     inst.setAlive(true);
     do
@@ -956,7 +956,7 @@ InstanceHandle SpatialDatabase::addTlasRootInstance(
     if (!instanceFlatSlots_.empty())
         if (instanceFlatSlots_.size() < instances_.size())
             instanceFlatSlots_.resize(instances_.size(), kInvalidIndex);
-    if (!root.mountable)
+    if (!root.isMountable())
     {
         if (instanceFlatSlots_.empty())
             instanceFlatSlots_.resize(instances_.size(), kInvalidIndex);

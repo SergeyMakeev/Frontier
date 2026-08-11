@@ -147,7 +147,7 @@ inline NodeDesc node(UserPayload payload, float error, const AABB& bounds,
     result.payload = payload;
     result.geometricError = error;
     result.bounds = bounds;
-    result.mountable = mountable;
+    result.flags = mountable ? NodeDesc::FlagMountable : 0;
     return result;
 }
 

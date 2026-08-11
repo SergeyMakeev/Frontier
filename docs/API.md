@@ -21,9 +21,11 @@ There is one node descriptor:
 struct ScalarAABB { /* min.xyz, max.xyz */ };
 
 struct NodeDesc {
+    enum Flag : uint32_t { FlagMountable = 1u << 0 };
+    // 31 bits remain available for future node properties.
     UserPayload payload = 0;
     float geometricError = 0.0f;
-    bool mountable = false;
+    uint32_t flags = 0;
     ScalarAABB bounds = AABB::empty();
 };
 ```
@@ -72,13 +74,13 @@ cityBuilder.reserve(2); // optional node-capacity hint
 cityBuilder.createNode(NodeDesc{
     .payload = leftHouseProxy,
     .geometricError = 16.0f,
-    .mountable = true,
+    .flags = NodeDesc::FlagMountable,
     .bounds = leftHouseBoundsInCity,
 });
 cityBuilder.createNode(NodeDesc{
     .payload = rightHouseProxy,
     .geometricError = 16.0f,
-    .mountable = true,
+    .flags = NodeDesc::FlagMountable,
     .bounds = rightHouseBoundsInCity,
 });
 SubtreeBytes cityBytes = cityBuilder.build();
@@ -165,7 +167,7 @@ SubtreeHandle city =
 InstanceHandle cityInstance = database.instantiate(NodeDesc{
     .payload = cityProxyPayload,
     .geometricError = 64.0f,
-    .mountable = true,
+    .flags = NodeDesc::FlagMountable,
     .bounds = cityBounds,
 }, InstanceDesc{
     .pos = worldPosition,
@@ -177,7 +179,8 @@ SubtreeInstanceHandle cityPlacement =
     database.mountSubtree(cityInstance.rootNode(), city);
 ```
 
-`instantiate()` creates only the permanent TLAS node. With `mountable == false`,
+`instantiate()` creates only the permanent TLAS node. Without
+`NodeDesc::FlagMountable`,
 a one-node object lives entirely in the TLAS and allocates no definition or
 mount state. `InstanceDesc::pos` and `scale` place its local bounds in world
 space; `mask` is ANDed with `Camera::viewMask` for top-level layer culling.

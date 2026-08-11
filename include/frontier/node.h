@@ -63,10 +63,21 @@ static_assert(sizeof(ScalarAABB) == 24,
 // explicitly to SpatialDatabase::mountSubtree().
 struct NodeDesc
 {
+    enum Flag : uint32_t
+    {
+        FlagMountable = 1u << 0,
+    };
+    // The remaining 31 bits are reserved for future node properties.
+
     UserPayload payload = 0;
     float geometricError = 0.0f;
-    bool mountable = false;
+    uint32_t flags = 0;
     ScalarAABB bounds = AABB::empty();
+
+    bool isMountable() const noexcept
+    {
+        return (flags & FlagMountable) != 0;
+    }
 };
 static_assert(sizeof(NodeDesc) == 40,
               "NodeDesc must stay at five eight-byte words");
