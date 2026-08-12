@@ -109,6 +109,19 @@ struct SubtreeHeader
 static_assert(sizeof(SubtreeHeader) == 128,
               "SubtreeHeader must stay two cache lines");
 
+struct SubtreeLayout
+{
+    uint32_t wide = 0;
+    uint32_t mask = 0;
+    uint32_t bbox = 0;
+    uint32_t payload = 0;
+    uint32_t parent = 0;
+    uint32_t subtreeSize = 0;
+    uint32_t meta = 0;
+    uint32_t error = 0;
+    uint32_t totalBytes = 0;
+};
+
 // Internal zero-copy interpretation of registered bytes. Moving SubtreeBytes
 // moves only its allocation owner, so these pointers remain stable.
 struct SubtreeView
@@ -154,7 +167,7 @@ struct SubtreeView
     }
 };
 
-size_t subtreeBlobBytes(uint32_t nodeCount, uint32_t wideCount);
+SubtreeLayout subtreeLayout(uint32_t nodeCount, uint32_t wideCount);
 void validateSubtreeBytes(const SubtreeBytes& bytes);
 SubtreeView viewSubtreeBytes(const SubtreeBytes& bytes);
 

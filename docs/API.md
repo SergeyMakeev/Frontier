@@ -620,8 +620,9 @@ CollectResult result = database.collect(retentionViews, mountBudget, minAge);
 ```
 
 Use `subtreeInstanceStateBytes()`, `overlayCount()`, and `overlayBytes()` to
-track placement-local mutable hierarchy cost. The first metric excludes
-registered bytes and definition-local readiness bits.
+track mutable hierarchy cost. The first metric includes mount records, shared
+coverage/readiness summaries and private coverage copies, but excludes
+registered bytes.
 
 ## 11. Update and threading model
 

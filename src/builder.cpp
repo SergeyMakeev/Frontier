@@ -73,33 +73,61 @@ SubtreeBytes SubtreeBuilder::build(const FrontierContext& context)
     FRONTIER_CHECK(!roots_.empty(), "SubtreeBuilder: subtree has no nodes");
 
     const uint32_t total = uint32_t(nodes_.size()) + 1;
-    std::vector<uint32_t> parent;
-    std::vector<uint32_t> subtreeSize;
-    std::vector<uint32_t> meta;
-    std::vector<UserPayload> payload;
-    std::vector<AABB> bbox;
-    std::vector<float> geometricError;
-    std::vector<WideBlock> wide;
-    std::vector<uint32_t> blockMask;
+    uint64_t wideCount64 = (roots_.size() + kWide - 1) / kWide;
+    uint32_t maxChildren = 0;
+    for (const BuildNode& node : nodes_)
+    {
+        wideCount64 += (node.childCount() + kWide - 1) / kWide;
+        maxChildren = std::max(maxChildren, node.childCount());
+    }
+    FRONTIER_CHECK(wideCount64 <= kMaxWideOffset,
+                   "SubtreeBuilder: wide offset overflow");
+    const uint32_t wideCount = uint32_t(wideCount64);
 
-    parent.reserve(total);
-    subtreeSize.reserve(total);
-    meta.reserve(total);
-    payload.reserve(total);
-    bbox.reserve(total);
-    geometricError.reserve(total);
+    const SubtreeLayout layout = subtreeLayout(total, wideCount);
+    SubtreeBytes bytes(layout.totalBytes, context);
+    std::memset(bytes.data(), 0, bytes.size());
+
+    auto* base = bytes.data();
+    auto* header = reinterpret_cast<SubtreeHeader*>(base);
+    header->magic = kSubtreeMagic;
+    header->version = kSubtreeVersion;
+    header->headerBytes = uint16_t(sizeof(SubtreeHeader));
+    header->totalBytes = layout.totalBytes;
+    header->nodeCount = total;
+    header->wideCount = wideCount;
+    header->wideOffset = layout.wide;
+    header->maskOffset = layout.mask;
+    header->bboxOffset = layout.bbox;
+    header->payloadOffset = layout.payload;
+    header->parentOffset = layout.parent;
+    header->subtreeSizeOffset = layout.subtreeSize;
+    header->metaOffset = layout.meta;
+    header->errorOffset = layout.error;
+
+    auto* wide = reinterpret_cast<WideBlock*>(base + layout.wide);
+    auto* blockMask = reinterpret_cast<uint32_t*>(base + layout.mask);
+    auto* bbox = reinterpret_cast<AABB*>(base + layout.bbox);
+    auto* payload = reinterpret_cast<UserPayload*>(base + layout.payload);
+    auto* parent = reinterpret_cast<uint32_t*>(base + layout.parent);
+    auto* subtreeSize = reinterpret_cast<uint32_t*>(base + layout.subtreeSize);
+    auto* meta = reinterpret_cast<uint32_t*>(base + layout.meta);
+    auto* geometricError = reinterpret_cast<float*>(base + layout.error);
+
+    uint32_t emitted = 0;
 
     const auto emit = [&](uint32_t parentIndex, uint32_t childCount,
                           bool mountable, UserPayload nodePayload,
                           const AABB& nodeBounds, float error) -> uint32_t
     {
-        parent.push_back(parentIndex);
-        subtreeSize.push_back(1);
-        meta.push_back(childCount | (mountable ? kMetaMountable : 0u));
-        payload.push_back(nodePayload);
-        bbox.push_back(nodeBounds);
-        geometricError.push_back(error);
-        return uint32_t(parent.size() - 1);
+        const uint32_t index = emitted++;
+        parent[index] = parentIndex;
+        subtreeSize[index] = 1;
+        meta[index] = childCount | (mountable ? kMetaMountable : 0u);
+        payload[index] = nodePayload;
+        bbox[index] = nodeBounds;
+        geometricError[index] = error;
+        return index;
     };
 
     emit(0, uint32_t(roots_.size()), false, kSentinelPayload, AABB::empty(),
@@ -108,6 +136,8 @@ SubtreeBytes SubtreeBuilder::build(const FrontierContext& context)
     std::vector<uint32_t> remap(nodes_.size(), kInvalidIndex);
     std::vector<uint32_t> stack;
     std::vector<uint32_t> siblingScratch;
+    stack.reserve(nodes_.size());
+    siblingScratch.reserve(maxChildren);
     for (auto it = roots_.rbegin(); it != roots_.rend(); ++it)
         stack.push_back(*it);
 
@@ -130,11 +160,11 @@ SubtreeBytes SubtreeBuilder::build(const FrontierContext& context)
              child != siblingScratch.rend(); ++child)
             stack.push_back(*child);
     }
-    FRONTIER_CHECK(parent.size() == total,
+    FRONTIER_CHECK(emitted == total,
                    "SubtreeBuilder: internal emission count mismatch");
 
     // Derive conservative bounds and contiguous subtree extents bottom-up.
-    for (uint32_t i = total - 1; i >= 1; --i)
+    for (uint32_t i = total; i-- > 1;)
     {
         subtreeSize[parent[i]] += subtreeSize[i];
         bbox[parent[i]].expand(bbox[i]);
@@ -151,26 +181,16 @@ SubtreeBytes SubtreeBuilder::build(const FrontierContext& context)
             geometricError[i] = parentError;
     }
 
-    std::vector<uint32_t> children;
+    uint32_t wideIndex = 0;
     for (uint32_t i = 0; i < total; ++i)
     {
         const uint32_t childCount = metaChildCount(meta[i]);
         if (childCount == 0) continue;
 
-        children.clear();
+        meta[i] |= wideIndex << kMetaOffsetShift;
+
         uint32_t child = i + 1;
-        for (uint32_t c = 0; c < childCount; ++c)
-        {
-            children.push_back(child);
-            child += subtreeSize[child];
-        }
-
-        const uint32_t offset = uint32_t(wide.size());
-        FRONTIER_CHECK(offset <= kMaxWideOffset,
-                       "SubtreeBuilder: wide offset overflow");
-        meta[i] |= offset << kMetaOffsetShift;
-
-        for (uint32_t base = 0; base < childCount; base += kWide)
+        for (uint32_t first = 0; first < childCount; first += kWide)
         {
             WideBlock block;
             block.bounds = WideBounds::allEmpty();
@@ -180,21 +200,24 @@ SubtreeBytes SubtreeBuilder::build(const FrontierContext& context)
             uint32_t valid = 0;
             uint32_t leaf = 0;
             for (uint32_t lane = 0;
-                 lane < kWide && base + lane < childCount; ++lane)
+                 lane < kWide && first + lane < childCount; ++lane)
             {
-                const uint32_t childIndex = children[base + lane];
-                block.bounds.setLane(lane, bbox[childIndex]);
-                block.error.v[lane] = geometricError[childIndex];
-                block.child[lane] = childIndex;
+                block.bounds.setLane(lane, bbox[child]);
+                block.error.v[lane] = geometricError[child];
+                block.child[lane] = child;
                 valid |= 1u << lane;
-                if (metaChildCount(meta[childIndex]) == 0 &&
-                    !metaIsMountable(meta[childIndex]))
+                if (metaChildCount(meta[child]) == 0 &&
+                    !metaIsMountable(meta[child]))
                     leaf |= 1u << lane;
+                child += subtreeSize[child];
             }
-            wide.push_back(block);
-            blockMask.push_back(valid | (leaf << kBlockLeafShift));
+            wide[wideIndex] = block;
+            blockMask[wideIndex] = valid | (leaf << kBlockLeafShift);
+            ++wideIndex;
         }
     }
+    FRONTIER_CHECK(wideIndex == wideCount,
+                   "SubtreeBuilder: internal wide-block count mismatch");
 
     for (uint32_t i = 1; i < total; ++i)
     {
@@ -211,46 +234,6 @@ SubtreeBytes SubtreeBuilder::build(const FrontierContext& context)
                            !metaIsMountable(meta[i]),
                        "SubtreeBuilder: local and mounted children conflict");
     }
-
-    const uint32_t wideCount = uint32_t(wide.size());
-    const size_t byteCount = subtreeBlobBytes(total, wideCount);
-    SubtreeBytes bytes(byteCount, context);
-    std::memset(bytes.data(), 0, byteCount);
-
-    auto* base = bytes.data();
-    auto* header = reinterpret_cast<SubtreeHeader*>(base);
-    header->magic = kSubtreeMagic;
-    header->version = kSubtreeVersion;
-    header->headerBytes = uint16_t(sizeof(SubtreeHeader));
-    header->totalBytes = uint32_t(byteCount);
-    header->nodeCount = total;
-    header->wideCount = wideCount;
-
-    size_t offset = sizeof(SubtreeHeader);
-    const auto place = [&](uint32_t& destination, size_t alignment,
-                           size_t count, size_t stride, const void* source)
-    {
-        offset = (offset + alignment - 1) & ~(alignment - 1);
-        destination = uint32_t(offset);
-        if (count) std::memcpy(base + offset, source, count * stride);
-        offset += count * stride;
-    };
-
-    place(header->wideOffset, alignof(WideBlock), wideCount,
-          sizeof(WideBlock), wide.data());
-    place(header->maskOffset, alignof(uint32_t), wideCount,
-          sizeof(uint32_t), blockMask.data());
-    place(header->bboxOffset, alignof(AABB), total, sizeof(AABB), bbox.data());
-    place(header->payloadOffset, alignof(UserPayload), total,
-          sizeof(UserPayload), payload.data());
-    place(header->parentOffset, alignof(uint32_t), total, sizeof(uint32_t),
-          parent.data());
-    place(header->subtreeSizeOffset, alignof(uint32_t), total,
-          sizeof(uint32_t), subtreeSize.data());
-    place(header->metaOffset, alignof(uint32_t), total, sizeof(uint32_t),
-          meta.data());
-    place(header->errorOffset, alignof(float), total, sizeof(float),
-          geometricError.data());
 
     return bytes;
 }

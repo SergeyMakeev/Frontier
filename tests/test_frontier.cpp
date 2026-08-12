@@ -209,6 +209,52 @@ TEST(Frontier, NestedCoverageTracksSharedReadiness)
     EXPECT_EQ(currentPayloads(), (std::vector<UserPayload>{99}));
 }
 
+TEST(Frontier, MountedCoverageStaysPlacementLocal)
+{
+    SpatialDatabase database;
+
+    SubtreeBuilder parentBuilder;
+    parentBuilder.createNode(node(20, 16.0f, box(2.0f), true));
+    const SubtreeHandle parent =
+        database.registerSubtree(parentBuilder.build());
+    const SubtreeHandle detail =
+        database.registerSubtree(makeLeafSubtree(99));
+
+    const InstanceHandle firstRoot = database.instantiate(
+        node(1, 64.0f, box(4.0f), true));
+    const InstanceHandle secondRoot = database.instantiate(
+        node(2, 64.0f, box(4.0f), true));
+    const SubtreeInstanceHandle firstParent =
+        database.mountSubtree(firstRoot.rootNode(), parent);
+    database.mountSubtree(secondRoot.rootNode(), parent);
+
+    const NodeHandle firstParentNode =
+        TestAccess::nodeAt(database, firstParent, 1);
+    const SubtreeInstanceHandle mountedDetail =
+        database.mountSubtree(firstParentNode, detail);
+    const NodeHandle detailNode =
+        TestAccess::nodeAt(database, mountedDetail, 1);
+    database.markNodeReady(detailNode);
+
+    SpatialQuery query;
+    SelectionParams params{.threshold = 1.0f};
+    const auto currentPayloads = [&]
+    {
+        std::vector<UserPayload> result = payloads(
+            database, select(database, query, cameraAt(-8), params), false);
+        std::sort(result.begin(), result.end());
+        return result;
+    };
+
+    EXPECT_EQ(currentPayloads(), (std::vector<UserPayload>{2, 99}));
+
+    database.unmountSubtree(mountedDetail);
+    EXPECT_EQ(currentPayloads(), (std::vector<UserPayload>{1, 2}));
+
+    database.markNodeReady(firstParentNode);
+    EXPECT_EQ(currentPayloads(), (std::vector<UserPayload>{20, 20}));
+}
+
 TEST(Frontier, ReleasedDefinitionsDiscardReadiness)
 {
     SpatialDatabase database;

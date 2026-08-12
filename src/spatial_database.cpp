@@ -320,9 +320,15 @@ uint16_t* SpatialDatabase::NodeStatePoolRt::acquire(uint32_t nodeCount)
     return state;
 }
 
+uint16_t* SpatialDatabase::NodeStatePoolRt::shared(uint32_t nodeCount)
+{
+    if (!sharedState) sharedState = acquire(nodeCount);
+    return sharedState;
+}
+
 void SpatialDatabase::NodeStatePoolRt::release(uint16_t* state)
 {
-    if (state) freeBlocks.push_back(state);
+    if (state && state != sharedState) freeBlocks.push_back(state);
 }
 
 size_t SpatialDatabase::NodeStatePoolRt::bytes() const
@@ -360,15 +366,6 @@ void SpatialDatabase::destroySubtree(uint32_t definition)
     --liveSubtrees_;
 }
 
-void SpatialDatabase::initializeDefinitionReadiness(uint32_t definitionIndex)
-{
-    SubtreeDefinitionRt& definition = subtrees_[definitionIndex];
-    const uint32_t count = definition.view.packedNodeCount();
-    const size_t wordCount = (size_t(count) + 63) / 64;
-    definition.readyBits = std::make_unique<uint64_t[]>(wordCount);
-    definition.readyNodes = 0;
-}
-
 SubtreeHandle SpatialDatabase::registerSubtree(SubtreeBytes&& bytes)
 {
     detail::validateSubtreeBytes(bytes);
@@ -391,7 +388,6 @@ SubtreeHandle SpatialDatabase::registerSubtree(SubtreeBytes&& bytes)
             break;
         }
     }
-    initializeDefinitionReadiness(definition);
     ++liveSubtrees_;
     return SubtreeHandle{definition, runtime.generation};
 }
@@ -477,28 +473,39 @@ void SpatialDatabase::releaseMountedChildSlots(SubtreeInstanceRt& instance)
 void SpatialDatabase::initializeMountCoverage(uint32_t slot)
 {
     SubtreeInstanceRt& instance = slots_[slot];
-    const SubtreeDefinitionRt& definition =
+    SubtreeDefinitionRt& definition =
         subtrees_[instance.definition];
-    const SubtreeView& subtree = definition.view;
-
-    for (uint32_t node = subtree.packedNodeCount(); node-- > 0;)
-    {
-        bool covered = node != 0 && definition.isNodeReady(node);
-        if (!covered)
-        {
-            const uint32_t children = subtree.childCount(node);
-            covered = children != 0 &&
-                      instance.coveredChildCount(node) == children;
-        }
-        if (!covered) continue;
-
-        instance.setCovered(node, true);
-        if (node != 0)
-            instance.addCoveredChild(subtree.parent_[node]);
-    }
+    instance.nodeState = nodeStatePools_[instance.definition].shared(
+        definition.view.packedNodeCount());
+    definition.sharedNodeState = instance.nodeState;
 
     MountReadiness& readiness = mountReadiness_[slot];
     readiness.setFullyReady(definition.allNodesReady());
+}
+
+void SpatialDatabase::ensurePrivateCoverage(uint32_t slot)
+{
+    SubtreeInstanceRt& instance = slots_[slot];
+    NodeStatePoolRt& pool = nodeStatePools_[instance.definition];
+    if (instance.nodeState != pool.sharedState) return;
+
+    const uint32_t count = subtreeView(instance).packedNodeCount();
+    uint16_t* state = pool.acquire(count);
+    for (uint32_t node = 0; node < count; ++node)
+        state[node] = uint16_t(pool.sharedState[node] &
+                               ~SubtreeDefinitionRt::kNodeReady);
+    instance.nodeState = state;
+}
+
+void SpatialDatabase::releasePrivateCoverage(uint32_t slot)
+{
+    SubtreeInstanceRt& instance = slots_[slot];
+    NodeStatePoolRt& pool = nodeStatePools_[instance.definition];
+    if (instance.nodeState == pool.sharedState) return;
+
+    uint16_t* state = instance.nodeState;
+    instance.nodeState = pool.sharedState;
+    pool.release(state);
 }
 
 void SpatialDatabase::refreshMountDefinitionReadiness(uint32_t slot)
@@ -524,8 +531,6 @@ uint32_t SpatialDatabase::registerMount(uint32_t definition, NodeRef owner)
         "SpatialDatabase: subtree exceeds node-handle index space");
     instance.definition = definition;
     instance.errClamp = FLT_MAX;
-    instance.nodeState = nodeStatePools_[definition].acquire(
-        defined.view.packedNodeCount());
     instance.mountLinks = kInvalidIndex;
     const uint32_t generation = nextMountGeneration(stamp.generation());
     stamp.setGeneration(generation);
@@ -612,6 +617,7 @@ SubtreeInstanceHandle SpatialDatabase::mountTransformed(
     mounted.pos = parentTransform.pos + transform.pos * parentTransform.scale;
     mounted.pos.w = 1.0f;
 
+    ensurePrivateCoverage(owner.slot);
     SubtreeInstanceRt& ort = slots_[owner.slot];
     const bool ownerWasFullyReady = mountedTreeFullyReady(owner.slot);
     ensureMountedChildSlots(owner.slot)[owner.index] = slot;
@@ -740,6 +746,8 @@ void SpatialDatabase::unmountSlot(uint32_t slot)
         propagateFullReadiness(rt.owner.slot, ownerWasFullyReady);
         bumpContentVersion(rt.owner.slot);   // it collapses to a leaf
         propagateCoverage(rt.owner.slot, rt.owner.index);
+        if (ownerRt.mountedChildSubtrees() == 0)
+            releasePrivateCoverage(rt.owner.slot);
     }
     else if (rt.owner.isTlasRoot())
     {
@@ -777,18 +785,19 @@ void SpatialDatabase::unmountTree(uint32_t rootSlot)
     if (rootSlot == kInvalidIndex || !slots_[rootSlot].inUse()) return;
     // Collect the mounted tree from its root through mount links, then
     // unmount bottom-up. O(this mounted tree), independent of database size.
-    std::vector<uint32_t> order;
-    order.push_back(rootSlot);
-    for (size_t k = 0; k < order.size(); ++k)
+    unmountScratch_.clear();
+    unmountScratch_.push_back(rootSlot);
+    for (size_t k = 0; k < unmountScratch_.size(); ++k)
         if (const std::vector<uint32_t>* links =
-                mountedChildSlots(slots_[order[k]]))
+                mountedChildSlots(slots_[unmountScratch_[k]]))
             for (const uint32_t child : *links)
-                if (child != kInvalidIndex) order.push_back(child);
-    for (size_t k = order.size(); k-- > 0;) unmountSlot(order[k]);
+                if (child != kInvalidIndex) unmountScratch_.push_back(child);
+    for (size_t k = unmountScratch_.size(); k-- > 0;)
+        unmountSlot(unmountScratch_[k]);
 }
 
 // ============================================================================
-// shared definition-node readiness and placement-local coverage
+// shared definition-node readiness and shared/COW placement coverage
 // ============================================================================
 
 bool SpatialDatabase::mountedTreeFullyReady(uint32_t slot) const
@@ -874,11 +883,75 @@ void SpatialDatabase::propagateCoverage(uint32_t slot, uint32_t node)
     }
 }
 
+void SpatialDatabase::propagateSharedCoverage(uint32_t definitionIndex,
+                                              uint32_t node)
+{
+    const SubtreeDefinitionRt& definition = subtrees_[definitionIndex];
+    NodeStatePoolRt& pool = nodeStatePools_[definitionIndex];
+    uint16_t* state = pool.sharedState;
+    if (!state) return;
+
+    const SubtreeView& subtree = definition.view;
+    for (;;)
+    {
+        const bool was = (state[node] & SubtreeInstanceRt::kCovered) != 0;
+        const uint32_t children = subtree.childCount(node);
+        const bool now =
+            (node != 0 && definition.isNodeReady(node)) ||
+            (children != 0 &&
+             (uint32_t(state[node] >>
+                       SubtreeInstanceRt::kCoveredChildShift) &
+              detail::kMaxChildren) ==
+                 children);
+        if (was == now) return;
+
+        if (now)
+            state[node] |= SubtreeInstanceRt::kCovered;
+        else
+            state[node] &= ~SubtreeInstanceRt::kCovered;
+        if (node == 0) return;
+
+        const uint32_t parent = subtree.parent_[node];
+        if (now)
+            state[parent] +=
+                uint16_t(1u << SubtreeInstanceRt::kCoveredChildShift);
+        else
+            state[parent] -=
+                uint16_t(1u << SubtreeInstanceRt::kCoveredChildShift);
+        node = parent;
+    }
+}
+
+void SpatialDatabase::propagateSharedRootCoverage(uint32_t slot,
+                                                  bool wasCovered)
+{
+    const SubtreeInstanceRt& instance = slots_[slot];
+    if (instance.isCovered(0) == wasCovered) return;
+
+    if (instance.owner.isTlasRoot())
+    {
+        const InstanceId root = instance.owner.index;
+        if (root < instanceFrontierVersions_.size())
+            instanceFrontierVersions_[root] = ++generationCounter_;
+        return;
+    }
+    if (!instance.owner.valid()) return;
+
+    const NodeRef owner = instance.owner;
+    bumpContentVersion(owner.slot);
+    propagateCoverage(owner.slot, owner.index);
+}
+
 void SpatialDatabase::setDefinitionNodeReadiness(
     uint32_t definitionIndex, uint32_t node, bool ready)
 {
     SubtreeDefinitionRt& definition = subtrees_[definitionIndex];
     if (definition.isNodeReady(node) == ready) return;
+
+    const uint16_t* sharedState = nodeStatePools_[definitionIndex].sharedState;
+    const bool sharedRootWasCovered =
+        sharedState &&
+        (sharedState[0] & SubtreeInstanceRt::kCovered) != 0;
 
     definition.setNodeReady(node, ready);
     if (ready)
@@ -890,12 +963,34 @@ void SpatialDatabase::setDefinitionNodeReadiness(
         --definition.readyNodes;
     }
 
+    propagateSharedCoverage(definitionIndex, node);
+
+    // A definition fanout commonly touches hundreds of placements below one
+    // mounted-tree root. Each placement keeps its own exact stamp, but the
+    // coalesced root dependency only needs one invalidation per consecutive
+    // root cohort.
+    uint32_t lastRoot = kInvalidIndex;
     for (uint32_t slot = definition.firstMount;
          slot != kInvalidIndex; slot = slots_[slot].definitionNext)
     {
         const bool wasFullyReady = mountedTreeFullyReady(slot);
-        propagateCoverage(slot, node);
-        bumpContentVersion(slot);
+        if (slots_[slot].nodeState == sharedState)
+            propagateSharedRootCoverage(slot, sharedRootWasCovered);
+        else
+            propagateCoverage(slot, node);
+
+        ++mountStamps_[slot].contentVersion;
+        const uint32_t root = slots_[slot].rootSlot;
+        if (root != lastRoot)
+        {
+            if (root != slot) ++mountStamps_[root].contentVersion;
+            const NodeRef rootOwner = slots_[root].owner;
+            if (rootOwner.isTlasRoot() &&
+                rootOwner.index < instanceFrontierVersions_.size())
+                instanceFrontierVersions_[rootOwner.index] =
+                    ++generationCounter_;
+            lastRoot = root;
+        }
         refreshMountDefinitionReadiness(slot);
         propagateFullReadiness(slot, wasFullyReady);
     }
@@ -1163,15 +1258,25 @@ void SpatialDatabase::moveInstance(InstanceHandle ref,
 void SpatialDatabase::moveInstanceDense(InstanceId dense, float4 pos, float scale)
 {
     Instance& inst = instances_[dense];
-    const float invOldScale = 1.0f / inst.scale;
-    const AABB localBounds = AABB::fromMinMax(
-        (inst.worldBox.mn - inst.pos) * invOldScale,
-        (inst.worldBox.mx - inst.pos) * invOldScale);
-    const float localError = inst.maxErrWorld * invOldScale;
-    inst.pos = pos;
-    inst.scale = scale;
-    inst.worldBox = toWorld(localBounds, pos, scale);
-    inst.maxErrWorld = localError * scale;
+    if (scale == inst.scale)
+    {
+        const float4 delta = pos - inst.pos;
+        inst.pos = pos;
+        inst.worldBox.mn = inst.worldBox.mn + delta;
+        inst.worldBox.mx = inst.worldBox.mx + delta;
+    }
+    else
+    {
+        const float invOldScale = 1.0f / inst.scale;
+        const AABB localBounds = AABB::fromMinMax(
+            (inst.worldBox.mn - inst.pos) * invOldScale,
+            (inst.worldBox.mx - inst.pos) * invOldScale);
+        const float localError = inst.maxErrWorld * invOldScale;
+        inst.pos = pos;
+        inst.scale = scale;
+        inst.worldBox = toWorld(localBounds, pos, scale);
+        inst.maxErrWorld = localError * scale;
+    }
     instanceFrontierVersions_[dense] = ++generationCounter_;
     tlasOnInstanceMoved(dense);
 }
@@ -1485,6 +1590,7 @@ size_t SpatialDatabase::subtreeInstanceStateBytes() const
                    mountStamps_.capacity() * sizeof(MountStamp) +
                    mountReadiness_.capacity() * sizeof(MountReadiness) +
                    freeSlots_.capacity() * sizeof(uint32_t) +
+                   unmountScratch_.capacity() * sizeof(uint32_t) +
                    mountLinks_.capacity() * sizeof(MountLinksRt) +
                    freeMountLinks_.capacity() * sizeof(uint32_t);
     bytes += nodeStatePools_.capacity() * sizeof(NodeStatePoolRt);
@@ -2574,6 +2680,8 @@ void SpatialDatabase::consumeMountUsage(std::span<SpatialQuery* const> queries)
         if (query) eventCapacity += query->dirtyMounts_.size();
     std::vector<Event> events;
     events.reserve(eventCapacity);
+    uint32_t firstEventEpoch = 0;
+    bool oneEventEpoch = true;
 
     for (SpatialQuery* query : queries)
     {
@@ -2588,6 +2696,10 @@ void SpatialDatabase::consumeMountUsage(std::span<SpatialQuery* const> queries)
             if (slot >= slots_.size()) continue;
             const MountStamp& stamp = mountStamps_[slot];
             if (!stamp.inUse() || stamp.generation() != rec.generation()) continue;
+            if (events.empty())
+                firstEventEpoch = rec.lastUsed;
+            else if (rec.lastUsed != firstEventEpoch)
+                oneEventEpoch = false;
             events.push_back({slot, rec.lastUsed});
         }
         query->dirtyMounts_.clear();
@@ -2596,11 +2708,14 @@ void SpatialDatabase::consumeMountUsage(std::span<SpatialQuery* const> queries)
     // Feedback may have accumulated for several frames and may come from
     // several cameras. Replay it oldest-to-newest so push-front preserves a
     // true LRU order instead of depending on context-list or discovery order.
-    std::stable_sort(events.begin(), events.end(), [this](const Event& a,
-                                                          const Event& b)
-    {
-        return frame_ - a.lastUsed > frame_ - b.lastUsed;
-    });
+    // The normal per-frame collection case gives every event the same epoch;
+    // equal-age LRU order is irrelevant, so avoid sorting that cohort at all.
+    if (!oneEventEpoch)
+        std::sort(events.begin(), events.end(), [this](const Event& a,
+                                                       const Event& b)
+        {
+            return frame_ - a.lastUsed > frame_ - b.lastUsed;
+        });
     for (const Event& event : events) lruTouch(event.slot, event.lastUsed);
 }
 
@@ -2691,7 +2806,7 @@ CollectResult SpatialDatabase::collect(std::span<SpatialQuery* const> queries,
 // surviving interior/mountable nodes go onto the DFS stack with their err and
 // narrowed plane mask carried along.
 //
-// Normal and dense-overlay bounds come through item.wide without a per-block
+// Normal and dense-overlay bounds come through item.bounds() without a per-block
 // branch. The sparse-overlay instantiation consults its compact patch table;
 // template dispatch happens once per subtree rather than once per block.
 template<bool FullyReady, bool SparseOverlay>
@@ -2713,7 +2828,7 @@ void SpatialDatabase::wideVisit(
         const WideBounds& wb = [&]() -> const WideBounds&
         {
             if constexpr (!SparseOverlay)
-                return item.wide[b];
+                return item.bounds(b);
             else
             {
                 const Overlay& ov = overlays_[item.sparseOverlay];
@@ -2804,7 +2919,7 @@ void SpatialDatabase::emitMountedRootLeavesInside(
     for (uint32_t base = 0; base < count; base += kWide, ++block)
     {
         const WideBlock& children = subtree.wide_[block];
-        const WideBounds& bounds = item.wide[block];
+        const WideBounds& bounds = item.bounds(block);
         const uint32_t lanes = blockValidLanes(subtree.blockMask_[block]);
         FRONTIER_STAT(w, wideBlocksTested, 1);
         FRONTIER_STAT(w, lanesSurvived, uint64_t(std::popcount(lanes)));
@@ -3219,14 +3334,28 @@ void SpatialDatabase::runTlasRootInstance(
 
     w.work.push_back(makeWorkItem(childSlot, inst,
                                   uint8_t(currentCanDescend), 1, mask));
-    while (!w.work.empty())
+    if (fullyReady)
     {
-        const WorkItem item = w.work.back();
-        w.work.pop_back();
-        if (fullyReady)
+        while (!w.work.empty())
+        {
+            const WorkItem item = w.work.back();
+            w.work.pop_back();
             runSubtree<true>(item, inst, local, params, w);
-        else
-            runSubtree<false>(item, inst, local, params, w);
+        }
+    }
+    else
+    {
+        while (!w.work.empty())
+        {
+            const WorkItem item = w.work.back();
+            w.work.pop_back();
+            const bool branchFullyReady = item.current() && item.ideal() &&
+                                          mountedTreeFullyReady(item.slot());
+            if (branchFullyReady)
+                runSubtree<true>(item, inst, local, params, w);
+            else
+                runSubtree<false>(item, inst, local, params, w);
+        }
     }
 }
 

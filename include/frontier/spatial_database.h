@@ -1020,8 +1020,8 @@ public:
     // Both stay zero for a scene that never calls setNodeBounds.
     size_t overlayCount() const { return liveOverlays_; }
     size_t overlayBytes() const;
-    // Retained capacity for mount records, transforms, node state, stamps,
-    // and mount links. Immutable subtree bytes are excluded.
+    // Retained capacity for mount records, transforms, shared/COW node state,
+    // stamps, and mount links. Immutable subtree bytes are excluded.
     size_t subtreeInstanceStateBytes() const;
 
     struct TestAccess;   // defined by tests; full access to internals
@@ -1047,10 +1047,11 @@ private:
     {
         SubtreeBytes bytes;
         detail::SubtreeView view;
-        // One shared bit per packed node. Index zero is the implicit parent
-        // and is never ready; renderable nodes share this bit across every
-        // placement of this registered definition.
-        std::unique_ptr<uint64_t[]> readyBits;
+        // The definition-shared node-state block owns readiness as well as
+        // intrinsic coverage. Index zero is the implicit parent and is never
+        // ready. The block is allocated lazily on the first mount.
+        static constexpr uint16_t kNodeReady = 1u << 15;
+        uint16_t* sharedNodeState = nullptr;
         uint32_t generation = 0;
         uint32_t readyNodes = 0;
         uint32_t firstMount = kInvalidIndex;
@@ -1059,14 +1060,15 @@ private:
         bool inUse() const { return !bytes.empty(); }
         bool isNodeReady(uint32_t node) const
         {
-            return (readyBits[node >> 6] &
-                    (uint64_t(1) << (node & 63))) != 0;
+            return sharedNodeState &&
+                   (sharedNodeState[node] & kNodeReady) != 0;
         }
         void setNodeReady(uint32_t node, bool ready)
         {
-            const uint64_t bit = uint64_t(1) << (node & 63);
-            if (ready) readyBits[node >> 6] |= bit;
-            else readyBits[node >> 6] &= ~bit;
+            FRONTIER_ASSERT(sharedNodeState != nullptr,
+                            "definition node state is not initialized");
+            if (ready) sharedNodeState[node] |= kNodeReady;
+            else sharedNodeState[node] &= ~kNodeReady;
         }
         bool allNodesReady() const
         {
@@ -1076,9 +1078,10 @@ private:
     static_assert(sizeof(SubtreeDefinitionRt) <= 160,
                   "subtree definition runtime state grew");
 
-    // Definition-local slab for per-mount node state. Repeated placements of one
-    // definition have the same node count, so geometric slabs remove one heap
-    // allocation per placement while retaining independently mutable state.
+    // Definition-local coverage state. Placements without mounted descendants
+    // point at one shared block; attaching a child takes a private copy on
+    // demand. Geometric slabs keep those uncommon private copies allocation
+    // free after warm-up.
     struct NodeStatePoolRt
     {
         struct Slab
@@ -1090,10 +1093,12 @@ private:
 
         std::vector<Slab> slabs;
         std::vector<uint16_t*> freeBlocks;
+        uint16_t* sharedState = nullptr;
         uint32_t wordsPerBlock = 0;
         uint32_t nextSlabBlocks = 1;
 
         uint16_t* acquire(uint32_t nodeCount);
+        uint16_t* shared(uint32_t nodeCount);
         void release(uint16_t* state);
         size_t bytes() const;
     };
@@ -1168,7 +1173,8 @@ private:
         // ceilings without rewriting authored node data.
         float                 errClamp = FLT_MAX;
         // The derived covered flag and covered-child count share one word.
-        // Node readiness is definition-shared and is not duplicated here.
+        // Childless placements point at the definition's shared state; adding
+        // a mounted child switches this pointer to a private COW block.
         static constexpr uint16_t kCovered = 1u << 0;
         static constexpr uint16_t kCoveredChildShift = 1;
         uint16_t* nodeState = nullptr;
@@ -1207,7 +1213,8 @@ private:
         }
         uint16_t coveredChildCount(uint32_t node) const
         {
-            return nodeState[node] >> kCoveredChildShift;
+            return uint16_t((nodeState[node] >> kCoveredChildShift) &
+                            detail::kMaxChildren);
         }
         void addCoveredChild(uint32_t node)
         {
@@ -1502,12 +1509,12 @@ private:
     static_assert(sizeof(VisibleItem) == 4, "visible TLAS hit must stay 4 bytes");
 
     // One subtree queued on an instance walk. Dense bounds are resolved when
-    // it is pushed; sparse overlays carry an index in existing padding
-    // and use a separately instantiated inner loop.
+    // it is pushed; the two possible strides use one state bit instead of a
+    // padded word. Sparse overlays use a separately instantiated inner loop.
     struct WorkItem
     {
-        detail::WideBoundsRef wide;
-        // slot[20] | plane mask[6] | current[1] | ideal[1]
+        const std::byte* wideBase = nullptr;
+        // slot[20] | plane mask[6] | current[1] | ideal[1] | packed bounds[1]
         uint32_t      state = 0;
         // Sparse overlay index, or kInvalidIndex. This occupies WorkItem's old
         // tail padding, so sparse support does not grow the traversal stack.
@@ -1517,13 +1524,22 @@ private:
         WorkItem(uint32_t slot, detail::WideBoundsRef bounds, uint8_t current,
                  uint8_t ideal, uint8_t mask,
                  uint32_t sparse = kInvalidIndex)
-            : wide(bounds),
+            : wideBase(bounds.base),
               state((slot & NodeHandle::kSlotMask) |
                     (uint32_t(mask & 0x3fu) << NodeHandle::kSlotBits) |
                     (uint32_t(current != 0) << 26) |
-                    (uint32_t(ideal != 0) << 27)),
+                    (uint32_t(ideal != 0) << 27) |
+                    (uint32_t(bounds.stride == sizeof(WideBounds)) << 28)),
               sparseOverlay(sparse)
         {}
+        const WideBounds& bounds(uint32_t block) const
+        {
+            const size_t stride = (state & (1u << 28)) != 0
+                                      ? sizeof(WideBounds)
+                                      : sizeof(detail::WideBlock);
+            return *reinterpret_cast<const WideBounds*>(
+                wideBase + size_t(block) * stride);
+        }
         uint32_t slot() const { return state & NodeHandle::kSlotMask; }
         uint8_t mask() const
         {
@@ -1532,7 +1548,7 @@ private:
         bool current() const { return (state & (1u << 26)) != 0; }
         bool ideal() const { return (state & (1u << 27)) != 0; }
     };
-    static_assert(sizeof(WorkItem) == 24, "subtree work item must stay 24 bytes");
+    static_assert(sizeof(WorkItem) == 16, "subtree work item must stay 16 bytes");
 
     // Node visit carried on the walk's explicit DFS stack; err and planes are
     // computed by the parent's wide test; current/ideal identify which walks
@@ -1614,10 +1630,13 @@ private:
     uint32_t allocSubtree();
     void destroySubtree(uint32_t definition);
     const SubtreeDefinitionRt* resolveSubtree(SubtreeHandle h) const;
-    void initializeDefinitionReadiness(uint32_t definition);
     void setDefinitionNodeReadiness(uint32_t definition, uint32_t node,
                                     bool ready);
     void initializeMountCoverage(uint32_t slot);
+    void ensurePrivateCoverage(uint32_t slot);
+    void releasePrivateCoverage(uint32_t slot);
+    void propagateSharedCoverage(uint32_t definition, uint32_t node);
+    void propagateSharedRootCoverage(uint32_t slot, bool wasCovered);
     void refreshMountDefinitionReadiness(uint32_t slot);
     static constexpr uint32_t kMountTreeDependency = 1u << 31;
     uint32_t traversalDependency(uint32_t slot) const;
@@ -1792,6 +1811,7 @@ private:
     std::vector<MountLinksRt> mountLinks_;
     std::vector<uint32_t> freeMountLinks_;
     std::vector<uint32_t> freeSlots_;
+    std::vector<uint32_t> unmountScratch_;
     size_t mountedSubtrees_ = 0;
     uint32_t              generationCounter_ = 0;
 

@@ -1393,9 +1393,9 @@ size_t subtreeInstanceStateBytes() const;
 - `overlayCount()` returns live copy-on-write bounds overlay count.
 - `overlayBytes()` returns retained overlay storage bytes.
 - `subtreeInstanceStateBytes()` returns retained placement records,
-  transforms, coverage words, readiness summaries, stamps, slab capacity,
-  definition-to-mount references, and mount-link capacity; immutable registered
-  `SubtreeBytes` and definition-local readiness bits are excluded.
+  transforms, shared coverage/readiness words, private coverage copies, stamps,
+  slab capacity, definition-to-mount references, and mount-link capacity;
+  immutable registered `SubtreeBytes` are excluded.
 
 ## 11. Threading contract
 

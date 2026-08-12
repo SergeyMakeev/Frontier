@@ -101,6 +101,56 @@ std::unique_ptr<AssemblyScene> buildScene(bool assembled, uint32_t count,
     return scene;
 }
 
+std::unique_ptr<AssemblyScene> buildMixedReadinessScene(uint32_t count)
+{
+    auto scene = std::make_unique<AssemblyScene>();
+    const uint32_t side =
+        uint32_t(std::ceil(std::sqrt(double(count))));
+
+    const auto buildHouse = [&](UserPayload firstPayload)
+    {
+        SubtreeBuilder builder;
+        builder.reserve(kDetailCount);
+        for (uint32_t detail = 0; detail < kDetailCount; ++detail)
+            builder.createNode(node(firstPayload + detail, 0.0f,
+                                    detailBounds(detail)));
+        SubtreeBytes bytes = builder.build();
+        scene->immutableBytes += bytes.size();
+        return scene->world.registerSubtree(std::move(bytes));
+    };
+    const SubtreeHandle readyHouse = buildHouse(1000);
+    const SubtreeHandle incompleteHouse = buildHouse(2000);
+
+    SubtreeBuilder cityBuilder;
+    cityBuilder.reserve(count);
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        const float4 position = housePosition(i, side);
+        cityBuilder.createNode(node(
+            10 + i, 16.0f,
+            AABB::fromCenterExtent(position, float4::vec(4, 2, 2)), true));
+    }
+    SubtreeBytes city = cityBuilder.build();
+    const AABB cityBounds = detail::viewSubtreeBytes(city).bounds();
+    scene->immutableBytes += city.size();
+    const SubtreeHandle cityHandle =
+        scene->world.registerSubtree(std::move(city));
+    const InstanceHandle instance = scene->world.instantiate(
+        node(1, 64.0f, cityBounds, true));
+    const SubtreeInstanceHandle cityMount =
+        scene->world.mountSubtree(instance.rootNode(), cityHandle);
+
+    for (uint32_t i = 0; i < count; ++i)
+        scene->world.mountSubtree(
+            TestAccess::nodeAt(scene->world, cityMount, i + 1),
+            (i & 1u) == 0 ? readyHouse : incompleteHouse,
+            Transform{housePosition(i, side), 1.0f});
+
+    TestAccess::markAllNodesReady(scene->world);
+    scene->world.markNodeUnavailable(handleOf(scene->world, 2000));
+    return scene;
+}
+
 void consume(const FrontierResultView& cut)
 {
     benchmark::DoNotOptimize(cut.shared.data());
@@ -197,6 +247,142 @@ static void BM_SharedNodeReadinessFanout(benchmark::State& state)
 
 BENCHMARK(BM_SharedNodeReadinessFanout)
     ->Arg(32)->Arg(128)->Arg(400)
+    ->Unit(benchmark::kMicrosecond);
+
+static void BM_MountUnmountLifecycle(benchmark::State& state)
+{
+    SpatialDatabase world;
+
+    SubtreeBuilder childBuilder;
+    for (uint32_t detail = 0; detail < kDetailCount; ++detail)
+        childBuilder.createNode(
+            node(1000 + detail, 0.0f, detailBounds(detail)));
+    const SubtreeHandle child =
+        world.registerSubtree(childBuilder.build());
+
+    SubtreeBuilder ownerBuilder;
+    ownerBuilder.createNode(node(
+        10, 16.0f,
+        AABB::fromCenterExtent(float4::point(0, 0, 0),
+                               float4::vec(4, 2, 2)),
+        true));
+    SubtreeBytes ownerBytes = ownerBuilder.build();
+    const AABB ownerBounds = detail::viewSubtreeBytes(ownerBytes).bounds();
+    const SubtreeHandle owner =
+        world.registerSubtree(std::move(ownerBytes));
+    const InstanceHandle instance =
+        world.instantiate(node(1, 64.0f, ownerBounds, true));
+    const SubtreeInstanceHandle ownerMount =
+        world.mountSubtree(instance.rootNode(), owner);
+    const NodeHandle parent = TestAccess::nodeAt(world, ownerMount, 1);
+
+    for (auto _ : state)
+    {
+        const SubtreeInstanceHandle mounted =
+            world.mountSubtree(parent, child);
+        benchmark::DoNotOptimize(mounted);
+        world.unmountSubtree(mounted);
+    }
+}
+
+BENCHMARK(BM_MountUnmountLifecycle)->Unit(benchmark::kNanosecond);
+
+static void BM_MountUsageConsumption(benchmark::State& state)
+{
+    const uint32_t count = uint32_t(state.range(0));
+    auto scene = buildScene(true, count, true);
+    const uint32_t side =
+        uint32_t(std::ceil(std::sqrt(double(count))));
+    const float span = float(side) * 12.0f;
+    const Camera view = makeLookAtCamera(
+        float4::point(0, span * 0.8f, -span * 0.8f),
+        float4::point(0, 0, 0));
+    const SelectionParams params{1.0f, 0.0f};
+    SpatialQuery query;
+    query.setReuseEnabled(false);
+    query.setMountUsageEnabled(true);
+
+    for (auto _ : state)
+    {
+        state.PauseTiming();
+        scene->world.applyUpdates();
+        consume(query.selectFrontier(scene->world, view, params));
+        state.ResumeTiming();
+        benchmark::DoNotOptimize(scene->world.collect(
+            query, scene->world.mountedSubtreeCount(), 0));
+    }
+    state.counters["mounts"] = double(scene->world.mountedSubtreeCount());
+}
+
+BENCHMARK(BM_MountUsageConsumption)
+    ->Arg(128)->Arg(400)
+    ->Unit(benchmark::kMicrosecond);
+
+static void BM_MotionGroupSteady(benchmark::State& state)
+{
+    const uint32_t count = uint32_t(state.range(0));
+    const bool unchanged = state.range(1) != 0;
+    SpatialDatabase world;
+    std::vector<InstanceHandle> handles;
+    std::vector<float4> positions;
+    handles.reserve(count);
+    positions.reserve(count);
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        const float4 position = float4::point(float(i) * 2.0f, 0, 0);
+        InstanceDesc desc;
+        desc.pos = position;
+        handles.push_back(world.instantiate(
+            node(1000 + i, 0.0f, box(0.5f)), desc));
+        positions.push_back(position);
+    }
+    SpatialDatabase::MotionGroup group(handles);
+
+    bool raised = false;
+    for (auto _ : state)
+    {
+        if (!unchanged) raised = !raised;
+        const float y = raised ? 0.25f : 0.0f;
+        for (float4& position : positions) position.y = y;
+        world.moveInstances(group, positions);
+        benchmark::ClobberMemory();
+    }
+    state.counters["instances"] = double(count);
+}
+
+BENCHMARK(BM_MotionGroupSteady)
+    ->Args({128, 0})->Args({400, 0})
+    ->Args({128, 1})->Args({400, 1})
+    ->ArgNames({"instances", "unchanged"})
+    ->Unit(benchmark::kMicrosecond);
+
+static void BM_MixedReadinessFrontier(benchmark::State& state)
+{
+    const uint32_t count = uint32_t(state.range(0));
+    auto scene = buildMixedReadinessScene(count);
+    const uint32_t side =
+        uint32_t(std::ceil(std::sqrt(double(count))));
+    const float span = float(side) * 12.0f;
+    const Camera view = makeLookAtCamera(
+        float4::point(0, span * 0.8f, -span * 0.8f),
+        float4::point(0, 0, 0));
+    const SelectionParams params{1.0f, 0.0f};
+    SpatialQuery query;
+    query.setReuseEnabled(false);
+    scene->world.applyUpdates();
+
+    FrontierResultView cut;
+    for (auto _ : state)
+    {
+        scene->world.applyUpdates();
+        cut = query.selectFrontier(scene->world, view, params);
+        consume(cut);
+    }
+    state.counters["frontier"] = double(cut.size());
+}
+
+BENCHMARK(BM_MixedReadinessFrontier)
+    ->Arg(128)->Arg(400)
     ->Unit(benchmark::kMicrosecond);
 
 static void BM_SubtreeBuilder_ConstructCost(benchmark::State& state)

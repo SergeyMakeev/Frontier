@@ -13,23 +13,10 @@ constexpr size_t alignUp(size_t value, size_t alignment)
     return (value + alignment - 1) & ~(alignment - 1);
 }
 
-struct Layout
-{
-    uint32_t wide = 0;
-    uint32_t mask = 0;
-    uint32_t bbox = 0;
-    uint32_t payload = 0;
-    uint32_t parent = 0;
-    uint32_t subtreeSize = 0;
-    uint32_t meta = 0;
-    uint32_t error = 0;
-    uint32_t totalBytes = 0;
-};
-
-Layout computeLayout(uint32_t nodeCount, uint32_t wideCount)
+detail::SubtreeLayout computeLayout(uint32_t nodeCount, uint32_t wideCount)
 {
     using namespace detail;
-    Layout layout;
+    SubtreeLayout layout;
     size_t offset = sizeof(SubtreeHeader);
 
     offset = alignUp(offset, alignof(WideBlock));
@@ -128,9 +115,9 @@ void SubtreeBytes::moveFrom(SubtreeBytes& other) noexcept
 
 namespace detail {
 
-size_t subtreeBlobBytes(uint32_t nodeCount, uint32_t wideCount)
+SubtreeLayout subtreeLayout(uint32_t nodeCount, uint32_t wideCount)
 {
-    return computeLayout(nodeCount, wideCount).totalBytes;
+    return computeLayout(nodeCount, wideCount);
 }
 
 void validateSubtreeBytes(const SubtreeBytes& bytes)
@@ -160,7 +147,8 @@ void validateSubtreeBytes(const SubtreeBytes& bytes)
     FRONTIER_CHECK(header->totalBytes == bytes.size(),
                    "registerSubtree: byte-array size mismatch");
 
-    const Layout layout = computeLayout(header->nodeCount, header->wideCount);
+    const SubtreeLayout layout =
+        computeLayout(header->nodeCount, header->wideCount);
     FRONTIER_CHECK(
         layout.totalBytes == header->totalBytes &&
             layout.wide == header->wideOffset &&
