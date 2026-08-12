@@ -70,6 +70,42 @@ TEST(Contracts, FixedOutputReportsOverflow)
     EXPECT_EQ(sink.shared.dropped(), 5u);
 }
 
+TEST(Contracts, FrontierCutViewsJoinBucketsWithoutCopying)
+{
+    static_assert(std::forward_iterator<FrontierCutView::iterator>);
+
+    const std::array<FrontierEntry, 2> shared{
+        FrontierEntry{{}, uint8_t(0), 1},
+        FrontierEntry{{}, uint8_t(0), 2}};
+    const std::array<FrontierEntry, 1> currentOnly{
+        FrontierEntry{{}, uint8_t(0), 3}};
+    const std::array<FrontierEntry, 2> idealOnly{
+        FrontierEntry{{}, uint8_t(0), 4},
+        FrontierEntry{{}, uint8_t(0), 5}};
+    const FrontierResultView result{shared, currentOnly, idealOnly};
+
+    const FrontierCutView current = result.current();
+    ASSERT_EQ(current.size(), 3u);
+    auto it = current.begin();
+    EXPECT_EQ(&*it++, &shared[0]);
+    EXPECT_EQ(&*it++, &shared[1]);
+    EXPECT_EQ(&*it++, &currentOnly[0]);
+    EXPECT_EQ(it, current.end());
+
+    std::vector<InstanceId> idealInstances;
+    for (const FrontierEntry& entry : result.ideal())
+        idealInstances.push_back(entry.instance());
+    EXPECT_EQ(idealInstances,
+              (std::vector<InstanceId>{1, 2, 4, 5}));
+
+    const FrontierResultView suffixOnly{{}, currentOnly, {}};
+    ASSERT_FALSE(suffixOnly.current().empty());
+    EXPECT_EQ(suffixOnly.current().begin()->instance(), 3u);
+    EXPECT_TRUE(FrontierResultView{}.current().empty());
+    EXPECT_EQ(FrontierResultView{}.ideal().begin(),
+              FrontierResultView{}.ideal().end());
+}
+
 TEST(Contracts, HotTypesStayCompact)
 {
     EXPECT_EQ(sizeof(NodeHandle), 8u);

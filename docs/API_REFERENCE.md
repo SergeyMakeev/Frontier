@@ -729,11 +729,26 @@ Size: 12 bytes.
 ### Result buckets
 
 ```cpp
+class FrontierCutView {
+public:
+    class iterator; // forward iterator yielding const FrontierEntry&
+
+    FrontierCutView();
+    FrontierCutView(std::span<const FrontierEntry> first,
+                    std::span<const FrontierEntry> second);
+    iterator begin() const;
+    iterator end() const;
+    size_t size() const;
+    bool empty() const;
+};
+
 struct FrontierResultView {
     std::span<const FrontierEntry> shared;
     std::span<const FrontierEntry> currentOnly;
     std::span<const FrontierEntry> idealOnly;
 
+    FrontierCutView current() const;
+    FrontierCutView ideal() const;
     size_t currentSize() const;
     size_t idealSize() const;
     size_t size() const;
@@ -741,10 +756,17 @@ struct FrontierResultView {
 };
 ```
 
-The current render cut is `shared + currentOnly`. The fully ready desired
-cut is `shared + idealOnly`. `size()` counts all three disjoint storage
-buckets. A view returned by `SpatialQuery` remains valid until that query's
-next selection, `reset()`, move assignment, or destruction.
+`current()` is a zero-allocation forward range that visits `shared` and then
+`currentOnly`. `ideal()` visits `shared` and then `idealOnly`. Neither range
+copies entries or makes the buckets contiguous; references point directly into
+the source spans. The individual spans remain available for bulk operations
+and delta-only processing.
+
+`currentSize()` and `idealSize()` report the corresponding logical range sizes.
+`size()` counts all three disjoint storage buckets. A view and any cut range or
+iterator obtained from it remain valid until the underlying result storage is
+invalidated. For a view returned by `SpatialQuery`, that means its next
+selection, `reset()`, move assignment, or destruction.
 
 ```cpp
 class FrontierResult : public FrontierResultView {

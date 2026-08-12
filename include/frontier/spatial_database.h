@@ -18,6 +18,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <iterator>
 #include <memory>
 #include <span>
 #include <vector>
@@ -183,6 +184,102 @@ struct FrontierEntry
 };
 static_assert(sizeof(FrontierEntry) == 12, "FrontierEntry must stay 12 bytes");
 
+// Zero-copy forward range over two result buckets. Iteration exhausts `first`
+// before continuing with `second`; neither bucket is copied or made contiguous.
+class FrontierCutView
+{
+public:
+    class iterator
+    {
+    public:
+        using iterator_category = std::forward_iterator_tag;
+        using iterator_concept = std::forward_iterator_tag;
+        using value_type = FrontierEntry;
+        using difference_type = std::ptrdiff_t;
+        using pointer = const FrontierEntry*;
+        using reference = const FrontierEntry&;
+
+        iterator() = default;
+
+        reference operator*() const { return *current_; }
+        pointer operator->() const { return current_; }
+
+        iterator& operator++()
+        {
+            ++current_;
+            if (firstEnd_)
+            {
+                if (current_ != firstEnd_) return *this;
+                current_ = secondBegin_;
+                firstEnd_ = nullptr;
+                if (current_ != secondEnd_) return *this;
+            }
+            else if (current_ != secondEnd_)
+            {
+                return *this;
+            }
+
+            *this = iterator{};
+            return *this;
+        }
+
+        iterator operator++(int)
+        {
+            iterator previous = *this;
+            ++*this;
+            return previous;
+        }
+
+        friend bool operator==(const iterator&, const iterator&) = default;
+
+    private:
+        friend class FrontierCutView;
+
+        iterator(std::span<const FrontierEntry> first,
+                 std::span<const FrontierEntry> second)
+            : secondBegin_(second.data()),
+              secondEnd_(second.empty() ? second.data()
+                                        : second.data() + second.size())
+        {
+            if (!first.empty())
+            {
+                current_ = first.data();
+                firstEnd_ = first.data() + first.size();
+            }
+            else if (!second.empty())
+            {
+                current_ = second.data();
+            }
+            else
+            {
+                *this = iterator{};
+            }
+        }
+
+        const FrontierEntry* current_ = nullptr;
+        const FrontierEntry* firstEnd_ = nullptr;
+        const FrontierEntry* secondBegin_ = nullptr;
+        const FrontierEntry* secondEnd_ = nullptr;
+    };
+
+    FrontierCutView() = default;
+    FrontierCutView(std::span<const FrontierEntry> first,
+                    std::span<const FrontierEntry> second)
+        : first_(first), second_(second)
+    {}
+
+    iterator begin() const { return iterator(first_, second_); }
+    iterator end() const { return {}; }
+    size_t size() const { return first_.size() + second_.size(); }
+    bool empty() const { return first_.empty() && second_.empty(); }
+
+private:
+    std::span<const FrontierEntry> first_;
+    std::span<const FrontierEntry> second_;
+};
+static_assert(sizeof(FrontierCutView) == 4 * sizeof(void*),
+              "two-span frontier cut view grew");
+
 // One traversal produces both realities without per-entry tags. The current
 // render frontier is shared + currentOnly. The fully-ready ideal frontier is
 // shared + idealOnly. A high-error ideal-side mountable node can be used
@@ -195,6 +292,8 @@ struct FrontierResultView
     std::span<const FrontierEntry> currentOnly;
     std::span<const FrontierEntry> idealOnly;
 
+    FrontierCutView current() const { return {shared, currentOnly}; }
+    FrontierCutView ideal() const { return {shared, idealOnly}; }
     size_t currentSize() const { return shared.size() + currentOnly.size(); }
     size_t idealSize() const { return shared.size() + idealOnly.size(); }
     size_t size() const

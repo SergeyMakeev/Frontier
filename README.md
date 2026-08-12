@@ -79,9 +79,10 @@ Runtime `NodeHandle` values normally come from frontier results or retained
 assembly state; builder `NodeId` values are authoring-local and are not runtime
 handles.
 
-`shared + currentOnly` is always a hole-free render frontier.
-`shared + idealOnly` is the frontier the mounted topology would choose with
-every known node ready. Readiness means the renderer has every GPU resource
+`cut.current()` is always a hole-free render frontier; it iterates `shared`
+followed by `currentOnly` without copying either bucket. `cut.ideal()` similarly
+iterates `shared` followed by `idealOnly`, the frontier the mounted topology
+would choose with every known node ready. Readiness means the renderer has every GPU resource
 needed to dispatch a node's payload. It belongs to a node in a registered
 definition and is shared by that node across every placement of the definition.
 Equal payload values in different nodes are independent; applications that use

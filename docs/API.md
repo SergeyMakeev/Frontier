@@ -52,9 +52,7 @@ Camera camera = makeLookAtCamera(cameraPosition, cameraTarget);
 FrontierResultView cut = query.selectFrontier(
     database, camera, SelectionParams{.threshold = 4.0f});
 
-for (const FrontierEntry& entry : cut.shared)
-    submitToRenderer(entry);
-for (const FrontierEntry& entry : cut.currentOnly)
+for (const FrontierEntry& entry : cut.current())
     submitToRenderer(entry);
 ```
 
@@ -324,40 +322,35 @@ One traversal returns two logical cuts in three disjoint buckets:
 - `currentOnly` contains ready fallbacks used only now;
 - `idealOnly` contains choices wanted if all known definition nodes were ready.
 
-Render `shared + currentOnly`:
+Render the zero-copy current-cut view:
 
 ```cpp
-auto render = [&](std::span<const FrontierEntry> entries) {
-    for (const FrontierEntry& entry : entries) {
-        UserPayload payload;
-        if (database.tryGetPayload(entry.nodeHandle, payload))
-            submitPayload(payload, entry.instance());
-    }
-};
-
-render(cut.shared);
-render(cut.currentOnly);
+for (const FrontierEntry& entry : cut.current()) {
+    UserPayload payload;
+    if (database.tryGetPayload(entry.nodeHandle, payload))
+        submitPayload(payload, entry.instance());
+}
 ```
 
-Use `shared + idealOnly` to drive demand:
+Use the corresponding ideal-cut view to drive demand:
 
 ```cpp
-auto request = [&](std::span<const FrontierEntry> entries) {
-    for (const FrontierEntry& entry : entries) {
-        UserPayload payload;
-        if (database.tryGetPayload(entry.nodeHandle, payload) &&
-            !database.isNodeReady(entry.nodeHandle))
-            requestPayload(entry.nodeHandle, payload);
+for (const FrontierEntry& entry : cut.ideal()) {
+    UserPayload payload;
+    if (database.tryGetPayload(entry.nodeHandle, payload) &&
+        !database.isNodeReady(entry.nodeHandle))
+        requestPayload(entry.nodeHandle, payload);
 
-        if (entry.overThreshold() &&
-            !database.hasMountedSubtree(entry.nodeHandle))
-            requestChildDefinition(entry.nodeHandle);
-    }
-};
-
-request(cut.shared);
-request(cut.idealOnly);
+    if (entry.overThreshold() &&
+        !database.hasMountedSubtree(entry.nodeHandle))
+        requestChildDefinition(entry.nodeHandle);
+}
 ```
+
+`current()` iterates `shared` followed by `currentOnly`; `ideal()` iterates
+`shared` followed by `idealOnly`. Both are allocation-free forward ranges over
+the original spans. The individual buckets remain public for bulk submission
+and code that needs only the delta between the cuts.
 
 `FrontierResultView` points into its `SpatialQuery` and remains valid until that
 query's next selection, `reset()`, or destruction. Use `FrontierResult` for an
@@ -689,7 +682,7 @@ database.mountSubtree(city.rootNode(), cityDefinition);
 The streaming loop discovers mountable proxies from the ideal frontier:
 
 ```cpp
-void processIdeal(std::span<const FrontierEntry> entries)
+void processIdeal(FrontierCutView entries)
 {
     for (const FrontierEntry& entry : entries) {
         UserPayload payload;
@@ -715,8 +708,7 @@ void processIdeal(std::span<const FrontierEntry> entries)
 
 database.applyUpdates();
 FrontierResultView cut = cityQuery.selectFrontier(database, camera, params);
-processIdeal(cut.shared);
-processIdeal(cut.idealOnly);
+processIdeal(cut.ideal());
 ```
 
 The city can contain a million proxies without duplicating the house

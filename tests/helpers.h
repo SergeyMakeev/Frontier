@@ -195,18 +195,14 @@ inline std::vector<UserPayload> payloads(const SpatialDatabase& database,
                                          bool ideal = true)
 {
     std::vector<UserPayload> output;
-    const auto append = [&](std::span<const FrontierEntry> entries)
+    const FrontierCutView cut = ideal ? result.ideal() : result.current();
+    for (const FrontierEntry& entry : cut)
     {
-        for (const FrontierEntry& entry : entries)
-        {
-            UserPayload payload = 0;
-            if (!database.tryGetPayload(entry.nodeHandle, payload))
-                throw std::logic_error("stale frontier handle");
-            output.push_back(payload);
-        }
-    };
-    append(result.shared);
-    append(ideal ? result.idealOnly : result.currentOnly);
+        UserPayload payload = 0;
+        if (!database.tryGetPayload(entry.nodeHandle, payload))
+            throw std::logic_error("stale frontier handle");
+        output.push_back(payload);
+    }
     std::sort(output.begin(), output.end());
     return output;
 }
