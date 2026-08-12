@@ -23,6 +23,9 @@ Frontier requires C++20.
 - A **frontier** or **cut** is an ancestor-free set of renderable nodes that
   covers the visible scene. The current cut uses resources available now; the
   ideal cut assumes every node in currently mounted topology is ready.
+- A **hole-free** current cut has complete logical hierarchy coverage: Frontier
+  retains a parent until ready descendants cover every visible branch that the
+  parent represented. This does not describe mesh seams or rasterization.
 - **Readiness** means the renderer can dispatch a node's opaque payload.
   **Coverage** is the internal summary proving that a node itself, or a complete
   descendant cut, is ready. Neither term means that additional topology is

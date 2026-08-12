@@ -13,8 +13,11 @@ acceleration structure (BLAS): it stores the reusable local hierarchy, while a
 mount supplies a placement below a renderable node. Frontier does not expose a
 `BLAS` type because definitions can be mounted recursively, and a one-node
 instance needs no lower hierarchy. A cut, or frontier, is the ancestor-free set
-of nodes selected to cover the visible scene. The current cut is renderable
-now; the ideal cut assumes every node in currently mounted topology is ready.
+of nodes selected to cover the visible scene. The current cut is renderable now
+and hole-free: it never replaces a parent until ready descendants cover every
+visible branch represented by that parent. The ideal cut assumes every node in
+currently mounted topology is ready. Here, hole-free describes logical
+hierarchy coverage; it does not guarantee crack-free mesh boundaries.
 
 Readiness need not form an unbroken path from root to leaf. If an unavailable
 node has a complete ready descendant cut, Frontier renders those descendants
@@ -95,7 +98,7 @@ Runtime `NodeHandle` values normally come from frontier results or retained
 assembly state; builder `NodeId` values are authoring-local and are not runtime
 handles.
 
-`cut.current()` is always a hole-free render frontier; it iterates `shared`
+`cut.current()` is always a complete render frontier; it iterates `shared`
 followed by `currentOnly` without copying either bucket. `cut.ideal()` similarly
 iterates `shared` followed by `idealOnly`, the frontier the mounted topology
 would choose with every known node ready. Readiness means the renderer has every GPU resource

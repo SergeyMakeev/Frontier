@@ -77,6 +77,13 @@ the visible scene. Frontier produces two cuts at once:
 - the **ideal cut** is what the currently mounted topology would select if all
   of its nodes were render-ready.
 
+**Hole-free** means complete hierarchy coverage: every visible region represented
+by a selected parent remains represented either by that parent or by a complete
+set of selected descendants. Frontier never drops a parent merely because some
+children are ready; it refines only when ready descendants cover every visible
+branch that the parent covered. This is a selection guarantee, not a claim about
+geometric cracks between meshes, occlusion, or rasterization.
+
 A node's `payload` is only an opaque application identifier. **Readiness** says
 whether the renderer can dispatch that node's payload; it does not mean that
 finer topology has been mounted. When a desired node is not ready, the current
