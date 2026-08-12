@@ -26,7 +26,9 @@ Frontier requires C++20.
 - **Readiness** means the renderer can dispatch a node's opaque payload.
   **Coverage** is the internal summary proving that a node itself, or a complete
   descendant cut, is ready. Neither term means that additional topology is
-  mounted.
+  mounted. A complete ready descendant cut remains usable when its ancestor is
+  unavailable; fallback to a ready ancestor is needed only when descendant
+  coverage is incomplete.
 - **Contract violation** means `FRONTIER_FATAL` is called. The default macro
   throws `std::logic_error`. A replacement handler must not return.
 - **Stale** means a generation-stamped handle no longer resolves. Operations

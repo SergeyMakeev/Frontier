@@ -16,6 +16,11 @@ instance needs no lower hierarchy. A cut, or frontier, is the ancestor-free set
 of nodes selected to cover the visible scene. The current cut is renderable
 now; the ideal cut assumes every node in currently mounted topology is ready.
 
+Readiness need not form an unbroken path from root to leaf. If an unavailable
+node has a complete ready descendant cut, Frontier renders those descendants
+directly; it falls back to a ready ancestor only when descendant coverage is
+incomplete.
+
 The data model is deliberately small:
 
 - Every top-level instance is one permanent, renderable node stored directly in

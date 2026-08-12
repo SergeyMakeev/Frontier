@@ -25,8 +25,10 @@ using namespace frontier;
 A conventional LOD system can choose one mesh for one object. Frontier makes
 the same decision across an assembled hierarchy: a city can refine into blocks,
 a block into reusable buildings, and a building into reusable detail trees.
-Definitions are shared, placements are independent, and missing content falls
-back to the nearest ready ancestor without leaving holes.
+Definitions are shared and placements are independent. When a selected node is
+not ready, Frontier uses a complete ready descendant cut when one exists;
+otherwise it falls back to the nearest ready ancestor. Either path preserves
+coverage without leaving holes.
 
 ### The two spatial levels
 
@@ -79,6 +81,11 @@ A node's `payload` is only an opaque application identifier. **Readiness** says
 whether the renderer can dispatch that node's payload; it does not mean that
 finer topology has been mounted. When a desired node is not ready, the current
 cut remains at a ready ancestor or uses a complete set of ready descendants.
+
+Importantly, readiness is not required at every level of the hierarchy. An
+unavailable ancestor does not block its descendants: if those descendants form
+a complete ready cut, Frontier can render them directly. It falls back upward
+only when descendant readiness is incomplete.
 
 With that model, the smallest useful scene needs only a permanent top-level
 node:
@@ -462,6 +469,12 @@ The readiness test is still necessary. If one child is unavailable, the
 hole-free current cut may remain at a common ancestor; ready siblings below
 that ancestor then also appear in `idealOnly` even though they need no upload.
 No topology is mounted or unmounted in this example.
+
+The reverse is equally important. A coarse building node may become unavailable
+after all of its wall descendants are ready. Because those walls form a
+complete ready cut, the current frontier keeps rendering them; it does not
+require the coarse ancestor to remain ready. Only a gap in that descendant cut
+forces selection back to a ready ancestor.
 
 ### Example: mounting reveals local detail
 
