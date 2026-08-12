@@ -1,9 +1,20 @@
 # Frontier
 
-Frontier is a C++20 hierarchical-LOD selection library. It maintains a dynamic
-8-wide top-level acceleration structure (TLAS), mounts reusable hierarchy
-fragments, tracks shared definition-node readiness, and returns both the
-renderable current cut and the fully available ideal cut.
+Frontier is a C++20 library that chooses which level-of-detail (LOD) nodes a
+renderer should draw from a large dynamic scene. It indexes independently
+movable objects, mounts reusable local hierarchies below them, and accounts for
+render resources that are still streaming.
+
+A bounding-volume hierarchy (BVH) groups spatial bounds so many objects can be
+rejected at once. Frontier's top-level acceleration structure (TLAS) is an
+8-wide, world-space BVH; each TLAS leaf is also a permanent renderable fallback.
+A registered subtree definition is the closest equivalent to a bottom-level
+acceleration structure (BLAS): it stores the reusable local hierarchy, while a
+mount supplies a placement below a renderable node. Frontier does not expose a
+`BLAS` type because definitions can be mounted recursively, and a one-node
+instance needs no lower hierarchy. A cut, or frontier, is the ancestor-free set
+of nodes selected to cover the visible scene. The current cut is renderable
+now; the ideal cut assumes every node in currently mounted topology is ready.
 
 The data model is deliberately small:
 

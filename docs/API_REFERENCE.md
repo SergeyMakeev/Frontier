@@ -11,6 +11,22 @@ Frontier requires C++20.
 
 ## Reference conventions
 
+- A **BVH** is a bounding-volume hierarchy used to reject spatial groups
+  without testing every member. Frontier's **TLAS** is its internal 8-wide,
+  world-space top-level BVH over independently movable instances. Every TLAS
+  leaf is also a permanent renderable root.
+- Ray-tracing APIs often call a local hierarchy below the TLAS a **BLAS**
+  (bottom-level acceleration structure). Frontier's closest equivalent is a
+  registered subtree definition; a mount supplies its placement below a
+  renderable node. The API does not expose a `BLAS` type because definitions
+  can be mounted recursively and a one-node instance needs no lower hierarchy.
+- A **frontier** or **cut** is an ancestor-free set of renderable nodes that
+  covers the visible scene. The current cut uses resources available now; the
+  ideal cut assumes every node in currently mounted topology is ready.
+- **Readiness** means the renderer can dispatch a node's opaque payload.
+  **Coverage** is the internal summary proving that a node itself, or a complete
+  descendant cut, is ready. Neither term means that additional topology is
+  mounted.
 - **Contract violation** means `FRONTIER_FATAL` is called. The default macro
   throws `std::logic_error`. A replacement handler must not return.
 - **Stale** means a generation-stamped handle no longer resolves. Operations
@@ -1066,11 +1082,12 @@ SubtreeHandle registerSubtree(SubtreeBytes&& bytes);
 - **Returns:** a live definition handle unique to this registration.
 - **Effects:** validates the serialized header, size, layout, version, and
   implicit-parent sentinel, then moves the allocation into the database. It
-  allocates zeroed definition readiness bits, but does not unpack or copy the
-  serialized node arrays.
-- **Complexity:** linear in renderable node count for validation and linear in
-  readiness-bit words for initialization; ownership transfer of the byte
-  allocation itself is constant-time.
+  does not unpack or copy serialized node arrays and does not allocate per-node
+  runtime state. Shared readiness/coverage state is allocated lazily on first
+  mount.
+- **Complexity:** constant in total descendant count, apart from classifying the
+  bounded direct-root fanout. Ownership transfer of the byte allocation is
+  constant-time.
 - **Contract:** `bytes` is non-empty and valid. Contract failure leaves the
   input's post-failure state unspecified.
 - **Notes:** identical arrays registered twice produce independent handles.
@@ -1191,26 +1208,29 @@ SubtreeInstanceHandle mountSubtree(
 - **Returns:** the new mounted placement. If `parent` became stale during
   asynchronous loading, returns an invalid handle without modifying the
   database.
-- **Effects:** creates placement-local coverage and links while sharing the
-  definition bytes and definition-node readiness. Every node inherits its
-  registered definition's current readiness bit. The mount transform is accumulated into
-  top-level instance-local space. Child effective errors are capped by the
-  parent's effective error without rewriting the definition.
-- **Complexity:** acquiring and initializing the placement's
-  16-bit-per-packed-node coverage block is linear in the child definition's
-  node count. The first nested child mounted anywhere in a placement also
-  allocates that owner's per-node mount-link array; later links are
-  constant-time. Immutable node data is neither copied nor rewritten, and
-  coverage blocks come from a definition-sized slab pool.
+- **Effects:** creates a compact placement record while sharing definition
+  bytes and the definition's readiness/coverage state. The mount transform is
+  accumulated into top-level instance-local space. Child effective errors are
+  capped by the parent's effective error without rewriting the definition. A
+  placement receiving its first mounted descendant takes a private copy of its
+  coverage state because completeness can then differ between placements.
+- **Complexity:** the first placement of a definition allocates and zeroes one
+  shared 16-bit-per-packed-node state block, linear in that definition's node
+  count. Later childless placements attach to it in constant time. Mounting the
+  first nested child in an owner copies the owner's state and allocates its
+  per-node mount-link array, linear in the owner definition's node count; later
+  links are constant-time. Private coverage blocks come from a
+  definition-sized slab pool.
 - **Contract:** the definition is live; transform is finite with positive
   scale; live parent is mountable and has no existing mounted child; the
   transformed aggregate definition bounds fit in the parent's containment
   bound. This is the shared authored bound for a mounted node and the current
   instance-local root bound for a TLAS root.
 
-The mount transform is immutable. To reposition a placement, unmount and
-mount it again; the replacement receives new coverage state and handles while
-inheriting existing shared definition-node readiness.
+The mount transform is immutable. To reposition a placement, unmount and mount
+it again; the replacement receives new handles, shares the definition's current
+readiness/coverage state, and takes private coverage only if it later receives
+mounted descendants.
 
 ```cpp
 void unmountSubtree(SubtreeInstanceHandle instance);

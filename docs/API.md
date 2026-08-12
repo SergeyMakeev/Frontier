@@ -1,11 +1,11 @@
 # Frontier API Guide
 
-Frontier is a C++20 library that selects a renderable hierarchical-LOD cut from
-a large dynamic scene. It owns the spatial index, reusable hierarchy topology,
-shared definition-node readiness, and the rules that keep the current cut
-complete while content streams. The application still owns rendering, resource loading,
-payload interpretation, and the policy that decides which reusable component
-belongs under an expandable node.
+Frontier is a C++20 library that chooses which level-of-detail (LOD) nodes a
+renderer should draw from a large dynamic scene. It owns the spatial index,
+reusable hierarchy topology, and the rules that preserve a complete renderable
+result while GPU resources and finer hierarchy stream. The application still
+owns rendering, resource loading, payload interpretation, and the policy that
+decides where finer hierarchy should be attached.
 
 This guide introduces the system in the order an integration normally uses it.
 The exhaustive type and function contracts are in
@@ -28,7 +28,60 @@ a block into reusable buildings, and a building into reusable detail trees.
 Definitions are shared, placements are independent, and missing content falls
 back to the nearest ready ancestor without leaving holes.
 
-The smallest useful scene needs only a permanent top-level node:
+### The two spatial levels
+
+A bounding-volume hierarchy (BVH) groups spatial bounds so a query can reject
+many objects or nodes without testing each one. Frontier uses two logical
+levels:
+
+- The **top-level acceleration structure (TLAS)** is an internal 8-wide BVH in
+  world space. It indexes independently movable top-level instances. Every TLAS
+  leaf is also that instance's permanent, renderable fallback node.
+- A **subtree definition** is an immutable local-space hierarchy registered
+  once and mounted wherever it is needed. In conventional ray-tracing
+  terminology this is the BLAS-like, or bottom-level, part of the system.
+  Frontier calls it a subtree definition rather than a BLAS because definitions
+  can be mounted recursively below other definitions instead of forming one
+  fixed lower tree per object.
+
+The resulting runtime shape is:
+
+```text
+world-space TLAS
+`-- top-level instance / permanent renderable root
+    `-- mounted subtree definition
+        `-- mountable renderable node
+            `-- another mounted subtree definition
+```
+
+The TLAS first finds visible top-level instances. Frontier then enters their
+mounted local hierarchies only when their roots need finer LOD. This separation
+keeps world movement out of shared local topology, lets many placements reuse
+one definition, and makes a one-node object require no bottom-level hierarchy
+at all.
+
+### Nodes, errors, and cuts
+
+Each hierarchy node is a renderable representation of everything below it. Its
+geometric error estimates how far that representation can deviate from finer
+detail. A query projects that error into screen pixels and refines while it is
+above `SelectionParams::threshold`.
+
+A **frontier**, also called a **cut**, is the set selected by that process. No
+selected node is an ancestor of another, and together the selected nodes cover
+the visible scene. Frontier produces two cuts at once:
+
+- the **current cut** is hole-free and renderable with resources available now;
+- the **ideal cut** is what the currently mounted topology would select if all
+  of its nodes were render-ready.
+
+A node's `payload` is only an opaque application identifier. **Readiness** says
+whether the renderer can dispatch that node's payload; it does not mean that
+finer topology has been mounted. When a desired node is not ready, the current
+cut remains at a ready ancestor or uses a complete set of ready descendants.
+
+With that model, the smallest useful scene needs only a permanent top-level
+node:
 
 ```cpp
 SpatialDatabase database;
@@ -56,9 +109,8 @@ for (const FrontierEntry& entry : cut.current())
     submitToRenderer(entry);
 ```
 
-The root lives directly in Frontier's top-level acceleration structure (TLAS).
-A one-node object allocates no subtree definition and no mounted-placement
-state.
+The rock's root lives directly in the TLAS. Because it has no finer hierarchy,
+it allocates no subtree definition or mounted-placement state.
 
 ## 2. The architecture in one pass
 
@@ -66,11 +118,11 @@ Frontier separates immutable authored data from mutable placement data:
 
 | Concept | What it represents | Ownership and mutability |
 |---|---|---|
-| node | one renderable LOD choice | payload, error, flags, and authored bounds |
+| node | one renderable representation of a hierarchy region | payload, error, flags, and authored bounds |
 | top-level instance | one permanent renderable root in the TLAS | mutable translation, uniform scale, mask, and world bound |
-| subtree definition | one reusable descendant hierarchy | immutable registered serialized bytes |
-| mounted placement | one definition attached below one renderable node | mutable coverage, mount links, and accumulated transform |
-| spatial query | one view's damping, reuse cache, scratch, and output | mutable and owned by the calling view |
+| subtree definition | one reusable BLAS-like descendant hierarchy | immutable registered serialized bytes |
+| mounted placement | one definition attached below one renderable node | accumulated transform and state for mounted descendants |
+| spatial query | one camera/view selection | owns per-view selection state, scratch, and output |
 
 An expandable node is called a **mountable node** by the API. It is both a real
 renderable fallback and a legal attachment point. It must be a leaf within its
@@ -92,8 +144,11 @@ SubtreeInstanceHandle secondHouse =
 ```
 
 Both placements share the house's immutable topology, bounds, errors, payload
-values, and definition-node readiness. Each placement has its own mounted
-descendants and derived coverage state.
+values, and definition-node readiness. Each placement can have different
+mounted descendants and therefore logically different coverage. Here,
+**coverage** is Frontier's internal proof that a node is ready itself or has a
+complete ready descendant cut. Childless placements share the definition's
+coverage summary; the first mounted descendant creates a private copy on write.
 
 Four rules explain most of the architecture:
 
@@ -118,7 +173,9 @@ NodeDesc proxy{
 
 - `payload` is an opaque application render-resource identifier. Equal values
   may identify the same resource, but do not couple library readiness state.
-- `geometricError` is expressed in the node hierarchy's local units.
+- `geometricError` is the authored deviation from finer detail, expressed in
+  the node hierarchy's local units. Frontier scales and projects it for the
+  current camera; zero means this node has no error-driven reason to refine.
 - `FlagMountable` makes the node an expandable assembly boundary.
 - `bounds` is exact six-float authoring storage and accepts an `AABB` directly.
 
@@ -203,10 +260,13 @@ simultaneously:
 - the registration input;
 - the immutable in-memory traversal representation.
 
-Registration validates and moves the existing allocation; it does not unpack
-the definition into a second semantic object. It does build a compact zeroed
-readiness bitset, so registration remains linear in node count for validation
-even though ownership transfer of the byte array is constant-time.
+Registration validates the header, layout, version, size, alignment, and
+implicit-parent sentinel, then moves the existing allocation. It does not
+unpack or copy the node arrays and does not allocate per-node runtime state.
+The bounded direct-root classification is independent of the definition's
+total descendant count, and ownership transfer of the byte array is
+constant-time. Shared readiness/coverage state is allocated lazily on the
+definition's first mount.
 
 ```cpp
 SubtreeBytes bytes = buildBuildingDefinition().build(context);
@@ -315,6 +375,14 @@ FrontierResultView cut = mainView.selectFrontier(
         .minPix = 0.0f,
     });
 ```
+
+`threshold` is the desired maximum projected geometric error in pixels: lower
+values refine more aggressively. `minPix` optionally rejects top-level
+instances whose projected contribution is too small. Query-local **damping**
+smooths LOD decisions over camera motion by evaluating a conservative temporal
+camera envelope; it does not modify scene state. The query's reuse cache is a
+separate optimization that returns a previous exact cut while its recorded
+decision margins remain valid.
 
 One traversal returns two logical cuts in three disjoint buckets:
 
@@ -463,7 +531,10 @@ its placements are temporarily unmounted. A later mount inherits it. Releasing
 the definition discards it. Publishing requires a live mounted `NodeHandle`;
 stale handles are ignored and `isNodeReady()` returns `false` for them.
 
-Each placement stores only derived coverage and covered-child counts. Coverage
+Readiness and topology-independent coverage live once in the definition's
+shared node-state block. A childless placement points directly at that state.
+When a placement receives a mounted descendant it takes a private coverage copy
+because its completeness can now differ from other placements. Coverage
 propagates toward the root so the current cut remains complete while
 intermediate nodes are unavailable.
 
@@ -519,6 +590,10 @@ SpatialDatabase::MotionGroup trafficGroup(trafficInstances);
 // positions[i] corresponds to trafficInstances[i].
 database.moveInstances(trafficGroup, positions, 1.0f);
 ```
+
+Here **dense order** means Frontier's compact internal instance-slot order. It
+may change during `optimize()`, unlike public `InstanceHandle` identity and the
+caller order retained by `MotionGroup`.
 
 This is the recommended path when the same collection moves repeatedly, such
 as traffic, particles, units, or a streamed terrain patch set. The application
@@ -590,8 +665,8 @@ if (database.tryGetNodeTransform(movingDoorNode, mountToInstance))
 ## 10. Reclaim cold mounted placements
 
 Definitions and TLAS roots are explicit-lifetime objects. Mounted placements
-can additionally be collected by an LRU policy. A query contributes retention
-feedback only when enabled:
+can additionally be collected by a least-recently-used (LRU) policy. A query
+contributes retention feedback only when enabled:
 
 ```cpp
 SpatialQuery streamingView;
@@ -690,6 +765,11 @@ SpatialDatabaseConfig config{
 
 SpatialDatabase database(config);
 ```
+
+`BinnedSAH` uses a binned surface-area heuristic to build a tighter TLAS at a
+higher rebuild cost. `Morton` is the cheapest, loosest build and `Median` is the
+middle option. The drift thresholds decide when inexpensive incremental edits
+have degraded the current TLAS enough to rebuild it.
 
 `parallelFor` must block until all requested tasks finish. Internal parallel
 selection is used only for uncached queries, above the configured visible
@@ -805,9 +885,10 @@ processIdeal(cut.ideal());
 ```
 
 The city can contain a million proxies without duplicating the house
-definition. Only proxies that actually receive a mounted house allocate
-per-placement coverage and mount state; each house definition node's readiness
-is shared across all house placements.
+definition. A mounted house needs one compact placement record, but childless
+house placements share the house definition's coverage/readiness state. The
+city placement takes private coverage only when one of its proxies receives a
+mounted descendant.
 
 ## 14. End-to-end example: asynchronous payload and topology streaming
 
