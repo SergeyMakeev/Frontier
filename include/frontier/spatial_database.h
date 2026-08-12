@@ -868,10 +868,12 @@ public:
     // are recycled, and a ref that outlives its instance (remove + later instantiate
     // reusing the slot) must not act on the newcomer. Stale refs make
     // moveInstance / removeInstance safe no-ops.
-    // A persistent cohort whose caller-visible order stays fixed while SpatialDatabase
-    // caches the corresponding physical instance order. This is intended for
-    // groups that move together every frame. The cache rebuilds automatically
-    // after optimize() or another physical layout change.
+    // A persistent cohort whose caller-visible order stays fixed while
+    // SpatialDatabase caches the corresponding physical instance order. This
+    // is intended for groups that move together every frame: dense instance
+    // writes become sequential and nearby TLAS paths retain cache locality.
+    // The one-time resolve/sort is amortized until optimize() or another
+    // physical layout change automatically invalidates the cache.
     class MotionGroup
     {
     public:

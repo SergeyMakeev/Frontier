@@ -1148,6 +1148,14 @@ A motion group owns a copy of a stable caller-order instance cohort and caches
 the corresponding physical database order. The cache refreshes automatically
 after `optimize()` or another layout change.
 
+The cached order is intended for cohorts updated repeatedly. It keeps dense
+instance and version writes sequential and improves reuse of nearby TLAS paths,
+especially after instances have been spatially reordered. It also avoids a
+fresh public-handle-to-dense lookup for every member on every update. The first
+update after construction or `reset()`, and any update after a layout change,
+resolves and sorts the live cohort; retain the group across frames to amortize
+that work.
+
 - The span constructor is equivalent to default construction plus `reset()`.
 - `reset()` replaces the copied handle sequence and invalidates the physical
   order cache.

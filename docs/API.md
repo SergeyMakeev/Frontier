@@ -367,6 +367,76 @@ Mounting makes finer topology known. Marking a node ready says the renderer has
 every GPU resource needed to dispatch that node's payload. These operations
 intentionally happen at different times.
 
+### Example: readiness follows GPU resources
+
+Suppose a building hierarchy is already mounted and therefore known to
+Frontier, but some wall meshes or materials are not in GPU memory yet. The
+current cut uses ready ancestors as fallbacks; `idealOnly` identifies choices
+that belong to the ideal cut but not the current cut. Start GPU demand there,
+without revisiting `shared` entries that are already usable in both cuts:
+
+```cpp
+for (const FrontierEntry& entry : cut.idealOnly) {
+    if (database.isNodeReady(entry.nodeHandle))
+        continue; // a ready sibling can still be ideal-only
+
+    UserPayload payload;
+    if (database.tryGetPayload(entry.nodeHandle, payload))
+        gpuStreamer.request(entry.nodeHandle, payload);
+}
+
+// Applied later, during a writer phase after the upload finishes.
+for (const GpuCompletion& completed : gpuStreamer.completed())
+    database.markNodeReady(completed.node);
+```
+
+The readiness test is still necessary. If one child is unavailable, the
+hole-free current cut may remain at a common ancestor; ready siblings below
+that ancestor then also appear in `idealOnly` even though they need no upload.
+No topology is mounted or unmounted in this example.
+
+### Example: mounting reveals local detail
+
+Now consider a planet-scale hierarchy. From orbit, the database needs only the
+planet, continent, and coarse terrain nodes. Individual city blocks, buildings,
+and walls do not need to be known at all. As the camera approaches the surface,
+an over-threshold mountable proxy in the ideal cut asks the application to load
+and mount its child definition:
+
+```cpp
+for (const FrontierEntry& entry : cut.ideal()) {
+    UserPayload payload;
+    if (!database.tryGetPayload(entry.nodeHandle, payload))
+        continue;
+
+    if (entry.overThreshold() && planetContent.isExpandable(payload))
+        topologyStreamer.request(entry.nodeHandle,
+                                 planetContent.childAsset(payload));
+}
+
+// Applied later, during the writer phase.
+for (TopologyCompletion& completed : topologyStreamer.completed()) {
+    SubtreeHandle detail = definitionCache.getOrRegister(
+        completed.asset, database);
+    database.mountSubtree(completed.parent, detail, completed.transform);
+}
+```
+
+Topology demand inspects `ideal()`, not only `idealOnly`. Until the child is
+mounted, the known ideal frontier itself stops at the proxy; that proxy can be
+`shared` because it is also the best current representation. Its over-threshold
+error is what signals that more topology is wanted. The application's request
+queue should coalesce repeated requests while the child definition is loading.
+
+After mounting, the next selection can expose much finer nodes around the
+camera. Those nodes are commonly unready at first, so the first loop requests
+their GPU resources and `markNodeReady()` publishes each completed upload.
+While the camera flies across the surface, the application keeps expanding
+over-threshold proxies ahead of it and removes detail behind it either
+explicitly with `unmountSubtree()` or by enabling query mount-usage feedback
+and calling `collect()` with a placement budget. The result is a small moving
+window of detailed topology rather than a fully expanded planet.
+
 Readiness belongs to one node in one registered definition. A `NodeHandle` from
 any live placement identifies that definition node, and the change applies to
 every current and future placement of the same definition:
@@ -449,6 +519,28 @@ SpatialDatabase::MotionGroup trafficGroup(trafficInstances);
 // positions[i] corresponds to trafficInstances[i].
 database.moveInstances(trafficGroup, positions, 1.0f);
 ```
+
+This is the recommended path when the same collection moves repeatedly, such
+as traffic, particles, units, or a streamed terrain patch set. The application
+can keep its natural stable order—`positions[i]` always belongs to the handle
+originally stored at `i`—while Frontier updates the corresponding dense
+instance records in physical database order.
+
+Physical ordering matters because a movement writes the instance record, its
+frontier-version entry, and one TLAS leaf-to-root path. After spatial
+optimization, nearby dense records also tend to occupy nearby TLAS branches.
+Walking the cached order therefore turns otherwise scattered instance writes
+into a mostly sequential stream and reuses nearby TLAS cache lines. It also
+avoids resolving every public handle through the handle-to-dense table on every
+frame; the cached dense id is validated directly, so stale handles remain safe.
+
+The first update after construction or `reset()` resolves and sorts the cohort.
+The database automatically rebuilds that cache after `optimize()` or another
+physical layout change; ordinary frames only perform the ordered O(n) update.
+Keep a `MotionGroup` alive across frames to amortize the sort—recreating it each
+frame throws away the benefit. Use individual `moveInstance()` calls for
+occasional movement, changing cohorts, or objects that require different
+scales, since one `moveInstances()` call applies one scale to the whole group.
 
 ### Place a mounted definition
 
