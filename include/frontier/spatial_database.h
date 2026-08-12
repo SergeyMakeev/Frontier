@@ -184,7 +184,7 @@ struct FrontierEntry
 static_assert(sizeof(FrontierEntry) == 12, "FrontierEntry must stay 12 bytes");
 
 // One traversal produces both realities without per-entry tags. The current
-// render frontier is shared + currentOnly. The fully-resident ideal frontier is
+// render frontier is shared + currentOnly. The fully-ready ideal frontier is
 // shared + idealOnly. A high-error ideal-side mountable node can be used
 // directly as the parent in mountSubtree().
 // Non-owning result of one SpatialQuery selection. The spans remain valid until the
@@ -383,12 +383,11 @@ struct SelectionStats
     uint64_t lanesSurvived = 0;
 };
 
-// Result of one collection pass. freedPayloads refers to SpatialDatabase-owned storage
-// and remains valid until the next collect() call or SpatialDatabase destruction.
+// Result of one mounted-topology collection pass. Definition-node readiness is
+// retained when a placement is removed.
 struct CollectResult
 {
     size_t unmountedSubtrees = 0;
-    std::span<const UserPayload> freedPayloads;
 };
 
 // ---------------------------------------------------------------------------
@@ -470,7 +469,7 @@ struct CollectResult
 // threshold classification; do not expect a cached result to reproduce a
 // freshly measured pixel error.
 //
-// Streaming and residency are part of the recorded three-bucket result. Mount
+// Streaming demand and readiness are part of the recorded three-bucket result. Mount
 // content versions invalidate a record when any dependency changes. Instances
 // that cross more dependencies than the compact record can hold are
 // simply re-walked.
@@ -765,7 +764,7 @@ public:
     size_t        subtreeCount() const { return liveSubtrees_; }
 
     // ---- database assembly -------------------------------------------------
-    // Every instance owns a permanent, always-resident renderable TLAS root.
+    // Every instance owns a permanent, always-ready renderable TLAS root.
     // InstanceHandle carries a generation stamp, like NodeHandle: instance slots
     // are recycled, and a ref that outlives its instance (remove + later instantiate
     // reusing the slot) must not act on the newcomer. Stale refs make
@@ -835,14 +834,15 @@ public:
     // The caller composes this with its transform table at entry.instance().
     bool tryGetNodeTransform(NodeHandle node, Transform& outTransform) const;
 
-    // ---- payload residency --------------------------------------------------
-    // Handles come from ideal-side FrontierEntry values. Stale handles are ignored
-    // (the mount was collected while the payload was loading); the query
-    // reports false for them. Residency changes incrementally propagate
-    // complete-subtree coverage toward the root.
-    void markPayloadResident(NodeHandle node);
-    void markPayloadNonResident(NodeHandle node);
-    bool isPayloadResident(NodeHandle node) const;
+    // ---- shared definition-node readiness ----------------------------------
+    // Readiness means the renderer can dispatch this renderable node. A
+    // mounted NodeHandle resolves to one node in a registered definition; its
+    // readiness is shared by that node across every placement of the same
+    // definition. Equal UserPayload values in other nodes remain independent.
+    // TLAS roots are permanently ready. Stale mounted handles are ignored.
+    void markNodeReady(NodeHandle node);
+    void markNodeUnavailable(NodeHandle node);
+    bool isNodeReady(NodeHandle node) const;
 
     // Resolve immutable application payload data for a live frontier handle. The
     // false case is the normal async race with unmount/collection.
@@ -920,7 +920,7 @@ public:
     size_t overlayCount() const { return liveOverlays_; }
     size_t overlayBytes() const;
     // Retained capacity for mount records, transforms, node state, stamps,
-    // and mount links. Immutable subtree byte arrays are excluded.
+    // and mount links. Immutable subtree bytes are excluded.
     size_t subtreeInstanceStateBytes() const;
 
     struct TestAccess;   // defined by tests; full access to internals
@@ -946,14 +946,34 @@ private:
     {
         SubtreeBytes bytes;
         detail::SubtreeView view;
+        // One shared bit per packed node. Index zero is the implicit parent
+        // and is never ready; renderable nodes share this bit across every
+        // placement of this registered definition.
+        std::unique_ptr<uint64_t[]> readyBits;
         uint32_t generation = 0;
-        uint32_t mountRefs = 0;
+        uint32_t readyNodes = 0;
+        uint32_t firstMount = kInvalidIndex;
         bool rootLeavesOnly = false;
 
         bool inUse() const { return !bytes.empty(); }
-        void addMountRef() { ++mountRefs; }
-        void removeMountRef() { --mountRefs; }
+        bool isNodeReady(uint32_t node) const
+        {
+            return (readyBits[node >> 6] &
+                    (uint64_t(1) << (node & 63))) != 0;
+        }
+        void setNodeReady(uint32_t node, bool ready)
+        {
+            const uint64_t bit = uint64_t(1) << (node & 63);
+            if (ready) readyBits[node >> 6] |= bit;
+            else readyBits[node >> 6] &= ~bit;
+        }
+        bool allNodesReady() const
+        {
+            return readyNodes + 1 == view.packedNodeCount();
+        }
     };
+    static_assert(sizeof(SubtreeDefinitionRt) <= 160,
+                  "subtree definition runtime state grew");
 
     // Definition-local slab for per-mount node state. Repeated placements of one
     // definition have the same node count, so geometric slabs remove one heap
@@ -1006,7 +1026,7 @@ private:
     // SpatialQuery hits validate the mounted-tree root through contentVersion;
     // descendant mutations propagate there. Handles and overlays validate
     // through generation. Keeping these stamps in a compact parallel stream
-    // avoids fetching a 48-byte SubtreeInstanceRt for every visible instance.
+    // avoids fetching a 56-byte SubtreeInstanceRt for every visible instance.
     struct MountStamp
     {
         uint32_t contentVersion = 0;
@@ -1046,11 +1066,10 @@ private:
         // lets one immutable definition back mounts with different parent error
         // ceilings without rewriting authored node data.
         float                 errClamp = FLT_MAX;
-        // Two flag bits plus the covered-child count share one word. Keeping
-        // them together removes an allocation and a pointer chase per mount.
-        static constexpr uint16_t kResident = 1u << 0;
-        static constexpr uint16_t kCovered = 1u << 1;
-        static constexpr uint16_t kCoveredChildShift = 2;
+        // The derived covered flag and covered-child count share one word.
+        // Node readiness is definition-shared and is not duplicated here.
+        static constexpr uint16_t kCovered = 1u << 0;
+        static constexpr uint16_t kCoveredChildShift = 1;
         uint16_t* nodeState = nullptr;
         // LRU links need 20 bits each and the handle generation needs 24.
         // Packing all three into one word retains generation beside the mount
@@ -1070,19 +1089,15 @@ private:
         // Root of this mounted subtree tree. Occupies what was tail padding and
         // lets cached traversal coalesce every descendant to one exact stamp.
         uint32_t rootSlot = kInvalidIndex;
+        // Intrusive list of all live placements sharing one definition. This
+        // lets a node-readiness transition visit affected placements without
+        // a second allocation or stale generation-stamped reference array.
+        uint32_t definitionPrev = kInvalidIndex;
+        uint32_t definitionNext = kInvalidIndex;
 
-        bool isResident(uint32_t node) const
-        {
-            return (nodeState[node] & kResident) != 0;
-        }
         bool isCovered(uint32_t node) const
         {
             return (nodeState[node] & kCovered) != 0;
-        }
-        void setResident(uint32_t node, bool resident)
-        {
-            if (resident) nodeState[node] |= kResident;
-            else nodeState[node] &= ~kResident;
         }
         void setCovered(uint32_t node, bool covered)
         {
@@ -1148,25 +1163,53 @@ private:
         void addMountedChild() { ++mountedChildren; }
         void removeMountedChild() { --mountedChildren; }
     };
-    static_assert(sizeof(SubtreeInstanceRt) == 48,
-                  "subtree-instance state must stay 48 bytes");
+    static_assert(sizeof(SubtreeInstanceRt) == 56,
+                  "subtree-instance state must stay 56 bytes");
 
     struct MountLinksRt
     {
         std::vector<uint32_t> slots;
     };
 
-    // Compact mount-wide summary for the shared-only traversal. A mount tree
-    // is fully resident when every payload-bearing node in this subtree is
-    // resident and every mounted child is recursively fully resident.
-    // Keeping this parallel avoids growing the dense mounted-state header.
-    struct MountResidency
+    // Compact placement-local summary derived from shared definition-node
+    // readiness and mounted children. The high bit makes the fully-ready test
+    // one load; the remaining bits count recursively incomplete children.
+    struct MountReadiness
     {
-        uint32_t residentNodes = 0;
-        uint32_t incompleteChildren = 0;
+        static constexpr uint32_t kFullyReady = 1u << 31;
+        static constexpr uint32_t kIncompleteMask = ~kFullyReady;
+
+        uint32_t incompleteChildrenAndReady = 0;
+
+        uint32_t incompleteChildren() const
+        {
+            return incompleteChildrenAndReady & kIncompleteMask;
+        }
+        bool fullyReady() const
+        {
+            return (incompleteChildrenAndReady & kFullyReady) != 0;
+        }
+        void setFullyReady(bool ready)
+        {
+            if (ready) incompleteChildrenAndReady |= kFullyReady;
+            else incompleteChildrenAndReady &= kIncompleteMask;
+        }
+        void addIncompleteChild()
+        {
+            FRONTIER_CHECK(incompleteChildren() != kIncompleteMask,
+                           "mount readiness child count overflow");
+            ++incompleteChildrenAndReady;
+            setFullyReady(false);
+        }
+        void removeIncompleteChild()
+        {
+            FRONTIER_CHECK(incompleteChildren() != 0,
+                           "mount readiness child count underflow");
+            --incompleteChildrenAndReady;
+        }
     };
-    static_assert(sizeof(MountResidency) == 8,
-                  "mount residency summary must stay 8 bytes");
+    static_assert(sizeof(MountReadiness) == 4,
+                  "mount readiness summary must stay 4 bytes");
 
     // Copy-on-write bounds for one (instance, mount) pair: the only part of a
     // subtree a deformed instance stops sharing. Allocated on that instance's
@@ -1470,6 +1513,11 @@ private:
     uint32_t allocSubtree();
     void destroySubtree(uint32_t definition);
     const SubtreeDefinitionRt* resolveSubtree(SubtreeHandle h) const;
+    void initializeDefinitionReadiness(uint32_t definition);
+    void setDefinitionNodeReadiness(uint32_t definition, uint32_t node,
+                                    bool ready);
+    void initializeMountCoverage(uint32_t slot);
+    void refreshMountDefinitionReadiness(uint32_t slot);
     static constexpr uint32_t kMountTreeDependency = 1u << 31;
     uint32_t traversalDependency(uint32_t slot) const;
     void recordTraversalDependency(Worker& worker, uint32_t slot) const;
@@ -1497,9 +1545,8 @@ private:
     SubtreeInstanceHandle mountTlasRoot(InstanceId dense,
                                         SubtreeHandle subtree,
                                         const Transform& transform);
-    void     unmountSlot(uint32_t slot, AppendBuffer<UserPayload>* freedPayloads);
-    void     unmountTree(uint32_t rootSlot,
-                             AppendBuffer<UserPayload>* freedPayloads);
+    void     unmountSlot(uint32_t slot);
+    void     unmountTree(uint32_t rootSlot);
     bool     descendantsCovered(uint32_t slot, uint32_t node) const;
     bool     computeCovered(uint32_t slot, uint32_t node) const;
     void     propagateCoverage(uint32_t slot, uint32_t node);
@@ -1585,8 +1632,8 @@ private:
                                    Worker* dependencyWorker = nullptr) const;
     Camera mountLocalCamera(const Camera& rootLocal, uint32_t slot,
                             uint8_t mask) const;
-    bool mountedTreeFullyResident(uint32_t slot) const;
-    void propagateFullResidency(uint32_t slot, bool wasFullyResident);
+    bool mountedTreeFullyReady(uint32_t slot) const;
+    void propagateFullReadiness(uint32_t slot, bool wasFullyReady);
     void runTlasFlatInstance(uint32_t instIdx, const Camera& view,
                              uint8_t mask, Worker& w) const;
     void runZeroErrorTlasFlatInstance(uint32_t instIdx, const Camera& view,
@@ -1594,15 +1641,15 @@ private:
     void runTlasRootInstance(uint32_t instIdx, const Camera& view,
                              const SelectionParams& params, uint8_t mask,
                              Worker& w) const;
-    template<bool FullyResident>
+    template<bool FullyReady>
     void runSubtree(const WorkItem& item, const Instance& inst,
                     const Camera& local, const SelectionParams& params,
                     Worker& w) const;
-    template<bool FullyResident, bool SparseOverlay>
+    template<bool FullyReady, bool SparseOverlay>
     void runSubtreeImpl(const WorkItem& item, const Instance& inst,
                         const Camera& local,
                         const SelectionParams& params, Worker& w) const;
-    template<bool FullyResident, bool SparseOverlay>
+    template<bool FullyReady, bool SparseOverlay>
     void wideVisit(const WorkItem& item, const detail::SubtreeView& subtree,
                    float errClamp,
                    uint32_t gen, InstanceId instance, uint32_t node, uint8_t mask,
@@ -1640,7 +1687,7 @@ private:
     std::vector<SubtreeInstanceRt> slots_;
     std::vector<MountTransformRt> mountTransforms_;
     std::vector<MountStamp> mountStamps_;
-    std::vector<MountResidency> mountResidency_;
+    std::vector<MountReadiness> mountReadiness_;
     std::vector<MountLinksRt> mountLinks_;
     std::vector<uint32_t> freeMountLinks_;
     std::vector<uint32_t> freeSlots_;
@@ -1704,11 +1751,6 @@ private:
     };
     static_assert(sizeof(PendingMove) == 48, "queued bounds edit must stay 48 bytes");
     std::vector<PendingMove> pendingMoves_;
-
-    // Backing storage for CollectResult::freedPayloads. Collection is a SpatialDatabase
-    // mutation, so one retained buffer has the same synchronization contract
-    // as the rest of SpatialDatabase state.
-    AppendBuffer<UserPayload> collectPayloads_;
 
     // Shared TLAS build scratch. Per-selection scratch lives in SpatialQuery.
     struct TlasItem

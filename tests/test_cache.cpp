@@ -38,7 +38,7 @@ TEST(QueryCache, MountedStateMutationInvalidatesRecordedCut)
     (void)query.selectFrontier(database, camera, params);
     ASSERT_GT(query.reused(), 0u);
 
-    database.markPayloadResident(handleOf(database, 11));
+    database.markNodeReady(handleOf(database, 11));
     database.applyUpdates();
     (void)query.selectFrontier(database, camera, params);
     EXPECT_GT(query.walked(), 0u);

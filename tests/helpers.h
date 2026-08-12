@@ -89,7 +89,7 @@ struct SpatialDatabase::TestAccess
     }
     static size_t mountedStateBytes() { return sizeof(SubtreeInstanceRt); }
     static size_t mountStampBytes() { return sizeof(MountStamp); }
-    static size_t mountResidencyBytes() { return sizeof(MountResidency); }
+    static size_t mountReadinessBytes() { return sizeof(MountReadiness); }
     static size_t instanceBytes() { return sizeof(Instance); }
     static size_t tlasNodeBytes() { return sizeof(TlasNode); }
     static size_t liveInstanceSlots(const SpatialDatabase& database)
@@ -97,19 +97,18 @@ struct SpatialDatabase::TestAccess
         return database.liveInstances_.size();
     }
 
-    static void markAllPayloadsResident(SpatialDatabase& database)
+    static void markAllNodesReady(SpatialDatabase& database)
     {
         for (uint32_t slot = 0; slot < database.slots_.size(); ++slot)
         {
             const SubtreeInstanceRt& instance = database.slots_[slot];
             if (!instance.inUse()) continue;
-            const uint32_t generation =
-                database.mountStamps_[slot].generation();
-            const uint32_t count =
-                database.subtreeView(instance).nodeCount();
+            const detail::SubtreeView& subtree =
+                database.subtreeView(instance);
+            const uint32_t count = subtree.nodeCount();
             for (uint32_t node = 1; node <= count; ++node)
-                database.markPayloadResident(
-                    NodeHandle{slot, node, generation});
+                database.markNodeReady(NodeHandle{
+                    slot, node, database.mountStamps_[slot].generation()});
         }
     }
 

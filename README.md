@@ -2,8 +2,8 @@
 
 Frontier is a C++20 hierarchical-LOD selection library. It maintains a dynamic
 8-wide top-level acceleration structure (TLAS), mounts reusable hierarchy
-fragments, tracks payload residency, and returns both the renderable current cut
-and the fully available ideal cut.
+fragments, tracks shared definition-node readiness, and returns both the
+renderable current cut and the fully available ideal cut.
 
 The data model is deliberately small:
 
@@ -81,7 +81,13 @@ handles.
 
 `shared + currentOnly` is always a hole-free render frontier.
 `shared + idealOnly` is the frontier the mounted topology would choose with
-every payload resident. Applications decide which definition handle belongs at
+every known node ready. Readiness means the renderer has every GPU resource
+needed to dispatch a node's payload. It belongs to a node in a registered
+definition and is shared by that node across every placement of the definition.
+Equal payload values in different nodes are independent; applications that use
+them for the same GPU resource may publish readiness to each corresponding
+node.
+Applications decide which definition handle belongs at
 each mountable node; Frontier deliberately stores no content lookup key.
 
 ## Bytes, ownership, and handles
@@ -109,9 +115,12 @@ The public handles are intentionally distinct:
 - `InstanceHandle`: one permanent TLAS root;
 - `NodeHandle`: one live renderable node.
 
-All are generation-stamped. Stale streaming completions are harmless: mutating
-operations ignore stale node/instance handles, and mounting returns an invalid
-placement when its parent disappeared. Invalid live topology, mounting below a
+All are generation-stamped. Stale topology and readiness completions are
+harmless: mutating operations ignore stale node/instance handles, and mounting
+returns an invalid placement when its parent disappeared. A readiness completion
+uses the `NodeHandle` that requested the payload; if its placement disappeared,
+the application can publish a later completion from any live placement of the
+same registered definition node. Invalid live topology, mounting below a
 non-mountable node, duplicate children, invalid transforms, and bounds escapes
 are contract errors routed through `FRONTIER_FATAL`.
 

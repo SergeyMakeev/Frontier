@@ -48,10 +48,12 @@ One registered serialized byte array permanently owns:
 - authored local bounds;
 - mountable-node bits.
 
-Runtime placements own accumulated transforms, residency/coverage flags,
-mounted-child links, content stamps, and LRU state. Runtime deformation never
-rewrites the definition. Effective bounds use a copy-on-write overlay scoped to
-the top-level instance and placement.
+Each registered definition owns one readiness bit per renderable node. That bit
+is shared across every placement of the definition. Runtime placements own
+accumulated transforms, derived coverage, mounted-child links, content stamps,
+and LRU state. Runtime deformation never rewrites the definition. Effective
+bounds use a copy-on-write overlay scoped to the top-level instance and
+placement.
 
 ## 5. Boundary invariants
 
@@ -77,34 +79,41 @@ current = shared + currentOnly
 ideal   = shared + idealOnly
 ```
 
-The current cut contains only resident payloads plus permanent TLAS roots and
-is guaranteed hole-free. The ideal cut assumes all known payloads are
+The current cut contains only ready definition nodes plus permanent TLAS roots
+and is guaranteed hole-free. The ideal cut assumes all known nodes are
 available. A missing mounted definition stops both cuts at its mountable parent;
 application metadata decides which definition handle to request.
 
 Plain leaves emit directly. Interior and mountable nodes are decided by
 projected geometric error. Frustum plane masks narrow as traversal descends.
 
-## 7. Residency coverage
+## 7. Readiness and coverage
 
-Each mounted node records resident and covered flags plus a covered-child
-count. A node is covered when its own payload is resident or its visible
-descendants provide a complete resident cut. Changes propagate toward the
-mount root incrementally. A fully resident mounted tree has a constant-time
-summary used to select the lean traversal path.
+Readiness means that every GPU resource required to dispatch one node's
+`UserPayload` is available. It belongs to the node in its registered definition,
+not to the payload value or placement. Every placement of that definition node
+shares the bit. Equal payload values in other nodes are independent; an
+integration may update them together when they identify one resource.
 
-Topology and payload residency are independent. Mounting exposes finer known
-topology; marking payload resident makes one render choice available.
+Each mounted node records only derived coverage and a covered-child count. A
+node is covered when it is ready or its visible descendants provide
+a complete ready cut. Changes propagate toward each affected mount root
+incrementally. A fully ready mounted tree has a constant-time summary used to
+select the lean traversal path.
+
+Topology and readiness are independent. Mounting exposes finer known topology;
+marking a node ready makes that definition node available in every placement.
 
 ## 8. Handle safety
 
 Runtime slots are recycled. `SubtreeHandle`, `SubtreeInstanceHandle`,
-`InstanceHandle`, and `NodeHandle` carry generations. A stale completion cannot
-modify a replacement occupying the same numeric slot.
+`InstanceHandle`, and `NodeHandle` carry generations. A stale topology
+completion cannot modify a replacement occupying the same numeric slot.
 
 Expected asynchronous races are non-fatal:
 
-- payload residency calls on a stale node do nothing;
+- readiness completions retain a `NodeHandle`; stale completions are ignored
+  rather than affecting a recycled placement;
 - stale queries report absence;
 - mounting below a parent collected during IO returns an invalid placement;
 - unmounting/removing an already stale handle does nothing.
@@ -148,7 +157,7 @@ Mount retention is an application policy. A query records usage only when
 explicitly enabled, and collection consumes only the queries selected by the
 host. Cold mounted leaves older than the minimum age are removed from the LRU
 tail until the placement budget is met. Removing a placement invalidates its
-node handles and reports resident payload values that became unreachable.
+node handles but never changes the registered definition's readiness bits.
 
 Definitions are not collected implicitly. The host releases them explicitly
 after all placements are gone.
@@ -158,10 +167,11 @@ after all placements are gone.
 | Operation | Expected cost |
 |---|---:|
 | build definition | O(nodes) |
-| register/release unused definition | O(1), excluding byte-array validation/destruction |
-| mount | O(1) plus node-state initialization |
-| unmount mounted tree | O(placements and resident nodes removed) |
-| payload residency change | O(ancestor depth) until stable |
+| register definition | O(nodes) validation plus O(nodes / 64) readiness initialization |
+| release unused definition | O(1), excluding allocator cost |
+| mount | O(nodes) for coverage initialization |
+| unmount mounted tree | O(placements removed) |
+| node readiness change | placements of one definition and ancestor paths until stable |
 | submit bound change | O(1) |
 | flush bound change | O(ancestor depth) until contained |
 | insert/remove/move instance | O(TLAS depth), excluding scheduled rebuild |

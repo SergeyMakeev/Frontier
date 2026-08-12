@@ -68,20 +68,30 @@ TEST(Streaming, QueryOwnsOptionalRetentionFeedback)
     EXPECT_EQ(database.mountedSubtreeCount(), 0u);
 }
 
-TEST(Streaming, CollectionReturnsResidentPayloads)
+TEST(Streaming, CollectionDoesNotChangeSharedDefinitionNodeReadiness)
 {
     SpatialDatabase database;
     SubtreeHandle subtree = database.registerSubtree(
         makeLeafSubtree(55));
-    instantiateFor(database, subtree, box(2.0f));
-    database.markPayloadResident(handleOf(database, 55));
+    const InstanceHandle root = database.instantiate(
+        node(1, 64.0f, box(2.0f), true));
+    const SubtreeInstanceHandle firstPlacement =
+        database.mountSubtree(root.rootNode(), subtree);
+    const NodeHandle stale =
+        TestAccess::nodeAt(database, firstPlacement, 1);
+    database.markNodeReady(stale);
     database.applyUpdates();
     database.applyUpdates();
 
     CollectResult result = database.collect(0, 1);
     ASSERT_EQ(result.unmountedSubtrees, 1u);
-    ASSERT_EQ(result.freedPayloads.size(), 1u);
-    EXPECT_EQ(result.freedPayloads[0], 55u);
+    EXPECT_FALSE(database.isNodeReady(stale));
+
+    const SubtreeInstanceHandle secondPlacement =
+        database.mountSubtree(root.rootNode(), subtree);
+    const NodeHandle replacement =
+        TestAccess::nodeAt(database, secondPlacement, 1);
+    EXPECT_TRUE(database.isNodeReady(replacement));
 }
 
 TEST(Streaming, StaleSubtreeInstanceHandleDoesNotAffectReplacement)

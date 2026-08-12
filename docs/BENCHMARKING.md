@@ -12,6 +12,8 @@ before treating a small delta as meaningful.
   a city whose house nodes mount one shared house definition;
 - `BM_SubtreeAssembly_ConstructCost` compares complete authoring,
   registration, instantiation, and mounting cost.
+- `BM_SharedNodeReadinessFanout` toggles one house definition node shared by
+  32, 128, or 400 mounted houses and measures complete coverage propagation.
 
 Both representations produce the same fully refined frontier. Cases cover 32,
 128, and 400 houses. Frontier selection runs both raw and with a stationary

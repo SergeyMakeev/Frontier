@@ -411,7 +411,9 @@ inline constexpr UserPayload kSentinelPayload = ~0ull;
 inline constexpr uint32_t kInvalidIndex = 0xffffffffu;
 ```
 
-`UserPayload` is application-owned opaque data and need not be unique.
+`UserPayload` is an opaque application-owned render-resource identifier. Equal
+values may refer to the same application resource, but they do not couple
+Frontier readiness: readiness belongs to a node in a registered definition.
 `kSentinelPayload` is reserved for the serialized implicit-parent record;
 applications should not assign it to a renderable node. `kInvalidIndex` is the
 library's public invalid-index value.
@@ -462,7 +464,9 @@ struct NodeDesc {
 };
 ```
 
-- `payload` is returned through live node handles.
+- `payload` identifies the render resources selected by the node and is
+  returned through live node handles. Equal values are allowed and have no
+  implicit effect on readiness.
 - `geometricError` must be finite and non-negative.
 - `flags` currently accepts `FlagMountable`; keep all reserved bits zero.
 - `bounds` is the node's conservative hierarchy-local bound.
@@ -737,7 +741,7 @@ struct FrontierResultView {
 };
 ```
 
-The current render cut is `shared + currentOnly`. The fully resident desired
+The current render cut is `shared + currentOnly`. The fully ready desired
 cut is `shared + idealOnly`. `size()` counts all three disjoint storage
 buckets. A view returned by `SpatialQuery` remains valid until that query's
 next selection, `reset()`, move assignment, or destruction.
@@ -839,14 +843,12 @@ the counters remain zero.
 ```cpp
 struct CollectResult {
     size_t unmountedSubtrees = 0;
-    std::span<const UserPayload> freedPayloads;
 };
 ```
 
 `unmountedSubtrees` counts placements removed by one collection pass.
-`freedPayloads` lists resident mounted-node payload values made unreachable;
-values can repeat. The span is database-owned and remains valid until the next
-`collect()` call or database destruction.
+Collection changes topology only and does not alter or report shared
+definition-node readiness.
 
 ## 8. `SpatialQuery`
 
@@ -1042,7 +1044,11 @@ SubtreeHandle registerSubtree(SubtreeBytes&& bytes);
 - **Returns:** a live definition handle unique to this registration.
 - **Effects:** validates the serialized header, size, layout, version, and
   implicit-parent sentinel, then moves the allocation into the database. It
-  does not unpack or copy node arrays.
+  allocates zeroed definition readiness bits, but does not unpack or copy the
+  serialized node arrays.
+- **Complexity:** linear in renderable node count for validation and linear in
+  readiness-bit words for initialization; ownership transfer of the byte
+  allocation itself is constant-time.
 - **Contract:** `bytes` is non-empty and valid. Contract failure leaves the
   input's post-failure state unspecified.
 - **Notes:** identical arrays registered twice produce independent handles.
@@ -1081,7 +1087,8 @@ InstanceHandle instantiate(const NodeDesc& root,
 - **Contract:** root error is finite/non-negative; root bounds are finite and
   non-empty; instance scale is finite and positive; position is expected to be
   finite.
-- **Residency:** the root payload is permanent and implicitly resident.
+- **Readiness:** the live TLAS root is always ready. Its payload value does not
+  affect the readiness of mounted definition nodes with the same value.
 
 ```cpp
 void removeInstance(InstanceHandle instance);
@@ -1154,17 +1161,17 @@ SubtreeInstanceHandle mountSubtree(
 - **Returns:** the new mounted placement. If `parent` became stale during
   asynchronous loading, returns an invalid handle without modifying the
   database.
-- **Effects:** creates placement-local residency and links while sharing the
-  definition bytes. All renderable nodes in the new placement begin
-  non-resident. The mount transform is accumulated into top-level
-  instance-local space. Child effective errors are capped by the parent's
-  effective error without rewriting the definition.
-- **Complexity:** acquiring and clearing the placement's
-  16-bit-per-packed-node residency block is linear in the child definition's
+- **Effects:** creates placement-local coverage and links while sharing the
+  definition bytes and definition-node readiness. Every node inherits its
+  registered definition's current readiness bit. The mount transform is accumulated into
+  top-level instance-local space. Child effective errors are capped by the
+  parent's effective error without rewriting the definition.
+- **Complexity:** acquiring and initializing the placement's
+  16-bit-per-packed-node coverage block is linear in the child definition's
   node count. The first nested child mounted anywhere in a placement also
   allocates that owner's per-node mount-link array; later links are
   constant-time. Immutable node data is neither copied nor rewritten, and
-  residency blocks come from a definition-sized slab pool.
+  coverage blocks come from a definition-sized slab pool.
 - **Contract:** the definition is live; transform is finite with positive
   scale; live parent is mountable and has no existing mounted child; the
   transformed aggregate definition bounds fit in the parent's containment
@@ -1172,7 +1179,8 @@ SubtreeInstanceHandle mountSubtree(
   instance-local root bound for a TLAS root.
 
 The mount transform is immutable. To reposition a placement, unmount and
-mount it again; the replacement receives new residency state and handles.
+mount it again; the replacement receives new coverage state and handles while
+inheriting existing shared definition-node readiness.
 
 ```cpp
 void unmountSubtree(SubtreeInstanceHandle instance);
@@ -1201,30 +1209,44 @@ bool tryGetNodeTransform(NodeHandle node, Transform& outTransform) const;
   local-to-top-level-instance transform. A TLAS root writes identity. On
   failure, `outTransform` is unchanged.
 
-### Payload residency and lookup
+### Definition-node readiness and payload lookup
 
 ```cpp
-void markPayloadResident(NodeHandle node);
+void markNodeReady(NodeHandle node);
 ```
 
-Marks one live mounted node's payload available and incrementally propagates
-coverage/residency summaries. A TLAS root or stale node is a no-op. Repeating
-the current state is a no-op.
+- **Parameters:** a live mounted node whose complete GPU resource set is now
+  available for dispatch, or a live TLAS root.
+- **Effects:** marks the corresponding registered definition node ready and
+  incrementally updates coverage in every live placement of that definition.
+  Future placements inherit the state. A live TLAS root is already ready, so
+  the call is a no-op.
+- **Repeat/stale behavior:** no-op when already ready or when the handle is
+  stale or invalid.
 
 ```cpp
-void markPayloadNonResident(NodeHandle node);
+void markNodeUnavailable(NodeHandle node);
 ```
 
-Marks one live mounted node unavailable and propagates coverage changes. A
-stale node or an already non-resident node is a no-op. A live TLAS root is a
-contract violation because root payloads are permanent.
+- **Parameters:** a mounted node that can no longer be dispatched.
+- **Effects:** marks the corresponding registered definition node unavailable
+  and propagates coverage changes through every live placement of that
+  definition. Equal payload values in other definition nodes are unaffected.
+- **Repeat/stale behavior:** no-op when already unavailable or when the handle
+  is stale or invalid.
+- **Contract:** a live TLAS root may not be made unavailable because it is the
+  permanent renderable fallback.
 
 ```cpp
-bool isPayloadResident(NodeHandle node) const;
+bool isNodeReady(NodeHandle node) const;
 ```
 
-Returns `true` for a live TLAS root, the placement-local bit for a live mounted
-node, and `false` for stale or invalid input.
+Returns `true` for a live TLAS root or a mounted node whose registered
+definition-node bit is ready. Returns `false` for unavailable, stale, or invalid
+mounted handles. Readiness survives unmounting and is inherited by later
+placements of the same registered definition; releasing the definition
+discards it. A readiness change cannot be published before the definition has
+at least one live placement because the public identifier is a `NodeHandle`.
 
 ```cpp
 bool tryGetPayload(NodeHandle node, UserPayload& outPayload) const;
@@ -1310,11 +1332,11 @@ CollectResult collect(std::span<SpatialQuery* const> queries,
   `minAge` is the minimum number of published update epochs since last touch.
   Query overloads first consume opt-in usage accumulated by the supplied
   views; null entries in the span are ignored.
-- **Returns:** the number of removed placements and a temporary span of
-  resident payload values made unreachable.
+- **Returns:** the number of removed placements.
 - **Effects:** walks the LRU tail and removes eligible cold placements until
   the budget is reached or no candidate remains. Only placements with no
-  mounted children and sufficient age are eligible.
+  mounted children and sufficient age are eligible. Collection never changes
+  definition-node readiness; resource eviction is separate application policy.
 - **Binding contract:** every non-null query is unbound or bound to this
   database; feedback from another database is a contract violation.
 - **Threading:** collection is a writer operation and must not overlap
@@ -1341,15 +1363,16 @@ size_t subtreeInstanceStateBytes() const;
 - `overlayCount()` returns live copy-on-write bounds overlay count.
 - `overlayBytes()` returns retained overlay storage bytes.
 - `subtreeInstanceStateBytes()` returns retained placement records,
-  transforms, residency words, stamps, slab capacity, and mount-link capacity;
-  immutable registered `SubtreeBytes` are excluded.
+  transforms, coverage words, readiness summaries, stamps, slab capacity,
+  definition-to-mount references, and mount-link capacity; immutable registered
+  `SubtreeBytes` and definition-local readiness bits are excluded.
 
 ## 11. Threading contract
 
 `SpatialDatabase` is single-writer with published concurrent reads:
 
-1. One writer performs registration, assembly, movement, residency, bounds,
-   maintenance, or collection.
+1. One writer performs registration, assembly, movement, readiness changes,
+   bounds, maintenance, or collection.
 2. The writer calls `applyUpdates()`.
 3. Any number of readers call `selectFrontier()` concurrently using distinct
    `SpatialQuery` and output objects.

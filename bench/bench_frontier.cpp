@@ -35,7 +35,7 @@ struct AssemblyScene
 };
 
 std::unique_ptr<AssemblyScene> buildScene(bool assembled, uint32_t count,
-                                          bool makeResident)
+                                          bool makeReady)
 {
     auto scene = std::make_unique<AssemblyScene>();
     const uint32_t side =
@@ -96,8 +96,8 @@ std::unique_ptr<AssemblyScene> buildScene(bool assembled, uint32_t count,
                 houseHandle,
                 Transform{housePosition(i, side), 1.0f});
 
-    if (makeResident)
-        TestAccess::markAllPayloadsResident(scene->world);
+    if (makeReady)
+        TestAccess::markAllNodesReady(scene->world);
     return scene;
 }
 
@@ -175,6 +175,28 @@ BENCHMARK(BM_SubtreeAssembly_ConstructCost)
     ->Args({0, 128})->Args({1, 128})
     ->Args({0, 400})->Args({1, 400})
     ->ArgNames({"assembled", "houses"})
+    ->Unit(benchmark::kMicrosecond);
+
+static void BM_SharedNodeReadinessFanout(benchmark::State& state)
+{
+    const uint32_t count = uint32_t(state.range(0));
+    auto scene = buildScene(true, count, false);
+    const NodeHandle sharedNode = handleOf(scene->world, 1000);
+    bool ready = false;
+    for (auto _ : state)
+    {
+        if (ready)
+            scene->world.markNodeUnavailable(sharedNode);
+        else
+            scene->world.markNodeReady(sharedNode);
+        ready = !ready;
+        benchmark::ClobberMemory();
+    }
+    state.counters["affected_mounts"] = double(count);
+}
+
+BENCHMARK(BM_SharedNodeReadinessFanout)
+    ->Arg(32)->Arg(128)->Arg(400)
     ->Unit(benchmark::kMicrosecond);
 
 static void BM_SubtreeBuilder_ConstructCost(benchmark::State& state)

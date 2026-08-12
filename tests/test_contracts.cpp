@@ -80,6 +80,29 @@ TEST(Contracts, HotTypesStayCompact)
     EXPECT_LE(TestAccess::definitionBytes(), 160u);
     EXPECT_LE(TestAccess::mountedStateBytes(), 64u);
     EXPECT_EQ(TestAccess::mountStampBytes(), 8u);
-    EXPECT_EQ(TestAccess::mountResidencyBytes(), 8u);
+    EXPECT_EQ(TestAccess::mountReadinessBytes(), 4u);
     EXPECT_LE(TestAccess::instanceBytes(), 80u);
+}
+
+TEST(Contracts, TlasRootsArePermanentlyReady)
+{
+    SpatialDatabase database;
+    const InstanceHandle first =
+        database.instantiate(node(91, 0.0f, box()));
+    const InstanceHandle second =
+        database.instantiate(node(91, 0.0f, box()));
+    EXPECT_TRUE(database.isNodeReady(first.rootNode()));
+    EXPECT_TRUE(database.isNodeReady(second.rootNode()));
+    database.markNodeReady(first.rootNode());
+    EXPECT_THROW(database.markNodeUnavailable(first.rootNode()),
+                 std::logic_error);
+
+    database.removeInstance(first);
+    EXPECT_FALSE(database.isNodeReady(first.rootNode()));
+    database.markNodeUnavailable(first.rootNode());
+    EXPECT_THROW(database.markNodeUnavailable(second.rootNode()),
+                 std::logic_error);
+    database.removeInstance(second);
+    EXPECT_FALSE(database.isNodeReady(second.rootNode()));
+    database.markNodeUnavailable(second.rootNode());
 }

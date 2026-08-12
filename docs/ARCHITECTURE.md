@@ -36,8 +36,16 @@ The public `SubtreeBytes` type owns the aligned array and a copied allocator
 context. Registration validates and O(1)-moves that allocation into a cold
 `SubtreeDefinitionRt`; an internal pointer-only `SubtreeView` binds traversal
 streams directly over the same bytes. No deserialized copy or public semantic
-definition object exists. Registration also creates a definition-local
-geometric slab allocator for per-placement node state.
+definition object exists. Registration builds a compact zeroed readiness bitset
+with one bit per packed node, so validation remains linear in node count and
+readiness initialization is linear in bitset words. It also creates a
+definition-local geometric slab allocator for per-placement coverage state.
+
+The definition-node bit is the authoritative ready/unavailable state and is
+shared by every placement of that exact registered definition. Equal
+`UserPayload` values in other nodes are not indexed or coupled. Live placements
+of one definition form an intrusive list, so one node-readiness change updates
+every affected coverage tree without scanning unrelated definitions or mounts.
 
 ## Mounted placement state
 
@@ -47,16 +55,16 @@ The placement hot/cold split is:
 |---|---:|---|
 | `MountTransformRt` | 32 B | accumulated translation/scale, error clamp, generation, definition id, root-leaf flag |
 | `MountStamp` | 8 B | content version, generation, live flag |
-| `MountResidency` | 8 B | resident-node count, incomplete-child count |
-| `SubtreeInstanceRt` | 48 B | definition, node-state pointer, LRU, owner, mount links, mounted-tree root |
-| node state | 2 B/node | resident/covered flags and covered-child count |
+| `MountReadiness` | 4 B | fully-ready bit, incomplete-child count |
+| `SubtreeInstanceRt` | 56 B | definition, node-state pointer, LRU, owner, mount links, mounted-tree root, definition-list links |
+| node state | 2 B/node | covered flag and covered-child count |
 
 Mount-link arrays are allocated only for placements that gain mounted
 children. Node-state blocks come from definition-local geometric slabs, avoiding
 one heap allocation per placement.
 
 Each placement stores the root slot of its mounted tree. Descendant topology or
-residency mutations bump the root content stamp, so a cached assembled-city cut
+readiness mutations bump the root content stamp, so a cached assembled-city cut
 normally validates one exact dependency rather than every house placement.
 
 ## Traversal
@@ -72,18 +80,19 @@ up to eight children together. Plain leaves emit immediately; other survivors
 go onto a compact DFS stack.
 
 Reusable definitions whose direct roots are all leaves have a batched
-fully-resident path. Consecutive placements of the same definition reuse the
+fully-ready path. Consecutive placements of the same definition reuse the
 resolved immutable block while transform, error clamp, and generation advance
 through a dense stream.
 
 ## Current and ideal coverage
 
-Mounted nodes carry resident and covered state. Per-placement summaries make a
-fully resident mounted tree a constant-time test. The lean traversal then emits
-only the shared bucket.
+Registered definitions own readiness by node. Mounted nodes carry only derived
+coverage. A 4-byte
+per-placement summary makes a fully ready mounted tree a constant-time test;
+the lean traversal then emits only the shared bucket.
 
-For partial residency, current/ideal liveness travels with the DFS item. An
-ideal proxy can be missing while a recursively complete resident descendant cut
+For partial readiness, current/ideal liveness travels with the DFS item. An
+ideal proxy can be unavailable while a recursively complete ready descendant cut
 keeps the current traversal alive. Visibility-aware coverage checks ignore
 unseen missing branches without allowing a visible hole.
 
@@ -130,18 +139,37 @@ and are concatenated deterministically.
 edits, performs scheduled TLAS maintenance, and advances the collection epoch.
 After publication, distinct queries may read concurrently until the next write.
 
-## Memory and performance result
+## Memory and performance checkpoints
 
 The city/house benchmark compares 400 houses with eight fully refined detail
-nodes each. With the keyless bytes API, the assembled representation occupies
-91.8 KiB versus 318.6 KiB flattened (71% less). Median raw traversal is 10.8 us
-versus 11.8 us, construction is 63.2 us versus 206 us, and warm cached
-traversal is approximately 0.7 us for both.
+nodes each. The current assembled representation reports 93.7 KiB of serialized
+bytes plus mounted-placement state versus 318.6 KiB flattened, about 71% less.
+This counter deliberately excludes definition-local readiness bits; it measures
+the same byte and placement categories as the retained historical comparisons.
 
-Against the immediately preceding keyed assembly API, assembled memory fell
-from 104.3 KiB to 91.8 KiB (12.0%), construction fell from 80.5 us to 63.2 us
-(21.5%), and raw traversal improved about 2.0%. Cached traversal moved by less
-than 1%, which is measurement noise at this scale.
+Against the immediately preceding per-placement-readiness build, the assembled
+placement figure increased from 91.8 KiB to 93.7 KiB (2.0%). The net four bytes
+per retained mount-capacity slot come from adding intrusive definition-list
+links while shrinking the hot readiness summary from eight bytes to four.
+Targeted 400-house runs put raw traversal at approximately 10.5 us before and
+after; cached traversal remained in the 1.3--1.4 us range. These differences are
+within run-to-run noise.
 
-The comparison is retained under `bench_results/bytes_api_before.json` and
-`bench_results/bytes_api_after.json`.
+`BM_SharedNodeReadinessFanout` measures one definition-node transition across
+32, 128, or 400 placements. One API call resolves the node's definition bit and
+walks only that definition's intrusive placement list; there is no payload hash
+lookup or per-registered-node inverted-index record. The retained shared state
+is one readiness bit per definition node. The latest five-run measurement was
+3.29 us at 400 placements, slightly below the approximately 3.4 us measured for
+the discarded payload-index implementation.
+
+In the same verification run, the 400-house assembled median was 10.4 us for
+uncached traversal, 0.683 us for cached selection, and 74.4 us for construction.
+The flattened construction median was 181 us. Treat these local microbenchmark
+figures as checkpoints, not cross-machine guarantees.
+
+The older keyless-bytes comparison remains under
+`bench_results/bytes_api_before.json` and
+`bench_results/bytes_api_after.json`; it predates definition-node readiness and
+should be read as historical data rather than a measurement of the current
+layout.

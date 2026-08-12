@@ -6,8 +6,9 @@
 
 namespace frontier {
 
-// Opaque application data carried by one renderable LOD node. Values are not
-// identities and need not be unique.
+// Opaque application render-payload identifier carried by one LOD node. Equal
+// values may identify the same render resources, but readiness is tracked by
+// registered definition node rather than by payload value.
 using UserPayload = uint64_t;
 inline constexpr UserPayload kSentinelPayload = ~0ull;
 inline constexpr uint32_t kInvalidIndex = 0xFFFFFFFFu;
