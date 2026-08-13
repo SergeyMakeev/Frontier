@@ -3722,7 +3722,6 @@ void SpatialDatabase::selectFrontierUncached(const Camera& camera, const Selecti
                         const SubtreeView& nextSubtree = subtreeView(nrt);
                         FRONTIER_PREFETCH(nextSubtree.wide_);
                         FRONTIER_PREFETCH(nextSubtree.meta_);
-                        FRONTIER_PREFETCH(nextSubtree.payload_);
                     }
                 }
                 runTlasRootInstance(scratch.visible[i].instance(), damped,
@@ -3754,7 +3753,6 @@ void SpatialDatabase::selectFrontierUncached(const Camera& camera, const Selecti
                             const SubtreeView& nextSubtree = subtreeView(nrt);
                             FRONTIER_PREFETCH(nextSubtree.wide_);
                             FRONTIER_PREFETCH(nextSubtree.meta_);
-                            FRONTIER_PREFETCH(nextSubtree.payload_);
                         }
                     }
                 }
