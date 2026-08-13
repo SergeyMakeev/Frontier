@@ -22,7 +22,11 @@ hierarchy coverage; it does not guarantee crack-free mesh boundaries.
 Readiness need not form an unbroken path from root to leaf. If an unavailable
 node has a complete ready descendant cut, Frontier renders those descendants
 directly; it falls back to a ready ancestor only when descendant coverage is
-incomplete.
+incomplete. This detailed behavior is the default; set
+`SelectionParams::currentCutPolicy` to
+`CurrentCutPolicy::PreferReadyAncestors` when a caller instead wants the
+smaller, coarser parent-only fallback cut. The illustrated comparison is in
+the [API guide](docs/API.md#two-current-cut-policies).
 
 The data model is deliberately small:
 

@@ -370,10 +370,26 @@ private:
     detail::FrontierBuffers buffers_;
 };
 
+// How the renderable current cut replaces an unavailable ideal-cut node.
+enum class CurrentCutPolicy : uint8_t
+{
+    // Prefer a complete ready descendant cut. Fall back to a ready ancestor
+    // only when the descendant cover is incomplete. This is usually the most
+    // detailed renderable result and is the default.
+    PreferReadyDescendants,
+
+    // Do not search below an unavailable ideal-cut node. Replace it with the
+    // nearest ready ancestor that can cover the affected branches. This
+    // normally emits fewer, coarser entries.
+    PreferReadyAncestors,
+};
+
 struct SelectionParams
 {
     float threshold = 4.0f;   // refine when screen error exceeds this (px)
     float minPix    = 0.0f;   // contribution culling at the top level; 0 = off
+    CurrentCutPolicy currentCutPolicy =
+        CurrentCutPolicy::PreferReadyDescendants;
 };
 
 struct InstanceDesc
@@ -762,10 +778,13 @@ private:
     float    kTravel_ = 0.0f;
     float4   lastQmn_{}, lastQmx_{};
     bool     primed_ = false;
-    // Bumped when the error threshold changes, invalidating every record in
-    // O(1). Projection-scale changes consume kTravel_ instead.
+    // Bumped when the error threshold or current-cut policy changes,
+    // invalidating every record in O(1). Projection-scale changes consume
+    // kTravel_ instead.
     uint32_t epoch_ = 1;
     float    k_ = 0.0f, bar_ = 0.0f;
+    CurrentCutPolicy currentCutPolicy_ =
+        CurrentCutPolicy::PreferReadyDescendants;
     uint32_t reused_ = 0;
     uint32_t walked_ = 0;
     SelectionStats stats_{};
@@ -1750,6 +1769,10 @@ private:
                                    const Instance& inst,
                                    const Camera& rootLocal,
                                    Worker* dependencyWorker = nullptr) const;
+    bool visibleIdealBranchesReachReady(
+        uint32_t slot, uint32_t node, uint8_t mask, const Instance& inst,
+        const Camera& rootLocal, const SelectionParams& params,
+        Worker* dependencyWorker = nullptr) const;
     Camera mountLocalCamera(const Camera& rootLocal, uint32_t slot,
                             uint8_t mask) const;
     bool mountedTreeFullyReady(uint32_t slot) const;

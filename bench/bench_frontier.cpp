@@ -107,19 +107,22 @@ std::unique_ptr<AssemblyScene> buildMixedReadinessScene(uint32_t count)
     const uint32_t side =
         uint32_t(std::ceil(std::sqrt(double(count))));
 
-    const auto buildHouse = [&](UserPayload firstPayload)
-    {
-        SubtreeBuilder builder;
-        builder.reserve(kDetailCount);
-        for (uint32_t detail = 0; detail < kDetailCount; ++detail)
-            builder.createNode(node(firstPayload + detail, 0.0f,
-                                    detailBounds(detail)));
-        SubtreeBytes bytes = builder.build();
-        scene->immutableBytes += bytes.size();
-        return scene->world.registerSubtree(std::move(bytes));
-    };
-    const SubtreeHandle readyHouse = buildHouse(1000);
-    const SubtreeHandle incompleteHouse = buildHouse(2000);
+    // A ready coarse house C refines into ready F plus unavailable ideal node
+    // G. G's descendants K/M/N/O form a complete ready cut. Ancestor mode
+    // therefore emits C; descendant mode emits F/K/M/N/O.
+    SubtreeBuilder houseBuilder;
+    const auto c = houseBuilder.createNode(node(1000, 64.0f, box(4.0f)));
+    houseBuilder.createNode(c, node(1001, 0.0f, box(4.0f)));
+    const auto g = houseBuilder.createNode(c, node(1002, 0.0f, box(4.0f)));
+    houseBuilder.createNode(g, node(1003, 0.0f, box(4.0f)));
+    const auto l = houseBuilder.createNode(g, node(1004, 0.0f, box(4.0f)));
+    houseBuilder.createNode(l, node(1005, 0.0f, box(4.0f)));
+    houseBuilder.createNode(l, node(1006, 0.0f, box(4.0f)));
+    houseBuilder.createNode(l, node(1007, 0.0f, box(4.0f)));
+    SubtreeBytes houseBytes = houseBuilder.build();
+    scene->immutableBytes += houseBytes.size();
+    const SubtreeHandle house =
+        scene->world.registerSubtree(std::move(houseBytes));
 
     SubtreeBuilder cityBuilder;
     cityBuilder.reserve(count);
@@ -128,7 +131,7 @@ std::unique_ptr<AssemblyScene> buildMixedReadinessScene(uint32_t count)
         const float4 position = housePosition(i, side);
         cityBuilder.createNode(node(
             10 + i, 16.0f,
-            AABB::fromCenterExtent(position, float4::vec(4, 2, 2)), true));
+            AABB::fromCenterExtent(position, float4::vec(4, 4, 4)), true));
     }
     SubtreeBytes city = cityBuilder.build();
     const AABB cityBounds = detail::viewSubtreeBytes(city).bounds();
@@ -143,11 +146,12 @@ std::unique_ptr<AssemblyScene> buildMixedReadinessScene(uint32_t count)
     for (uint32_t i = 0; i < count; ++i)
         scene->world.mountSubtree(
             TestAccess::nodeAt(scene->world, cityMount, i + 1),
-            (i & 1u) == 0 ? readyHouse : incompleteHouse,
+            house,
             Transform{housePosition(i, side), 1.0f});
 
     TestAccess::markAllNodesReady(scene->world);
-    scene->world.markNodeUnavailable(handleOf(scene->world, 2000));
+    scene->world.markNodeUnavailable(handleOf(scene->world, 1002));
+    scene->world.markNodeUnavailable(handleOf(scene->world, 1004));
     return scene;
 }
 
@@ -359,6 +363,7 @@ BENCHMARK(BM_MotionGroupSteady)
 static void BM_MixedReadinessFrontier(benchmark::State& state)
 {
     const uint32_t count = uint32_t(state.range(0));
+    const bool preferDescendants = state.range(1) != 0;
     auto scene = buildMixedReadinessScene(count);
     const uint32_t side =
         uint32_t(std::ceil(std::sqrt(double(count))));
@@ -366,7 +371,11 @@ static void BM_MixedReadinessFrontier(benchmark::State& state)
     const Camera view = makeLookAtCamera(
         float4::point(0, span * 0.8f, -span * 0.8f),
         float4::point(0, 0, 0));
-    const SelectionParams params{1.0f, 0.0f};
+    SelectionParams params{1.0f, 0.0f};
+    params.currentCutPolicy =
+        preferDescendants
+            ? CurrentCutPolicy::PreferReadyDescendants
+            : CurrentCutPolicy::PreferReadyAncestors;
     SpatialQuery query;
     query.setReuseEnabled(false);
     scene->world.applyUpdates();
@@ -378,11 +387,15 @@ static void BM_MixedReadinessFrontier(benchmark::State& state)
         cut = query.selectFrontier(scene->world, view, params);
         consume(cut);
     }
-    state.counters["frontier"] = double(cut.size());
+    state.counters["stored_entries"] = double(cut.size());
+    state.counters["current"] = double(cut.currentSize());
+    state.counters["ideal"] = double(cut.idealSize());
 }
 
 BENCHMARK(BM_MixedReadinessFrontier)
-    ->Arg(128)->Arg(400)
+    ->Args({128, 0})->Args({128, 1})
+    ->Args({400, 0})->Args({400, 1})
+    ->ArgNames({"houses", "ready_descendants"})
     ->Unit(benchmark::kMicrosecond);
 
 static void BM_SubtreeBuilder_ConstructCost(benchmark::State& state)

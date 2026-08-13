@@ -14,6 +14,10 @@ before treating a small delta as meaningful.
   registration, instantiation, and mounting cost.
 - `BM_SharedNodeReadinessFanout` toggles one house definition node shared by
   32, 128, or 400 mounted houses and measures complete coverage propagation.
+- `BM_MixedReadinessFrontier` compares ancestor- and descendant-preferring
+  current cuts on a hierarchy where an unavailable ideal node has a complete
+  ready descendant cover. Counters report current, ideal, and physically
+  stored bucket-entry counts.
 
 Both representations produce the same fully refined frontier. Cases cover 32,
 128, and 400 houses. Frontier selection runs both raw and with a stationary

@@ -387,6 +387,7 @@ FrontierResultView cut = mainView.selectFrontier(
     SelectionParams{
         .threshold = 4.0f,
         .minPix = 0.0f,
+        .currentCutPolicy = CurrentCutPolicy::PreferReadyDescendants,
     });
 ```
 
@@ -398,11 +399,46 @@ camera envelope; it does not modify scene state. The query's reuse cache is a
 separate optimization that returns a previous exact cut while its recorded
 decision margins remain valid.
 
+`currentCutPolicy` controls how an unavailable ideal choice is replaced:
+
+- `PreferReadyDescendants` uses a complete ready descendant cut when one
+  exists, falling back to a ready ancestor only when that cover is incomplete.
+  This default normally preserves the most detail.
+- `PreferReadyAncestors` never searches below the unavailable ideal choice. It
+  falls back upward, normally producing a smaller but coarser current cut.
+
 One traversal returns two logical cuts in three disjoint buckets:
 
 - `shared` belongs to both current and ideal cuts;
 - `currentOnly` contains ready fallbacks used only now;
 - `idealOnly` contains choices wanted if all known definition nodes were ready.
+
+### Two current-cut policies
+
+The following three diagrams show the same hierarchy and camera decision.
+Green nodes are ready, yellow nodes are unavailable, and the colored region
+marks the selected frontier.
+
+The ideal frontier is `D, H, I, J, F, G`. It is the desired LOD result, but it
+cannot be rendered in this example because `H`, `I`, `J`, and `G` are not
+ready:
+
+![Ideal frontier containing unavailable nodes](images/cuts/ideal-cut.svg)
+
+`PreferReadyAncestors` produces the compact current frontier `D, E, C`.
+Unavailable `H/I/J` retreat to their ready ancestor `E`; unavailable `G`
+retreats to `C`. Selecting `C` also replaces its ready child `F`, because a cut
+cannot contain both an ancestor and its descendant:
+
+![Compact current frontier using ready ancestors](images/cuts/current-cut-ancestors.svg)
+
+`PreferReadyDescendants` produces the detailed current frontier
+`D, E, F, K, M, N, O`. The complete ready descendant cut `K, M, N, O` covers
+the unavailable `G`, so `F` can remain selected independently. If even one
+visible branch below `G` lacked ready coverage, Frontier would fall back to
+the ready ancestor `C` instead:
+
+![Detailed current frontier using ready descendants](images/cuts/current-cut-descendants.svg)
 
 Render the zero-copy current-cut view:
 

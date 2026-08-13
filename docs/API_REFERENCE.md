@@ -848,16 +848,32 @@ and overflow state after selection.
 ### Selection inputs and diagnostics
 
 ```cpp
+enum class CurrentCutPolicy : uint8_t {
+    PreferReadyDescendants,
+    PreferReadyAncestors,
+};
+
 struct SelectionParams {
     float threshold = 4.0f;
     float minPix = 0.0f;
+    CurrentCutPolicy currentCutPolicy =
+        CurrentCutPolicy::PreferReadyDescendants;
 };
 ```
 
+- `PreferReadyDescendants` uses a complete ready descendant cut below an
+  unavailable ideal node when possible, and otherwise falls back to a ready
+  ancestor. It normally produces the most detailed current cut and is the
+  default.
+- `PreferReadyAncestors` does not search below an unavailable ideal node. It
+  falls back to a ready ancestor, normally producing fewer, coarser entries.
 - `threshold` is the screen-error refinement threshold in pixels. Use a
   positive finite value for ordinary selection.
 - `minPix` enables top-level contribution culling when greater than zero;
   zero disables it.
+- `currentCutPolicy` selects the replacement rule above. Changing it
+  invalidates that query's reusable frontier records in O(1); allocations and
+  damping state are retained.
 
 ```cpp
 struct InstanceDesc {
@@ -972,8 +988,9 @@ void selectFrontier(const SpatialDatabase& database,
 
 - **Parameters:** `database` must expose a snapshot published by
   `applyUpdates()`; `camera` is raw input and is damped internally; `params`
-  controls refinement and contribution culling. The final overload argument
-  selects query-owned, caller-fixed, or caller-owned output.
+  controls refinement, contribution culling, and current-cut fallback policy.
+  The final overload argument selects query-owned, caller-fixed, or
+  caller-owned output.
 - **Returns/results:** all overloads produce the same ordered three-bucket cut.
   The returned view uses query-owned storage. The sink overload reports
   truncation through its sinks. The owning overload replaces `outResult`'s

@@ -96,6 +96,14 @@ ideal proxy can be unavailable while a recursively complete ready descendant cut
 keeps the current traversal alive. Visibility-aware coverage checks ignore
 unseen missing branches without allowing a visible hole.
 
+That descendant-cover path implements
+`CurrentCutPolicy::PreferReadyDescendants`. Under
+`PreferReadyAncestors`, a query-local proof instead follows each unavailable
+branch only until the ideal frontier or the first ready node. Failure before a
+ready node stops current traversal at the nearest ready ancestor. This policy
+adds no persistent per-node state, and changing policy invalidates cached cuts
+through the existing query epoch.
+
 ## TLAS maintenance
 
 Initial and quality builds use the configured `BinnedSAH`, `Median`, or `Morton`

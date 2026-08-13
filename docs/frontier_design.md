@@ -80,12 +80,14 @@ ideal   = shared + idealOnly
 ```
 
 The current cut contains only ready definition nodes plus permanent TLAS roots
-and has complete hierarchy coverage: a parent remains selected until ready
-descendants cover every visible branch it represented. This is the meaning of
-the hole-free guarantee; it does not concern mesh seams or rasterization. The
-ideal cut assumes all known nodes are available. A missing mounted definition
-stops both cuts at its mountable parent; application metadata decides which
-definition handle to request.
+and has complete hierarchy coverage. By default, complete ready descendants
+may replace an unavailable node; otherwise a ready parent remains selected.
+`CurrentCutPolicy::PreferReadyAncestors` disables the descendant substitution
+and permits only upward fallback, producing a smaller, coarser cut. This is the
+meaning of the hole-free guarantee; it does not concern mesh seams or
+rasterization. The ideal cut assumes all known nodes are available. A missing
+mounted definition stops both cuts at its mountable parent; application
+metadata decides which definition handle to request.
 
 Plain leaves emit directly. Interior and mountable nodes are decided by
 projected geometric error. Frustum plane masks narrow as traversal descends.

@@ -209,6 +209,69 @@ TEST(Frontier, NestedCoverageTracksSharedReadiness)
     EXPECT_EQ(currentPayloads(), (std::vector<UserPayload>{99}));
 }
 
+TEST(Frontier, CurrentCutPolicyChoosesAncestorOrDescendantFallback)
+{
+    SpatialDatabase database;
+    SubtreeBuilder builder;
+
+    // Matches docs/images/cuts: A is the permanent TLAS root and B..O are
+    // definition nodes. High-error interior nodes refine at this camera; G
+    // is the unavailable ideal choice whose ready descendants distinguish the
+    // two current-cut policies.
+    const auto b = builder.createNode(node(2, 64.0f, box(4.0f)));       // B
+    builder.createNode(b, node(4, 0.0f, box(4.0f)));                    // D
+    const auto e = builder.createNode(b, node(5, 32.0f, box(4.0f)));    // E
+    builder.createNode(e, node(8, 0.0f, box(4.0f)));                    // H
+    builder.createNode(e, node(9, 0.0f, box(4.0f)));                    // I
+    builder.createNode(e, node(10, 0.0f, box(4.0f)));                   // J
+
+    const auto c = builder.createNode(node(3, 64.0f, box(4.0f)));       // C
+    builder.createNode(c, node(6, 0.0f, box(4.0f)));                    // F
+    const auto g = builder.createNode(c, node(7, 0.0f, box(4.0f)));     // G
+    builder.createNode(g, node(11, 0.0f, box(4.0f)));                   // K
+    const auto l = builder.createNode(g, node(12, 0.0f, box(4.0f)));    // L
+    builder.createNode(l, node(13, 0.0f, box(4.0f)));                   // M
+    builder.createNode(l, node(14, 0.0f, box(4.0f)));                   // N
+    builder.createNode(l, node(15, 0.0f, box(4.0f)));                   // O
+
+    const SubtreeHandle definition =
+        database.registerSubtree(builder.build());
+    const InstanceHandle root = database.instantiate(
+        node(1, 128.0f, box(4.0f), true));                              // A
+    database.mountSubtree(root.rootNode(), definition);
+
+    for (const UserPayload ready : {3u, 4u, 5u, 6u, 11u, 13u, 14u, 15u})
+        database.markNodeReady(handleOf(database, ready));
+
+    SpatialQuery query;
+    SelectionParams params{.threshold = 1.0f};
+    const Camera camera = cameraAt(-20.0f);
+
+    FrontierResultView cut = select(database, query, camera, params);
+    EXPECT_EQ(payloads(database, cut, true),
+              (std::vector<UserPayload>{4, 6, 7, 8, 9, 10}));
+    EXPECT_EQ(payloads(database, cut, false),
+              (std::vector<UserPayload>{4, 5, 6, 11, 13, 14, 15}));
+
+    // Establish a cache hit before changing only the policy.
+    cut = select(database, query, camera, params);
+    EXPECT_EQ(query.reused(), 1u);
+
+    params.currentCutPolicy = CurrentCutPolicy::PreferReadyAncestors;
+    cut = select(database, query, camera, params);
+    EXPECT_EQ(payloads(database, cut, true),
+              (std::vector<UserPayload>{4, 6, 7, 8, 9, 10}));
+    EXPECT_EQ(payloads(database, cut, false),
+              (std::vector<UserPayload>{3, 4, 5}));
+    EXPECT_EQ(query.walked(), 1u);
+
+    params.currentCutPolicy = CurrentCutPolicy::PreferReadyDescendants;
+    cut = select(database, query, camera, params);
+    EXPECT_EQ(payloads(database, cut, false),
+              (std::vector<UserPayload>{4, 5, 6, 11, 13, 14, 15}));
+    EXPECT_EQ(query.walked(), 1u);
+}
+
 TEST(Frontier, MountedCoverageStaysPlacementLocal)
 {
     SpatialDatabase database;

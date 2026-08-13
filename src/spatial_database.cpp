@@ -3066,6 +3066,89 @@ bool SpatialDatabase::visibleDescendantsCovered(uint32_t slot, uint32_t node, ui
     return true;
 }
 
+// The compact current-cut policy may descend through unavailable nodes that
+// are still above the ideal frontier, but it must not descend below an
+// unavailable ideal choice. Prove that every visible branch reaches a ready
+// node before the ideal walk would stop. Ready nodes terminate the proof: the
+// main walk will decide later whether each one can refine further or must serve
+// as that branch's fallback.
+bool SpatialDatabase::visibleIdealBranchesReachReady(
+    uint32_t slot, uint32_t node, uint8_t mask, const Instance& inst,
+    const Camera& rootLocal, const SelectionParams& params,
+    Worker* dependencyWorker) const
+{
+    if (dependencyWorker)
+        recordTraversalDependency(*dependencyWorker, slot);
+
+    const SubtreeInstanceRt* rt = &slots_[slot];
+    if (node != 0 && subtreeView(*rt).isMountable(node))
+    {
+        const uint32_t child = mountedChildSlot(*rt, node);
+        if (child == kInvalidIndex) return false;
+        slot = child;
+        node = 0;
+        rt = &slots_[slot];
+        if (dependencyWorker)
+            recordTraversalDependency(*dependencyWorker, slot);
+    }
+
+    const Camera local = mountLocalCamera(rootLocal, slot, mask);
+    const SubtreeDefinitionRt& definition = subtrees_[rt->definition];
+    const SubtreeView& subtree = definition.view;
+    const WorkItem item = makeWorkItem(slot, inst, 0, 0, mask);
+    const uint32_t count = subtree.childCount(node);
+    if (count == 0) return false;
+
+    uint32_t block = subtree.wideOffset(node);
+    const float8 clamp = float8::splat(rt->errClamp);
+    const float4 qmn = local.queryMin(), qmx = local.queryMax();
+    for (uint32_t base = 0; base < count; base += kWide, ++block)
+    {
+        const WideBlock& children = subtree.wide_[block];
+        const WideBounds& bounds = [&]() -> const WideBounds&
+        {
+            if (item.sparseOverlay == kInvalidIndex)
+                return item.bounds(block);
+            const Overlay& overlay = overlays_[item.sparseOverlay];
+            const uint32_t patch = overlay.widePatch[block];
+            return patch == kInvalidIndex ? subtree.wide_[block].bounds
+                                          : overlay.patchedWide[patch];
+        }();
+
+        uint8_t childMasks[kWide];
+        const uint32_t lanes = subtree.blockMask_[block];
+        uint32_t survivors =
+            testWideAabb(bounds, local.frustum, mask, childMasks) & lanes;
+        if (!survivors) continue;
+
+        const float8 errors = min8(children.error, clamp);
+        const float8 distanceSq = distanceToBoxesSq(bounds, qmn, qmx);
+        const float8 screen =
+            screenErrorFromSq8(errors, local.k, distanceSq);
+        const uint32_t leafLanes = blockLeafLanes(lanes);
+
+        while (survivors)
+        {
+            const uint32_t lane = uint32_t(std::countr_zero(survivors));
+            survivors &= survivors - 1;
+            const uint32_t child = children.child[lane];
+            if (definition.isNodeReady(child)) continue;
+
+            // Plain leaves are always ideal choices. Interior and mountable
+            // nodes are ideal choices once their error reaches the bar.
+            if ((leafLanes & (1u << lane)) != 0 ||
+                !(screen.v[lane] > params.threshold))
+                return false;
+
+            if (!visibleIdealBranchesReachReady(
+                    slot, child, childMasks[lane], inst, rootLocal, params,
+                    dependencyWorker))
+                return false;
+        }
+    }
+    return true;
+}
+
 template<bool FullyReady>
 void SpatialDatabase::runSubtree(const WorkItem& item, const Instance& inst,
                     const Camera& local,
@@ -3220,12 +3303,21 @@ void SpatialDatabase::runSubtreeImpl(const WorkItem& item,
             }
             else if (!(e.err > bar))
             {
-                const bool shared = current &&
-                                    definition.isNodeReady(i);
+                const bool ready = definition.isNodeReady(i);
+                const bool shared = current && ready;
                 const FrontierEntry entry =
                     makeFrontierEntry(here, e.err, bar, w.barInv, instance);
                 w.emit(entry, shared, true);
                 if (!current || shared) continue;
+
+                // Ancestor-preferring traversal proves readiness before it
+                // descends from the nearest ready node. It can never carry the
+                // current walk onto an unavailable ideal choice.
+                FRONTIER_CHECK(
+                    params.currentCutPolicy ==
+                        CurrentCutPolicy::PreferReadyDescendants,
+                    "SpatialQuery::selectFrontier: compact current cut crossed "
+                    "an unavailable ideal node");
                 // The ideal proxy is unavailable, but a recursively complete
                 // ready descendant cut exists because the current walk reached it.
                 nextCurrent = 1;
@@ -3249,10 +3341,30 @@ void SpatialDatabase::runSubtreeImpl(const WorkItem& item,
 
             if (ideal && e.err > bar)
             {
-                const bool canDescend =
-                    !current ||
-                    visibleDescendantsCovered(item.slot(), i, e.planes(), inst, rootLocal,
-                                               w.trackTouches ? &w : nullptr);
+                bool canDescend = !current;
+                if (current)
+                {
+                    if (params.currentCutPolicy ==
+                        CurrentCutPolicy::PreferReadyDescendants)
+                    {
+                        canDescend = visibleDescendantsCovered(
+                            item.slot(), i, e.planes(), inst, rootLocal,
+                            w.trackTouches ? &w : nullptr);
+                    }
+                    else if (!definition.isNodeReady(i))
+                    {
+                        // A ready ancestor already proved this unavailable
+                        // path reaches another ready node before the ideal
+                        // frontier. Avoid proving the same segment again.
+                        canDescend = true;
+                    }
+                    else
+                    {
+                        canDescend = visibleIdealBranchesReachReady(
+                            item.slot(), i, e.planes(), inst, rootLocal,
+                            params, w.trackTouches ? &w : nullptr);
+                    }
+                }
                 if (current && !canDescend)
                 {
                     FRONTIER_CHECK(definition.isNodeReady(i),
@@ -3324,10 +3436,15 @@ void SpatialDatabase::runTlasRootInstance(
 
     const Camera local = toLocal(view, inst.pos, inst.scale);
     const bool fullyReady = mountedTreeFullyReady(childSlot);
-    const bool currentCanDescend =
-        fullyReady ||
-        visibleDescendantsCovered(childSlot, 0, mask, inst, local,
-                                  w.trackTouches ? &w : nullptr);
+    const bool currentCanDescend = fullyReady ||
+        (params.currentCutPolicy ==
+                 CurrentCutPolicy::PreferReadyDescendants
+             ? visibleDescendantsCovered(
+                   childSlot, 0, mask, inst, local,
+                   w.trackTouches ? &w : nullptr)
+             : visibleIdealBranchesReachReady(
+                   childSlot, 0, mask, inst, local, params,
+                   w.trackTouches ? &w : nullptr));
     if (!currentCanDescend)
         w.result.currentOnly.push(makeFrontierEntry(
             root, error, w.bar, w.barInv, outputInstance));
@@ -3695,6 +3812,7 @@ void SpatialQuery::reset()
     travel_ = kTravel_ = 0.0f;
     primed_ = false;
     k_ = bar_ = 0.0f;
+    currentCutPolicy_ = CurrentCutPolicy::PreferReadyDescendants;
     stats_ = SelectionStats{};
     database_ = nullptr;
     instanceLayoutVersion_ = 0;
@@ -3830,14 +3948,16 @@ void SpatialDatabase::selectFrontierCached(const Camera& camera, const Selection
     query.lastQmx_ = qmx;
     query.primed_ = true;
 
-    // Threshold changes alter every record's slope and still invalidate the
-    // cache in O(1). Projection-scale changes instead feed an odometer: each
-    // record bounds how far any flip point can move per unit k, so gradual
-    // damped zoom consumes its margin instead of voiding the whole cache.
-    if (query.bar_ != params.threshold)
+    // Threshold and current-cut policy changes invalidate every result in
+    // O(1). Projection-scale changes instead feed an odometer: each record
+    // bounds how far any flip point can move per unit k, so gradual damped zoom
+    // consumes its margin instead of voiding the whole cache.
+    if (query.bar_ != params.threshold ||
+        query.currentCutPolicy_ != params.currentCutPolicy)
     {
         ++query.epoch_;
         query.bar_ = params.threshold;
+        query.currentCutPolicy_ = params.currentCutPolicy;
         query.kTravel_ = 0.0f;
     }
     else
