@@ -2,6 +2,7 @@
 
 #include <cmath>
 #include <memory>
+#include <string>
 #include <vector>
 
 #include "helpers.h"
@@ -742,3 +743,15 @@ static void BM_BoundsOverrideBatch(benchmark::State& state)
 BENCHMARK(BM_BoundsOverrideBatch)
     ->Arg(1)->Arg(32)->Arg(64)->Arg(256)
     ->Unit(benchmark::kMicrosecond);
+
+int main(int argc, char** argv)
+{
+    benchmark::MaybeReenterWithoutASLR(argc, argv);
+    benchmark::Initialize(&argc, argv);
+    benchmark::AddCustomContext(
+        "frontier_payload_bytes", std::to_string(sizeof(UserPayload)));
+    if (benchmark::ReportUnrecognizedArguments(argc, argv)) return 1;
+    benchmark::RunSpecifiedBenchmarks();
+    benchmark::Shutdown();
+    return 0;
+}

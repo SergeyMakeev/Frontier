@@ -125,6 +125,26 @@ endfunction()
 add_library(frontier STATIC ${FRONTIER_SOURCES})
 frontier_configure_library(frontier ${FRONTIER_EFFECTIVE_BVH_WIDTH})
 
+# End-to-end performance tests compile the implementation once per supported
+# payload word width. These private variants keep the public library's payload
+# customization macro-based while guaranteeing an otherwise matched 32/64-bit
+# benchmark comparison in one build directory.
+if(FRONTIER_BUILD_BENCH)
+    add_library(frontier_bench_payload64_lib STATIC ${FRONTIER_SOURCES})
+    frontier_configure_library(frontier_bench_payload64_lib
+                               ${FRONTIER_EFFECTIVE_BVH_WIDTH})
+    target_compile_definitions(frontier_bench_payload64_lib PUBLIC
+        FRONTIER_USER_PAYLOAD=::std::uint64_t
+        FRONTIER_INVALID_PAYLOAD=UINT64_MAX)
+
+    add_library(frontier_bench_payload32_lib STATIC ${FRONTIER_SOURCES})
+    frontier_configure_library(frontier_bench_payload32_lib
+                               ${FRONTIER_EFFECTIVE_BVH_WIDTH})
+    target_compile_definitions(frontier_bench_payload32_lib PUBLIC
+        FRONTIER_USER_PAYLOAD=::std::uint32_t
+        FRONTIER_INVALID_PAYLOAD=UINT32_MAX)
+endif()
+
 # A normal unit-test build always compiles and executes the other branch width
 # as well. This prevents the configured/default width from silently leaving
 # the other serialized layout and traversal implementation untested.
