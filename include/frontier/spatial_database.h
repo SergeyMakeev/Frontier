@@ -990,9 +990,10 @@ public:
     void markNodeUnavailable(NodeHandle node);
     bool isNodeReady(NodeHandle node) const;
 
-    // Resolve immutable application payload data for a live frontier handle. The
-    // false case is the normal async race with unmount/collection.
-    bool tryGetPayload(NodeHandle h, UserPayload& outPayload) const;
+    // Resolve immutable application payload data for a live frontier handle.
+    // Returns kInvalidPayload for the normal async race with
+    // unmount/collection. The reserved value can never be authored.
+    UserPayload tryGetPayload(NodeHandle h) const;
 
     // ---- motion --------------------------------------------------------------
     // Record new local-space bounds for one node OF ONE INSTANCE: a bounds

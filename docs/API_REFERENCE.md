@@ -478,15 +478,31 @@ per lane. Their backend-specific numerical path is selected at compile time.
 Declared in `frontier/node.h`.
 
 ```cpp
-using UserPayload = uint64_t;
+using UserPayload = FRONTIER_USER_PAYLOAD;
+inline constexpr UserPayload kInvalidPayload = FRONTIER_INVALID_PAYLOAD;
 inline constexpr uint32_t kInvalidIndex = 0xffffffffu;
 ```
 
 `UserPayload` is an opaque application-owned render-resource identifier. Equal
 values may refer to the same application resource, but they do not couple
 Frontier readiness: readiness belongs to a node in a registered definition.
-All 64-bit payload values are available to applications. `kInvalidIndex` is
-the library's public invalid-index value.
+The type must be trivially copyable, default constructible, equality comparable,
+exactly eight bytes, and aligned to no more than eight bytes. By default it is
+`uint64_t` and `kInvalidPayload` is `UINT64_MAX`. The invalid value is reserved
+and cannot be authored. Supply both macros as consistent build-wide
+preprocessor definitions for the library and all consumers to select another
+type:
+
+```cpp
+// Build configuration, before including any Frontier header:
+#define FRONTIER_USER_PAYLOAD void*
+#define FRONTIER_INVALID_PAYLOAD nullptr
+```
+
+Raw pointers are valid for definitions built and registered in the same
+process, but pointer-bearing serialized bytes are not meaningful after process
+exit or in another address space. `kInvalidIndex` is the library's separate
+public invalid-index value.
 
 ### `Transform`
 
@@ -525,7 +541,7 @@ quantize spatial components. It occupies 24 bytes.
 struct NodeDesc {
     enum Flag : uint32_t { FlagMountable = 1u << 0 };
 
-    UserPayload payload = 0;
+    UserPayload payload{};
     float geometricError = 0.0f;
     uint32_t flags = 0;
     ScalarAABB bounds = AABB::empty();
@@ -536,7 +552,7 @@ struct NodeDesc {
 
 - `payload` identifies the render resources selected by the node and is
   returned through live node handles. Equal values are allowed and have no
-  implicit effect on readiness.
+  implicit effect on readiness. It must not equal `kInvalidPayload`.
 - `geometricError` must be finite and non-negative.
 - `flags` currently accepts `FlagMountable`; keep all reserved bits zero.
 - `bounds` is the node's conservative hierarchy-local bound.
@@ -596,11 +612,12 @@ The type does not distinguish builder-produced and file-loaded data. A caller
 loading from disk constructs the final-sized array and reads directly into
 `bytes()`. Persisted arrays are a versioned native traversal format;
 registration requires matching format version, byte order, layout, size,
-alignment, topology, bounds, errors, and wide traversal data. Validation is
-linear in node and wide-block count and does not unpack or copy the arrays.
-The bytes are not a format-independent interchange schema and carry no
-authentication or application-defined allocation limit; authenticate and
-size-limit untrusted files before allocating `SubtreeBytes` for them.
+alignment, payload type and invalid value, topology, bounds, errors, and wide
+traversal data. Validation is linear in node and wide-block count and does not
+unpack or copy the arrays. The bytes are not a format-independent interchange
+schema and carry no authentication or application-defined allocation limit;
+authenticate and size-limit untrusted files before allocating `SubtreeBytes`
+for them.
 
 ## 5. `SubtreeBuilder`
 
@@ -1410,14 +1427,15 @@ discards it. A readiness change cannot be published before the definition has
 at least one live placement because the public identifier is a `NodeHandle`.
 
 ```cpp
-bool tryGetPayload(NodeHandle node, UserPayload& outPayload) const;
+UserPayload tryGetPayload(NodeHandle node) const;
 ```
 
-Returns `true` and writes the immutable node payload when the handle resolves.
-Returns `false` for stale/invalid input and leaves `outPayload` unchanged. An
-entry produced by a selection resolves throughout the same published read
-interval; failure is relevant when the application retains a handle across a
-later writer phase.
+Returns the immutable node payload when the handle resolves and
+`kInvalidPayload` for stale or invalid input. The value is reserved by the
+authoring contract, rejected by checked builders and validated registration,
+and is therefore unambiguous. An entry produced by a selection resolves
+throughout the same published read interval; failure is relevant when the
+application retains a handle across a later writer phase.
 
 ### Per-instance bounds overrides
 

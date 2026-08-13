@@ -119,6 +119,15 @@ TEST(Contracts, SerializedSubtreeValidationMatchesBuildMode)
         SubtreeBytes bytes = makeHierarchy();
         const auto* header = reinterpret_cast<const detail::SubtreeHeader*>(
             bytes.data());
+        auto* payload = reinterpret_cast<UserPayload*>(
+            bytes.data() + header->payloadOffset);
+        payload[1] = kInvalidPayload;
+        registerStructurallyCorrupt(std::move(bytes));
+    }
+    {
+        SubtreeBytes bytes = makeHierarchy();
+        const auto* header = reinterpret_cast<const detail::SubtreeHeader*>(
+            bytes.data());
         auto* parent = reinterpret_cast<uint32_t*>(
             bytes.data() + header->parentOffset);
         parent[2] = header->nodeCount;

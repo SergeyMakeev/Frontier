@@ -196,7 +196,7 @@ void validateSubtreeBytes(const SubtreeBytes& bytes)
 
     const auto* payload = reinterpret_cast<const UserPayload*>(
         bytes.data() + header->payloadOffset);
-    FRONTIER_CHECK(payload[0] == kSentinelPayload,
+    FRONTIER_CHECK(payload[0] == kInvalidPayload,
                    "registerSubtree: missing implicit-parent sentinel");
 
     const auto* parent = reinterpret_cast<const uint32_t*>(
@@ -236,6 +236,9 @@ void validateSubtreeBytes(const SubtreeBytes& bytes)
     {
         FRONTIER_CHECK(finiteNonEmptyBounds(bbox[node]),
                        "registerSubtree: invalid node bounds");
+        if (node != 0)
+            FRONTIER_CHECK(payload[node] != kInvalidPayload,
+                           "registerSubtree: reserved invalid payload");
         FRONTIER_CHECK(subtreeSize[node] != 0 &&
                            subtreeSize[node] <= nodeCount - node,
                        "registerSubtree: invalid subtree extent");

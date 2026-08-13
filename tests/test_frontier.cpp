@@ -411,6 +411,5 @@ TEST(Frontier, StaleNodeHandlesRemainSafeForPayloadLookup)
     Scene scene;
     const NodeHandle stale = handleOf(scene.database, 11);
     scene.database.removeInstance(scene.instance);
-    UserPayload payload = 0;
-    EXPECT_FALSE(scene.database.tryGetPayload(stale, payload));
+    EXPECT_EQ(scene.database.tryGetPayload(stale), kInvalidPayload);
 }

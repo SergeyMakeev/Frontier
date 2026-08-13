@@ -47,6 +47,14 @@ This makes a one-node object exceptionally cheap: it has no definition bytes or
 mount state. Deep assemblies remain composable—a city definition can contain a
 million mountable house nodes, all populated from the same house handle.
 
+`UserPayload` defaults to `uint64_t`. Applications may instead define
+`FRONTIER_USER_PAYLOAD` and `FRONTIER_INVALID_PAYLOAD` build-wide; for example,
+`void*` and `nullptr`. The invalid value is reserved so `tryGetPayload()` can
+return a payload directly and report a stale handle without an out-parameter or
+`std::optional`. See the
+[API reference](docs/API_REFERENCE.md#3-node-authoring-types) for the exact type
+and serialization contract.
+
 ## Example
 
 ```cpp
@@ -99,18 +107,19 @@ FrontierResultView cut = query.selectFrontier(world, camera,
 // Mountable runtime nodes are discovered through the ideal frontier. The
 // application payload maps each proxy to its child definition and placement.
 for (const FrontierEntry& entry : cut.ideal()) {
-    UserPayload payload;
     if (!entry.overThreshold() ||
-        !world.tryGetPayload(entry.nodeHandle, payload) ||
         world.hasMountedSubtree(entry.nodeHandle))
         continue;
 
-    if (payload == 10)
-        world.mountSubtree(entry.nodeHandle, house,
-                           Transform{leftHousePosition, 1.0f});
-    else if (payload == 11)
-        world.mountSubtree(entry.nodeHandle, house,
-                           Transform{rightHousePosition, 1.0f});
+    if (UserPayload payload = world.tryGetPayload(entry.nodeHandle);
+        payload != kInvalidPayload) {
+        if (payload == 10)
+            world.mountSubtree(entry.nodeHandle, house,
+                               Transform{leftHousePosition, 1.0f});
+        else if (payload == 11)
+            world.mountSubtree(entry.nodeHandle, house,
+                               Transform{rightHousePosition, 1.0f});
+    }
 }
 world.applyUpdates(); // publish the newly mounted houses
 ```

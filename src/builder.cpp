@@ -45,6 +45,8 @@ SubtreeBuilder::NodeId SubtreeBuilder::createNode(NodeId parent,
                    "SubtreeBuilder: node-count limit exceeded");
     FRONTIER_CHECK(parent == kInvalidIndex || parent < nodes_.size(),
                    "SubtreeBuilder: invalid parent");
+    FRONTIER_CHECK(node.payload != kInvalidPayload,
+                   "SubtreeBuilder: reserved invalid payload");
     FRONTIER_CHECK(node.geometricError >= 0.0f &&
                        std::isfinite(node.geometricError),
                    "SubtreeBuilder: invalid geometric error");
@@ -157,7 +159,7 @@ SubtreeBytes SubtreeBuilder::build(const FrontierContext& context)
         return index;
     };
 
-    emit(0, uint32_t(roots_.size()), false, kSentinelPayload, AABB::empty(),
+    emit(0, uint32_t(roots_.size()), false, kInvalidPayload, AABB::empty(),
          FLT_MAX);
 
     std::vector<uint32_t> remap(nodes_.size(), kInvalidIndex);

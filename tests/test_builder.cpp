@@ -105,20 +105,31 @@ TEST(SubtreeBuilder, RejectsMixedLocalAndMountedChildren)
                  std::logic_error);
 }
 
-TEST(SubtreeBuilder, AcceptsEveryUserPayloadBitPattern)
+TEST(SubtreeBuilder, AcceptsLargestNonReservedPayload)
 {
-    constexpr UserPayload payload =
-        std::numeric_limits<UserPayload>::max();
+    constexpr UserPayload payload = kInvalidPayload - 1;
     SpatialDatabase database;
     const SubtreeHandle definition =
         database.registerSubtree(makeLeafSubtree(payload));
     const InstanceHandle instance =
         instantiateFor(database, definition, box(2.0f));
 
-    UserPayload resolved = 0;
-    ASSERT_TRUE(database.tryGetPayload(
-        TestAccess::requireNode(database, instance, payload), resolved));
+    const UserPayload resolved = database.tryGetPayload(
+        TestAccess::requireNode(database, instance, payload));
     EXPECT_EQ(resolved, payload);
+}
+
+TEST(SubtreeBuilder, RejectsReservedInvalidPayload)
+{
+    SubtreeBuilder builder;
+    EXPECT_THROW(builder.createNode(
+                     node(kInvalidPayload, 0.0f, box())),
+                 std::logic_error);
+
+    SpatialDatabase database;
+    EXPECT_THROW(database.instantiate(
+                     node(kInvalidPayload, 0.0f, box())),
+                 std::logic_error);
 }
 
 TEST(SubtreeBuilder, RejectsReservedFlagsAndMalformedBounds)
@@ -229,7 +240,7 @@ TEST(Assembly, SingleNodeLivesOnlyInTlas)
     SpatialQuery query;
     const FrontierResultView cut = select(database, query, cameraAt());
     ASSERT_EQ(cut.shared.size(), 1u);
-    UserPayload payload = 0;
-    ASSERT_TRUE(database.tryGetPayload(cut.shared[0].nodeHandle, payload));
+    const UserPayload payload =
+        database.tryGetPayload(cut.shared[0].nodeHandle);
     EXPECT_EQ(payload, 42u);
 }

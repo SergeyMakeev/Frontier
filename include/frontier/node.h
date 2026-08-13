@@ -1,6 +1,8 @@
 #pragma once
 
+#include <concepts>
 #include <cstdint>
+#include <type_traits>
 
 #include "math.h"
 
@@ -8,8 +10,33 @@ namespace frontier {
 
 // Opaque application render-payload identifier carried by one LOD node. Equal
 // values may identify the same render resources, but readiness is tracked by
-// registered definition node rather than by payload value.
-using UserPayload = uint64_t;
+// registered definition node rather than by payload value. Applications may
+// override both macros build-wide; for example:
+//
+//   FRONTIER_USER_PAYLOAD=void*
+//   FRONTIER_INVALID_PAYLOAD=nullptr
+//
+// The fixed eight-byte contract preserves NodeDesc and serialized layouts.
+#ifndef FRONTIER_USER_PAYLOAD
+  #define FRONTIER_USER_PAYLOAD ::std::uint64_t
+#endif
+#ifndef FRONTIER_INVALID_PAYLOAD
+  #define FRONTIER_INVALID_PAYLOAD (~::std::uint64_t{0})
+#endif
+
+using UserPayload = FRONTIER_USER_PAYLOAD;
+inline constexpr UserPayload kInvalidPayload = FRONTIER_INVALID_PAYLOAD;
+static_assert(std::is_trivially_copyable_v<UserPayload>,
+              "UserPayload must be trivially copyable");
+static_assert(std::is_default_constructible_v<UserPayload>,
+              "UserPayload must be default constructible");
+static_assert(requires(UserPayload a, UserPayload b) {
+                  { a == b } -> std::convertible_to<bool>;
+              }, "UserPayload must be equality comparable");
+static_assert(sizeof(UserPayload) == 8,
+              "UserPayload must be exactly eight bytes");
+static_assert(alignof(UserPayload) <= 8,
+              "UserPayload alignment must not exceed eight bytes");
 inline constexpr uint32_t kInvalidIndex = 0xFFFFFFFFu;
 
 // Translation plus positive uniform scale, the transform contract shared by
@@ -72,7 +99,7 @@ struct NodeDesc
     };
     // The remaining 31 bits are reserved for future node properties.
 
-    UserPayload payload = 0;
+    UserPayload payload{};
     float geometricError = 0.0f;
     uint32_t flags = 0;
     ScalarAABB bounds = AABB::empty();

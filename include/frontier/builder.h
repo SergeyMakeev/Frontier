@@ -34,7 +34,7 @@ private:
         static constexpr uint32_t kChildCountMask = (1u << 9) - 1;
         static constexpr uint32_t kMountableBit = 1u << 31;
 
-        UserPayload payload = 0;
+        UserPayload payload{};
         float geometricError = 0.0f;
         NodeId parent = kInvalidIndex;
         NodeId firstChild = kInvalidIndex;

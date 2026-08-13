@@ -156,8 +156,8 @@ TEST(Torture, RandomizedTlasChurnMatchesTheLiveInstanceModel)
             database.removeInstance(stale);
             database.moveInstance(
                 stale, Transform{float4::point(500, 0, 0), 1.0f});
-            UserPayload ignored = 0;
-            EXPECT_FALSE(database.tryGetPayload(stale.rootNode(), ignored));
+            EXPECT_EQ(database.tryGetPayload(stale.rootNode()),
+                      kInvalidPayload);
             record.alive = false;
             --liveCount;
         }
@@ -270,8 +270,7 @@ TEST(Torture, RandomizedReadinessMaintainsACompleteRenderableCover)
             const NodeHandle stale = handles[rng.bounded(
                 uint32_t(handles.size()))];
             database.unmountSubtree(placement);
-            UserPayload ignored = 0;
-            EXPECT_FALSE(database.tryGetPayload(stale, ignored));
+            EXPECT_EQ(database.tryGetPayload(stale), kInvalidPayload);
             placement = database.mountSubtree(
                 instance.rootNode(), definition);
             ASSERT_TRUE(placement.valid());
@@ -365,8 +364,8 @@ TEST(Torture, IndependentQueriesReadOnePublishedSnapshotConcurrently)
                     }
                     for (const FrontierEntry& entry : result.shared)
                     {
-                        UserPayload payload = 0;
-                        if (!database.tryGetPayload(entry.nodeHandle, payload))
+                        if (database.tryGetPayload(entry.nodeHandle) ==
+                            kInvalidPayload)
                         {
                             valid.store(false, std::memory_order_relaxed);
                             return;

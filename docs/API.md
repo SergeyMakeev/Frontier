@@ -193,6 +193,8 @@ NodeDesc proxy{
 
 - `payload` is an opaque application render-resource identifier. Equal values
   may identify the same resource, but do not couple library readiness state.
+  `kInvalidPayload` is reserved so stale-safe lookup can return the payload
+  directly without an out-parameter or `std::optional`.
 - `geometricError` is the authored deviation from finer detail, expressed in
   the node hierarchy's local units. Frontier scales and projects it for the
   current camera; zero means this node has no error-driven reason to refine.
@@ -202,6 +204,21 @@ NodeDesc proxy{
 The descriptor occupies 40 bytes. The 32-bit flag word currently defines only
 `FlagMountable`; the remaining bits are reserved for future node properties
 and must remain zero. Builder and TLAS-root creation reject unknown bits.
+
+`UserPayload` defaults to `uint64_t`, with `UINT64_MAX` as the invalid value.
+Applications can replace both build-wide using preprocessor definitions; the
+library and every consumer must use the same definitions:
+
+```cpp
+// Build configuration, before including any Frontier header:
+#define FRONTIER_USER_PAYLOAD void*
+#define FRONTIER_INVALID_PAYLOAD nullptr
+```
+
+The configured type must be trivially copyable, default constructible,
+equality comparable, exactly eight bytes, and aligned to at most eight bytes.
+Pointer payloads work for in-process definitions, but serialized pointer values
+cannot be persisted or transferred to another address space.
 
 ```cpp
 if (proxy.isMountable()) {
@@ -329,9 +346,11 @@ SubtreeHandle building = database.registerSubtree(std::move(bytes));
 Persisted bytes are a versioned native traversal format, not a long-term
 interchange schema. With full validation enabled, registration rejects
 incompatible or structurally invalid format versions, layout, size, alignment,
-topology, traversal mirrors, or byte order; rebuild authored assets when those
-change. Registration does not authenticate content or choose an allocation
-limit, so verify file origin and size before allocating `SubtreeBytes`.
+topology, traversal mirrors, or byte order. The payload type and invalid-value
+configuration must also match the build that authored the bytes; rebuild assets
+when any of these change. Registration does not authenticate content or choose
+an allocation limit, so verify file origin and size before allocating
+`SubtreeBytes`.
 
 Important ownership rules:
 
@@ -476,8 +495,8 @@ Render the zero-copy current-cut view:
 
 ```cpp
 for (const FrontierEntry& entry : cut.current()) {
-    UserPayload payload;
-    if (database.tryGetPayload(entry.nodeHandle, payload))
+    if (UserPayload payload = database.tryGetPayload(entry.nodeHandle);
+        payload != kInvalidPayload)
         submitPayload(payload, entry.instance());
 }
 ```
@@ -493,8 +512,8 @@ test:
 
 ```cpp
 for (const FrontierEntry& entry : cut.idealOnly) {
-    UserPayload payload;
-    if (database.tryGetPayload(entry.nodeHandle, payload) &&
+    if (UserPayload payload = database.tryGetPayload(entry.nodeHandle);
+        payload != kInvalidPayload &&
         !database.isNodeReady(entry.nodeHandle))
         requestPayload(entry.nodeHandle, payload);
 }
@@ -509,8 +528,8 @@ for (const FrontierEntry& entry : cut.ideal()) {
         database.hasMountedSubtree(entry.nodeHandle))
         continue;
 
-    UserPayload payload;
-    if (database.tryGetPayload(entry.nodeHandle, payload) &&
+    if (UserPayload payload = database.tryGetPayload(entry.nodeHandle);
+        payload != kInvalidPayload &&
         content.isExpandable(payload))
         requestChildDefinition(entry.nodeHandle, payload);
 }
@@ -549,8 +568,8 @@ for (const FrontierEntry& entry : cut.idealOnly) {
     if (database.isNodeReady(entry.nodeHandle))
         continue; // a ready sibling can still be ideal-only
 
-    UserPayload payload;
-    if (database.tryGetPayload(entry.nodeHandle, payload))
+    if (UserPayload payload = database.tryGetPayload(entry.nodeHandle);
+        payload != kInvalidPayload)
         gpuStreamer.request(entry.nodeHandle, payload);
 }
 
@@ -580,8 +599,8 @@ and mount its child definition:
 
 ```cpp
 for (const FrontierEntry& entry : cut.ideal()) {
-    UserPayload payload;
-    if (!database.tryGetPayload(entry.nodeHandle, payload))
+    const UserPayload payload = database.tryGetPayload(entry.nodeHandle);
+    if (payload == kInvalidPayload)
         continue;
 
     if (entry.overThreshold() && planetContent.isExpandable(payload))
@@ -981,8 +1000,8 @@ void requestReadiness(std::span<const FrontierEntry> idealOnly)
     for (const FrontierEntry& entry : idealOnly) {
         if (database.isNodeReady(entry.nodeHandle))
             continue;
-        UserPayload payload;
-        if (database.tryGetPayload(entry.nodeHandle, payload))
+        if (UserPayload payload = database.tryGetPayload(entry.nodeHandle);
+            payload != kInvalidPayload)
             payloadStreamer.request(entry.nodeHandle, payload);
     }
 }
@@ -994,8 +1013,9 @@ void expandHouses(FrontierCutView ideal)
             database.hasMountedSubtree(entry.nodeHandle))
             continue;
 
-        UserPayload payload;
-        if (!database.tryGetPayload(entry.nodeHandle, payload) ||
+        const UserPayload payload =
+            database.tryGetPayload(entry.nodeHandle);
+        if (payload == kInvalidPayload ||
             !applicationSaysHouseProxy(payload))
             continue;
 

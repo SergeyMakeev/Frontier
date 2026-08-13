@@ -1111,18 +1111,14 @@ bool SpatialDatabase::isNodeReady(NodeHandle node) const
            subtrees_[placement->definition].isNodeReady(node.index());
 }
 
-bool SpatialDatabase::tryGetPayload(NodeHandle h, UserPayload& outPayload) const
+UserPayload SpatialDatabase::tryGetPayload(NodeHandle h) const
 {
     const InstanceId root = resolveTlasRoot(h);
     if (root != kInvalidInstanceId)
-    {
-        outPayload = tlasRootPayloads_[root];
-        return true;
-    }
+        return tlasRootPayloads_[root];
     const SubtreeInstanceRt* rt = resolve(h);
-    if (!rt) return false;
-    outPayload = subtreeView(*rt).payload_[h.index()];
-    return true;
+    if (!rt) return kInvalidPayload;
+    return subtreeView(*rt).payload_[h.index()];
 }
 
 // ============================================================================
@@ -1138,6 +1134,8 @@ InstanceHandle SpatialDatabase::addTlasRootInstance(
     FRONTIER_CHECK(root.geometricError >= 0.0f &&
                        std::isfinite(root.geometricError),
                    "SpatialDatabase::instantiate: invalid geometric error");
+    FRONTIER_CHECK(root.payload != kInvalidPayload,
+                   "SpatialDatabase::instantiate: reserved invalid payload");
     FRONTIER_CHECK((root.flags & ~uint32_t(NodeDesc::FlagMountable)) == 0,
                    "SpatialDatabase::instantiate: unknown node flags");
     const AABB rootBounds = root.bounds;

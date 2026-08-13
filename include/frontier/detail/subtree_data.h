@@ -15,7 +15,6 @@ inline constexpr uint32_t kMetaMountable = 1u << kMetaChildBits;
 inline constexpr uint32_t kMetaOffsetShift = kMetaChildBits + 1;
 inline constexpr uint32_t kMaxWideOffset =
     (1u << (32 - kMetaOffsetShift)) - 1;
-inline constexpr UserPayload kSentinelPayload = ~UserPayload{0};
 
 inline uint32_t metaChildCount(uint32_t m) { return m & kMaxChildren; }
 inline bool metaIsMountable(uint32_t m) { return (m & kMetaMountable) != 0; }
@@ -84,7 +83,7 @@ struct MutWideBoundsRef
 };
 
 inline constexpr uint32_t kSubtreeMagic = 0x42545346u; // 'FSTB'
-inline constexpr uint16_t kSubtreeVersion = 3;
+inline constexpr uint16_t kSubtreeVersion = 4;
 inline constexpr size_t kSubtreeAlign = kSubtreeByteAlignment;
 
 // The immutable in-memory layout is also the serialized format. It contains

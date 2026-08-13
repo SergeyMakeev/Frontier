@@ -24,9 +24,8 @@ struct SpatialDatabase::TestAccess
             {
                 NodeHandle handle{slot, node,
                                   database.mountStamps_[slot].generation()};
-                UserPayload candidate = 0;
-                if (database.tryGetPayload(handle, candidate) &&
-                    candidate == payload)
+                const UserPayload candidate = database.tryGetPayload(handle);
+                if (candidate == payload)
                     return handle;
             }
         }
@@ -62,9 +61,8 @@ struct SpatialDatabase::TestAccess
             {
                 NodeHandle handle{slot, node,
                                   database.mountStamps_[slot].generation()};
-                UserPayload candidate = 0;
-                if (database.tryGetPayload(handle, candidate) &&
-                    candidate == payload)
+                const UserPayload candidate = database.tryGetPayload(handle);
+                if (candidate == payload)
                     return handle;
             }
         }
@@ -218,8 +216,8 @@ inline std::vector<UserPayload> payloads(const SpatialDatabase& database,
     const FrontierCutView cut = ideal ? result.ideal() : result.current();
     for (const FrontierEntry& entry : cut)
     {
-        UserPayload payload = 0;
-        if (!database.tryGetPayload(entry.nodeHandle, payload))
+        const UserPayload payload = database.tryGetPayload(entry.nodeHandle);
+        if (payload == kInvalidPayload)
             throw std::logic_error("stale frontier handle");
         output.push_back(payload);
     }
