@@ -36,9 +36,9 @@ A bounding-volume hierarchy (BVH) groups spatial bounds so a query can reject
 many objects or nodes without testing each one. Frontier uses two logical
 levels:
 
-- The **top-level acceleration structure (TLAS)** is an internal 8-wide BVH in
-  world space. It indexes independently movable top-level instances. Every TLAS
-  leaf is also that instance's permanent, renderable fallback node.
+- The **top-level acceleration structure (TLAS)** is an internal BVH4 or BVH8
+  in world space. It indexes independently movable top-level instances. Every
+  TLAS leaf is also that instance's permanent, renderable fallback node.
 - A **subtree definition** is an immutable local-space hierarchy registered
   once and mounted wherever it is needed. In conventional ray-tracing
   terminology this is the BLAS-like, or bottom-level, part of the system.
@@ -61,6 +61,12 @@ mounted local hierarchies only when their roots need finer LOD. This separation
 keeps world movement out of shared local topology, lets many placements reuse
 one definition, and makes a one-node object require no bottom-level hierarchy
 at all.
+
+Both levels use the build-wide `FRONTIER_BVH_WIDTH`. Its `AUTO` default chooses
+BVH8 for AVX2's eight-lane backend and BVH4 for four-lane SSE2/NEON (and for
+forced scalar). An application can explicitly select `4` or `8` after profiling
+its target content and hardware. Serialized subtree bytes record the selected
+width and must be rebuilt when it changes.
 
 ### Nodes, errors, and cuts
 
@@ -194,7 +200,8 @@ NodeDesc proxy{
 - `bounds` is exact six-float authoring storage and accepts an `AABB` directly.
 
 The descriptor occupies 40 bytes. The 32-bit flag word currently defines only
-`FlagMountable`; the remaining bits are reserved for future node properties.
+`FlagMountable`; the remaining bits are reserved for future node properties
+and must remain zero. Builder and TLAS-root creation reject unknown bits.
 
 ```cpp
 if (proxy.isMountable()) {
@@ -244,9 +251,11 @@ handle.
 
 - at least one renderable node exists;
 - error values are finite and non-negative;
-- every final node bound is non-empty;
+- every final node bound is finite and non-empty on all three axes;
+- reserved flag bits are zero;
 - no local child exists below a mountable node;
 - local fanout is at most 511;
+- one definition contains at most 1,048,575 renderable nodes;
 - child error is clamped monotonically to its parent's error.
 
 An interior node may start with empty bounds if its children establish a
@@ -274,13 +283,25 @@ simultaneously:
 - the registration input;
 - the immutable in-memory traversal representation.
 
-Registration validates the header, layout, version, size, alignment, and
-implicit-parent sentinel, then moves the existing allocation. It does not
-unpack or copy the node arrays and does not allocate per-node runtime state.
-The bounded direct-root classification is independent of the definition's
-total descendant count, and ownership transfer of the byte array is
-constant-time. Shared readiness/coverage state is allocated lazily on the
-definition's first mount.
+By default, registration validates the header, layout, version, size,
+alignment, complete preorder topology, extents, node data, and wide traversal
+mirrors, then moves the existing allocation. Validation is linear in node and
+wide-block count, but it does not unpack or copy the node arrays and ownership
+transfer itself is constant-time. No per-node runtime state is allocated;
+shared readiness/coverage state is allocated lazily on the definition's first
+mount.
+
+Applications whose registered bytes come exclusively from a trusted,
+compatible Frontier builder can compile with
+`FRONTIER_VALIDATE_SUBTREES=OFF`. Registration then performs only
+constant-time format-envelope and root-range checks before taking ownership;
+the O(nodes + wide blocks) structural scan is not compiled in. This is a
+build-wide trust decision: malformed internal arrays can otherwise become
+unchecked traversal data, so keep validation enabled for files, downloads,
+mod content, or any other untrusted or independently versioned input.
+If `FRONTIER_CONTRACT_CHECKS` is also disabled, those remaining preconditions
+are assumed instead of checked; this is the repository benchmark profile, not
+the normal application profile.
 
 ```cpp
 SubtreeBytes bytes = buildBuildingDefinition().build(context);
@@ -306,10 +327,11 @@ SubtreeHandle building = database.registerSubtree(std::move(bytes));
 ```
 
 Persisted bytes are a versioned native traversal format, not a long-term
-interchange schema. Registration rejects incompatible format versions, layout,
-size, alignment, or byte order; rebuild authored assets when those change. The
-validation is a compatibility check, not a hardened parser for untrusted
-input, so load bytes produced by a trusted authoring pipeline.
+interchange schema. With full validation enabled, registration rejects
+incompatible or structurally invalid format versions, layout, size, alignment,
+topology, traversal mirrors, or byte order; rebuild authored assets when those
+change. Registration does not authenticate content or choose an allocation
+limit, so verify file origin and size before allocating `SubtreeBytes`.
 
 Important ownership rules:
 
@@ -322,6 +344,12 @@ Important ownership rules:
 
 `SubtreeBytes` is explicitly copyable for tools that need duplicate byte
 arrays, but registration exposes only the ownership-taking rvalue overload.
+
+All runtime handles are scoped to the `SpatialDatabase` that created them.
+Generation stamps reject stale values after removal and slot reuse inside that
+database; they are not global database identifiers. Do not pass instance,
+definition, placement, or node handles to another database, where the same
+packed slot and generation may name unrelated live state.
 
 ## 6. Create a root and mount a definition
 
@@ -368,7 +396,9 @@ Mounting on a live non-mountable parent, mounting twice, escaping the parent
 bounds, or using an invalid definition is a contract violation.
 
 Mount transforms are translation plus positive uniform scale and accumulate
-across nested placements.
+across nested placements. The supplied and accumulated transforms must remain
+finite and representable. A top-level mount scale must also have a finite
+reciprocal because traversal transforms the camera into placement-local space.
 
 ## 7. Select the current and ideal frontiers
 
@@ -397,7 +427,9 @@ instances whose projected contribution is too small. Query-local **damping**
 smooths LOD decisions over camera motion by evaluating a conservative temporal
 camera envelope; it does not modify scene state. The query's reuse cache is a
 separate optimization that returns a previous exact cut while its recorded
-decision margins remain valid.
+decision margins remain valid. A snapshot containing only TLAS-owned
+single-node objects automatically uses the direct selection path instead;
+there is no hierarchy walk for a cache hit to avoid.
 
 `currentCutPolicy` controls how an unavailable ideal choice is replaced:
 
@@ -450,18 +482,37 @@ for (const FrontierEntry& entry : cut.current()) {
 }
 ```
 
-Use the corresponding ideal-cut view to drive demand:
+Handles in a freshly returned cut resolve throughout that published read
+interval. `tryGetPayload()` is stale-safe because applications may also retain
+node handles across writer phases; failure in the loop above would indicate
+that the threading contract was violated.
+
+Use the ideal-only delta for GPU demand. A ready sibling can still be in this
+bucket when a common ancestor covers the current cut, so retain the readiness
+test:
 
 ```cpp
-for (const FrontierEntry& entry : cut.ideal()) {
+for (const FrontierEntry& entry : cut.idealOnly) {
     UserPayload payload;
     if (database.tryGetPayload(entry.nodeHandle, payload) &&
         !database.isNodeReady(entry.nodeHandle))
         requestPayload(entry.nodeHandle, payload);
+}
+```
 
-    if (entry.overThreshold() &&
-        !database.hasMountedSubtree(entry.nodeHandle))
-        requestChildDefinition(entry.nodeHandle);
+Topology demand is different: inspect the complete ideal cut because an
+unexpanded mountable proxy can be shared by both cuts:
+
+```cpp
+for (const FrontierEntry& entry : cut.ideal()) {
+    if (!entry.overThreshold() ||
+        database.hasMountedSubtree(entry.nodeHandle))
+        continue;
+
+    UserPayload payload;
+    if (database.tryGetPayload(entry.nodeHandle, payload) &&
+        content.isExpandable(payload))
+        requestChildDefinition(entry.nodeHandle, payload);
 }
 ```
 
@@ -637,6 +688,10 @@ database.moveInstance(carInstance, Transform{
 });
 ```
 
+Positions and scales must be finite, scales must be positive with a finite
+reciprocal, and transformed root bounds and errors must remain representable.
+Invalid motion is rejected before the instance or TLAS is changed.
+
 For a stable cohort, `MotionGroup` preserves caller order while caching the
 database's physical order:
 
@@ -706,7 +761,9 @@ AABB effective = database.nodeBounds(carInstance, movingDoorNode);
 The first edit to an `(instance, mounted placement)` pair creates a private
 copy-on-write bounds overlay. Topology, payloads, errors, readiness, and every
 other placement remain shared. Ancestor propagation is conservative and
-grow-only.
+grow-only. Bounds must be finite and non-empty, remain representable through
+every containing mount and instance transform, and belong to the supplied
+instance; these requirements are checked in release builds.
 
 `setNodeBounds()` does not create a render transform. Use
 `tryGetNodeTransform()` to obtain the containing mount's accumulated transform,
@@ -837,9 +894,17 @@ uncached.setReuseEnabled(false);
 FrontierResultView cut = uncached.selectFrontier(database, camera, params);
 ```
 
+Database construction rejects unknown TLAS quality values and non-finite or
+negative cost/drift settings. If parallel selection is enabled with more than
+one worker, `parallelFor` must be non-null. Selection likewise rejects invalid
+cameras, thresholds, culling limits, and current-cut policy values before
+traversal begins.
+
 Contract violations route through `FRONTIER_FATAL`, which throws
 `std::logic_error` by default. Exception-free hosts can define it before any
-Frontier include.
+Frontier include. Treat this as a panic hook for programmer errors, not a
+recoverable input-error channel: unless a function explicitly says otherwise,
+Frontier does not promise transactional rollback after a contract failure.
 
 ## 13. End-to-end example: reusable houses in a streamed city
 
@@ -911,33 +976,42 @@ database.mountSubtree(city.rootNode(), cityDefinition);
 The streaming loop discovers mountable proxies from the ideal frontier:
 
 ```cpp
-void processIdeal(FrontierCutView entries)
+void requestReadiness(std::span<const FrontierEntry> idealOnly)
 {
-    for (const FrontierEntry& entry : entries) {
+    for (const FrontierEntry& entry : idealOnly) {
+        if (database.isNodeReady(entry.nodeHandle))
+            continue;
         UserPayload payload;
-        if (!database.tryGetPayload(entry.nodeHandle, payload))
+        if (database.tryGetPayload(entry.nodeHandle, payload))
+            payloadStreamer.request(entry.nodeHandle, payload);
+    }
+}
+
+void expandHouses(FrontierCutView ideal)
+{
+    for (const FrontierEntry& entry : ideal) {
+        if (!entry.overThreshold() ||
+            database.hasMountedSubtree(entry.nodeHandle))
             continue;
 
-        if (!database.isNodeReady(entry.nodeHandle))
-            payloadStreamer.request(entry.nodeHandle, payload);
+        UserPayload payload;
+        if (!database.tryGetPayload(entry.nodeHandle, payload) ||
+            !applicationSaysHouseProxy(payload))
+            continue;
 
-        if (entry.overThreshold() &&
-            !database.hasMountedSubtree(entry.nodeHandle) &&
-            applicationSaysHouseProxy(payload)) {
-            // The application authored the proxy-to-house placement together
-            // with the proxy payload. Different proxies reuse the same bytes
-            // with different local transforms.
-            const Transform placement =
-                authoredCity.housePlacementFor(payload);
-            database.mountSubtree(entry.nodeHandle, houseDefinition,
-                                  placement);
-        }
+        // The application authored the proxy-to-house placement together
+        // with the proxy payload. Different proxies reuse the same bytes
+        // with different local transforms.
+        const Transform placement =
+            authoredCity.housePlacementFor(payload);
+        database.mountSubtree(entry.nodeHandle, houseDefinition, placement);
     }
 }
 
 database.applyUpdates();
 FrontierResultView cut = cityQuery.selectFrontier(database, camera, params);
-processIdeal(cut.ideal());
+requestReadiness(cut.idealOnly);
+expandHouses(cut.ideal());
 ```
 
 The city can contain a million proxies without duplicating the house

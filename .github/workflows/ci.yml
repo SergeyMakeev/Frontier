@@ -19,9 +19,9 @@ jobs:
           - name: linux-x64-gcc-avx2
             os: ubuntu-latest
             cmake_args: -DCMAKE_CXX_COMPILER=g++ -DFRONTIER_AVX2=ON
-          - name: linux-x64-gcc-sse2
+          - name: linux-x64-gcc-sse2-trusted-subtrees
             os: ubuntu-latest
-            cmake_args: -DCMAKE_CXX_COMPILER=g++ -DFRONTIER_AVX2=OFF
+            cmake_args: -DCMAKE_CXX_COMPILER=g++ -DFRONTIER_AVX2=OFF -DFRONTIER_BVH_WIDTH=4 -DFRONTIER_VALIDATE_SUBTREES=OFF
           - name: linux-x64-gcc-scalar
             os: ubuntu-latest
             cmake_args: -DCMAKE_CXX_COMPILER=g++ -DFRONTIER_AVX2=OFF -DFRONTIER_FORCE_SCALAR=ON
@@ -38,7 +38,7 @@ jobs:
           # ---- Linux ARM64: GCC and Clang, NEON / scalar -------------------
           - name: linux-arm64-gcc-neon
             os: ubuntu-24.04-arm
-            cmake_args: -DCMAKE_CXX_COMPILER=g++
+            cmake_args: -DCMAKE_CXX_COMPILER=g++ -DFRONTIER_BVH_WIDTH=4
           - name: linux-arm64-gcc-scalar
             os: ubuntu-24.04-arm
             cmake_args: -DCMAKE_CXX_COMPILER=g++ -DFRONTIER_FORCE_SCALAR=ON
@@ -55,7 +55,7 @@ jobs:
             cmake_args: -DFRONTIER_AVX2=ON
           - name: windows-x64-msvc-sse2
             os: windows-latest
-            cmake_args: -DFRONTIER_AVX2=OFF
+            cmake_args: -DFRONTIER_AVX2=OFF -DFRONTIER_BVH_WIDTH=4
           - name: windows-x64-msvc-scalar
             os: windows-latest
             cmake_args: -DFRONTIER_AVX2=OFF -DFRONTIER_FORCE_SCALAR=ON
@@ -97,21 +97,75 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Configure
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release ${{ matrix.cmake_args }}
+        run: >-
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=Debug
+          -DFRONTIER_BUILD_TESTS=ON
+          -DFRONTIER_BUILD_BENCH=OFF
+          -DFRONTIER_CONTRACT_CHECKS=ON
+          -DFRONTIER_VALIDATE_SUBTREES=ON
+          ${{ matrix.cmake_args }}
 
       - name: Build
-        run: cmake --build build --config Release --parallel 4
+        run: cmake --build build --config Debug --parallel 4 --target frontier_unit_tests
 
-      - name: Unit tests
-        run: ctest --test-dir build -C Release --output-on-failure --parallel 4
+      - name: Unit tests (BVH4 + BVH8)
+        run: ctest --test-dir build -C Debug --output-on-failure --parallel 4
+
+  performance:
+    name: perf-${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x64-gcc-avx2
+            os: ubuntu-latest
+            cmake_args: -DCMAKE_CXX_COMPILER=g++ -DFRONTIER_AVX2=ON
+          - name: linux-arm64-gcc-neon
+            os: ubuntu-24.04-arm
+            cmake_args: -DCMAKE_CXX_COMPILER=g++ -DFRONTIER_AVX2=OFF
+          - name: windows-x64-msvc-avx2
+            os: windows-latest
+            cmake_args: -DFRONTIER_AVX2=ON
+          - name: windows-arm64-msvc-neon
+            os: windows-11-arm
+            cmake_args: -DFRONTIER_AVX2=OFF
+          - name: macos-arm64-clang-neon
+            os: macos-latest
+            cmake_args: -DFRONTIER_AVX2=OFF
+          - name: macos-x64-clang-avx2
+            os: macos-15-intel
+            cmake_args: -DFRONTIER_AVX2=ON
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure maximum-performance build
+        run: >-
+          cmake -S . -B build-perf
+          -DCMAKE_BUILD_TYPE=Release
+          -DFRONTIER_IPO=ON
+          -DFRONTIER_BUILD_TESTS=OFF
+          -DFRONTIER_BUILD_BENCH=ON
+          -DFRONTIER_BVH_WIDTH=AUTO
+          -DFRONTIER_FORCE_SCALAR=OFF
+          -DFRONTIER_STATS=OFF
+          -DFRONTIER_CONTRACT_CHECKS=OFF
+          -DFRONTIER_VALIDATE_SUBTREES=OFF
+          ${{ matrix.cmake_args }}
+
+      - name: Build performance tests
+        run: cmake --build build-perf --config Release --parallel 4
 
       - name: Performance tests
         shell: bash
         run: |
-          if [ -x build/bench/frontier_bench ]; then
-            BENCH=build/bench/frontier_bench
+          if [ -x build-perf/bench/frontier_bench ]; then
+            BENCH=build-perf/bench/frontier_bench
           else
-            BENCH=build/bench/Release/frontier_bench.exe
+            BENCH=build-perf/bench/Release/frontier_bench.exe
           fi
           "$BENCH" --benchmark_min_time=0.1s \
                    --benchmark_out=bench-${{ matrix.name }}.json \
@@ -126,9 +180,103 @@ jobs:
           path: bench-${{ matrix.name }}.json
           retention-days: 3
 
+  sanitizers:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-clang-address-undefined
+            compiler: clang++
+            flags: -fsanitize=address,undefined -fno-omit-frame-pointer
+          - name: linux-gcc-thread
+            compiler: g++
+            flags: -fsanitize=thread -fno-omit-frame-pointer
+    env:
+      ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+      UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+      TSAN_OPTIONS: halt_on_error=1
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: >-
+          cmake -S . -B build-sanitize
+          -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_CXX_COMPILER=${{ matrix.compiler }}
+          -DCMAKE_CXX_FLAGS="${{ matrix.flags }}"
+          -DCMAKE_EXE_LINKER_FLAGS="${{ matrix.flags }}"
+          -DFRONTIER_BUILD_TESTS=ON
+          -DFRONTIER_BUILD_BENCH=OFF
+          -DFRONTIER_AVX2=OFF
+
+      - name: Build
+        run: cmake --build build-sanitize --parallel 4
+
+      - name: Sanitized tests
+        run: ctest --test-dir build-sanitize --output-on-failure --parallel 4
+
+  coverage:
+    name: linux-clang-coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: >-
+          cmake -S . -B build-coverage
+          -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_CXX_COMPILER=clang++
+          -DCMAKE_CXX_FLAGS="-fprofile-instr-generate -fcoverage-mapping"
+          -DCMAKE_EXE_LINKER_FLAGS="-fprofile-instr-generate -fcoverage-mapping"
+          -DFRONTIER_BUILD_TESTS=ON
+          -DFRONTIER_BUILD_BENCH=OFF
+          -DFRONTIER_AVX2=OFF
+
+      - name: Build
+        run: cmake --build build-coverage --parallel 4
+
+      - name: Instrumented tests
+        env:
+          LLVM_PROFILE_FILE: ${{ github.workspace }}/build-coverage/coverage-%p.profraw
+        run: ctest --test-dir build-coverage --output-on-failure --parallel 4
+
+      - name: Coverage report
+        shell: bash
+        run: |
+          llvm-profdata merge -sparse \
+            build-coverage/coverage-*.profraw \
+            -o build-coverage/coverage.profdata
+          llvm-cov report build-coverage/tests/frontier_tests \
+            -instr-profile=build-coverage/coverage.profdata \
+            -ignore-filename-regex='(_deps|/tests/|/usr/|/opt/)' \
+            | tee build-coverage/coverage.txt
+          llvm-cov export build-coverage/tests/frontier_tests \
+            -instr-profile=build-coverage/coverage.profdata \
+            -ignore-filename-regex='(_deps|/tests/|/usr/|/opt/)' \
+            -format=lcov > build-coverage/coverage.lcov
+          {
+            echo '## Library coverage'
+            echo
+            echo '```text'
+            cat build-coverage/coverage.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-linux-clang
+          path: |
+            build-coverage/coverage.txt
+            build-coverage/coverage.lcov
+
   collect-bench:
     name: collect-bench-results
-    needs: build-test
+    needs: performance
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     steps:

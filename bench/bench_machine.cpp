@@ -46,11 +46,23 @@ constexpr int64_t kMiB = 1024 * kKiB;
 #if FRONTIER_SIMD_AVX2
 constexpr const char* kKernelBackend = "AVX2 256-bit";
 #elif FRONTIER_SIMD_NEON
+  #if FRONTIER_BVH_WIDTH == 8
 constexpr const char* kKernelBackend = "NEON 128-bit x2";
+  #else
+constexpr const char* kKernelBackend = "NEON 128-bit x1";
+  #endif
 #elif FRONTIER_SIMD_SSE2
+  #if FRONTIER_BVH_WIDTH == 8
 constexpr const char* kKernelBackend = "SSE2 128-bit x2";
+  #else
+constexpr const char* kKernelBackend = "SSE2 128-bit x1";
+  #endif
 #else
+  #if FRONTIER_BVH_WIDTH == 8
 constexpr const char* kKernelBackend = "portable scalar x8";
+  #else
+constexpr const char* kKernelBackend = "portable scalar x4";
+  #endif
 #endif
 
 #if FRONTIER_MACHINE_NEON
@@ -429,8 +441,8 @@ static void BM_KernelWideAabb(benchmark::State& state)
             const uint32_t alive = wideAabbProduction(
                 fixture.bounds[size_t(i) & (WideAabbFixture::kCases - 1)],
                 fixture.frustum, inMask, masks);
-            uint64_t packed;
-            std::memcpy(&packed, masks, sizeof(packed));
+            uint64_t packed = 0;
+            std::memcpy(&packed, masks, sizeof(masks));
             checksum[i & 3] += packed ^ alive;
         }
         benchmark::DoNotOptimize(checksum);
@@ -596,7 +608,7 @@ static void BM_OutputAppendBuffer(benchmark::State& state)
             uint8_t(i), uint32_t(i) & frontier::kInstanceIdMask);
     }
 
-    frontier::AppendBuffer<frontier::FrontierEntry> output;
+    frontier::detail::AppendBuffer<frontier::FrontierEntry> output;
     output.reserve(entryCount);
     for (auto _ : state)
     {

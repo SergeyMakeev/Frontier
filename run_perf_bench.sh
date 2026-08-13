@@ -46,10 +46,15 @@ configure_args=(
     -S "${ROOT_DIR}"
     -B "${BUILD_DIR}"
     -DCMAKE_BUILD_TYPE=Release
+    -DFRONTIER_IPO=ON
     -DFRONTIER_BUILD_TESTS=OFF
     -DFRONTIER_BUILD_BENCH=ON
     -DFRONTIER_AVX2="${avx2}"
+    -DFRONTIER_BVH_WIDTH=AUTO
     -DFRONTIER_FORCE_SCALAR=OFF
+    -DFRONTIER_STATS=OFF
+    -DFRONTIER_CONTRACT_CHECKS=OFF
+    -DFRONTIER_VALIDATE_SUBTREES=OFF
 )
 if [[ -n "${generator}" ]]; then
     configure_args+=(-G "${generator}")

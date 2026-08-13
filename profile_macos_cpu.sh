@@ -219,11 +219,16 @@ echo "Building optimized arm64 benchmark with source line tables..."
 configure_benchmark() {
     cmake -S "${ROOT_DIR}" -B "${BUILD_DIR}" "$@" \
         -DCMAKE_BUILD_TYPE=Release \
+        -DFRONTIER_IPO=ON \
         -DCMAKE_OSX_ARCHITECTURES=arm64 \
         -DFRONTIER_BUILD_TESTS=OFF \
         -DFRONTIER_BUILD_BENCH=ON \
         -DFRONTIER_AVX2=OFF \
+        -DFRONTIER_BVH_WIDTH=AUTO \
         -DFRONTIER_FORCE_SCALAR=OFF \
+        -DFRONTIER_STATS=OFF \
+        -DFRONTIER_CONTRACT_CHECKS=OFF \
+        -DFRONTIER_VALIDATE_SUBTREES=OFF \
         -DFRONTIER_PROFILE_SYMBOLS=ON
 }
 if [[ ! -f "${BUILD_DIR}/CMakeCache.txt" ]] && command -v ninja >/dev/null 2>&1; then

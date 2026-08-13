@@ -8,10 +8,25 @@
 #include "frontier/detail/subtree_data.h"
 
 namespace frontier {
+namespace {
+
+bool finiteNonEmptyBounds(const AABB& bounds)
+{
+    return bounds.mn.x <= bounds.mx.x &&
+           bounds.mn.y <= bounds.mx.y &&
+           bounds.mn.z <= bounds.mx.z &&
+           bounds.mx.x - bounds.mn.x < FLT_MAX &&
+           bounds.mx.y - bounds.mn.y < FLT_MAX &&
+           bounds.mx.z - bounds.mn.z < FLT_MAX;
+}
+
+} // namespace
 
 void SubtreeBuilder::reserve(uint32_t nodeCount)
 {
     FRONTIER_CHECK(!built_, "SubtreeBuilder: builder already consumed");
+    FRONTIER_CHECK(nodeCount < detail::kMaxSubtreeNodes,
+                   "SubtreeBuilder: node-count limit exceeded");
     nodes_.reserve(nodeCount);
     roots_.reserve(std::min(nodeCount, detail::kMaxChildren));
 }
@@ -26,14 +41,27 @@ SubtreeBuilder::NodeId SubtreeBuilder::createNode(NodeId parent,
 {
     using namespace detail;
     FRONTIER_CHECK(!built_, "SubtreeBuilder: builder already consumed");
+    FRONTIER_CHECK(nodes_.size() < detail::kMaxSubtreeNodes - 1,
+                   "SubtreeBuilder: node-count limit exceeded");
     FRONTIER_CHECK(parent == kInvalidIndex || parent < nodes_.size(),
                    "SubtreeBuilder: invalid parent");
     FRONTIER_CHECK(node.geometricError >= 0.0f &&
                        std::isfinite(node.geometricError),
                    "SubtreeBuilder: invalid geometric error");
+    FRONTIER_CHECK((node.flags & ~uint32_t(NodeDesc::FlagMountable)) == 0,
+                   "SubtreeBuilder: unknown node flags");
     if (parent != kInvalidIndex)
+    {
         FRONTIER_CHECK(!nodes_[parent].mountable(),
                        "SubtreeBuilder: mountable node must stay a leaf");
+        FRONTIER_CHECK(nodes_[parent].childCount() < kMaxChildren,
+                       "SubtreeBuilder: fanout exceeds limit");
+    }
+    else
+    {
+        FRONTIER_CHECK(roots_.size() < kMaxChildren,
+                       "SubtreeBuilder: too many top-level nodes");
+    }
 
     BuildNode built;
     built.bounds = node.bounds;
@@ -46,8 +74,6 @@ SubtreeBuilder::NodeId SubtreeBuilder::createNode(NodeId parent,
     if (parent == kInvalidIndex)
     {
         roots_.push_back(id);
-        FRONTIER_CHECK(roots_.size() <= kMaxChildren,
-                       "SubtreeBuilder: too many top-level nodes");
     }
     else
     {
@@ -58,8 +84,8 @@ SubtreeBuilder::NodeId SubtreeBuilder::createNode(NodeId parent,
             nodes_[owner.lastChild].nextSibling = id;
         owner.lastChild = id;
         const uint32_t childCount = owner.childCount() + 1;
-        FRONTIER_CHECK(childCount <= kMaxChildren,
-                       "SubtreeBuilder: fanout exceeds limit");
+        FRONTIER_ASSERT(childCount <= kMaxChildren,
+                        "builder fanout preflight failed");
         owner.setChildCount(childCount);
     }
     return id;
@@ -69,8 +95,8 @@ SubtreeBytes SubtreeBuilder::build(const FrontierContext& context)
 {
     using namespace detail;
     FRONTIER_CHECK(!built_, "SubtreeBuilder: builder already consumed");
-    built_ = true;
     FRONTIER_CHECK(!roots_.empty(), "SubtreeBuilder: subtree has no nodes");
+    built_ = true;
 
     const uint32_t total = uint32_t(nodes_.size()) + 1;
     uint64_t wideCount64 = (roots_.size() + kWide - 1) / kWide;
@@ -104,6 +130,7 @@ SubtreeBytes SubtreeBuilder::build(const FrontierContext& context)
     header->subtreeSizeOffset = layout.subtreeSize;
     header->metaOffset = layout.meta;
     header->errorOffset = layout.error;
+    header->branchingFactor = kWide;
 
     auto* wide = reinterpret_cast<WideBlock*>(base + layout.wide);
     auto* blockMask = reinterpret_cast<uint32_t*>(base + layout.mask);
@@ -170,8 +197,8 @@ SubtreeBytes SubtreeBuilder::build(const FrontierContext& context)
         bbox[parent[i]].expand(bbox[i]);
     }
     for (uint32_t i = 1; i < total; ++i)
-        FRONTIER_CHECK(!bbox[i].isEmpty(),
-                       "SubtreeBuilder: leaf node without bounds");
+        FRONTIER_CHECK(finiteNonEmptyBounds(bbox[i]),
+                       "SubtreeBuilder: empty or non-finite node bounds");
 
     // Clamp error monotonically from the implicit parent down.
     for (uint32_t i = 1; i < total; ++i)

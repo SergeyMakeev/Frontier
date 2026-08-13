@@ -1,5 +1,7 @@
 #include "frontier/config.h"
 
+#include <limits>
+
 #if defined(_WIN32)
   #include <malloc.h>
 #endif
@@ -9,6 +11,10 @@ namespace frontier {
 void* defaultAlloc(size_t bytes, size_t alignment, void*)
 {
     if (bytes == 0) return nullptr;
+    if (alignment < alignof(void*) ||
+        (alignment & (alignment - 1)) != 0 ||
+        bytes > std::numeric_limits<size_t>::max() - (alignment - 1))
+        return nullptr;
 #if defined(_WIN32)
     return _aligned_malloc(bytes, alignment);
 #else

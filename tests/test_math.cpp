@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <limits>
 
 #include "frontier/math.h"
 #include "deterministic_rng.h"
@@ -65,6 +66,14 @@ TEST(Aabb, DistanceToBox)
     EXPECT_FLOAT_EQ(distanceToBox(b, float4::point(3, 0, 0)), 2.0f);      // face
     EXPECT_FLOAT_EQ(distanceToBox(b, float4::point(4, 5, 1)),
                     std::sqrt(9.0f + 16.0f));                             // edge
+}
+
+TEST(Aabb, EmptyDetectionChecksEveryAxis)
+{
+    EXPECT_TRUE(AABB::fromMinMax(float4::vec(0, 1, 0),
+                                 float4::vec(1, 0, 1)).isEmpty());
+    EXPECT_TRUE(AABB::fromMinMax(float4::vec(0, 0, 1),
+                                 float4::vec(1, 1, 0)).isEmpty());
 }
 
 TEST(Aabb, SquaredWideMatchesScalarEnvelopes)
@@ -193,7 +202,7 @@ TEST(Frustum, WideMatchesScalarOnDegenerateBoxes)
     const Camera v = makeLookAtCamera(float4::point(0, 0, -10), float4::point(0, 0, 0));
 
     WideBounds wb = WideBounds::allEmpty();
-    AABB boxes[kWide] = {
+    const AABB cases[8] = {
         AABB::fromCenterExtent(float4::vec(0, 0, 0), float4::vec(0, 0, 0)),        // point in view
         AABB::fromCenterExtent(float4::vec(0, 0, -100), float4::vec(0, 0, 0)),     // point behind
         AABB::fromCenterExtent(float4::vec(0, 0, -10), float4::vec(0, 0, 0)),      // point at camera
@@ -203,7 +212,12 @@ TEST(Frustum, WideMatchesScalarOnDegenerateBoxes)
         AABB::fromCenterExtent(float4::vec(0, 0, 0), float4::vec(1e-20f, 1e-20f, 1e-20f)),
         AABB::fromCenterExtent(float4::vec(1e7f, 1e7f, 1e7f), float4::vec(1, 1, 1)),
     };
-    for (uint32_t l = 0; l < kWide; ++l) wb.setLane(l, boxes[l]);
+    AABB boxes[kWide];
+    for (uint32_t l = 0; l < kWide; ++l)
+    {
+        boxes[l] = cases[l];
+        wb.setLane(l, boxes[l]);
+    }
 
     uint8_t outMasks[kWide];
     const uint32_t survivors = testWideAabb(wb, v.frustum, kAllPlanes, outMasks);
@@ -218,10 +232,10 @@ TEST(Frustum, WideMatchesScalarOnDegenerateBoxes)
         EXPECT_FLOAT_EQ(dist.v[l], distanceToBox(boxes[l], v.pos)) << "lane " << l;
     }
     // Camera inside a box: distance saturates to zero, never negative/NaN.
-    EXPECT_FLOAT_EQ(distanceToBox(boxes[4], v.pos), 0.0f);
+    EXPECT_FLOAT_EQ(distanceToBox(boxes[2], v.pos), 0.0f);
 }
 
-TEST(ScreenError, Wide8MatchesScalarFuzz)
+TEST(ScreenError, WideMatchesScalarFuzz)
 {
     DeterministicRng rng(31337);
     DeterministicUniformFloat errDist(0.0f, 1.0e5f);
@@ -302,4 +316,30 @@ TEST(Camera, LocalTransformIsScaleInvariant)
     const float errWorld = screenError(ge * scale, v.k, distanceToBox(worldBox, v.pos));
     const float errLocal = screenError(ge, local.k, distanceToBox(localBox, local.pos));
     EXPECT_NEAR(errWorld, errLocal, 1e-3f * errWorld);
+}
+
+TEST(Camera, DamperConstructorNormalizesInvalidHalfLife)
+{
+    CameraDamper negative(-4.0f);
+    CameraDamper notANumber(std::numeric_limits<float>::quiet_NaN());
+    CameraDamper infinite(std::numeric_limits<float>::infinity());
+    EXPECT_FLOAT_EQ(negative.halfLife(), 0.0f);
+    EXPECT_FLOAT_EQ(notANumber.halfLife(), 0.0f);
+    EXPECT_FLOAT_EQ(infinite.halfLife(), 0.0f);
+    EXPECT_EQ(sizeof(CameraDamper), 48u);
+}
+
+TEST(Camera, PointerHelpersRejectNullInput)
+{
+    EXPECT_THROW(float4x4::fromMemory(nullptr), std::logic_error);
+    EXPECT_THROW(float4x4{}.coeffs(4), std::logic_error);
+    EXPECT_THROW(cameraFromViewProjection(nullptr, {}, 1080.0f, 1.0f),
+                 std::logic_error);
+    EXPECT_THROW(cameraFromPlanes(nullptr, {}, 1.0f), std::logic_error);
+
+    const float4x4 matrix{};
+    EXPECT_THROW(cameraFromViewProjection(
+                     matrix, {}, 1080.0f, 1.0f,
+                     static_cast<ClipRange>(255)),
+                 std::logic_error);
 }

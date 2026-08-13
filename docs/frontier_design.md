@@ -124,7 +124,8 @@ Expected asynchronous races are non-fatal:
 - unmounting/removing an already stale handle does nothing.
 
 Incorrect live operations remain contract failures: invalid transform,
-non-mountable parent, duplicate child, or bound escape.
+non-mountable parent, duplicate child, cross-instance bounds access, or bound
+escape.
 
 ## 9. TLAS contracts
 
@@ -172,9 +173,9 @@ after all placements are gone.
 | Operation | Expected cost |
 |---|---:|
 | build definition | O(nodes) |
-| register definition | O(nodes) validation plus O(nodes / 64) readiness initialization |
+| register definition | default: O(nodes + wide blocks) validation; `FRONTIER_VALIDATE_SUBTREES=0`: O(1) trusted registration |
 | release unused definition | O(1), excluding allocator cost |
-| mount | O(nodes) for coverage initialization |
+| mount | O(definition nodes) on its first mount; O(1) for later childless placements; the first nested child copies its owner's coverage state |
 | unmount mounted tree | O(placements removed) |
 | node readiness change | placements of one definition and ancestor paths until stable |
 | submit bound change | O(1) |

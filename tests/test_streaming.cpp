@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
 
+#include <array>
+
 #include "helpers.h"
 
 using namespace frontier;
@@ -65,6 +67,52 @@ TEST(Streaming, QueryOwnsOptionalRetentionFeedback)
     database.applyUpdates();
     CollectResult collected = database.collect(0, 1);
     EXPECT_EQ(collected.unmountedSubtrees, 1u);
+    EXPECT_EQ(database.mountedSubtreeCount(), 0u);
+}
+
+TEST(Streaming, MixedDatabaseCollectionFailureDoesNotConsumeEarlierFeedback)
+{
+    SpatialDatabase first;
+    const SubtreeHandle subtree =
+        first.registerSubtree(makeLodSubtree());
+    instantiateFor(first, subtree, box(5.0f), 64.0f);
+
+    SpatialQuery firstQuery;
+    firstQuery.setMountUsageEnabled(true);
+    (void)select(first, firstQuery, cameraAt(-8),
+                 SelectionParams{.threshold = 1.0f});
+
+    SpatialDatabase second;
+    second.instantiate(node(100, 0.0f, box()));
+    SpatialQuery foreignQuery;
+    (void)select(second, foreignQuery, cameraAt());
+
+    std::array<SpatialQuery*, 2> mixed{&firstQuery, &foreignQuery};
+    EXPECT_THROW(first.collect(mixed, 0, 1), std::logic_error);
+
+    // The first query's touch must still be pending after the failed batch.
+    // Consuming it now keeps the just-used mount alive for this frame.
+    const CollectResult result = first.collect(firstQuery, 0, 1);
+    EXPECT_EQ(result.unmountedSubtrees, 0u);
+    EXPECT_EQ(first.mountedSubtreeCount(), 1u);
+}
+
+TEST(Streaming, ResetMountUsageDropsUnconsumedRetentionFeedback)
+{
+    SpatialDatabase database;
+    const SubtreeHandle subtree =
+        database.registerSubtree(makeLodSubtree());
+    instantiateFor(database, subtree, box(5.0f), 64.0f);
+
+    SpatialQuery query;
+    query.setMountUsageEnabled(true);
+    (void)select(database, query, cameraAt(-8),
+                 SelectionParams{.threshold = 1.0f});
+    query.resetMountUsage();
+    database.applyUpdates();
+
+    const CollectResult result = database.collect(query, 0, 1);
+    EXPECT_EQ(result.unmountedSubtrees, 1u);
     EXPECT_EQ(database.mountedSubtreeCount(), 0u);
 }
 

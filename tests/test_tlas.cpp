@@ -90,3 +90,47 @@ TEST(Tlas, StaleInstanceHandleCannotMoveReusedSlot)
     EXPECT_NEAR(TestAccess::instanceBounds(database, live).center().x,
                 0.0f, 0.001f);
 }
+
+TEST(Tlas, EveryQualityTierReturnsTheSameVisibleSet)
+{
+    constexpr uint32_t count = 1200;
+    std::vector<UserPayload> reference;
+    for (const TlasQuality quality : {TlasQuality::Morton,
+                                      TlasQuality::Median,
+                                      TlasQuality::BinnedSAH})
+    {
+        SpatialDatabaseConfig config;
+        config.tlasQuality = quality;
+        SpatialDatabase database(config);
+        for (uint32_t i = 0; i < count; ++i)
+        {
+            InstanceDesc desc;
+            desc.pos = float4::point(
+                float(int((i * 37) % 101) - 50),
+                float(int((i * 53) % 97) - 48), 0.0f);
+            database.instantiate(node(1000 + i, 0.0f, box(0.1f)), desc);
+        }
+
+        SpatialQuery query;
+        const std::vector<UserPayload> selected = payloads(
+            database, select(database, query, cameraAt(-1000.0f)), false);
+        ASSERT_EQ(selected.size(), count);
+        if (reference.empty())
+            reference = selected;
+        else
+            EXPECT_EQ(selected, reference);
+    }
+}
+
+TEST(Tlas, CoincidentCentroidsStillBuildACompleteTree)
+{
+    SpatialDatabase database;
+    constexpr uint32_t count = 128;
+    for (uint32_t i = 0; i < count; ++i)
+        database.instantiate(node(1000 + i, 0.0f, box()));
+
+    SpatialQuery query;
+    const FrontierResultView result =
+        select(database, query, cameraAt(-1000.0f));
+    EXPECT_EQ(result.shared.size(), count);
+}

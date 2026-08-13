@@ -10,6 +10,11 @@ if defined FRONTIER_ALL_PERF_BUILD_DIR (
 ) else (
     set "BUILD_DIR=%ROOT%\build-perf-report"
 )
+if defined FRONTIER_ALL_TEST_BUILD_DIR (
+    set "TEST_BUILD_DIR=%FRONTIER_ALL_TEST_BUILD_DIR%"
+) else (
+    set "TEST_BUILD_DIR=%BUILD_DIR%-unit-debug"
+)
 if defined FRONTIER_PERF_REPORT_ROOT (
     set "REPORT_ROOT=%FRONTIER_PERF_REPORT_ROOT%"
 ) else (
@@ -96,7 +101,7 @@ powercfg /getactivescheme >> "%REPORT_DIR%\hardware.txt" 2>&1
 
 (
     echo Correctness:
-    echo   ctest --test-dir ^<build^> -C Release --output-on-failure
+    echo   ctest --test-dir ^<unit-build^> -C Debug --output-on-failure
     echo.
     echo Real world:
     echo   frontier_bench
@@ -124,23 +129,64 @@ if not exist "%BUILD_DIR%\CMakeCache.txt" (
     where ninja >nul 2>nul
     if not errorlevel 1 set "GENERATOR_ARGS=-G Ninja"
 )
+set "TEST_GENERATOR_ARGS="
+if not exist "%TEST_BUILD_DIR%\CMakeCache.txt" (
+    where ninja >nul 2>nul
+    if not errorlevel 1 set "TEST_GENERATOR_ARGS=-G Ninja"
+)
 
-set "FAILURE_STAGE=configure"
-echo Configuring Release AVX2 build...
+set "FAILURE_STAGE=configure-unit-tests"
+echo Configuring Debug unit tests ^(BVH4 + BVH8^)...
+cmake -S "%ROOT%" -B "%TEST_BUILD_DIR%" !TEST_GENERATOR_ARGS! ^
+    -DCMAKE_BUILD_TYPE=Debug ^
+    -DFRONTIER_BUILD_TESTS=ON ^
+    -DFRONTIER_BUILD_BENCH=OFF ^
+    -DFRONTIER_AVX2=ON ^
+    -DFRONTIER_BVH_WIDTH=AUTO ^
+    -DFRONTIER_FORCE_SCALAR=OFF ^
+    -DFRONTIER_STATS=OFF ^
+    -DFRONTIER_CONTRACT_CHECKS=ON ^
+    -DFRONTIER_VALIDATE_SUBTREES=ON > "%REPORT_DIR%\configure-tests.log" 2>&1
+set "RUN_RC=!errorlevel!"
+type "%REPORT_DIR%\configure-tests.log"
+if not "!RUN_RC!"=="0" goto package
+
+set "FAILURE_STAGE=build-unit-tests"
+echo Building Debug unit tests...
+cmake --build "%TEST_BUILD_DIR%" --config Debug --parallel ^
+    --target frontier_unit_tests > "%REPORT_DIR%\build-tests.log" 2>&1
+set "RUN_RC=!errorlevel!"
+type "%REPORT_DIR%\build-tests.log"
+if not "!RUN_RC!"=="0" goto package
+
+set "FAILURE_STAGE=correctness-tests"
+echo Running Debug correctness tests...
+ctest --test-dir "%TEST_BUILD_DIR%" -C Debug --output-on-failure > "%REPORT_DIR%\tests.log" 2>&1
+set "RUN_RC=!errorlevel!"
+type "%REPORT_DIR%\tests.log"
+if not "!RUN_RC!"=="0" goto package
+
+set "FAILURE_STAGE=configure-performance"
+echo Configuring unchecked Release AVX2 performance build...
 cmake -S "%ROOT%" -B "%BUILD_DIR%" !GENERATOR_ARGS! ^
     -DCMAKE_BUILD_TYPE=Release ^
-    -DFRONTIER_BUILD_TESTS=ON ^
+    -DFRONTIER_IPO=ON ^
+    -DFRONTIER_BUILD_TESTS=OFF ^
     -DFRONTIER_BUILD_BENCH=ON ^
     -DFRONTIER_AVX2=ON ^
-    -DFRONTIER_FORCE_SCALAR=OFF > "%REPORT_DIR%\configure.log" 2>&1
+    -DFRONTIER_BVH_WIDTH=AUTO ^
+    -DFRONTIER_FORCE_SCALAR=OFF ^
+    -DFRONTIER_STATS=OFF ^
+    -DFRONTIER_CONTRACT_CHECKS=OFF ^
+    -DFRONTIER_VALIDATE_SUBTREES=OFF > "%REPORT_DIR%\configure.log" 2>&1
 set "RUN_RC=!errorlevel!"
 type "%REPORT_DIR%\configure.log"
 if not "!RUN_RC!"=="0" goto package
 
-set "FAILURE_STAGE=build"
-echo Building tests and performance executables...
+set "FAILURE_STAGE=build-performance"
+echo Building performance executables...
 cmake --build "%BUILD_DIR%" --config Release --parallel ^
-    --target frontier_tests frontier_bench frontier_machine_bench > "%REPORT_DIR%\build.log" 2>&1
+    --target frontier_bench frontier_machine_bench > "%REPORT_DIR%\build.log" 2>&1
 set "RUN_RC=!errorlevel!"
 type "%REPORT_DIR%\build.log"
 if not "!RUN_RC!"=="0" goto package
@@ -165,15 +211,8 @@ if not exist "%MACHINE_EXE%" (
     echo.
     git --version
     echo.
-    findstr /R /B "CMAKE_BUILD_TYPE: CMAKE_CXX_COMPILER: CMAKE_CXX_COMPILER_ID: CMAKE_CXX_COMPILER_VERSION: CMAKE_GENERATOR: CMAKE_OSX_ARCHITECTURES: FRONTIER_AVX2: FRONTIER_FORCE_SCALAR:" "%BUILD_DIR%\CMakeCache.txt"
+    findstr /R /B "CMAKE_BUILD_TYPE: CMAKE_CXX_COMPILER: CMAKE_CXX_COMPILER_ID: CMAKE_CXX_COMPILER_VERSION: CMAKE_GENERATOR: CMAKE_OSX_ARCHITECTURES: FRONTIER_AVX2: FRONTIER_BVH_WIDTH: FRONTIER_CONTRACT_CHECKS: FRONTIER_FORCE_SCALAR: FRONTIER_IPO: FRONTIER_STATS: FRONTIER_VALIDATE_SUBTREES:" "%BUILD_DIR%\CMakeCache.txt"
 ) > "%REPORT_DIR%\toolchain.txt" 2>&1
-
-set "FAILURE_STAGE=correctness-tests"
-echo Running correctness tests...
-ctest --test-dir "%BUILD_DIR%" -C Release --output-on-failure > "%REPORT_DIR%\tests.log" 2>&1
-set "RUN_RC=!errorlevel!"
-type "%REPORT_DIR%\tests.log"
-if not "!RUN_RC!"=="0" goto package
 
 set "FAILURE_STAGE=real-world-benchmarks"
 echo Running real-world performance suite...
@@ -243,14 +282,15 @@ for /f "delims=" %%I in ('git -c "safe.directory=%GIT_ROOT%" -C "%ROOT%" status 
     echo - CPU affinity: scheduler default
     echo - Workload RNG: %RNG_POLICY%
     echo - Benchmark order: registration order
-    echo - Build: Release
+    echo - Unit-test build: Debug
+    echo - Performance build: Release, contract checks and subtree validation disabled
     echo.
     echo ## Result files
     echo.
     echo - real_world_perf.json: end-to-end subtree assembly workloads
     echo - machine_perf.json: ALU, SIMD, branch, cache, latency, and bandwidth probes
     echo - arch_kernel_perf.json: focused production-kernel probes with longer sampling
-    echo - tests.log: correctness-suite result
+    echo - tests.log: Debug BVH4 + BVH8 correctness-suite result
     echo - hardware.txt: CPU, memory, topology, OS, and power information
     echo - toolchain.txt: compiler, CMake, and build configuration
     echo - source.txt: exact Git revision and working-tree state
@@ -271,7 +311,8 @@ for /f "delims=" %%I in ('git -c "safe.directory=%GIT_ROOT%" -C "%ROOT%" status 
     echo git_dirty=%GIT_DIRTY%
     echo host_os=Windows
     echo host_arch=%PROCESSOR_ARCHITECTURE%
-    echo build_type=Release
+    echo unit_build_type=Debug
+    echo perf_build_type=Release
     echo affinity=scheduler-default
     echo rng_policy=%RNG_POLICY%
     echo benchmark_order=registration-order

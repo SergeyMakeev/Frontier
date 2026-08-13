@@ -1,19 +1,21 @@
 #pragma once
-// Permanent renderable roots live directly in an 8-wide TLAS. Reusable
+// Permanent renderable roots live directly in a build-configured BVH4/BVH8
+// TLAS. Reusable
 // immutable subtree definitions mount only beneath those roots or beneath
 // renderable mountable nodes in another mounted subtree. Single-node objects
 // therefore allocate no hierarchy storage, while deep assemblies share their
 // immutable topology, payload, error, and authored-bound data.
 //
 // Runtime operations are generation-stamped and handle-based. NodeHandle
-// values come from frontier entries or retained assembly state;
+// values come from frontier entries or InstanceHandle::rootNode();
 // SubtreeHandle names registered bytes; SubtreeInstanceHandle names one
 // mounted placement; and InstanceHandle names one permanent TLAS root.
 //
 // SpatialDatabase updates are single-writer. applyUpdates() publishes a stable snapshot;
 // SpatialQuery::selectFrontier then reads only that snapshot and may run concurrently when
 // each call has its own SpatialQuery and outputs. LOD damping, frontier reuse, query scratch,
-// and selection statistics all live in the SpatialQuery, never as mutable SpatialDatabase state.
+// and optional selection statistics live in the SpatialQuery, never as mutable
+// SpatialDatabase state.
 
 #include <cstddef>
 #include <cstdint>
@@ -21,10 +23,11 @@
 #include <iterator>
 #include <memory>
 #include <span>
+#include <type_traits>
 #include <vector>
 
-#include "append_buffer.h"
 #include "config.h"
+#include "detail/append_buffer.h"
 #include "detail/subtree_data.h"
 #include "math.h"
 #include "node.h"
@@ -40,7 +43,8 @@ struct SubtreeHandle
 {
     uint32_t slot = kInvalidIndex;
     uint32_t generation = 0;
-    bool valid() const { return slot != kInvalidIndex; }
+    constexpr bool valid() const noexcept { return slot != kInvalidIndex; }
+    friend constexpr bool operator==(SubtreeHandle, SubtreeHandle) = default;
 };
 static_assert(sizeof(SubtreeHandle) == 8, "SubtreeHandle must stay 64 bits");
 
@@ -49,7 +53,9 @@ struct SubtreeInstanceHandle
 {
     uint32_t slot = kInvalidIndex;
     uint32_t generation = 0;
-    bool valid() const { return slot != kInvalidIndex; }
+    constexpr bool valid() const noexcept { return slot != kInvalidIndex; }
+    friend constexpr bool operator==(SubtreeInstanceHandle,
+                                     SubtreeInstanceHandle) = default;
 };
 static_assert(sizeof(SubtreeInstanceHandle) == 8,
               "SubtreeInstanceHandle must stay 64 bits");
@@ -133,11 +139,12 @@ struct InstanceHandle
     InstanceId id = kInvalidInstanceId;
     uint32_t generation = 0;
 
-    bool valid() const { return id != kInvalidInstanceId; }
-    NodeHandle rootNode() const
+    constexpr bool valid() const noexcept { return id != kInvalidInstanceId; }
+    constexpr NodeHandle rootNode() const noexcept
     {
         return valid() ? NodeHandle::tlasRoot(id, generation) : NodeHandle{};
     }
+    friend constexpr bool operator==(InstanceHandle, InstanceHandle) = default;
 };
 static_assert(sizeof(InstanceHandle) == 8,
               "InstanceHandle must stay 64 bits");
@@ -415,6 +422,9 @@ struct InstanceDesc
 template <class T>
 class Sink
 {
+    static_assert(std::is_trivially_copyable_v<T>,
+                  "Sink requires trivially copyable values");
+
 public:
     Sink() = default;
 
@@ -465,9 +475,9 @@ private:
     friend class SpatialDatabase;
 
     // Internal growable sink. Public callers see only fixed spans.
-    explicit Sink(AppendBuffer<T>& v) : vec_(&v) { v.clear(); }
+    explicit Sink(detail::AppendBuffer<T>& v) : vec_(&v) { v.clear(); }
 
-    AppendBuffer<T>* vec_ = nullptr;
+    detail::AppendBuffer<T>* vec_ = nullptr;
     T*              data_ = nullptr;
     uint32_t        capacity_ = 0;
     uint32_t        count_ = 0;
@@ -612,12 +622,24 @@ public:
     uint32_t walked() const { return walked_; }
 
     // Counters from this SpatialQuery's last call. Per-query ownership keeps
-    // concurrent queries from racing over a global "last selection" value.
-    const SelectionStats& lastSelectionStats() const { return stats_; }
+    // concurrent instrumented queries from racing over a global value.
+    // Non-instrumented builds return one immutable zero value and store no
+    // otherwise-dead counters in every query.
+    const SelectionStats& lastSelectionStats() const
+    {
+#ifdef FRONTIER_STATS
+        return stats_;
+#else
+        static const SelectionStats empty{};
+        return empty;
+#endif
+    }
 
-    // Cached selection is the default. Disable it for highly dynamic queries
-    // that prefer the internally parallel uncached traversal. Changing modes
-    // resets accumulated damping and reuse state but retains allocations.
+    // Cached hierarchical selection is the default. All-flat TLAS snapshots
+    // use the direct path automatically because they have no hierarchy walk
+    // to cache. Disable reuse for highly dynamic hierarchical queries that
+    // prefer the internally parallel uncached traversal. Changing modes resets
+    // accumulated damping and reuse state but retains allocations.
     bool reuseEnabled() const { return reuseEnabled_; }
     void setReuseEnabled(bool enabled);
 
@@ -756,16 +778,12 @@ private:
     std::vector<RecCold>  recCold_;  // miss/compaction state, by InstanceId
     // Allocated only after a cacheable walk actually needs two dependencies.
     // Ordinary selection coalesces a whole mounted tree to its root stamp.
-    AppendBuffer<SecondDep> secondDep_;
+    detail::AppendBuffer<SecondDep> secondDep_;
     // Sparse: allocated only for cacheable frontiers whose bucket counts do
     // not fit the inline 10-bit fields.
-    AppendBuffer<OverflowCounts> overflowCounts_;
-    AppendBuffer<uint32_t> freeOverflowCounts_;
-    AppendBuffer<FrontierEntry> store_;   // slab of recorded runs
-    uint32_t              used_ = 0;
-    uint32_t              garbage_ = 0;
-    uint32_t              instanceLayoutVersion_ = 0;
-
+    detail::AppendBuffer<OverflowCounts> overflowCounts_;
+    detail::AppendBuffer<uint32_t> freeOverflowCounts_;
+    detail::AppendBuffer<FrontierEntry> store_;   // slab of recorded runs
     // Distance the damped query envelope has travelled since this SpatialQuery was
     // created, accumulated per call. kTravel_ similarly accumulates absolute
     // projection-scale motion. A record taken with margin m remains valid
@@ -774,29 +792,35 @@ private:
     // This replaces storing a camera and projection value per instance with
     // two scalar odometers and one per-record slope, keeping hot Rec at 32 bytes.
     // Doubling back is conservative; a teleport consumes the budget at once.
+    float4   lastQmn_{}, lastQmx_{};
     float    travel_ = 0.0f;
     float    kTravel_ = 0.0f;
-    float4   lastQmn_{}, lastQmx_{};
-    bool     primed_ = false;
+    float    k_ = 0.0f;
+    float    bar_ = 0.0f;
+    uint32_t used_ = 0;
+    uint32_t garbage_ = 0;
+    uint32_t instanceLayoutVersion_ = 0;
     // Bumped when the error threshold or current-cut policy changes,
     // invalidating every record in O(1). Projection-scale changes consume
     // kTravel_ instead.
     uint32_t epoch_ = 1;
-    float    k_ = 0.0f, bar_ = 0.0f;
-    CurrentCutPolicy currentCutPolicy_ =
-        CurrentCutPolicy::PreferReadyDescendants;
     uint32_t reused_ = 0;
     uint32_t walked_ = 0;
+#ifdef FRONTIER_STATS
     SelectionStats stats_{};
+#endif
     const SpatialDatabase* database_ = nullptr;
-    bool reuseEnabled_ = true;
-    bool mountUsageEnabled_ = false;
     std::vector<MountUseRec> mountUse_;
     std::vector<uint32_t> dirtyMounts_;
 
     // Mutable query scratch. Opaque so traversal
     // implementation details do not become part of the public API.
     std::unique_ptr<QueryScratch> scratch_;
+    CurrentCutPolicy currentCutPolicy_ =
+        CurrentCutPolicy::PreferReadyDescendants;
+    bool primed_ = false;
+    bool reuseEnabled_ = true;
+    bool mountUsageEnabled_ = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -874,8 +898,10 @@ public:
 
     // ---- reusable definitions ---------------------------------------------
     // Consume one traversal-ready serialized byte array for reuse by any
-    // number of mounted placements. Registration validates and moves the
-    // allocation without deserializing or copying it.
+    // number of mounted placements. Registration moves the allocation without
+    // deserializing or copying it. It performs complete structural validation
+    // by default; FRONTIER_VALIDATE_SUBTREES=0 retains constant-time format
+    // envelope checks for trusted, builder-produced bytes.
     SubtreeHandle registerSubtree(SubtreeBytes&& bytes);
     void          releaseSubtree(SubtreeHandle subtree);
     bool          isSubtree(SubtreeHandle subtree) const;
@@ -916,8 +942,8 @@ public:
         };
         static_assert(sizeof(Slot) == 8, "motion-group slot must stay 8 bytes");
 
-        AppendBuffer<InstanceHandle> instances_;
-        AppendBuffer<Slot> physicalOrder_;
+        detail::AppendBuffer<InstanceHandle> instances_;
+        detail::AppendBuffer<Slot> physicalOrder_;
         uint32_t layoutVersion_ = 0;
         bool physicalOrderValid_ = false;
     };
@@ -991,6 +1017,8 @@ public:
     // nearby overlay data. Ordering is irrelevant to correctness, and SpatialDatabase
     // intentionally does not sort the queue because sorting can cost more
     // than the saved cache misses.
+    // Bounds must also remain finite after every containing mount and instance
+    // transform; deferred refit checks that before publishing a parent bound.
     void setNodeBounds(InstanceHandle instance, NodeHandle node,
                        const AABB& localBounds);
 
@@ -1032,7 +1060,6 @@ public:
 
     // ---- introspection -----------------------------------------------------------
     size_t mountedSubtreeCount() const { return mountedSubtrees_; }
-    size_t streamedSubtreeCount() const { return mountedSubtrees_; }
     uint32_t frame() const { return frame_; }   // published update epoch
 
     // Number of live copy-on-write bounds overlays, and the bytes they hold.
@@ -1237,10 +1264,14 @@ private:
         }
         void addCoveredChild(uint32_t node)
         {
+            FRONTIER_ASSERT(coveredChildCount(node) < detail::kMaxChildren,
+                            "covered-child count overflow");
             nodeState[node] += 1u << kCoveredChildShift;
         }
         void removeCoveredChild(uint32_t node)
         {
+            FRONTIER_ASSERT(coveredChildCount(node) != 0,
+                            "covered-child count underflow");
             nodeState[node] -= 1u << kCoveredChildShift;
         }
         bool inUse() const { return definition != kInvalidIndex; }
@@ -1287,8 +1318,18 @@ private:
                 (lruLinksAndGeneration & ~mask) | encoded;
         }
         uint32_t mountedChildSubtrees() const { return mountedChildren; }
-        void addMountedChild() { ++mountedChildren; }
-        void removeMountedChild() { --mountedChildren; }
+        void addMountedChild()
+        {
+            FRONTIER_ASSERT(mountedChildren != UINT32_MAX,
+                            "mounted-child count overflow");
+            ++mountedChildren;
+        }
+        void removeMountedChild()
+        {
+            FRONTIER_ASSERT(mountedChildren != 0,
+                            "mounted-child count underflow");
+            --mountedChildren;
+        }
     };
     static_assert(sizeof(SubtreeInstanceRt) == 56,
                   "subtree-instance state must stay 56 bytes");
@@ -1323,15 +1364,15 @@ private:
         }
         void addIncompleteChild()
         {
-            FRONTIER_CHECK(incompleteChildren() != kIncompleteMask,
-                           "mount readiness child count overflow");
+            FRONTIER_ASSERT(incompleteChildren() != kIncompleteMask,
+                            "mount readiness child count overflow");
             ++incompleteChildrenAndReady;
             setFullyReady(false);
         }
         void removeIncompleteChild()
         {
-            FRONTIER_CHECK(incompleteChildren() != 0,
-                           "mount readiness child count underflow");
+            FRONTIER_ASSERT(incompleteChildren() != 0,
+                            "mount readiness child count underflow");
             --incompleteChildrenAndReady;
         }
     };
@@ -1360,7 +1401,11 @@ private:
         bool inUse() const { return slot != kInvalidIndex; }
         bool sparseWide() const { return !widePatch.empty(); }
     };
-    static_assert(sizeof(Overlay) == 104, "bounds overlay header must stay 104 bytes");
+#ifdef NDEBUG
+    // MSVC's checked Debug iterators intentionally enlarge std::vector.
+    static_assert(sizeof(Overlay) == 104,
+                  "bounds overlay header must stay 104 bytes");
+#endif
 
     // (mount slot -> overlay index), kept sorted by slot on each instance so
     // the traversal can binary search it. Empty for undeformed instances,
@@ -1376,8 +1421,10 @@ private:
     {
         std::vector<OverlayRef> refs;   // sorted by mount slot
     };
+#ifdef NDEBUG
     static_assert(sizeof(OverlayList) == 24,
                   "cold overlay-list header must stay 24 bytes");
+#endif
 
     // Instance transform and its derived exact world bound are updated
     // together, so selection and TLAS-edit state share one spatially ordered
@@ -1453,11 +1500,15 @@ private:
         }
 
         uint32_t tlasNode() const { return tlasPlacement & kInstanceIdMask; }
-        uint32_t tlasLane() const { return (tlasPlacement >> 24) & 7u; }
+        uint32_t tlasLane() const
+        {
+            return (tlasPlacement >> 24) & (kWide - 1u);
+        }
         bool escapedSinceBuild() const { return (tlasPlacement & (1u << 27)) != 0; }
         void setTlasPlacement(uint32_t node, uint32_t lane)
         {
-            tlasPlacement = (node & kInstanceIdMask) | ((lane & 7u) << 24);
+            tlasPlacement = (node & kInstanceIdMask) |
+                            ((lane & (kWide - 1u)) << 24);
         }
         void clearTlasPlacement() { tlasPlacement = kInvalidInstanceId; }
         void setEscapedSinceBuild(bool escaped)
@@ -1478,15 +1529,14 @@ private:
     void reorderInstancesByTlas();
 
     // Wide top-level BVH node; lanes are children (inner nodes or instances).
-    // Query-hot bounds, links and flags occupy the first four cache lines.
-    // Error/layer metadata follows in the fifth, keeping one predictable AoS
-    // stream for queries that need it while cached queries stop after 256 B.
+    // Query-hot bounds, links and flags occupy two cache lines in BVH4 and
+    // four in BVH8. Error/layer metadata follows in the remaining cache line.
     struct alignas(64) TlasNode
     {
         static constexpr uint32_t kValidLaneMask = (1u << kWide) - 1u;
         WideBounds bounds;
         int32_t    child[kWide];   // >= 0: node index; < 0: instance ~child
-        // Low eight bits mark valid lanes.
+        // Low kWide bits mark valid lanes.
         uint32_t   validMask = 0;
         int32_t    parent = -1;
         float8     maxErr{};
@@ -1502,10 +1552,10 @@ private:
             validMask &= ~(1u << lane);
         }
     };
-    static_assert(offsetof(TlasNode, maxErr) == 256,
-                  "cached TLAS query data must end at four cache lines");
-    static_assert(sizeof(TlasNode) == 320,
-                  "SIMD TLAS node must stay five cache lines");
+    static_assert(offsetof(TlasNode, maxErr) == kWide * 32,
+                  "cached TLAS query data must stay tightly packed");
+    static_assert(sizeof(TlasNode) == (kWide == 8 ? 320 : 192),
+                  "SIMD TLAS node has unexpected padding");
 
     struct TlasItem;
 
@@ -1726,7 +1776,9 @@ private:
         bool trackTouches = false;
         bool uniqueTouches = false;         // SpatialQuery dependency list
         bool coalesceMountTreeDependencies = false;
+#ifdef FRONTIER_STATS
         SelectionStats stats;
+#endif
 
         // Validity-margin tracking for SpatialQuery. Off for every ordinary
         // selection, and the branch is invariant for a whole call.
@@ -1832,7 +1884,6 @@ private:
     void patchParentLane(const detail::SubtreeView& subtree, AABB* bbox,
                          Overlay& overlay,
                          uint32_t index);
-    void refreshInstanceBounds(InstanceId id, bool recomputeError);
 
     InstanceHandle addTlasRootInstance(const NodeDesc& root,
                                        const InstanceDesc& desc);
@@ -1848,7 +1899,6 @@ private:
     void tlasQueryImpl(const Camera& view, float minPix,
                        std::vector<VisibleItem>& outVisible,
                        std::vector<TlasItem>& stack) const;
-    void recomputeInstanceBounds(InstanceId id, bool recomputeError);
     void tlasOnInstanceMoved(InstanceId id);
     void tlasNoteGrowth(float addedArea);
 
@@ -1950,7 +2000,7 @@ private:
     // Packed TLAS-root marker for exact one-node instances; a cold
     // high bit also records the common zero-error case. Keeping this as a
     // lazily allocated compact stream lets mixed forests bypass the 64-byte
-    // Instance and 256-byte WideBlock records for flat objects. Databases that
+    // Instance and wide-block records for flat objects. Databases that
     // have never contained a flat instance allocate no stream at all.
     std::vector<uint32_t> instanceFlatSlots_;
     size_t                flatInstanceCount_ = 0;

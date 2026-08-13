@@ -1,7 +1,7 @@
 #pragma once
 // Minimal SIMD-friendly math for Frontier. float4 is the public vector
-// interface; float8 and WideBounds form the fixed eight-lane working set used
-// by the AVX2, SSE2, NEON, and scalar backends.
+// interface; float8 and WideBounds form the build-configured four- or
+// eight-lane working set used by the AVX2, SSE2, NEON, and scalar backends.
 
 #include <bit>
 #include <cassert>
@@ -33,7 +33,7 @@
 // ---------------------------------------------------------------------------
 
 #if !defined(FRONTIER_FORCE_SCALAR)
-  #if defined(__AVX2__)
+  #if FRONTIER_BVH_WIDTH == 8 && defined(__AVX2__)
     #include <immintrin.h>
     #define FRONTIER_SIMD_AVX2 1
   #elif defined(__aarch64__) || defined(_M_ARM64) || defined(_M_ARM64EC)
@@ -75,7 +75,7 @@ inline float fmadd(float a, float b, float c) { return a * b + c; }
 inline float fmadd(float a, float b, float c) { return std::fma(a, b, c); }
 #endif
 
-inline constexpr uint32_t kWide = 8;   // SIMD width of the wide paths
+inline constexpr uint32_t kWide = FRONTIER_BVH_WIDTH;
 
 // ---------------------------------------------------------------------------
 // float4
@@ -129,6 +129,7 @@ struct alignas(16) float4x4
 
     static float4x4 fromMemory(const float* m16)
     {
+        FRONTIER_CHECK(m16 != nullptr, "float4x4::fromMemory: null matrix");
         float4x4 r;
         for (int i = 0; i < 16; ++i) r.m[i] = m16[i];
         return r;
@@ -138,6 +139,8 @@ struct alignas(16) float4x4
     // clip[c] = dot(coeffs(c), (p.x, p.y, p.z, 1)).
     float4 coeffs(int c) const
     {
+        FRONTIER_CHECK(c >= 0 && c < 4,
+                       "float4x4::coeffs: component out of range");
         return {m[c], m[c + 4], m[c + 8], m[c + 12]};
     }
 };
@@ -148,10 +151,12 @@ static_assert(sizeof(float4) == 16, "frontier::float4 must be 16 bytes");
 static_assert(alignof(float4) >= 16, "frontier::float4 must be 16-byte aligned");
 
 // ---------------------------------------------------------------------------
-// float8 — lane-wise; lanes carry independent values (typically 8 boxes)
+// float8: lane-wise; lanes carry independent values.
 // ---------------------------------------------------------------------------
 
-struct alignas(32) float8
+// The historical name remains source-compatible; the actual lane count is
+// kWide, so a BVH4 build stores one 128-bit vector here.
+struct alignas(kWide * sizeof(float)) float8
 {
     float v[kWide];
 
@@ -221,7 +226,10 @@ struct AABB
     static AABB fromMinMax(float4 lo, float4 hi) { return {lo, hi}; }
     static AABB fromCenterExtent(float4 c, float4 e) { return {c - e, c + e}; }
 
-    bool isEmpty() const { return mn.x > mx.x; }
+    bool isEmpty() const
+    {
+        return mn.x > mx.x || mn.y > mx.y || mn.z > mx.z;
+    }
 
     void expand(const AABB& o)
     {
@@ -317,7 +325,7 @@ inline CullState testAabb(const AABB& b, const Frustum& fr, uint8_t& ioMask)
 }
 
 // ---------------------------------------------------------------------------
-// Wide bounds: 8 boxes, SoA-transposed (lanes = boxes)
+// Wide bounds: kWide boxes, SoA-transposed (lanes = boxes)
 // ---------------------------------------------------------------------------
 
 struct WideBounds
@@ -379,7 +387,7 @@ inline __m128 fmadd4(__m128 a, __m128 b, __m128 c)
 } // namespace detail
 #endif
 
-// Wide masked tri-state: 8 boxes against the planes set in inMask.
+// Wide masked tri-state: kWide boxes against the planes set in inMask.
 // Returns the survivor lane bitmask; outMasks[l] is lane l's narrowed plane
 // mask (valid only for surviving lanes). inMask == 0 means an ancestor was
 // fully inside: every lane survives untested with mask 0.
@@ -438,20 +446,31 @@ inline uint32_t testWideAabb(const WideBounds& b, const Frustum& fr,
     for (uint32_t l = 0; l < kWide; ++l) outMasks[l] = inMask;
     if (!inMask) return (1u << kWide) - 1;
 
-    const float32x4_t mnx[2] = {vld1q_f32(b.mnx.v), vld1q_f32(b.mnx.v + 4)};
-    const float32x4_t mny[2] = {vld1q_f32(b.mny.v), vld1q_f32(b.mny.v + 4)};
-    const float32x4_t mnz[2] = {vld1q_f32(b.mnz.v), vld1q_f32(b.mnz.v + 4)};
-    const float32x4_t mxx[2] = {vld1q_f32(b.mxx.v), vld1q_f32(b.mxx.v + 4)};
-    const float32x4_t mxy[2] = {vld1q_f32(b.mxy.v), vld1q_f32(b.mxy.v + 4)};
-    const float32x4_t mxz[2] = {vld1q_f32(b.mxz.v), vld1q_f32(b.mxz.v + 4)};
+    constexpr uint32_t kSimdGroups = kWide / 4;
+    float32x4_t mnx[kSimdGroups], mny[kSimdGroups], mnz[kSimdGroups];
+    float32x4_t mxx[kSimdGroups], mxy[kSimdGroups], mxz[kSimdGroups];
+    for (uint32_t h = 0; h < kSimdGroups; ++h)
+    {
+        mnx[h] = vld1q_f32(b.mnx.v + 4 * h);
+        mny[h] = vld1q_f32(b.mny.v + 4 * h);
+        mnz[h] = vld1q_f32(b.mnz.v + 4 * h);
+        mxx[h] = vld1q_f32(b.mxx.v + 4 * h);
+        mxy[h] = vld1q_f32(b.mxy.v + 4 * h);
+        mxz[h] = vld1q_f32(b.mxz.v + 4 * h);
+    }
     const float32x4_t zero = vdupq_n_f32(0.0f);
 
     // Keep both survivor state and the narrowed per-lane plane masks in NEON
     // registers for the whole test. Scalarizing every comparison costs a
     // horizontal reduction plus a vector-to-GPR transfer on AArch64; doing it
     // twice per half, per plane, dominated this otherwise compact kernel.
-    uint32x4_t alive[2] = {vdupq_n_u32(~0u), vdupq_n_u32(~0u)};
-    uint32x4_t remaining[2] = {vdupq_n_u32(inMask), vdupq_n_u32(inMask)};
+    uint32x4_t alive[kSimdGroups];
+    uint32x4_t remaining[kSimdGroups];
+    for (uint32_t h = 0; h < kSimdGroups; ++h)
+    {
+        alive[h] = vdupq_n_u32(~0u);
+        remaining[h] = vdupq_n_u32(inMask);
+    }
     for (uint32_t p = 0; p < 6; ++p)
     {
         if (!((inMask >> p) & 1)) continue;
@@ -464,7 +483,7 @@ inline uint32_t testWideAabb(const WideBounds& b, const Frustum& fr,
         const uint32x4_t sy = vcltq_f32(ny, zero);
         const uint32x4_t sz = vcltq_f32(nz, zero);
 
-        for (uint32_t h = 0; h < 2; ++h)
+        for (uint32_t h = 0; h < kSimdGroups; ++h)
         {
             const float32x4_t px = vbslq_f32(sx, mnx[h], mxx[h]);
             const float32x4_t py = vbslq_f32(sy, mny[h], mxy[h]);
@@ -485,11 +504,19 @@ inline uint32_t testWideAabb(const WideBounds& b, const Frustum& fr,
         }
     }
 
+#if FRONTIER_BVH_WIDTH == 8
     const uint16x8_t remaining16 = vcombine_u16(
         vmovn_u32(remaining[0]), vmovn_u32(remaining[1]));
     vst1_u8(outMasks, vmovn_u16(remaining16));
     return detail::movemask4(alive[0]) |
            (detail::movemask4(alive[1]) << 4);
+#else
+    alignas(16) uint32_t remainingLanes[4];
+    vst1q_u32(remainingLanes, remaining[0]);
+    for (uint32_t lane = 0; lane < 4; ++lane)
+        outMasks[lane] = uint8_t(remainingLanes[lane]);
+    return detail::movemask4(alive[0]);
+#endif
 }
 #elif FRONTIER_SIMD_SSE2
 inline uint32_t testWideAabb(const WideBounds& b, const Frustum& fr,
@@ -498,12 +525,18 @@ inline uint32_t testWideAabb(const WideBounds& b, const Frustum& fr,
     for (uint32_t l = 0; l < kWide; ++l) outMasks[l] = inMask;
     if (!inMask) return (1u << kWide) - 1;
 
-    const __m128 mnx[2] = {_mm_load_ps(b.mnx.v), _mm_load_ps(b.mnx.v + 4)};
-    const __m128 mny[2] = {_mm_load_ps(b.mny.v), _mm_load_ps(b.mny.v + 4)};
-    const __m128 mnz[2] = {_mm_load_ps(b.mnz.v), _mm_load_ps(b.mnz.v + 4)};
-    const __m128 mxx[2] = {_mm_load_ps(b.mxx.v), _mm_load_ps(b.mxx.v + 4)};
-    const __m128 mxy[2] = {_mm_load_ps(b.mxy.v), _mm_load_ps(b.mxy.v + 4)};
-    const __m128 mxz[2] = {_mm_load_ps(b.mxz.v), _mm_load_ps(b.mxz.v + 4)};
+    constexpr uint32_t kSimdGroups = kWide / 4;
+    __m128 mnx[kSimdGroups], mny[kSimdGroups], mnz[kSimdGroups];
+    __m128 mxx[kSimdGroups], mxy[kSimdGroups], mxz[kSimdGroups];
+    for (uint32_t h = 0; h < kSimdGroups; ++h)
+    {
+        mnx[h] = _mm_load_ps(b.mnx.v + 4 * h);
+        mny[h] = _mm_load_ps(b.mny.v + 4 * h);
+        mnz[h] = _mm_load_ps(b.mnz.v + 4 * h);
+        mxx[h] = _mm_load_ps(b.mxx.v + 4 * h);
+        mxy[h] = _mm_load_ps(b.mxy.v + 4 * h);
+        mxz[h] = _mm_load_ps(b.mxz.v + 4 * h);
+    }
     const __m128 zero = _mm_setzero_ps();
 
     uint32_t alive = (1u << kWide) - 1;
@@ -518,7 +551,7 @@ inline uint32_t testWideAabb(const WideBounds& b, const Frustum& fr,
         const __m128 sy = _mm_cmplt_ps(ny, zero);
         const __m128 sz = _mm_cmplt_ps(nz, zero);
 
-        for (uint32_t h = 0; h < 2; ++h)
+        for (uint32_t h = 0; h < kSimdGroups; ++h)
         {
             const __m128 px = detail::select4(sx, mnx[h], mxx[h]);
             const __m128 py = detail::select4(sy, mny[h], mxy[h]);
@@ -576,7 +609,7 @@ inline uint32_t testWideAabb(const WideBounds& b, const Frustum& fr,
 }
 #endif
 
-// Wide box-to-box separation, one query box vs 8 boxes; 0 when they overlap.
+// Wide box-to-box separation, one query box vs kWide boxes; 0 when they overlap.
 //
 // This is the same instruction count as the point query it replaces: the two
 // broadcasts differ, nothing else. That is what makes envelope-based LOD
@@ -613,7 +646,7 @@ inline float8 distanceToBoxes(const WideBounds& b, float4 qmn, float4 qmx)
                       hiz = vdupq_n_f32(qmx.z);
     const float32x4_t zero = vdupq_n_f32(0.0f);
     float8 r;
-    for (uint32_t h = 0; h < 2; ++h)
+    for (uint32_t h = 0; h < kWide / 4; ++h)
     {
         const float32x4_t cx = vmaxq_f32(
             vmaxq_f32(vsubq_f32(vld1q_f32(b.mnx.v + 4 * h), hix),
@@ -639,7 +672,7 @@ inline float8 distanceToBoxes(const WideBounds& b, float4 qmn, float4 qmx)
                  hiz = _mm_set1_ps(qmx.z);
     const __m128 zero = _mm_setzero_ps();
     float8 r;
-    for (uint32_t h = 0; h < 2; ++h)
+    for (uint32_t h = 0; h < kWide / 4; ++h)
     {
         const __m128 cx = _mm_max_ps(
             _mm_max_ps(_mm_sub_ps(_mm_load_ps(b.mnx.v + 4 * h), hix),
@@ -781,6 +814,11 @@ inline Camera cameraFromViewProjection(const float* m16, float4 cameraPos,
                                        float viewportHeightPx, float projYScale,
                                        ClipRange range = ClipRange::ZeroToOne)
 {
+    FRONTIER_CHECK(m16 != nullptr,
+                   "cameraFromViewProjection: null matrix");
+    FRONTIER_CHECK(range == ClipRange::ZeroToOne ||
+                       range == ClipRange::MinusOneToOne,
+                   "cameraFromViewProjection: invalid clip range");
     auto coeffs = [&](int c) -> float4
     { return {m16[c], m16[c + 4], m16[c + 8], m16[c + 12]}; };
 
@@ -823,6 +861,7 @@ inline Camera cameraFromViewProjection(const float4x4& viewProj, float4 cameraPo
 // Planes are inward: a point p is inside plane i when dot3(n, p) + w >= 0.
 inline Camera cameraFromPlanes(const float4 planes[6], float4 cameraPos, float errorScaleK)
 {
+    FRONTIER_CHECK(planes != nullptr, "cameraFromPlanes: null plane array");
     Camera v;
     v.pos = cameraPos;
     v.k   = errorScaleK;
@@ -891,7 +930,7 @@ inline float8 screenError8(const float8& geomError, float k, const float8& dist)
 {
     const float32x4_t kk = vdupq_n_f32(k), eps = vdupq_n_f32(1.0e-30f);
     float8 r;
-    for (uint32_t h = 0; h < 2; ++h)
+    for (uint32_t h = 0; h < kWide / 4; ++h)
     {
         const float32x4_t d = vmaxq_f32(vld1q_f32(dist.v + 4 * h), eps);
         const float32x4_t e = vmulq_f32(vld1q_f32(geomError.v + 4 * h), kk);
@@ -904,7 +943,7 @@ inline float8 screenError8(const float8& geomError, float k, const float8& dist)
 {
     const __m128 kk = _mm_set1_ps(k), eps = _mm_set1_ps(1.0e-30f);
     float8 r;
-    for (uint32_t h = 0; h < 2; ++h)
+    for (uint32_t h = 0; h < kWide / 4; ++h)
     {
         const __m128 d = _mm_max_ps(_mm_load_ps(dist.v + 4 * h), eps);
         const __m128 e = _mm_mul_ps(_mm_load_ps(geomError.v + 4 * h), kk);
@@ -984,7 +1023,7 @@ inline float8 distanceToBoxesSq(const WideBounds& b, float4 qmn, float4 qmx)
                       hiz = vdupq_n_f32(qmx.z);
     const float32x4_t zero = vdupq_n_f32(0.0f);
     float8 r;
-    for (uint32_t h = 0; h < 2; ++h)
+    for (uint32_t h = 0; h < kWide / 4; ++h)
     {
         const float32x4_t cx = vmaxq_f32(
             vmaxq_f32(vsubq_f32(vld1q_f32(b.mnx.v + 4 * h), hix),
@@ -1005,20 +1044,16 @@ inline float8 screenErrorFromSq8(const float8& geomError, float k,
                                  const float8& d2)
 {
     const float32x4_t eps = vdupq_n_f32(1.0e-30f);
-    // Issue both independent square roots before their dependent divisions;
-    // this exposes the two 128-bit halves to the out-of-order scheduler.
-    const float32x4_t d0 =
-        vmaxq_f32(vsqrtq_f32(vld1q_f32(d2.v)), eps);
-    const float32x4_t d1 =
-        vmaxq_f32(vsqrtq_f32(vld1q_f32(d2.v + 4)), eps);
     const float32x4_t kk = vdupq_n_f32(k);
-    const float32x4_t e0 =
-        vmulq_f32(vld1q_f32(geomError.v), kk);
-    const float32x4_t e1 =
-        vmulq_f32(vld1q_f32(geomError.v + 4), kk);
     float8 r;
-    vst1q_f32(r.v, vdivq_f32(e0, d0));
-    vst1q_f32(r.v + 4, vdivq_f32(e1, d1));
+    for (uint32_t h = 0; h < kWide / 4; ++h)
+    {
+        const float32x4_t d = vmaxq_f32(
+            vsqrtq_f32(vld1q_f32(d2.v + 4 * h)), eps);
+        const float32x4_t e = vmulq_f32(
+            vld1q_f32(geomError.v + 4 * h), kk);
+        vst1q_f32(r.v + 4 * h, vdivq_f32(e, d));
+    }
     return r;
 }
 #else
@@ -1069,10 +1104,16 @@ class CameraDamper
 {
 public:
     CameraDamper() = default;
-    explicit CameraDamper(float halfLifeFrames) : halfLife_(halfLifeFrames) {}
+    explicit CameraDamper(float halfLifeFrames)
+    {
+        setHalfLife(halfLifeFrames);
+    }
 
     float halfLife() const { return halfLife_; }
-    void  setHalfLife(float frames) { halfLife_ = frames > 0.0f ? frames : 0.0f; }
+    void setHalfLife(float frames)
+    {
+        halfLife_ = frames > 0.0f && std::isfinite(frames) ? frames : 0.0f;
+    }
 
     // Forget the accumulated window. Call on a teleport or camera cut, so the
     // envelope does not stretch across the discontinuity and over-refine
@@ -1110,10 +1151,12 @@ public:
     }
 
 private:
-    float  halfLife_ = 0.0f;
-    bool   primed_   = false;
     float4 mn_{}, mx_{};
+    float  halfLife_ = 0.0f;
     float  kMax_ = 0.0f;
+    bool   primed_ = false;
 };
+static_assert(sizeof(CameraDamper) == 48,
+              "CameraDamper should occupy three SIMD words");
 
 } // namespace frontier

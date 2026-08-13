@@ -6,8 +6,9 @@ movable objects, mounts reusable local hierarchies below them, and accounts for
 render resources that are still streaming.
 
 A bounding-volume hierarchy (BVH) groups spatial bounds so many objects can be
-rejected at once. Frontier's top-level acceleration structure (TLAS) is an
-8-wide, world-space BVH; each TLAS leaf is also a permanent renderable fallback.
+rejected at once. Frontier's top-level acceleration structure (TLAS) is a
+build-configured 4- or 8-wide world-space BVH; each TLAS leaf is also a
+permanent renderable fallback.
 A registered subtree definition is the closest equivalent to a bottom-level
 acceleration structure (BLAS): it stores the reusable local hierarchy, while a
 mount supplies a placement below a renderable node. Frontier does not expose a
@@ -66,13 +67,13 @@ const SubtreeHandle house =
     world.registerSubtree(houseBuilder.build());
 
 SubtreeBuilder cityBuilder;
-const auto leftHouse = cityBuilder.createNode(NodeDesc{
+cityBuilder.createNode(NodeDesc{
     .payload = 10,
     .geometricError = 16.0f,
     .flags = NodeDesc::FlagMountable,
     .bounds = leftHouseBoundsInCity,
 });
-const auto rightHouse = cityBuilder.createNode(NodeDesc{
+cityBuilder.createNode(NodeDesc{
     .payload = 11,
     .geometricError = 16.0f,
     .flags = NodeDesc::FlagMountable,
@@ -87,20 +88,36 @@ const InstanceHandle cityInstance = world.instantiate(NodeDesc{
     .flags = NodeDesc::FlagMountable,
     .bounds = cityBounds,
 });
-const SubtreeInstanceHandle cityPlacement =
-    world.mountSubtree(cityInstance.rootNode(), city);
+world.mountSubtree(cityInstance.rootNode(), city);
+world.applyUpdates();
 
-NodeHandle leftHouseNode = /* retained from frontier/application state */;
-NodeHandle rightHouseNode = /* retained from frontier/application state */;
-world.mountSubtree(leftHouseNode, house,
-                   Transform{leftHousePosition, 1.0f});
-world.mountSubtree(rightHouseNode, house,
-                   Transform{rightHousePosition, 1.0f});
+SpatialQuery query;
+const Camera camera = currentCamera(); // application function
+FrontierResultView cut = query.selectFrontier(world, camera,
+                                               SelectionParams{});
+
+// Mountable runtime nodes are discovered through the ideal frontier. The
+// application payload maps each proxy to its child definition and placement.
+for (const FrontierEntry& entry : cut.ideal()) {
+    UserPayload payload;
+    if (!entry.overThreshold() ||
+        !world.tryGetPayload(entry.nodeHandle, payload) ||
+        world.hasMountedSubtree(entry.nodeHandle))
+        continue;
+
+    if (payload == 10)
+        world.mountSubtree(entry.nodeHandle, house,
+                           Transform{leftHousePosition, 1.0f});
+    else if (payload == 11)
+        world.mountSubtree(entry.nodeHandle, house,
+                           Transform{rightHousePosition, 1.0f});
+}
+world.applyUpdates(); // publish the newly mounted houses
 ```
 
-Runtime `NodeHandle` values normally come from frontier results or retained
-assembly state; builder `NodeId` values are authoring-local and are not runtime
-handles.
+Builder `NodeId` values are authoring-local and are never converted to runtime
+handles. Nested mount points are deliberately discovered as `NodeHandle`
+values in frontier results, then retained while asynchronous loading runs.
 
 `cut.current()` is always a complete render frontier; it iterates `shared`
 followed by `currentOnly` without copying either bucket. `cut.ideal()` similarly
@@ -110,8 +127,7 @@ needed to dispatch a node's payload. It belongs to a node in a registered
 definition and is shared by that node across every placement of the definition.
 Equal payload values in different nodes are independent; applications that use
 them for the same GPU resource may publish readiness to each corresponding
-node.
-Applications decide which definition handle belongs at
+node. Applications decide which definition handle belongs at
 each mountable node; Frontier deliberately stores no content lookup key.
 
 ## Bytes, ownership, and handles
@@ -128,9 +144,14 @@ SubtreeHandle definition = world.registerSubtree(std::move(bytes));
 ```
 
 To load saved data, allocate `SubtreeBytes(fileSize, context)`, read into
-`bytes()`, then move it into `registerSubtree()`. Registration validates and
-takes over the existing allocation; there are no copy and borrowed registration
-variants.
+`bytes()`, then move it into `registerSubtree()`. By default, registration
+validates the complete structure in linear time and takes over the existing
+allocation without unpacking or copying its node arrays; there are no copy and
+borrowed registration variants. Trusted-content builds can configure
+`FRONTIER_VALIDATE_SUBTREES=OFF` to retain only constant-time format-envelope
+checks and remove the structural scan. The performance runners additionally set
+`FRONTIER_CONTRACT_CHECKS=OFF`, which assumes even that envelope is valid and
+must only be used with trusted benchmark inputs.
 
 The public handles are intentionally distinct:
 
@@ -154,21 +175,43 @@ are contract errors routed through `FRONTIER_FATAL`.
 run any number of concurrent reads with distinct `SpatialQuery` objects. All
 reads must finish before the next mutation or collection.
 
-Each query owns damping, reuse records, scratch, output, statistics, and optional
-mount-retention feedback. Enable the latter with
+Each query owns damping, reuse records, scratch, output, optional instrumented
+statistics, and optional mount-retention feedback. Enable the latter with
 `query.setMountUsageEnabled(true)` and pass the query to `collect()` when its
 camera should influence retention.
 
 ## Building
 
 ```sh
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build
-ctest --test-dir build --output-on-failure
+bash ./run_unit_tests.sh  # Debug, checks enabled, BVH4 + BVH8
+bash ./run_perf_bench.sh  # Release, checks/validation disabled, native width
 ```
 
+On Windows, use `run_unit_tests.bat` and `run_perf_bench.bat`.
+
+The full correctness matrix, deterministic torture tests, sanitizer jobs, and
+release verification commands are described in [docs/TESTING.md](docs/TESTING.md).
+
 Important options are `FRONTIER_BUILD_TESTS`, `FRONTIER_BUILD_BENCH`,
-`FRONTIER_AVX2`, and `FRONTIER_FORCE_SCALAR`.
+`FRONTIER_BVH_WIDTH`, `FRONTIER_AVX2`, `FRONTIER_FORCE_SCALAR`,
+`FRONTIER_IPO`, `FRONTIER_STATS`, `FRONTIER_CONTRACT_CHECKS`, and
+`FRONTIER_VALIDATE_SUBTREES`.
+
+`FRONTIER_BVH_WIDTH` accepts `AUTO`, `4`, or `8` and defaults to `AUTO`.
+Automatic selection uses BVH8 with AVX2's eight-lane backend and BVH4 with
+four-lane SSE2/NEON. Forced-scalar builds also default to the compact BVH4
+layout. An explicit `4` or `8` always overrides this policy. Branch width is a
+build-wide layout choice, including serialized subtrees.
+
+On x86-64, `FRONTIER_AVX2=ON` produces an AVX2/FMA-targeted BVH8 binary without
+runtime dispatch. Set it to `OFF` when the executable must run on the SSE2
+baseline or when the host performs its own per-ISA library dispatch. BVH4 uses
+the 128-bit backend and does not require AVX2.
+
+Tests default on only for a standalone Frontier checkout; benchmarks default
+off because they require a separate optimized build. When the project is
+included with `add_subdirectory()`, both default off and the
+`frontier` target propagates its C++20 requirement to consumers.
 
 See the progressive [API guide](docs/API.md) for the integration flow, the
 exhaustive [API reference](docs/API_REFERENCE.md) for exact contracts,

@@ -3,6 +3,7 @@
 #include <bit>
 #include <cstddef>
 #include <cstring>
+#include <limits>
 #include <utility>
 
 #include "frontier/detail/subtree_data.h"
@@ -19,6 +20,10 @@ TEST(NodeDesc, ScalarBoundsRoundTripExactly)
     EXPECT_EQ(alignof(NodeDesc), alignof(UserPayload));
     EXPECT_EQ(offsetof(NodeDesc, flags), 12u);
     EXPECT_EQ(offsetof(NodeDesc, bounds), 16u);
+
+    ScalarAABB inverted = AABB::fromMinMax(float4::vec(0, 1, 0),
+                                           float4::vec(1, 0, 1));
+    EXPECT_TRUE(inverted.isEmpty());
 
     const AABB source = AABB::fromMinMax(
         float4::point(-0.0f, -12345.625f, 1.0e-20f),
@@ -68,6 +73,9 @@ TEST(SubtreeBuilder, BuildsTraversalReadySerializableBytes)
     EXPECT_EQ(reinterpret_cast<uintptr_t>(bytes.data()) %
                   kSubtreeByteAlignment,
               0u);
+    const auto* header = reinterpret_cast<const detail::SubtreeHeader*>(
+        bytes.data());
+    EXPECT_EQ(header->branchingFactor, kWide);
     detail::validateSubtreeBytes(bytes);
     const detail::SubtreeView view = detail::viewSubtreeBytes(bytes);
     EXPECT_EQ(view.nodeCount(), 3u);
@@ -95,6 +103,72 @@ TEST(SubtreeBuilder, RejectsMixedLocalAndMountedChildren)
     const auto mountable = builder.createNode(node(1, 8.0f, box(), true));
     EXPECT_THROW(builder.createNode(mountable, node(2, 0.0f, box(0.5f))),
                  std::logic_error);
+}
+
+TEST(SubtreeBuilder, AcceptsEveryUserPayloadBitPattern)
+{
+    constexpr UserPayload payload =
+        std::numeric_limits<UserPayload>::max();
+    SpatialDatabase database;
+    const SubtreeHandle definition =
+        database.registerSubtree(makeLeafSubtree(payload));
+    const InstanceHandle instance =
+        instantiateFor(database, definition, box(2.0f));
+
+    UserPayload resolved = 0;
+    ASSERT_TRUE(database.tryGetPayload(
+        TestAccess::requireNode(database, instance, payload), resolved));
+    EXPECT_EQ(resolved, payload);
+}
+
+TEST(SubtreeBuilder, RejectsReservedFlagsAndMalformedBounds)
+{
+    SubtreeBuilder oversized;
+    EXPECT_THROW(oversized.reserve(detail::kMaxSubtreeNodes),
+                 std::logic_error);
+
+    SubtreeBuilder flagsBuilder;
+    NodeDesc unknownFlags = node(1, 0.0f, box());
+    unknownFlags.flags = 1u << 31;
+    EXPECT_THROW(flagsBuilder.createNode(unknownFlags), std::logic_error);
+
+    SubtreeBuilder boundsBuilder;
+    NodeDesc malformed = node(2, 0.0f, box());
+    malformed.bounds = AABB::fromMinMax(
+        float4::point(-1.0f, 1.0f, -1.0f),
+        float4::point(1.0f, -1.0f, 1.0f));
+    boundsBuilder.createNode(malformed);
+    EXPECT_THROW(boundsBuilder.build(), std::logic_error);
+}
+
+TEST(SubtreeBuilder, ContractFailuresDoNotPartiallyConsumeTheBuilder)
+{
+    SubtreeBuilder empty;
+    EXPECT_THROW(empty.build(), std::logic_error);
+    empty.createNode(node(1, 0.0f, box()));
+    EXPECT_NO_THROW((void)empty.build());
+
+    SubtreeBuilder roots;
+    for (uint32_t i = 0; i < detail::kMaxChildren; ++i)
+        roots.createNode(node(i + 1, 0.0f, box()));
+    EXPECT_THROW(roots.createNode(
+                     node(detail::kMaxChildren + 1, 0.0f, box())),
+                 std::logic_error);
+    const SubtreeBytes rootBytes = roots.build();
+    EXPECT_EQ(detail::viewSubtreeBytes(rootBytes).nodeCount(),
+              detail::kMaxChildren);
+
+    SubtreeBuilder fanout;
+    const auto parent = fanout.createNode(node(1, 1.0f, box()));
+    for (uint32_t i = 0; i < detail::kMaxChildren; ++i)
+        fanout.createNode(parent, node(i + 2, 0.0f, box()));
+    EXPECT_THROW(fanout.createNode(
+                     parent,
+                     node(detail::kMaxChildren + 2, 0.0f, box())),
+                 std::logic_error);
+    const SubtreeBytes fanoutBytes = fanout.build();
+    EXPECT_EQ(detail::viewSubtreeBytes(fanoutBytes).nodeCount(),
+              detail::kMaxChildren + 1);
 }
 
 TEST(Assembly, ReusesOneHouseDefinitionAtManyCityNodes)

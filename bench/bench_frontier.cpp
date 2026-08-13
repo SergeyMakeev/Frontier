@@ -35,19 +35,20 @@ struct AssemblyScene
 };
 
 std::unique_ptr<AssemblyScene> buildScene(bool assembled, uint32_t count,
-                                          bool makeReady)
+                                          bool makeReady,
+                                          uint32_t detailCount = kDetailCount)
 {
     auto scene = std::make_unique<AssemblyScene>();
     const uint32_t side =
         uint32_t(std::ceil(std::sqrt(double(count))));
     SubtreeBuilder cityBuilder;
-    cityBuilder.reserve(assembled ? count : count * (kDetailCount + 1));
+    cityBuilder.reserve(assembled ? count : count * (detailCount + 1));
     SubtreeHandle houseHandle;
     if (assembled)
     {
         SubtreeBuilder houseBuilder;
-        houseBuilder.reserve(kDetailCount);
-        for (uint32_t detail = 0; detail < kDetailCount; ++detail)
+        houseBuilder.reserve(detailCount);
+        for (uint32_t detail = 0; detail < detailCount; ++detail)
             houseBuilder.createNode(
                 node(1000 + detail, 0.0f, detailBounds(detail)));
         SubtreeBytes house = houseBuilder.build();
@@ -71,7 +72,7 @@ std::unique_ptr<AssemblyScene> buildScene(bool assembled, uint32_t count,
             const auto proxy = cityBuilder.createNode(node(
                 10 + i, 16.0f,
                 AABB::fromCenterExtent(position, float4::vec(4, 2, 2))));
-            for (uint32_t detail = 0; detail < kDetailCount; ++detail)
+            for (uint32_t detail = 0; detail < detailCount; ++detail)
                 cityBuilder.createNode(
                     proxy,
                     node(1000 + detail, 0.0f,
@@ -155,6 +156,40 @@ std::unique_ptr<AssemblyScene> buildMixedReadinessScene(uint32_t count)
     return scene;
 }
 
+SubtreeBytes makeRegistrationBytes(uint32_t count)
+{
+    SubtreeBuilder builder;
+    builder.reserve(count);
+    std::vector<SubtreeBuilder::NodeId> ids;
+    ids.reserve(count);
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        const NodeDesc desc = node(1000 + i, 0.0f, box(1.0f));
+        ids.push_back(i == 0
+                          ? builder.createNode(desc)
+                          : builder.createNode(ids[(i - 1) / 8], desc));
+    }
+    return builder.build();
+}
+
+std::unique_ptr<AssemblyScene> buildFlatReadinessFanoutScene(uint32_t count)
+{
+    auto scene = std::make_unique<AssemblyScene>();
+    const SubtreeHandle detail = scene->world.registerSubtree(
+        makeLeafSubtree(1000));
+    const uint32_t side =
+        uint32_t(std::ceil(std::sqrt(double(count))));
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        InstanceDesc desc;
+        desc.pos = housePosition(i, side);
+        const InstanceHandle root = scene->world.instantiate(
+            node(i + 1, 16.0f, box(1.0f), true), desc);
+        scene->world.mountSubtree(root.rootNode(), detail);
+    }
+    return scene;
+}
+
 void consume(const FrontierResultView& cut)
 {
     benchmark::DoNotOptimize(cut.shared.data());
@@ -213,6 +248,43 @@ BENCHMARK(BM_SubtreeAssembly_FrontierCost)
     ->ArgNames({"assembled", "houses", "cached"})
     ->Unit(benchmark::kMicrosecond);
 
+// Same assembled city and shared-house workflow with controlled logical
+// fanout. This is the direct BVH4/BVH8 occupancy experiment: each house visits
+// exactly `children` renderable roots in its mounted definition.
+static void BM_BranchWidthOccupancy(benchmark::State& state)
+{
+    constexpr uint32_t count = 400;
+    const uint32_t children = uint32_t(state.range(0));
+    auto scene = buildScene(true, count, true, children);
+    const uint32_t side =
+        uint32_t(std::ceil(std::sqrt(double(count))));
+    const float span = float(side) * 12.0f;
+    const Camera view = makeLookAtCamera(
+        float4::point(0, span * 0.8f, -span * 0.8f),
+        float4::point(0, 0, 0));
+    const SelectionParams params{1.0f, 0.0f};
+    SpatialQuery query;
+    query.setReuseEnabled(false);
+    scene->world.applyUpdates();
+
+    FrontierResultView cut;
+    for (auto _ : state)
+    {
+        cut = query.selectFrontier(scene->world, view, params);
+        consume(cut);
+    }
+    state.counters["branching_factor"] = double(kWide);
+    state.counters["children"] = double(children);
+    state.counters["frontier"] = double(cut.size());
+    state.counters["immutable_KB"] =
+        double(scene->immutableBytes) / 1024.0;
+}
+
+BENCHMARK(BM_BranchWidthOccupancy)
+    ->Arg(2)->Arg(4)->Arg(6)->Arg(8)
+    ->ArgName("children")
+    ->Unit(benchmark::kMicrosecond);
+
 static void BM_SubtreeAssembly_ConstructCost(benchmark::State& state)
 {
     const bool assembled = state.range(0) != 0;
@@ -251,6 +323,28 @@ static void BM_SharedNodeReadinessFanout(benchmark::State& state)
 
 BENCHMARK(BM_SharedNodeReadinessFanout)
     ->Arg(32)->Arg(128)->Arg(400)
+    ->Unit(benchmark::kMicrosecond);
+
+static void BM_SharedNodeReadinessLargeFanout(benchmark::State& state)
+{
+    const uint32_t count = uint32_t(state.range(0));
+    auto scene = buildFlatReadinessFanoutScene(count);
+    const NodeHandle sharedNode = handleOf(scene->world, 1000);
+    bool ready = false;
+    for (auto _ : state)
+    {
+        if (ready)
+            scene->world.markNodeUnavailable(sharedNode);
+        else
+            scene->world.markNodeReady(sharedNode);
+        ready = !ready;
+        benchmark::ClobberMemory();
+    }
+    state.counters["affected_mounts"] = double(count);
+}
+
+BENCHMARK(BM_SharedNodeReadinessLargeFanout)
+    ->Arg(1024)->Arg(10000)
     ->Unit(benchmark::kMicrosecond);
 
 static void BM_MountUnmountLifecycle(benchmark::State& state)
@@ -432,4 +526,152 @@ static void BM_SubtreeBuilder_ConstructCost(benchmark::State& state)
 BENCHMARK(BM_SubtreeBuilder_ConstructCost)
     ->Args({0, 400})->Args({1, 400})
     ->ArgNames({"assembled", "houses"})
+    ->Unit(benchmark::kMicrosecond);
+
+static void BM_SubtreeRegistration(benchmark::State& state)
+{
+    const uint32_t count = uint32_t(state.range(0));
+    const SubtreeBytes source = makeRegistrationBytes(count);
+    SpatialDatabase world;
+    for (auto _ : state)
+    {
+        state.PauseTiming();
+        SubtreeBytes bytes = source;
+        state.ResumeTiming();
+        const SubtreeHandle handle =
+            world.registerSubtree(std::move(bytes));
+        benchmark::DoNotOptimize(handle);
+        state.PauseTiming();
+        world.releaseSubtree(handle);
+        state.ResumeTiming();
+    }
+    state.SetBytesProcessed(
+        int64_t(state.iterations()) * int64_t(source.size()));
+    state.counters["nodes"] = double(count);
+}
+
+BENCHMARK(BM_SubtreeRegistration)
+    ->Arg(128)->Arg(4096)
+    ->Unit(benchmark::kMicrosecond);
+
+static void BM_FlatTlasSelectionScale(benchmark::State& state)
+{
+    const uint32_t count = uint32_t(state.range(0));
+    const bool cached = state.range(1) != 0;
+    SpatialDatabase world;
+    const uint32_t side =
+        uint32_t(std::ceil(std::sqrt(double(count))));
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        InstanceDesc desc;
+        desc.pos = float4::point(
+            float(int(i % side) - int(side / 2)) * 3.0f,
+            float(int(i / side) - int(side / 2)) * 3.0f, 0.0f);
+        world.instantiate(node(1000 + i, 0.0f, box(0.5f)), desc);
+    }
+    world.applyUpdates();
+    const Camera camera = cameraAt(-2000.0f);
+    SpatialQuery query;
+    query.setReuseEnabled(cached);
+    if (cached) consume(query.selectFrontier(world, camera, {}));
+
+    FrontierResultView result;
+    for (auto _ : state)
+    {
+        result = query.selectFrontier(world, camera, {});
+        consume(result);
+    }
+    state.counters["entries"] = double(result.size());
+    state.counters["instances"] = double(count);
+    state.counters["branching_factor"] = double(kWide);
+    state.counters["tlas_nodes"] =
+        double(TestAccess::tlasNodeCount(world));
+    state.counters["tlas_KB"] =
+        double(TestAccess::tlasNodeCount(world) *
+               TestAccess::tlasNodeBytes()) /
+        1024.0;
+}
+
+BENCHMARK(BM_FlatTlasSelectionScale)
+    ->Args({1000, 0})->Args({1000, 1})
+    ->Args({10000, 0})->Args({10000, 1})
+    ->ArgNames({"instances", "cached"})
+    ->Unit(benchmark::kMicrosecond);
+
+static void BM_FlatInstanceLifecycle(benchmark::State& state)
+{
+    constexpr uint32_t population = 1024;
+    SpatialDatabase world;
+    for (uint32_t i = 0; i < population; ++i)
+    {
+        InstanceDesc desc;
+        desc.pos = float4::point(float(i % 32) * 2.0f,
+                                 float(i / 32) * 2.0f, 0.0f);
+        world.instantiate(node(i + 1, 0.0f, box(0.5f)), desc);
+    }
+    world.applyUpdates();
+
+    for (auto _ : state)
+    {
+        const InstanceHandle transient = world.instantiate(
+            node(50000, 0.0f, box(0.5f)),
+            InstanceDesc{.pos = float4::point(100, 100, 0)});
+        world.removeInstance(transient);
+        world.applyUpdates();
+    }
+    state.counters["steady_population"] = population;
+}
+
+BENCHMARK(BM_FlatInstanceLifecycle)->Unit(benchmark::kMicrosecond);
+
+static void BM_BoundsOverrideBatch(benchmark::State& state)
+{
+    constexpr uint32_t nodeCount = detail::kMaxChildren;
+    const uint32_t changedCount = uint32_t(state.range(0));
+    SpatialDatabase world;
+    SubtreeBuilder builder;
+    std::vector<AABB> firstBounds;
+    std::vector<AABB> secondBounds;
+    firstBounds.reserve(nodeCount);
+    secondBounds.reserve(nodeCount);
+    for (uint32_t i = 0; i < nodeCount; ++i)
+    {
+        const float4 center = float4::point(
+            float(int(i % 16) - 8) * 3.0f,
+            float(int(i / 16) - 8) * 3.0f, 0.0f);
+        const AABB authored = box(1.0f, center);
+        builder.createNode(node(1000 + i, 0.0f, authored));
+        firstBounds.push_back(box(0.75f, center + float4::vec(0.1f, 0, 0)));
+        secondBounds.push_back(box(0.75f, center - float4::vec(0.1f, 0, 0)));
+    }
+    SubtreeBytes bytes = builder.build();
+    const AABB definitionBounds = detail::viewSubtreeBytes(bytes).bounds();
+    const SubtreeHandle definition =
+        world.registerSubtree(std::move(bytes));
+    const InstanceHandle instance = world.instantiate(
+        node(1, 16.0f, definitionBounds, true));
+    const SubtreeInstanceHandle placement =
+        world.mountSubtree(instance.rootNode(), definition);
+    std::vector<NodeHandle> handles;
+    handles.reserve(nodeCount);
+    for (uint32_t i = 0; i < nodeCount; ++i)
+        handles.push_back(TestAccess::nodeAt(world, placement, i + 1));
+
+    bool alternate = false;
+    for (auto _ : state)
+    {
+        const std::vector<AABB>& bounds =
+            alternate ? firstBounds : secondBounds;
+        for (uint32_t i = 0; i < changedCount; ++i)
+            world.setNodeBounds(instance, handles[i], bounds[i]);
+        world.flushBounds();
+        alternate = !alternate;
+        benchmark::ClobberMemory();
+    }
+    state.counters["changed_nodes"] = double(changedCount);
+    state.counters["overlays"] = double(world.overlayCount());
+}
+
+BENCHMARK(BM_BoundsOverrideBatch)
+    ->Arg(1)->Arg(32)->Arg(64)->Arg(256)
     ->Unit(benchmark::kMicrosecond);

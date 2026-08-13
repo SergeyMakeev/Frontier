@@ -79,6 +79,13 @@ struct SpatialDatabase::TestAccess
         return instance ? instance->worldBox : AABB::empty();
     }
 
+    static AABB unflushedInstanceBounds(SpatialDatabase& database,
+                                        InstanceHandle handle)
+    {
+        const Instance* instance = database.resolveInstance(handle);
+        return instance ? instance->worldBox : AABB::empty();
+    }
+
     static size_t definitionBytes() { return sizeof(SubtreeDefinitionRt); }
     static const void* definitionData(const SpatialDatabase& database,
                                       SubtreeHandle handle)
@@ -92,9 +99,22 @@ struct SpatialDatabase::TestAccess
     static size_t mountReadinessBytes() { return sizeof(MountReadiness); }
     static size_t instanceBytes() { return sizeof(Instance); }
     static size_t tlasNodeBytes() { return sizeof(TlasNode); }
+    static size_t tlasNodeCount(const SpatialDatabase& database)
+    {
+        return database.tlasNodes_.size();
+    }
     static size_t liveInstanceSlots(const SpatialDatabase& database)
     {
         return database.liveInstances_.size();
+    }
+
+    static bool overlayIsSparse(SpatialDatabase& database,
+                                InstanceHandle owner, NodeHandle node)
+    {
+        const Instance* instance = database.resolveInstance(owner);
+        if (!instance || node.isTlasRoot()) return false;
+        const Overlay* overlay = database.findOverlay(*instance, node.slot());
+        return overlay && overlay->sparseWide();
     }
 
     static void markAllNodesReady(SpatialDatabase& database)

@@ -37,10 +37,15 @@ if not exist "%BUILD_DIR%\CMakeCache.txt" (
 echo Configuring Release AVX2 performance build...
 cmake -S "%ROOT%" -B "%BUILD_DIR%" !GENERATOR_ARGS! ^
     -DCMAKE_BUILD_TYPE=Release ^
+    -DFRONTIER_IPO=ON ^
     -DFRONTIER_BUILD_TESTS=OFF ^
     -DFRONTIER_BUILD_BENCH=ON ^
     -DFRONTIER_AVX2=ON ^
-    -DFRONTIER_FORCE_SCALAR=OFF
+    -DFRONTIER_BVH_WIDTH=AUTO ^
+    -DFRONTIER_FORCE_SCALAR=OFF ^
+    -DFRONTIER_STATS=OFF ^
+    -DFRONTIER_CONTRACT_CHECKS=OFF ^
+    -DFRONTIER_VALIDATE_SUBTREES=OFF
 if errorlevel 1 exit /b 1
 
 echo Building frontier_bench...

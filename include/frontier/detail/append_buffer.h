@@ -11,7 +11,7 @@
 #include <type_traits>
 #include <utility>
 
-namespace frontier {
+namespace frontier::detail {
 
 // Retained-capacity, append-only storage for trivially copyable hot-path
 // output. It deliberately omits middle insertion, erasure, and shrinking.
@@ -140,8 +140,6 @@ public:
     const T* end() const noexcept { return size_ ? data_ + size_ : data_; }
     T& operator[](size_t i) noexcept { return data_[i]; }
     const T& operator[](size_t i) const noexcept { return data_[i]; }
-    T& front() noexcept { return data_[0]; }
-    const T& front() const noexcept { return data_[0]; }
     T& back() noexcept { return data_[size_ - 1]; }
     const T& back() const noexcept { return data_[size_ - 1]; }
     size_t size() const noexcept { return size_; }
@@ -197,4 +195,4 @@ private:
     uint32_t capacity_ = 0;
 };
 
-} // namespace frontier
+} // namespace frontier::detail

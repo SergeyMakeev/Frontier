@@ -12,9 +12,9 @@ Frontier requires C++20.
 ## Reference conventions
 
 - A **BVH** is a bounding-volume hierarchy used to reject spatial groups
-  without testing every member. Frontier's **TLAS** is its internal 8-wide,
-  world-space top-level BVH over independently movable instances. Every TLAS
-  leaf is also a permanent renderable root.
+  without testing every member. Frontier's **TLAS** is its internal 4- or
+  8-wide world-space top-level BVH over independently movable instances. Every
+  TLAS leaf is also a permanent renderable root.
 - Ray-tracing APIs often call a local hierarchy below the TLAS a **BLAS**
   (bottom-level acceleration structure). Frontier's closest equivalent is a
   registered subtree definition; a mount supplies its placement below a
@@ -52,8 +52,7 @@ The main headers are:
 #include <frontier/spatial_database.h> // runtime and selection API
 ```
 
-`math.h`, `node.h`, `subtree.h`, `config.h`, and `append_buffer.h` may also be
-included directly.
+`math.h`, `node.h`, `subtree.h`, and `config.h` may also be included directly.
 
 ## 1. Compile-time configuration and host context
 
@@ -80,7 +79,10 @@ FRONTIER_ASSERT(condition, message)
 Define it before including any Frontier header to replace the default
 exception. `FRONTIER_CHECK` is always enabled. `FRONTIER_ASSERT` is disabled
 under `NDEBUG` unless the host overrides it. Normal streaming races involving
-stale handles do not use these macros.
+stale handles do not use these macros. Contract failures are programmer errors,
+not a recoverable result channel; unless a function explicitly documents an
+early preflight guarantee, no transactional rollback is promised if the
+default exception is caught.
 
 ### SIMD and vector configuration
 
@@ -89,6 +91,25 @@ header selects AVX2, 64-bit NEON, SSE2, or the scalar backend from compiler
 target macros. `FRONTIER_PREFETCH(pointer)` exposes the selected best-effort
 prefetch operation.
 
+`FRONTIER_BVH_WIDTH` is a build-wide choice of `AUTO`, `4`, or `8` and defaults
+to `AUTO`. CMake resolves `AUTO` to BVH8 for the eight-lane AVX2 backend and
+BVH4 for four-lane SSE2/NEON or forced-scalar builds, then propagates the
+resolved numeric value to consumers. An explicit `4` or `8` overrides that
+policy. The result changes public wide-type sizes, internal TLAS/BLAS layouts,
+and the serialized subtree format; the library and every consumer translation
+unit must use the same value. BVH4 uses one 128-bit SIMD group. BVH8 uses AVX2
+when enabled, or two 128-bit SSE2/NEON groups.
+
+The CMake `FRONTIER_AVX2=ON` option applies AVX2/FMA flags to BVH8 library and
+consumer builds; it does not add runtime CPU dispatch. Disable it for an
+SSE2-baseline x86-64 BVH8 binary or build separate ISA variants in the host.
+BVH4 always uses the 128-bit x86 backend and does not require AVX2.
+
+`FRONTIER_IPO=ON` enables compiler-supported interprocedural optimization for
+Frontier targets. It defaults off for predictable integration builds; the
+repository performance runners enable it. Third-party benchmark libraries are
+deliberately excluded from this setting.
+
 Define `FRONTIER_USE_CUSTOM_VECTOR_TYPES` and declare compatible
 `frontier::float4` and `frontier::float4x4` types before the first Frontier
 include to use engine vector types. `float4` must be 16 bytes, at least
@@ -96,6 +117,29 @@ include to use engine vector types. `float4` must be 16 bytes, at least
 arithmetic, and free-function operations used by `math.h`. `float4x4` must
 expose the same 16-float `m` representation used by the camera overload.
 `float8` and `WideBounds` are not replaceable.
+
+Custom vector types are a build-wide ABI choice: the Frontier library and
+every translation unit that includes a Frontier header must see the same
+definitions and configuration macros.
+
+`FRONTIER_STATS` enables per-query traversal counters. It adds counter updates
+to selection and storage to `SpatialQuery`; without it, statistics read as
+zero and the traversal carries no instrumentation. This is also a build-wide
+ABI choice. CMake propagates it when configured with `-DFRONTIER_STATS=ON`.
+
+`FRONTIER_CONTRACT_CHECKS` controls caller-precondition checks and defaults to
+`1`. Setting it to `0` removes those branches; violating any documented
+precondition is then undefined behavior. It does not disable Debug-only
+internal assertions, which are controlled by `NDEBUG`.
+
+`FRONTIER_VALIDATE_SUBTREES` controls complete serialized-subtree validation
+at registration and defaults to `1`. CMake propagates `0` when configured with
+`-DFRONTIER_VALIDATE_SUBTREES=OFF`. Disabled builds retain constant-time
+header, layout, and root-range checks, but trust all remaining traversal arrays
+and remove their O(nodes + wide blocks) validation code. Use `0` only when all
+registered bytes were produced by a compatible trusted Frontier builder. When
+`FRONTIER_CONTRACT_CHECKS=0` as well, those constant-time preconditions are
+assumed rather than checked.
 
 ### Allocation and parallel callbacks
 
@@ -147,6 +191,8 @@ const FrontierContext& defaultContext();
 
 The defaults provide aligned host allocation and serial execution.
 `defaultContext()` returns a process-wide immutable context using them.
+`defaultAlloc()` returns `nullptr` for zero-sized, invalid-alignment, or
+size-rounding-overflow requests.
 
 ```cpp
 struct FrontierContext {
@@ -168,18 +214,20 @@ struct FrontierContext {
 ## 2. Math and cameras
 
 Declared in `frontier/math.h`. The scalar types and camera constructors are the
-normal application-facing surface. The eight-lane types are public primarily
-to support Frontier's traversal representation.
+normal application-facing surface. The build-width lane types are public
+primarily to support Frontier's traversal representation.
 
 ### Scalar/vector helpers
 
 ```cpp
 float fmadd(float a, float b, float c);
-inline constexpr uint32_t kWide = 8;
+inline constexpr uint32_t kWide = FRONTIER_BVH_WIDTH;
 ```
 
 `fmadd()` returns the backend-matching multiply-add result. `kWide` is the
-number of lanes in `float8` and `WideBounds`.
+number of lanes in `float8` and `WideBounds`. `float8` retains its historical
+source-compatible name; it contains four lanes in a BVH4 build and eight lanes
+in a BVH8 build.
 
 ```cpp
 struct alignas(16) float4 {
@@ -205,7 +253,7 @@ struct alignas(16) float4x4 {
 };
 ```
 
-- `fromMemory()` copies 16 floats from graphics-API matrix storage.
+- `fromMemory()` copies 16 floats from non-null graphics-API matrix storage.
 - `coeffs(component)` returns the coefficients producing clip component 0
   through 3. `component` must be in that range.
 
@@ -231,6 +279,7 @@ struct AABB {
 - `empty()` returns the canonical inverted box.
 - `fromMinMax()` and `fromCenterExtent()` construct boxes without validating
   inputs.
+- `isEmpty()` returns true when any spatial axis is inverted.
 - `expand()` grows the receiver to include the argument.
 - `contains()` implements true containment: any box contains an empty box, and
   an empty box contains no non-empty box.
@@ -324,6 +373,7 @@ Camera cameraFromViewProjection(
   `range` identifies clip-space depth convention.
 - **Returns:** a camera with planes extracted from the matrix. Reverse-Z needs
   no separate flag.
+- **Contract:** the pointer overload requires a non-null 16-float array.
 
 ```cpp
 Camera cameraFromPlanes(const float4 planes[6], float4 cameraPosition,
@@ -331,6 +381,7 @@ Camera cameraFromPlanes(const float4 planes[6], float4 cameraPosition,
 ```
 
 Copies six caller-provided inward planes and the supplied screen-error scale.
+The plane-array pointer must be non-null.
 
 ```cpp
 Camera makeLookAtCamera(float4 position, float4 target,
@@ -369,17 +420,17 @@ public:
 ```
 
 - `halfLife()` returns the configured relaxation time in frames.
-- `setHalfLife()` clamps non-positive values to zero.
+- `setHalfLife()` clamps non-positive and non-finite values to zero.
 - `reset()` forgets the accumulated envelope but keeps the configured
   half-life.
 - `damp()` returns a camera whose position/projection envelope includes recent
-  history. Zero or negative half-life returns the input unchanged.
+  history. A disabled half-life returns the input unchanged.
 - Do not pre-damp a camera that is also passed to a damped `SpatialQuery`.
 
-### Eight-lane traversal helpers
+### Wide traversal helpers
 
 ```cpp
-struct alignas(32) float8 {
+struct alignas(kWide * sizeof(float)) float8 {
     float v[kWide];
     static float8 splat(float value);
     float operator[](uint32_t lane) const;
@@ -401,7 +452,7 @@ struct WideBounds {
 };
 ```
 
-`allEmpty()` initializes all eight lanes as empty; `setLane()` and `lane()`
+`allEmpty()` initializes all `kWide` lanes as empty; `setLane()` and `lane()`
 write and read one lane.
 
 ```cpp
@@ -428,16 +479,14 @@ Declared in `frontier/node.h`.
 
 ```cpp
 using UserPayload = uint64_t;
-inline constexpr UserPayload kSentinelPayload = ~0ull;
 inline constexpr uint32_t kInvalidIndex = 0xffffffffu;
 ```
 
 `UserPayload` is an opaque application-owned render-resource identifier. Equal
 values may refer to the same application resource, but they do not couple
 Frontier readiness: readiness belongs to a node in a registered definition.
-`kSentinelPayload` is reserved for the serialized implicit-parent record;
-applications should not assign it to a renderable node. `kInvalidIndex` is the
-library's public invalid-index value.
+All 64-bit payload values are available to applications. `kInvalidIndex` is
+the library's public invalid-index value.
 
 ### `Transform`
 
@@ -546,9 +595,12 @@ public:
 The type does not distinguish builder-produced and file-loaded data. A caller
 loading from disk constructs the final-sized array and reads directly into
 `bytes()`. Persisted arrays are a versioned native traversal format;
-registration requires matching format version, byte order, layout, size, and
-alignment. They are not a format-independent interchange schema, and
-registration is not a hardened validation boundary for untrusted bytes.
+registration requires matching format version, byte order, layout, size,
+alignment, topology, bounds, errors, and wide traversal data. Validation is
+linear in node and wide-block count and does not unpack or copy the arrays.
+The bytes are not a format-independent interchange schema and carry no
+authentication or application-defined allocation limit; authenticate and
+size-limit untrusted files before allocating `SubtreeBytes` for them.
 
 ## 5. `SubtreeBuilder`
 
@@ -572,15 +624,17 @@ public:
 
 - **Parameters:** expected count of renderable builder nodes.
 - **Effects:** reserves authoring storage; it does not create nodes.
-- **Contract:** the builder must not already have been consumed by `build()`.
+- **Contract:** the builder must not already have been consumed by `build()`;
+  the hint must fit the definition-local node-index limit.
 
 #### `createNode(node)`
 
 - **Parameters:** descriptor for a direct child of the eventual runtime mount
   parent.
 - **Returns:** a builder-local `NodeId` usable by later `createNode()` calls.
-- **Contract:** the builder is unconsumed, error is finite/non-negative, and
-  the definition has no more than 511 direct nodes.
+- **Contract:** the builder is unconsumed, error is finite/non-negative,
+  reserved flag bits are zero, and the definition has no more than 511 direct
+  nodes.
 
 #### `createNode(parent, node)`
 
@@ -588,18 +642,19 @@ public:
   new local child.
 - **Returns:** the new builder-local id.
 - **Contract:** `parent` exists and is not mountable, the builder is
-  unconsumed, error is finite/non-negative, and parent fanout stays at or below
-  511.
+  unconsumed, error is finite/non-negative, reserved flag bits are zero, and
+  parent fanout stays at or below 511.
 
 #### `build(context)`
 
 - **Parameters:** allocation context copied into the returned byte array.
 - **Returns:** a complete, traversal-ready `SubtreeBytes` value.
-- **Effects:** permanently consumes the builder; derives interior and implicit
-  parent bounds bottom-up, clamps child errors to parent errors, packs nodes in
-  depth-first order, and creates wide traversal blocks.
+- **Effects:** on success, permanently consumes the builder; derives interior
+  and implicit parent bounds bottom-up, clamps child errors to parent errors,
+  packs nodes in depth-first order, and creates wide traversal blocks.
 - **Contract:** at least one renderable node exists and every final renderable
-  node bound is non-empty. All earlier authoring contracts still apply.
+  node bound is finite and non-empty on all three axes. All earlier authoring
+  contracts still apply.
 
 Builder `NodeId` values do not survive `build()` and are unrelated to runtime
 `NodeHandle` values.
@@ -616,9 +671,15 @@ application identity.
 struct SubtreeHandle {
     uint32_t slot = kInvalidIndex;
     uint32_t generation = 0;
-    bool valid() const;
+    constexpr bool valid() const noexcept;
+    friend constexpr bool operator==(SubtreeHandle, SubtreeHandle);
 };
 ```
+
+All handle types in this section are scoped to the `SpatialDatabase` that
+created them. Generation stamps protect against stale reuse within that
+database, not accidental use in another database whose packed values may
+coincide.
 
 Names one registered immutable subtree definition. `valid()` tests only the
 invalid value; call `SpatialDatabase::isSubtree()` to test liveness in a
@@ -630,7 +691,9 @@ specific database. Size: 8 bytes.
 struct SubtreeInstanceHandle {
     uint32_t slot = kInvalidIndex;
     uint32_t generation = 0;
-    bool valid() const;
+    constexpr bool valid() const noexcept;
+    friend constexpr bool operator==(SubtreeInstanceHandle,
+                                     SubtreeInstanceHandle);
 };
 ```
 
@@ -653,25 +716,26 @@ struct NodeHandle {
     static constexpr uint32_t kTlasGenerationMask =
         (1u << kTlasGenerationBits) - 1;
 
-    NodeHandle();
-    NodeHandle(uint32_t slot, uint32_t index, uint32_t generation);
+    constexpr NodeHandle();
+    constexpr NodeHandle(uint32_t slot, uint32_t index,
+                         uint32_t generation);
 
-    uint32_t slot() const;
-    uint32_t index() const;
-    uint32_t generation() const;
-    bool isTlasRoot() const;
-    bool valid() const;
-    uint32_t tlasInstance() const;
-    uint32_t tlasGeneration() const;
-    static NodeHandle tlasRoot(uint32_t instance,
-                               uint32_t instanceGeneration);
-    friend bool operator==(NodeHandle, NodeHandle);
+    constexpr uint32_t slot() const;
+    constexpr uint32_t index() const;
+    constexpr uint32_t generation() const;
+    constexpr bool isTlasRoot() const;
+    constexpr bool valid() const;
+    constexpr uint32_t tlasInstance() const;
+    constexpr uint32_t tlasGeneration() const;
+    static constexpr NodeHandle tlasRoot(
+        uint32_t instance, uint32_t instanceGeneration);
+    friend constexpr bool operator==(NodeHandle, NodeHandle);
 };
 ```
 
 Represents either a renderable node in a mounted placement or a permanent TLAS
-root. Normal application code obtains it from `InstanceHandle::rootNode()`, a
-`FrontierEntry`, or retained assembly state. The packing helpers are exposed
+root. Normal application code obtains it from `InstanceHandle::rootNode()` or
+a `FrontierEntry`. The packing helpers are exposed
 for value inspection and testing; constructing arbitrary live handles is not a
 supported way to discover nodes. Size: 8 bytes.
 
@@ -690,8 +754,9 @@ inline constexpr InstanceId kInvalidInstanceId = kInstanceIdMask;
 struct InstanceHandle {
     InstanceId id = kInvalidInstanceId;
     uint32_t generation = 0;
-    bool valid() const;
-    NodeHandle rootNode() const;
+    constexpr bool valid() const noexcept;
+    constexpr NodeHandle rootNode() const noexcept;
+    friend constexpr bool operator==(InstanceHandle, InstanceHandle);
 };
 ```
 
@@ -820,6 +885,8 @@ public:
 };
 ```
 
+`T` must be trivially copyable.
+
 - The default sink has zero capacity and drops every pushed element.
 - The span constructor writes into caller-owned storage and requires capacity
   not to exceed `UINT32_MAX`.
@@ -867,13 +934,13 @@ struct SelectionParams {
   default.
 - `PreferReadyAncestors` does not search below an unavailable ideal node. It
   falls back to a ready ancestor, normally producing fewer, coarser entries.
-- `threshold` is the screen-error refinement threshold in pixels. Use a
-  positive finite value for ordinary selection.
+- `threshold` is the screen-error refinement threshold in pixels and must be
+  positive and finite.
 - `minPix` enables top-level contribution culling when greater than zero;
-  zero disables it.
+  zero disables it. It must be finite and non-negative.
 - `currentCutPolicy` selects the replacement rule above. Changing it
   invalidates that query's reusable frontier records in O(1); allocations and
-  damping state are retained.
+  damping state are retained. Reserved enumerator values are rejected.
 
 ```cpp
 struct InstanceDesc {
@@ -883,7 +950,8 @@ struct InstanceDesc {
 };
 ```
 
-Describes one TLAS placement. `scale` must be finite and positive.
+Describes one TLAS placement. Position components must be finite and `scale`
+must be finite, positive, and large enough that `1.0f / scale` remains finite.
 `mask & Camera::viewMask == 0` culls the instance at the top level.
 
 ```cpp
@@ -897,7 +965,9 @@ struct SelectionStats {
 ```
 
 Filled by selection only in builds compiled with `FRONTIER_STATS`. Otherwise
-the counters remain zero.
+the counters remain zero and each query omits their storage. CMake users enable
+and propagate the matching ABI setting with `-DFRONTIER_STATS=ON`; manual
+builds must define the macro consistently for the library and every consumer.
 
 ```cpp
 struct CollectResult {
@@ -912,7 +982,8 @@ definition-node readiness.
 ## 8. `SpatialQuery`
 
 One mutable query stores damping, exact-cut reuse records, scratch/output,
-statistics, and optional mount-usage feedback for one logical view.
+optional instrumented statistics, and optional mount-usage feedback for one
+logical view.
 
 ```cpp
 class SpatialQuery {
@@ -945,14 +1016,17 @@ const SelectionStats& lastSelectionStats() const;
 ```
 
 - `halfLife()` and `setHalfLife()` access the query-owned camera damper;
-  non-positive values disable damping.
-- `reuseEnabled()` reports whether exact frontier-record reuse is active.
+  non-positive and non-finite values disable damping.
+- `reuseEnabled()` reports whether exact frontier-record reuse is requested.
+  An all-flat TLAS snapshot still takes the faster direct path automatically
+  because it has no hierarchy walk to cache.
 - `setReuseEnabled()` resets damping/reuse/usage state when the value changes,
   while retaining allocations and the configured half-life.
 - `reused()` and `walked()` report instance counts from the most recent
   selection.
-- `lastSelectionStats()` returns a query-owned reference overwritten by the
-  next selection or reset.
+- With `FRONTIER_STATS`, `lastSelectionStats()` returns a query-owned reference
+  overwritten by the next selection or reset. Without instrumentation it
+  returns a process-lifetime immutable zero value and allocates no query state.
 
 ### Mount-usage controls
 
@@ -1000,6 +1074,9 @@ void selectFrontier(const SpatialDatabase& database,
   concurrently.
 - **Binding:** the first selection binds the query to `database`. Selecting a
   different database before `reset()` is a contract violation.
+- **Contract:** camera position, planes, projection scale, and envelope must
+  be finite; projection scale must be positive and envelope extents
+  non-negative. `params` must satisfy the contracts documented above.
 - **Reuse:** cached entries reproduce the exact node set but may retain their
   earlier quantized magnitude within the proven reuse margin.
 
@@ -1065,9 +1142,11 @@ struct SpatialDatabaseConfig {
   uncached parallel selection. Zero disables it; `context.workerCount` must
   also exceed one.
 
-Hosts should supply finite, non-negative cost and drift values. Internal
-parallel selection is blocking and concatenates worker output in instance
-order, so serial and parallel cuts are identical.
+Construction rejects unknown quality values and non-finite or negative cost
+and drift values. When `parallelInstanceThreshold` is non-zero and
+`workerCount > 1`, `context.parallelFor` must be non-null. Internal parallel
+selection is blocking and concatenates worker output in instance order, so
+serial and parallel cuts are identical.
 
 ## 10. `SpatialDatabase`
 
@@ -1087,8 +1166,8 @@ public:
 };
 ```
 
-Construction copies the configuration and normalizes `workerCount == 0` to
-one. Destruction releases registered definitions and all runtime storage. The
+Construction validates and copies the configuration and normalizes
+`workerCount == 0` to one. Destruction releases registered definitions and all runtime storage. The
 database is neither copyable nor movable. `config()` returns a reference valid
 for the database lifetime.
 
@@ -1102,16 +1181,20 @@ SubtreeHandle registerSubtree(SubtreeBytes&& bytes);
   format. Pass a named array with `std::move`; a `build()` temporary binds
   directly.
 - **Returns:** a live definition handle unique to this registration.
-- **Effects:** validates the serialized header, size, layout, version, and
-  implicit-parent sentinel, then moves the allocation into the database. It
-  does not unpack or copy serialized node arrays and does not allocate per-node
-  runtime state. Shared readiness/coverage state is allocated lazily on first
-  mount.
-- **Complexity:** constant in total descendant count, apart from classifying the
-  bounded direct-root fanout. Ownership transfer of the byte allocation is
-  constant-time.
-- **Contract:** `bytes` is non-empty and valid. Contract failure leaves the
-  input's post-failure state unspecified.
+- **Effects:** validates the serialized format envelope and root range, then
+  moves the allocation into the database. With
+  `FRONTIER_VALIDATE_SUBTREES=1` (the default), it also validates topology,
+  bounds, errors, and all wide traversal arrays. It does not unpack or copy
+  serialized node arrays and does not allocate per-node runtime state. Shared
+  readiness/coverage state is allocated lazily on first mount.
+- **Complexity:** with `FRONTIER_VALIDATE_SUBTREES=1`, O(nodes + wide blocks)
+  validation followed by constant-time ownership transfer. With it set to
+  `0`, registration and ownership transfer are O(1).
+- **Contract:** `bytes` is non-empty and valid. When structural validation is
+  disabled, all internal arrays must be trusted and structurally valid;
+  violating this precondition can cause undefined behavior during later
+  traversal. Contract failure leaves the input's post-failure state
+  unspecified.
 - **Notes:** identical arrays registered twice produce independent handles.
   Definition deduplication is application policy.
 
@@ -1145,9 +1228,10 @@ InstanceHandle instantiate(const NodeDesc& root,
   immediately.
 - **Effects:** inserts one TLAS leaf. A non-mountable one-node instance needs no
   subtree definition or mounted-placement state.
-- **Contract:** root error is finite/non-negative; root bounds are finite and
-  non-empty; instance scale is finite and positive; position is expected to be
-  finite.
+- **Contract:** root error is finite/non-negative, reserved root flag bits are
+  zero, root bounds are finite and non-empty on all axes, and instance position
+  and scale are finite with positive scale and finite reciprocal. The
+  transformed root bound and error must remain representable as finite floats.
 - **Readiness:** the live TLAS root is always ready. Its payload value does not
   affect the readiness of mounted definition nodes with the same value.
 
@@ -1168,8 +1252,9 @@ void moveInstance(InstanceHandle instance, const Transform& transform);
 - **Effects:** moves the TLAS root and every mounted descendant as one object;
   invalidates affected query reuse records but not public handles.
 - **Stale behavior:** no-op.
-- **Contract:** scale is positive; all transform components are expected to be
-  finite.
+- **Contract:** position and scale are finite, with positive scale and finite
+  reciprocal. The transformed root bound and error must remain representable
+  as finite floats.
 
 ### `MotionGroup`
 
@@ -1212,8 +1297,10 @@ void moveInstances(MotionGroup& group,
 - **Effects:** moves live instances in cached physical order. Stale handles are
   ignored. If the group contains the same live instance more than once, the
   final caller-order position wins.
-- **Contract:** position and group sizes match, scale is positive, and values
-  are expected to be finite.
+- **Contract:** position and group sizes match, scale is finite and positive
+  with finite reciprocal, and every position belonging to a live instance is
+  finite. Each transformed root bound and error must remain representable as
+  finite floats.
 
 ### Runtime topology assembly
 
@@ -1244,10 +1331,12 @@ SubtreeInstanceHandle mountSubtree(
   links are constant-time. Private coverage blocks come from a
   definition-sized slab pool.
 - **Contract:** the definition is live; transform is finite with positive
-  scale; live parent is mountable and has no existing mounted child; the
-  transformed aggregate definition bounds fit in the parent's containment
-  bound. This is the shared authored bound for a mounted node and the current
-  instance-local root bound for a TLAS root.
+  scale; its accumulated transform remains finite with finite reciprocal; a
+  transform mounted directly below a TLAS root also has finite reciprocal;
+  live parent is mountable and has no existing mounted child; the transformed
+  aggregate definition bounds fit in the parent's containment bound. This is
+  the shared authored bound for a mounted node and the current instance-local
+  root bound for a TLAS root.
 
 The mount transform is immutable. To reposition a placement, unmount and mount
 it again; the replacement receives new handles, shares the definition's current
@@ -1325,7 +1414,10 @@ bool tryGetPayload(NodeHandle node, UserPayload& outPayload) const;
 ```
 
 Returns `true` and writes the immutable node payload when the handle resolves.
-Returns `false` for stale/invalid input and leaves `outPayload` unchanged.
+Returns `false` for stale/invalid input and leaves `outPayload` unchanged. An
+entry produced by a selection resolves throughout the same published read
+interval; failure is relevant when the application retains a handle across a
+later writer phase.
 
 ### Per-instance bounds overrides
 
@@ -1343,8 +1435,10 @@ void setNodeBounds(InstanceHandle instance, NodeHandle node,
   Immutable topology, errors, payloads, and other placements stay shared.
 - **Stale behavior:** stale instance or node updates are dropped, including
   updates that become stale while queued.
-- **Contract:** bounds are finite and non-empty, and the live node belongs to
-  the supplied live instance.
+- **Contract:** bounds are finite and non-empty, remain finite after every
+  containing mount and top-level instance transform, and the live node belongs
+  to the supplied live instance. Transform overflow is detected when the
+  deferred edit is flushed.
 
 ```cpp
 void flushBounds();
@@ -1360,8 +1454,8 @@ AABB nodeBounds(InstanceHandle instance, NodeHandle node);
 
 Flushes pending edits, then returns the effective instance-specific local
 bound: an overlay if one exists, otherwise the shared authored bound. Returns
-`AABB::empty()` when the instance or node does not resolve. Live inputs are
-expected to refer to the same assembled instance tree.
+`AABB::empty()` when the instance or node does not resolve. For live inputs,
+the node must belong to the supplied instance.
 
 `setNodeBounds()` changes spatial coverage only; it does not store a node pose
 or render transform.
@@ -1421,7 +1515,6 @@ affects retention only after `setMountUsageEnabled(true)`.
 
 ```cpp
 size_t mountedSubtreeCount() const;
-size_t streamedSubtreeCount() const;
 uint32_t frame() const;
 size_t overlayCount() const;
 size_t overlayBytes() const;
@@ -1429,8 +1522,6 @@ size_t subtreeInstanceStateBytes() const;
 ```
 
 - `mountedSubtreeCount()` returns the number of live mounted placements.
-- `streamedSubtreeCount()` is the same count, retained as a streaming-oriented
-  synonym.
 - `frame()` returns the latest `applyUpdates()` epoch.
 - `overlayCount()` returns live copy-on-write bounds overlay count.
 - `overlayBytes()` returns retained overlay storage bytes.
@@ -1451,7 +1542,7 @@ size_t subtreeInstanceStateBytes() const;
 4. All readers join before the next database mutation.
 
 One `SpatialQuery` is never concurrently callable because selection mutates
-its damping, reuse, usage, statistics, scratch, and output. Const database
+its damping, reuse, usage, optional statistics, scratch, and output. Const database
 lookup helpers are intended for the same stable read interval unless the
 application otherwise serializes them with mutation.
 
@@ -1459,76 +1550,11 @@ The host `parallelFor` callback creates parallel work inside one uncached
 selection. It must be blocking. Cached selection remains serial because its
 reuse-record updates are query-local and ordered.
 
-## 12. `AppendBuffer<T>` support type
-
-Declared in `frontier/append_buffer.h`. This is retained-capacity append-only
-storage used by public sink/result support. `T` must be trivially copyable and
-no more aligned than `std::max_align_t`.
-
-```cpp
-template <class T>
-class AppendBuffer {
-public:
-    using value_type = T;
-    using iterator = T*;
-    using const_iterator = const T*;
-
-    AppendBuffer();
-    AppendBuffer(const AppendBuffer&);
-    AppendBuffer(AppendBuffer&&) noexcept;
-    AppendBuffer& operator=(const AppendBuffer&);
-    AppendBuffer& operator=(AppendBuffer&&) noexcept;
-    ~AppendBuffer();
-
-    void clear() noexcept;
-    void reserve(size_t requested);
-    void resize_uninitialized(size_t requested);
-    void swap(AppendBuffer&) noexcept;
-    void push_back(T value);
-
-    template <class... Args>
-    T& emplace_back(Args&&... args);
-
-    void append(const T* source, size_t count);
-
-    T* data() noexcept;
-    const T* data() const noexcept;
-    T* begin() noexcept;
-    const T* begin() const noexcept;
-    T* end() noexcept;
-    const T* end() const noexcept;
-    T& operator[](size_t index) noexcept;
-    const T& operator[](size_t index) const noexcept;
-    T& front() noexcept;
-    const T& front() const noexcept;
-    T& back() noexcept;
-    const T& back() const noexcept;
-    size_t size() const noexcept;
-    size_t capacity() const noexcept;
-    bool empty() const noexcept;
-};
-```
-
-- Copy operations duplicate logical elements; move operations transfer the
-  allocation and leave the source empty.
-- `clear()` sets size to zero and retains capacity.
-- `reserve()` grows capacity to at least `requested` without changing size.
-- `resize_uninitialized()` changes logical size without initializing newly
-  exposed elements; every new element must be overwritten before it is read.
-- `push_back()` and `emplace_back()` append one value, growing geometrically.
-- `append()` copies a contiguous range. `source` must not point into the same
-  buffer because growth can relocate it.
-- Index, `front()`, and `back()` access require an in-range/non-empty buffer.
-- Capacity overflow throws `std::length_error`; allocation failure throws
-  `std::bad_alloc`.
-
-`AppendBuffer` uses the C allocation API directly and is not affected by
-`FrontierContext`.
-
-## 13. Current representation limits
+## 12. Current representation limits
 
 - One builder node has at most 511 local children; a definition has at most
-  511 direct nodes beneath its runtime mount parent.
+  511 direct nodes beneath its runtime mount parent and at most 1,048,575
+  renderable nodes in total.
 - Mounted placement slots and definition-local node indices use 20 bits.
 - Mounted-node generations use 24 bits.
 - TLAS root generations use 20 bits.

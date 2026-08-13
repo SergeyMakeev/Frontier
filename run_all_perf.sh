@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="${FRONTIER_ALL_PERF_BUILD_DIR:-${ROOT_DIR}/build-perf-report}"
+TEST_BUILD_DIR="${FRONTIER_ALL_TEST_BUILD_DIR:-${BUILD_DIR}-unit-debug}"
 REPORT_ROOT="${FRONTIER_PERF_REPORT_ROOT:-${ROOT_DIR}/perf_reports}"
 RNG_POLICY="xorshift32-explicit-seeds-v1"
 
@@ -64,14 +65,15 @@ write_report()
 - CPU affinity: scheduler default
 - Workload RNG: ${RNG_POLICY}
 - Benchmark order: registration order
-- Build: Release
+- Unit-test build: Debug
+- Performance build: Release with IPO; contract checks and subtree validation disabled
 
 ## Result files
 
 - \`real_world_perf.json\`: end-to-end subtree assembly workloads
 - \`machine_perf.json\`: ALU, SIMD, branch, cache, latency, and bandwidth probes
 - \`arch_kernel_perf.json\`: focused production-kernel probes with longer sampling
-- \`tests.log\`: correctness-suite result
+- \`tests.log\`: Debug BVH4 + BVH8 correctness-suite result
 - \`hardware.txt\`: CPU, memory, topology, OS, and power information
 - \`toolchain.txt\`: compiler, CMake, and build configuration
 - \`source.txt\`: exact Git revision and working-tree state
@@ -94,7 +96,8 @@ git_commit=${commit}
 git_dirty=${dirty}
 host_os=${host_system}
 host_arch=${host_machine}
-build_type=Release
+unit_build_type=Debug
+perf_build_type=Release
 affinity=scheduler-default
 rng_policy=${RNG_POLICY}
 benchmark_order=registration-order
@@ -199,7 +202,7 @@ trap finish EXIT
 
 cat > "${report_dir}/commands.txt" <<EOF
 Correctness:
-  ctest --test-dir <build> -C Release --output-on-failure
+  ctest --test-dir <unit-build> -C Debug --output-on-failure
 
 Real world:
   frontier_bench
@@ -242,30 +245,66 @@ elif [[ "${host_machine}" == "x86_64" ]]; then
     avx2=ON
 fi
 
+test_configure_args=(
+    -S "${ROOT_DIR}"
+    -B "${TEST_BUILD_DIR}"
+    -DCMAKE_BUILD_TYPE=Debug
+    -DFRONTIER_BUILD_TESTS=ON
+    -DFRONTIER_BUILD_BENCH=OFF
+    -DFRONTIER_AVX2="${avx2}"
+    -DFRONTIER_BVH_WIDTH=AUTO
+    -DFRONTIER_FORCE_SCALAR=OFF
+    -DFRONTIER_STATS=OFF
+    -DFRONTIER_CONTRACT_CHECKS=ON
+    -DFRONTIER_VALIDATE_SUBTREES=ON
+)
 configure_args=(
     -S "${ROOT_DIR}"
     -B "${BUILD_DIR}"
     -DCMAKE_BUILD_TYPE=Release
-    -DFRONTIER_BUILD_TESTS=ON
+    -DFRONTIER_IPO=ON
+    -DFRONTIER_BUILD_TESTS=OFF
     -DFRONTIER_BUILD_BENCH=ON
     -DFRONTIER_AVX2="${avx2}"
+    -DFRONTIER_BVH_WIDTH=AUTO
     -DFRONTIER_FORCE_SCALAR=OFF
+    -DFRONTIER_STATS=OFF
+    -DFRONTIER_CONTRACT_CHECKS=OFF
+    -DFRONTIER_VALIDATE_SUBTREES=OFF
 )
+if [[ ! -f "${TEST_BUILD_DIR}/CMakeCache.txt" ]] && command -v ninja >/dev/null 2>&1; then
+    test_configure_args+=(-G Ninja)
+fi
 if [[ ! -f "${BUILD_DIR}/CMakeCache.txt" ]] && command -v ninja >/dev/null 2>&1; then
     configure_args+=(-G Ninja)
 fi
 if [[ -n "${target_architecture}" ]]; then
+    test_configure_args+=("-DCMAKE_OSX_ARCHITECTURES=${target_architecture}")
     configure_args+=("-DCMAKE_OSX_ARCHITECTURES=${target_architecture}")
 fi
 
-failure_stage=configure
-echo "Configuring Release build..."
+failure_stage=configure-unit-tests
+echo "Configuring Debug unit tests (BVH4 + BVH8)..."
+cmake "${test_configure_args[@]}" 2>&1 | tee "${report_dir}/configure-tests.log"
+
+failure_stage=build-unit-tests
+echo "Building Debug unit tests..."
+cmake --build "${TEST_BUILD_DIR}" --config Debug --parallel \
+    --target frontier_unit_tests 2>&1 | tee "${report_dir}/build-tests.log"
+
+failure_stage=correctness-tests
+echo "Running Debug correctness tests..."
+ctest --test-dir "${TEST_BUILD_DIR}" -C Debug --output-on-failure 2>&1 |
+    tee "${report_dir}/tests.log"
+
+failure_stage=configure-performance
+echo "Configuring unchecked Release performance build..."
 cmake "${configure_args[@]}" 2>&1 | tee "${report_dir}/configure.log"
 
-failure_stage=build
-echo "Building tests and performance executables..."
+failure_stage=build-performance
+echo "Building performance executables..."
 cmake --build "${BUILD_DIR}" --config Release --parallel \
-    --target frontier_tests frontier_bench frontier_machine_bench 2>&1 |
+    --target frontier_bench frontier_machine_bench 2>&1 |
     tee "${report_dir}/build.log"
 
 cache_file="${BUILD_DIR}/CMakeCache.txt"
@@ -294,16 +333,11 @@ fi
     echo
     git --version 2>&1 || true
     echo
-    grep -E '^(CMAKE_(BUILD_TYPE|CXX_COMPILER|CXX_COMPILER_ID|CXX_COMPILER_VERSION|GENERATOR|OSX_ARCHITECTURES)|FRONTIER_(AVX2|FORCE_SCALAR)):' \
+    grep -E '^(CMAKE_(BUILD_TYPE|CXX_COMPILER|CXX_COMPILER_ID|CXX_COMPILER_VERSION|GENERATOR|OSX_ARCHITECTURES)|FRONTIER_(AVX2|BVH_WIDTH|CONTRACT_CHECKS|FORCE_SCALAR|IPO|STATS|VALIDATE_SUBTREES)):' \
         "${cache_file}" || true
     echo
     file "${bench_exe}" 2>&1 || true
 } > "${report_dir}/toolchain.txt"
-
-failure_stage=correctness-tests
-echo "Running correctness tests..."
-ctest --test-dir "${BUILD_DIR}" -C Release --output-on-failure 2>&1 |
-    tee "${report_dir}/tests.log"
 
 failure_stage=real-world-benchmarks
 echo "Running real-world performance suite..."

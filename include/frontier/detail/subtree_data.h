@@ -15,6 +15,7 @@ inline constexpr uint32_t kMetaMountable = 1u << kMetaChildBits;
 inline constexpr uint32_t kMetaOffsetShift = kMetaChildBits + 1;
 inline constexpr uint32_t kMaxWideOffset =
     (1u << (32 - kMetaOffsetShift)) - 1;
+inline constexpr UserPayload kSentinelPayload = ~UserPayload{0};
 
 inline uint32_t metaChildCount(uint32_t m) { return m & kMaxChildren; }
 inline bool metaIsMountable(uint32_t m) { return (m & kMetaMountable) != 0; }
@@ -26,11 +27,12 @@ struct WideBlock
     float8 error;
     uint32_t child[kWide];
 };
-static_assert(sizeof(WideBlock) == 256,
-              "WideBlock must stay exactly four cache lines");
+static_assert(sizeof(WideBlock) == kWide * 32,
+              "WideBlock must stay exactly 32 bytes per lane");
 
-inline constexpr uint32_t kBlockLeafShift = 8;
-inline uint32_t blockValidLanes(uint32_t m) { return m & 0xFFu; }
+inline constexpr uint32_t kBlockLaneMask = (1u << kWide) - 1u;
+inline constexpr uint32_t kBlockLeafShift = kWide;
+inline uint32_t blockValidLanes(uint32_t m) { return m & kBlockLaneMask; }
 inline uint32_t blockLeafLanes(uint32_t m) { return m >> kBlockLeafShift; }
 
 struct WideBoundsRef
@@ -82,7 +84,7 @@ struct MutWideBoundsRef
 };
 
 inline constexpr uint32_t kSubtreeMagic = 0x42545346u; // 'FSTB'
-inline constexpr uint16_t kSubtreeVersion = 2;
+inline constexpr uint16_t kSubtreeVersion = 3;
 inline constexpr size_t kSubtreeAlign = kSubtreeByteAlignment;
 
 // The immutable in-memory layout is also the serialized format. It contains
@@ -104,7 +106,8 @@ struct SubtreeHeader
     uint32_t subtreeSizeOffset;
     uint32_t metaOffset;
     uint32_t errorOffset;
-    uint32_t reserved[19];
+    uint32_t branchingFactor;
+    uint32_t reserved[18];
 };
 static_assert(sizeof(SubtreeHeader) == 128,
               "SubtreeHeader must stay two cache lines");

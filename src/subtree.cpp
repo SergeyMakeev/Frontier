@@ -1,5 +1,8 @@
 #include "frontier/subtree.h"
 
+#include <algorithm>
+#include <cfloat>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 
@@ -48,6 +51,31 @@ detail::SubtreeLayout computeLayout(uint32_t nodeCount, uint32_t wideCount)
     layout.totalBytes = uint32_t(alignUp(offset, kSubtreeAlign));
     return layout;
 }
+
+#if FRONTIER_VALIDATE_SUBTREES
+bool finiteNonEmptyBounds(const AABB& bounds)
+{
+    return bounds.mn.x <= bounds.mx.x &&
+           bounds.mn.y <= bounds.mx.y &&
+           bounds.mn.z <= bounds.mx.z &&
+           bounds.mx.x - bounds.mn.x < FLT_MAX &&
+           bounds.mx.y - bounds.mn.y < FLT_MAX &&
+           bounds.mx.z - bounds.mn.z < FLT_MAX;
+}
+
+bool sameBounds(const AABB& a, const AABB& b)
+{
+    return a.mn.x == b.mn.x && a.mn.y == b.mn.y && a.mn.z == b.mn.z &&
+           a.mx.x == b.mx.x && a.mx.y == b.mx.y && a.mx.z == b.mx.z;
+}
+
+bool canonicalEmptyBounds(const AABB& bounds)
+{
+    return bounds.mn.x == FLT_MAX && bounds.mn.y == FLT_MAX &&
+           bounds.mn.z == FLT_MAX && bounds.mx.x == -FLT_MAX &&
+           bounds.mx.y == -FLT_MAX && bounds.mx.z == -FLT_MAX;
+}
+#endif
 
 } // namespace
 
@@ -137,6 +165,11 @@ void validateSubtreeBytes(const SubtreeBytes& bytes)
                    "registerSubtree: format version mismatch");
     FRONTIER_CHECK(header->headerBytes == sizeof(SubtreeHeader),
                    "registerSubtree: header size mismatch");
+    FRONTIER_CHECK(header->branchingFactor == kWide,
+                   "registerSubtree: branching factor mismatch");
+    FRONTIER_CHECK(std::all_of(header->reserved, header->reserved + 18,
+                               [](uint32_t value) { return value == 0; }),
+                   "registerSubtree: reserved header fields are non-zero");
     FRONTIER_CHECK(header->nodeCount > 1,
                    "registerSubtree: subtree has no renderable nodes");
     FRONTIER_CHECK(header->nodeCount <= kMaxSubtreeNodes,
@@ -165,6 +198,136 @@ void validateSubtreeBytes(const SubtreeBytes& bytes)
         bytes.data() + header->payloadOffset);
     FRONTIER_CHECK(payload[0] == kSentinelPayload,
                    "registerSubtree: missing implicit-parent sentinel");
+
+    const auto* parent = reinterpret_cast<const uint32_t*>(
+        bytes.data() + header->parentOffset);
+    const auto* subtreeSize = reinterpret_cast<const uint32_t*>(
+        bytes.data() + header->subtreeSizeOffset);
+    const auto* meta = reinterpret_cast<const uint32_t*>(
+        bytes.data() + header->metaOffset);
+    const auto* error = reinterpret_cast<const float*>(
+        bytes.data() + header->errorOffset);
+
+    const uint32_t nodeCount = header->nodeCount;
+    FRONTIER_CHECK(parent[0] == 0 && subtreeSize[0] == nodeCount,
+                   "registerSubtree: invalid implicit-parent extent");
+    const uint32_t rootChildren = metaChildCount(meta[0]);
+    FRONTIER_CHECK(!metaIsMountable(meta[0]) && rootChildren != 0,
+                   "registerSubtree: invalid implicit-parent metadata");
+    const uint32_t rootBlocks = (rootChildren + kWide - 1) / kWide;
+    FRONTIER_CHECK(metaWideOffset(meta[0]) == 0 &&
+                       rootBlocks <= header->wideCount,
+                   "registerSubtree: implicit-parent blocks escape array");
+    FRONTIER_CHECK(error[0] == FLT_MAX,
+                   "registerSubtree: invalid implicit-parent error");
+
+#if FRONTIER_VALIDATE_SUBTREES
+    const auto* wide = reinterpret_cast<const WideBlock*>(
+        bytes.data() + header->wideOffset);
+    const auto* blockMask = reinterpret_cast<const uint32_t*>(
+        bytes.data() + header->maskOffset);
+    const auto* bbox = reinterpret_cast<const AABB*>(
+        bytes.data() + header->bboxOffset);
+
+    // Validate all scalar arrays before using any serialized index. This is
+    // deliberately linear: registration remains zero-copy, while malformed
+    // persisted bytes can never become unchecked traversal pointers.
+    for (uint32_t node = 0; node < nodeCount; ++node)
+    {
+        FRONTIER_CHECK(finiteNonEmptyBounds(bbox[node]),
+                       "registerSubtree: invalid node bounds");
+        FRONTIER_CHECK(subtreeSize[node] != 0 &&
+                           subtreeSize[node] <= nodeCount - node,
+                       "registerSubtree: invalid subtree extent");
+
+        const uint32_t children = metaChildCount(meta[node]);
+        FRONTIER_CHECK(!metaIsMountable(meta[node]) || children == 0,
+                       "registerSubtree: mountable node has local children");
+        if (children == 0)
+            FRONTIER_CHECK(subtreeSize[node] == 1,
+                           "registerSubtree: leaf has descendants");
+
+        if (node == 0) continue;
+        FRONTIER_CHECK(parent[node] < node,
+                       "registerSubtree: parent ordering violated");
+        FRONTIER_CHECK(error[node] >= 0.0f &&
+                           std::isfinite(error[node]) &&
+                           error[node] <= error[parent[node]],
+                       "registerSubtree: invalid geometric error");
+        FRONTIER_CHECK(bbox[parent[node]].contains(bbox[node]),
+                       "registerSubtree: parent bounds do not contain child");
+    }
+
+    uint32_t expectedWide = 0;
+    for (uint32_t node = 0; node < nodeCount; ++node)
+    {
+        const uint32_t children = metaChildCount(meta[node]);
+        if (children == 0)
+        {
+            FRONTIER_CHECK(metaWideOffset(meta[node]) == 0,
+                           "registerSubtree: leaf has a wide-block offset");
+            continue;
+        }
+
+        FRONTIER_CHECK(metaWideOffset(meta[node]) == expectedWide,
+                       "registerSubtree: non-canonical wide-block offset");
+        const uint32_t blocks = (children + kWide - 1) / kWide;
+        FRONTIER_CHECK(expectedWide <= header->wideCount &&
+                           blocks <= header->wideCount - expectedWide,
+                       "registerSubtree: wide-block range escapes array");
+
+        uint32_t child = node + 1;
+        for (uint32_t blockIndex = 0; blockIndex < blocks; ++blockIndex)
+        {
+            const WideBlock& block = wide[expectedWide + blockIndex];
+            const uint32_t first = blockIndex * kWide;
+            const uint32_t lanes =
+                std::min(kWide, children - first);
+            uint32_t expectedValid = 0;
+            uint32_t expectedLeaf = 0;
+
+            for (uint32_t lane = 0; lane < kWide; ++lane)
+            {
+                if (lane < lanes)
+                {
+                    FRONTIER_CHECK(child < nodeCount &&
+                                       parent[child] == node,
+                                   "registerSubtree: invalid preorder topology");
+                    FRONTIER_CHECK(block.child[lane] == child,
+                                   "registerSubtree: wide child index mismatch");
+                    FRONTIER_CHECK(sameBounds(block.bounds.lane(lane),
+                                              bbox[child]) &&
+                                       block.error.v[lane] == error[child],
+                                   "registerSubtree: wide child data mismatch");
+                    expectedValid |= 1u << lane;
+                    if (metaChildCount(meta[child]) == 0 &&
+                        !metaIsMountable(meta[child]))
+                        expectedLeaf |= 1u << lane;
+                    child += subtreeSize[child];
+                }
+                else
+                {
+                    FRONTIER_CHECK(block.child[lane] == kInvalidIndex &&
+                                       canonicalEmptyBounds(
+                                           block.bounds.lane(lane)) &&
+                                       block.error.v[lane] == 0.0f,
+                                   "registerSubtree: non-canonical unused lane");
+                }
+            }
+
+            FRONTIER_CHECK(
+                blockMask[expectedWide + blockIndex] ==
+                    (expectedValid | (expectedLeaf << kBlockLeafShift)),
+                "registerSubtree: invalid wide-block lane mask");
+        }
+
+        FRONTIER_CHECK(child == node + subtreeSize[node],
+                       "registerSubtree: child extents do not cover subtree");
+        expectedWide += blocks;
+    }
+    FRONTIER_CHECK(expectedWide == header->wideCount,
+                   "registerSubtree: unused wide blocks");
+#endif
 }
 
 SubtreeView viewSubtreeBytes(const SubtreeBytes& bytes)

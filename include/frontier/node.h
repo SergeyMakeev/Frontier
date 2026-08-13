@@ -10,7 +10,6 @@ namespace frontier {
 // values may identify the same render resources, but readiness is tracked by
 // registered definition node rather than by payload value.
 using UserPayload = uint64_t;
-inline constexpr UserPayload kSentinelPayload = ~0ull;
 inline constexpr uint32_t kInvalidIndex = 0xFFFFFFFFu;
 
 // Translation plus positive uniform scale, the transform contract shared by
@@ -53,7 +52,10 @@ struct ScalarAABB
     }
 
     operator AABB() const noexcept { return toAABB(); }
-    bool isEmpty() const noexcept { return mn.x > mx.x; }
+    bool isEmpty() const noexcept
+    {
+        return mn.x > mx.x || mn.y > mx.y || mn.z > mx.z;
+    }
 };
 static_assert(sizeof(ScalarAABB) == 24,
               "ScalarAABB must contain exactly six floats");

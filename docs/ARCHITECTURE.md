@@ -7,11 +7,12 @@ the [API guide](API.md), exact signatures are in the
 
 ## Spatial structure
 
-The dynamic TLAS is an 8-wide BVH. Every leaf lane names a live top-level
-instance whose permanent renderable root data is stored in dense instance
-streams. Internal TLAS nodes contain wide bounds, maximum error, layer masks,
-child references, and a flag indicating whether a hierarchical root can be
-tested directly.
+The dynamic TLAS uses the build-wide `FRONTIER_BVH_WIDTH`: four or eight lanes.
+Every leaf lane names a live top-level instance whose permanent renderable root
+data is stored in dense instance streams. Internal TLAS nodes contain wide
+bounds, maximum error, layer masks, child references, and a flag indicating
+whether a hierarchical root can be tested directly. A BVH4 `TlasNode` is 192
+bytes; a BVH8 node is 320 bytes.
 
 Each mounted definition is a BLAS fragment below one renderable parent. A
 definition can have several direct roots because the parent is external. A
@@ -23,7 +24,7 @@ single placement in one runtime tree.
 `SubtreeBuilder` emits one aligned, versioned allocation with:
 
 - a 128-byte header;
-- interleaved `WideBlock` data;
+- interleaved `WideBlock` data (128 bytes in BVH4, 256 bytes in BVH8);
 - valid/leaf lane masks;
 - authored bounds and payload arrays;
 - parent, contiguous-subtree-size, and packed metadata arrays;
@@ -31,15 +32,20 @@ single placement in one runtime tree.
 
 Mountability is one bit in packed node metadata. Definition targets and
 transforms are deliberately absent: they are supplied when a handle is mounted.
+The header records the branching factor, so registration rejects bytes built
+for the other width even when complete structural validation is disabled.
 
 The public `SubtreeBytes` type owns the aligned array and a copied allocator
-context. Registration validates and O(1)-moves that allocation into a cold
-`SubtreeDefinitionRt`; an internal pointer-only `SubtreeView` binds traversal
-streams directly over the same bytes. No deserialized copy or public semantic
-definition object exists. Registration builds a compact zeroed readiness bitset
-with one bit per packed node, so validation remains linear in node count and
-readiness initialization is linear in bitset words. It also creates a
-definition-local geometric slab allocator for per-placement coverage state.
+context. Registration O(1)-moves that allocation into a cold
+`SubtreeDefinitionRt`; an internal pointer-only `SubtreeView` binds directly
+over the same bytes. By default it first validates every scalar and wide
+traversal stream in O(nodes + wide blocks). `FRONTIER_VALIDATE_SUBTREES=0`
+compiles out that complete scan for trusted builder output while retaining
+constant-time format-envelope and root-range checks. No deserialized copy or
+public semantic definition object exists. The first mount lazily allocates one
+shared 16-bit node-state word per packed node. That word combines readiness
+with derived coverage; definition-local geometric slabs supply uncommon
+private coverage copies without one allocation per placement.
 
 The definition-node bit is the authoritative ready/unavailable state and is
 shared by every placement of that exact registered definition. Equal
@@ -70,8 +76,11 @@ normally validates one exact dependency rather than every house placement.
 ## Traversal
 
 Selection first queries the TLAS using 8-lane bound/error tests. Flat roots use
-a direct path that does not read mounted-state arrays. Hierarchical roots either
-terminate in the TLAS or enqueue their first mounted placement.
+a direct path that does not read mounted-state arrays. An all-flat snapshot
+also bypasses per-instance frontier caching even when reuse is enabled: there
+is no hierarchy walk to save, so recording and copying one cached entry would
+only add work. Hierarchical roots either terminate in the TLAS or enqueue their
+first mounted placement.
 
 A `WorkItem` carries placement slot, effective wide bounds, current/ideal
 liveness, and narrowed frustum mask. One dispatch selects dense authored/COW
@@ -138,7 +147,7 @@ grow-only; top-level rebuilds do not shrink them.
 
 Each `SpatialQuery` owns a camera damper, 32-byte hot reuse records, 4-byte cold
 allocation records, a compact output slab, optional dependency spill, scratch,
-statistics, and optional mount-use records. Cache validity is proved using a
+optional compile-time statistics, and optional mount-use records. Cache validity is proved using a
 position/projection travel budget plus instance and mounted-tree versions.
 
 Only instances fully inside the frustum are reusable because no plane decision
@@ -155,8 +164,9 @@ After publication, distinct queries may read concurrently until the next write.
 The city/house benchmark compares 400 houses with eight fully refined detail
 nodes each. The current assembled representation reports 93.7 KiB of serialized
 bytes plus mounted-placement state versus 318.6 KiB flattened, about 71% less.
-This counter deliberately excludes definition-local readiness bits; it measures
-the same byte and placement categories as the retained historical comparisons.
+The placement-state counter includes definition-local shared readiness/coverage
+words and retained private coverage slabs; it measures the same byte and
+placement categories as the retained historical comparisons.
 
 Against the immediately preceding per-placement-readiness build, the assembled
 placement figure increased from 91.8 KiB to 93.7 KiB (2.0%). The net four bytes

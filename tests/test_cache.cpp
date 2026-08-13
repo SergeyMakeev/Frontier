@@ -8,12 +8,14 @@ using namespace frontiertest;
 TEST(QueryCache, ReusesStableFrontiers)
 {
     SpatialDatabase database;
+    const SubtreeHandle subtree =
+        database.registerSubtree(makeLeafSubtree(1000));
     for (uint32_t i = 0; i < 128; ++i)
     {
         InstanceDesc desc;
         desc.pos = float4::point(float(i % 16) * 4.0f, 0,
                                  float(i / 16) * 4.0f);
-        database.instantiate(node(i + 1, 0.0f, box()), desc);
+        instantiateFor(database, subtree, box(), 64.0f, desc);
     }
     database.applyUpdates();
     SpatialQuery query;
@@ -47,7 +49,9 @@ TEST(QueryCache, MountedStateMutationInvalidatesRecordedCut)
 TEST(QueryCache, QueriesOwnIndependentDampingAndReuseState)
 {
     SpatialDatabase database;
-    database.instantiate(node(1, 4.0f, box()));
+    const SubtreeHandle subtree =
+        database.registerSubtree(makeLeafSubtree(2));
+    instantiateFor(database, subtree, box(), 4.0f);
     database.applyUpdates();
     SpatialQuery mainView(4.0f);
     SpatialQuery shadowView(0.0f);
@@ -74,4 +78,25 @@ TEST(QueryCache, DisableReuseKeepsTraversalCorrect)
     const FrontierResultView second = query.selectFrontier(database, cameraAt(), {});
     EXPECT_EQ(payloads(database, second), (std::vector<UserPayload>{9}));
     EXPECT_EQ(query.reused(), 0u);
+}
+
+TEST(QueryCache, TlasOnlyObjectsBypassEntryCaching)
+{
+    SpatialDatabase database;
+    constexpr uint32_t count = 64;
+    for (uint32_t i = 0; i < count; ++i)
+        database.instantiate(node(1000 + i, 0.0f, box()));
+    database.applyUpdates();
+
+    SpatialQuery query;
+    ASSERT_TRUE(query.reuseEnabled());
+    const Camera camera = cameraAt(-1000.0f);
+    for (uint32_t iteration = 0; iteration < 2; ++iteration)
+    {
+        const FrontierResultView result =
+            query.selectFrontier(database, camera, {});
+        EXPECT_EQ(result.shared.size(), count);
+        EXPECT_EQ(query.reused(), 0u);
+        EXPECT_EQ(query.walked(), count);
+    }
 }

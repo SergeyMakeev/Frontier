@@ -1,14 +1,30 @@
 cmake_minimum_required(VERSION 3.24)
 project(Frontier VERSION 0.7.0 LANGUAGES CXX)
 
-set(CMAKE_CXX_STANDARD 20)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-
-option(FRONTIER_BUILD_TESTS "Build unit tests" ON)
-option(FRONTIER_BUILD_BENCH "Build performance tests" ON)
-option(FRONTIER_AVX2 "Enable AVX2 code generation (x86-64 only)" ON)
+# A standalone checkout is developer-friendly by default. When Frontier is
+# embedded with add_subdirectory(), do not fetch or build its test-only
+# dependencies unless the parent explicitly opts in.
+option(FRONTIER_BUILD_TESTS "Build unit tests" ${PROJECT_IS_TOP_LEVEL})
+option(FRONTIER_BUILD_BENCH "Build performance tests" OFF)
+option(FRONTIER_AVX2 "Enable AVX2 code generation for BVH8 (x86-64 only)" ON)
 option(FRONTIER_FORCE_SCALAR "Disable SIMD intrinsics; use the portable scalar paths" OFF)
+set(FRONTIER_BVH_WIDTH "AUTO" CACHE STRING
+    "BVH branching factor and wide traversal width (AUTO, 4, or 8)")
+set_property(CACHE FRONTIER_BVH_WIDTH PROPERTY STRINGS AUTO 4 8)
 option(FRONTIER_PROFILE_SYMBOLS "Keep optimized source line tables for CPU profiling" OFF)
+option(FRONTIER_IPO "Enable interprocedural optimization for Frontier targets" OFF)
+option(FRONTIER_STATS "Enable per-query traversal statistics" OFF)
+option(FRONTIER_CONTRACT_CHECKS "Enable public caller-contract checks" ON)
+option(FRONTIER_VALIDATE_SUBTREES
+       "Validate complete serialized subtree structure during registration" ON)
+
+# Standalone correctness builds are Debug unless the caller explicitly chose a
+# configuration. Benchmarks use their own Release build directory and never
+# share this default.
+if(PROJECT_IS_TOP_LEVEL AND FRONTIER_BUILD_TESTS AND
+   NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Debug CACHE STRING "Build type" FORCE)
+endif()
 
 if(FRONTIER_BUILD_TESTS OR FRONTIER_BUILD_BENCH)
     find_package(Threads REQUIRED)
@@ -22,33 +38,105 @@ else()
     set(FRONTIER_ARCH_X64 FALSE)
 endif()
 
+if(FRONTIER_BVH_WIDTH STREQUAL "AUTO")
+    # AVX2 is the only eight-lane backend. SSE2 and NEON are four lanes, so
+    # their natural default is BVH4. Scalar builds also prefer the compact
+    # BVH4 layout; callers can explicitly request BVH8 for comparisons.
+    if(FRONTIER_AVX2 AND FRONTIER_ARCH_X64 AND NOT FRONTIER_FORCE_SCALAR)
+        set(FRONTIER_EFFECTIVE_BVH_WIDTH 8)
+    else()
+        set(FRONTIER_EFFECTIVE_BVH_WIDTH 4)
+    endif()
+elseif(FRONTIER_BVH_WIDTH STREQUAL "4" OR
+       FRONTIER_BVH_WIDTH STREQUAL "8")
+    set(FRONTIER_EFFECTIVE_BVH_WIDTH ${FRONTIER_BVH_WIDTH})
+else()
+    message(FATAL_ERROR "FRONTIER_BVH_WIDTH must be AUTO, 4, or 8")
+endif()
+message(STATUS
+    "Frontier BVH width: ${FRONTIER_EFFECTIVE_BVH_WIDTH} "
+    "(requested ${FRONTIER_BVH_WIDTH})")
+
+if(FRONTIER_IPO)
+    include(CheckIPOSupported)
+    check_ipo_supported(RESULT FRONTIER_IPO_SUPPORTED OUTPUT FRONTIER_IPO_ERROR)
+    if(NOT FRONTIER_IPO_SUPPORTED)
+        message(FATAL_ERROR
+            "FRONTIER_IPO requested but unsupported: ${FRONTIER_IPO_ERROR}")
+    endif()
+endif()
+
 # ---- core library -----------------------------------------------------------
-add_library(frontier STATIC
+set(FRONTIER_SOURCES
     src/builder.cpp
     src/config.cpp
     src/subtree.cpp
     src/spatial_database.cpp
 )
-target_include_directories(frontier PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
-if(MSVC)
-    target_compile_options(frontier PRIVATE /W4 /permissive-)
-    if(FRONTIER_AVX2 AND FRONTIER_ARCH_X64 AND NOT FRONTIER_FORCE_SCALAR)
-        target_compile_options(frontier PUBLIC /arch:AVX2)
+function(frontier_configure_library target width)
+    target_include_directories(${target} PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_compile_features(${target} PUBLIC cxx_std_20)
+    target_compile_definitions(${target} PUBLIC FRONTIER_BVH_WIDTH=${width})
+    set_target_properties(${target} PROPERTIES CXX_EXTENSIONS OFF)
+    if(FRONTIER_IPO)
+        set_property(TARGET ${target} PROPERTY INTERPROCEDURAL_OPTIMIZATION ON)
     endif()
-else()
-    target_compile_options(frontier PRIVATE -Wall -Wextra)
-    if(FRONTIER_AVX2 AND FRONTIER_ARCH_X64 AND NOT FRONTIER_FORCE_SCALAR)
-        target_compile_options(frontier PUBLIC -mavx2 -mfma)
+
+    if(MSVC)
+        target_compile_options(${target} PRIVATE /W4 /permissive-)
+        if(FRONTIER_AVX2 AND FRONTIER_ARCH_X64 AND NOT FRONTIER_FORCE_SCALAR AND
+           width EQUAL 8)
+            target_compile_options(${target} PUBLIC /arch:AVX2)
+        endif()
+    else()
+        target_compile_options(${target} PRIVATE -Wall -Wextra)
+        if(FRONTIER_AVX2 AND FRONTIER_ARCH_X64 AND NOT FRONTIER_FORCE_SCALAR AND
+           width EQUAL 8)
+            target_compile_options(${target} PUBLIC -mavx2 -mfma)
+        endif()
     endif()
-endif()
 
-if(FRONTIER_FORCE_SCALAR)
-    target_compile_definitions(frontier PUBLIC FRONTIER_FORCE_SCALAR=1)
-endif()
+    if(FRONTIER_FORCE_SCALAR)
+        target_compile_definitions(${target} PUBLIC FRONTIER_FORCE_SCALAR=1)
+    endif()
 
-if(FRONTIER_PROFILE_SYMBOLS AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-    target_compile_options(frontier PRIVATE -gline-tables-only)
+    if(FRONTIER_STATS)
+        target_compile_definitions(${target} PUBLIC FRONTIER_STATS=1)
+    endif()
+
+    if(FRONTIER_CONTRACT_CHECKS)
+        target_compile_definitions(${target} PUBLIC FRONTIER_CONTRACT_CHECKS=1)
+    else()
+        target_compile_definitions(${target} PUBLIC FRONTIER_CONTRACT_CHECKS=0)
+    endif()
+
+    if(FRONTIER_VALIDATE_SUBTREES)
+        target_compile_definitions(${target} PUBLIC FRONTIER_VALIDATE_SUBTREES=1)
+    else()
+        target_compile_definitions(${target} PUBLIC FRONTIER_VALIDATE_SUBTREES=0)
+    endif()
+
+    if(FRONTIER_PROFILE_SYMBOLS AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        target_compile_options(${target} PRIVATE -gline-tables-only)
+    endif()
+endfunction()
+
+add_library(frontier STATIC ${FRONTIER_SOURCES})
+frontier_configure_library(frontier ${FRONTIER_EFFECTIVE_BVH_WIDTH})
+
+# A normal unit-test build always compiles and executes the other branch width
+# as well. This prevents the configured/default width from silently leaving
+# the other serialized layout and traversal implementation untested.
+if(FRONTIER_BUILD_TESTS)
+    if(FRONTIER_EFFECTIVE_BVH_WIDTH EQUAL 8)
+        set(FRONTIER_ALTERNATE_BVH_WIDTH 4)
+    else()
+        set(FRONTIER_ALTERNATE_BVH_WIDTH 8)
+    endif()
+    add_library(frontier_test_alternate STATIC ${FRONTIER_SOURCES})
+    frontier_configure_library(frontier_test_alternate
+                               ${FRONTIER_ALTERNATE_BVH_WIDTH})
 endif()
 
 # ---- external deps via FetchContent ------------------------------------------
