@@ -600,8 +600,8 @@ BENCHMARK(BM_FlatTlasSelectionScale)
 
 // Exercises the indexed/dependent-load pipelines between the TLAS result,
 // Instance records, mount slots, and shared subtree arrays. Reuse mode 0 is
-// uncached, 1 measures stable hits, and 2 moves far enough on every call to
-// force existing records through the cached-miss path.
+// uncached, 1 measures stable hits, and 2 alternates the current-cut policy to
+// invalidate every record and force the cached-miss path deterministically.
 static void BM_InstanceForestSelectionScale(benchmark::State& state)
 {
     const uint32_t count = uint32_t(state.range(0));
@@ -636,10 +636,6 @@ static void BM_InstanceForestSelectionScale(benchmark::State& state)
     const Camera stable = makeLookAtCamera(
         float4::point(0.0f, 0.0f, -span),
         float4::point(0.0f, 0.0f, 0.0f));
-    const Camera moved = makeLookAtCamera(
-        float4::point(span * 0.3f, 0.0f, -span),
-        float4::point(0.0f, 0.0f, 0.0f));
-
     SpatialQuery query;
     query.setReuseEnabled(reuseMode != 0);
     if (reuseMode != 0)
@@ -649,9 +645,11 @@ static void BM_InstanceForestSelectionScale(benchmark::State& state)
     FrontierResultView result;
     for (auto _ : state)
     {
-        const Camera& camera =
-            reuseMode == 2 && (++call & 1) ? moved : stable;
-        result = query.selectFrontier(world, camera, {});
+        SelectionParams params;
+        if (reuseMode == 2 && (++call & 1))
+            params.currentCutPolicy =
+                CurrentCutPolicy::PreferReadyAncestors;
+        result = query.selectFrontier(world, stable, params);
         consume(result);
     }
     state.counters["entries"] = double(result.size());
