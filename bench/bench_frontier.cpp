@@ -598,6 +598,75 @@ BENCHMARK(BM_FlatTlasSelectionScale)
     ->ArgNames({"instances", "cached"})
     ->Unit(benchmark::kMicrosecond);
 
+// Exercises the indexed/dependent-load pipelines between the TLAS result,
+// Instance records, mount slots, and shared subtree arrays. Reuse mode 0 is
+// uncached, 1 measures stable hits, and 2 moves far enough on every call to
+// force existing records through the cached-miss path.
+static void BM_InstanceForestSelectionScale(benchmark::State& state)
+{
+    const uint32_t count = uint32_t(state.range(0));
+    const uint32_t hierarchicalPercent = uint32_t(state.range(1));
+    const uint32_t reuseMode = uint32_t(state.range(2));
+
+    SpatialDatabase world;
+    const SubtreeHandle definition =
+        world.registerSubtree(makeLodSubtree(50000, 50001, 50002));
+    const uint32_t side =
+        uint32_t(std::ceil(std::sqrt(double(count))));
+    constexpr float pitch = 12.0f;
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        InstanceDesc desc;
+        desc.pos = float4::point(
+            float(int(i % side) - int(side / 2)) * pitch,
+            float(int(i / side) - int(side / 2)) * pitch, 0.0f);
+        const bool hierarchical =
+            (i % 100) < hierarchicalPercent;
+        const InstanceHandle instance = world.instantiate(
+            node(1000 + i, hierarchical ? 64.0f : 0.0f,
+                 box(4.0f), hierarchical),
+            desc);
+        if (hierarchical)
+            world.mountSubtree(instance.rootNode(), definition);
+    }
+    TestAccess::markAllNodesReady(world);
+    world.applyUpdates();
+
+    const float span = float(side) * pitch;
+    const Camera stable = makeLookAtCamera(
+        float4::point(0.0f, 0.0f, -span),
+        float4::point(0.0f, 0.0f, 0.0f));
+    const Camera moved = makeLookAtCamera(
+        float4::point(span * 0.3f, 0.0f, -span),
+        float4::point(0.0f, 0.0f, 0.0f));
+
+    SpatialQuery query;
+    query.setReuseEnabled(reuseMode != 0);
+    if (reuseMode != 0)
+        consume(query.selectFrontier(world, stable, {}));
+
+    uint64_t call = 0;
+    FrontierResultView result;
+    for (auto _ : state)
+    {
+        const Camera& camera =
+            reuseMode == 2 && (++call & 1) ? moved : stable;
+        result = query.selectFrontier(world, camera, {});
+        consume(result);
+    }
+    state.counters["entries"] = double(result.size());
+    state.counters["reused"] = double(query.reused());
+    state.counters["walked"] = double(query.walked());
+}
+
+BENCHMARK(BM_InstanceForestSelectionScale)
+    ->Args({1000, 50, 0})->Args({1000, 50, 1})->Args({1000, 50, 2})
+    ->Args({1000, 100, 0})->Args({1000, 100, 1})->Args({1000, 100, 2})
+    ->Args({10000, 50, 0})->Args({10000, 50, 1})->Args({10000, 50, 2})
+    ->Args({10000, 100, 0})->Args({10000, 100, 1})->Args({10000, 100, 2})
+    ->ArgNames({"instances", "hierarchical_percent", "reuse_mode"})
+    ->Unit(benchmark::kMicrosecond);
+
 static void BM_FlatInstanceLifecycle(benchmark::State& state)
 {
     constexpr uint32_t population = 1024;
