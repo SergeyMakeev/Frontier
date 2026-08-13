@@ -34,7 +34,7 @@ private:
         static constexpr uint32_t kChildCountMask = (1u << 9) - 1;
         static constexpr uint32_t kMountableBit = 1u << 31;
 
-        UserPayload payload{};
+        detail::PayloadWord payload{};
         float geometricError = 0.0f;
         NodeId parent = kInvalidIndex;
         NodeId firstChild = kInvalidIndex;
@@ -62,8 +62,8 @@ private:
             else childCountAndFlags &= ~kMountableBit;
         }
     };
-    static_assert(sizeof(BuildNode) == 56,
-                  "BuildNode must stay at seven eight-byte words");
+    static_assert(sizeof(BuildNode) == sizeof(detail::PayloadWord) + 48,
+                  "BuildNode layout changed");
 
     std::vector<BuildNode> nodes_;
     std::vector<NodeId> roots_;

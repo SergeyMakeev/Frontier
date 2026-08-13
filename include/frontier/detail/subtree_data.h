@@ -83,7 +83,7 @@ struct MutWideBoundsRef
 };
 
 inline constexpr uint32_t kSubtreeMagic = 0x42545346u; // 'FSTB'
-inline constexpr uint16_t kSubtreeVersion = 4;
+inline constexpr uint16_t kSubtreeVersion = 5;
 inline constexpr size_t kSubtreeAlign = kSubtreeByteAlignment;
 
 // The immutable in-memory layout is also the serialized format. It contains
@@ -106,7 +106,9 @@ struct SubtreeHeader
     uint32_t metaOffset;
     uint32_t errorOffset;
     uint32_t branchingFactor;
-    uint32_t reserved[18];
+    uint64_t invalidPayloadWord;
+    uint32_t payloadBytes;
+    uint32_t reserved[15];
 };
 static_assert(sizeof(SubtreeHeader) == 128,
               "SubtreeHeader must stay two cache lines");
@@ -133,7 +135,7 @@ struct SubtreeView
     const uint32_t* meta_ = nullptr;
     const WideBlock* wide_ = nullptr;
     const uint32_t* blockMask_ = nullptr;
-    const UserPayload* payload_ = nullptr;
+    const PayloadWord* payload_ = nullptr;
     const AABB* bbox_ = nullptr;
     const float* geometricError_ = nullptr;
     uint32_t packedNodeCount_ = 0;

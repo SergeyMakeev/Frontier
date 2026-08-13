@@ -487,17 +487,29 @@ inline constexpr uint32_t kInvalidIndex = 0xffffffffu;
 values may refer to the same application resource, but they do not couple
 Frontier readiness: readiness belongs to a node in a registered definition.
 The type must be trivially copyable, default constructible, equality comparable,
-exactly eight bytes, and aligned to no more than eight bytes. By default it is
-`uint64_t` and `kInvalidPayload` is `UINT64_MAX`. The invalid value is reserved
-and cannot be authored. Supply both macros as consistent build-wide
-preprocessor definitions for the library and all consumers to select another
-type:
+have a unique object representation, and occupy exactly four or eight bytes.
+By default it is `uint64_t` and `kInvalidPayload` is `UINT64_MAX`. The invalid
+value is reserved and cannot be authored. Supply both macros as consistent
+build-wide preprocessor definitions for the library and all consumers to select
+another type:
 
 ```cpp
 // Build configuration, before including any Frontier header:
+#define FRONTIER_USER_PAYLOAD uint32_t
+#define FRONTIER_INVALID_PAYLOAD UINT32_MAX
+```
+
+or:
+
+```cpp
 #define FRONTIER_USER_PAYLOAD void*
 #define FRONTIER_INVALID_PAYLOAD nullptr
 ```
+
+At the public boundary a header-only `std::bit_cast` codec maps the configured
+type to an internal `uint32_t` or `uint64_t`. Serialized payload arrays, builder
+storage, and TLAS-root payload streams contain only that unsigned word. The
+conversion normally emits no instructions.
 
 Raw pointers are valid for definitions built and registered in the same
 process, but pointer-bearing serialized bytes are not meaningful after process
@@ -559,8 +571,8 @@ struct NodeDesc {
 - `isMountable()` tests `FlagMountable`.
 
 A mountable builder node must remain a local leaf. A mountable TLAS root or
-mounted node may receive one runtime child placement. `NodeDesc` occupies 40
-bytes.
+mounted node may receive one runtime child placement. `NodeDesc` occupies 36
+bytes with a four-byte payload and 40 bytes with an eight-byte payload.
 
 ## 4. Serialized subtree storage
 
@@ -612,12 +624,12 @@ The type does not distinguish builder-produced and file-loaded data. A caller
 loading from disk constructs the final-sized array and reads directly into
 `bytes()`. Persisted arrays are a versioned native traversal format;
 registration requires matching format version, byte order, layout, size,
-alignment, payload type and invalid value, topology, bounds, errors, and wide
-traversal data. Validation is linear in node and wide-block count and does not
-unpack or copy the arrays. The bytes are not a format-independent interchange
-schema and carry no authentication or application-defined allocation limit;
-authenticate and size-limit untrusted files before allocating `SubtreeBytes`
-for them.
+alignment, payload-word width and invalid bit pattern, topology, bounds, errors,
+and wide traversal data. Validation is linear in node and wide-block count and
+does not unpack or copy the arrays. The bytes are not a format-independent
+interchange schema and carry no authentication or application-defined
+allocation limit; authenticate and size-limit untrusted files before allocating
+`SubtreeBytes` for them.
 
 ## 5. `SubtreeBuilder`
 

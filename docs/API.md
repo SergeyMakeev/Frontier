@@ -201,9 +201,10 @@ NodeDesc proxy{
 - `FlagMountable` makes the node an expandable assembly boundary.
 - `bounds` is exact six-float authoring storage and accepts an `AABB` directly.
 
-The descriptor occupies 40 bytes. The 32-bit flag word currently defines only
-`FlagMountable`; the remaining bits are reserved for future node properties
-and must remain zero. Builder and TLAS-root creation reject unknown bits.
+The descriptor occupies 36 bytes with a four-byte payload and 40 bytes with an
+eight-byte payload. The 32-bit flag word currently defines only
+`FlagMountable`; the remaining bits are reserved for future node properties and
+must remain zero. Builder and TLAS-root creation reject unknown bits.
 
 `UserPayload` defaults to `uint64_t`, with `UINT64_MAX` as the invalid value.
 Applications can replace both build-wide using preprocessor definitions; the
@@ -211,14 +212,25 @@ library and every consumer must use the same definitions:
 
 ```cpp
 // Build configuration, before including any Frontier header:
+#define FRONTIER_USER_PAYLOAD uint32_t
+#define FRONTIER_INVALID_PAYLOAD UINT32_MAX
+```
+
+Pointer-sized payloads are also supported:
+
+```cpp
 #define FRONTIER_USER_PAYLOAD void*
 #define FRONTIER_INVALID_PAYLOAD nullptr
 ```
 
 The configured type must be trivially copyable, default constructible,
-equality comparable, exactly eight bytes, and aligned to at most eight bytes.
-Pointer payloads work for in-process definitions, but serialized pointer values
-cannot be persisted or transferred to another address space.
+equality comparable, have a unique object representation, and occupy exactly
+four or eight bytes. Frontier bit-preservingly encodes it once into `uint32_t`
+or `uint64_t`; builder storage, registered bytes, and TLAS payload streams use
+only that internal word. `tryGetPayload()` performs the inverse conversion in
+its inline header-only façade. Pointer payloads work for in-process definitions,
+but serialized pointer values cannot be persisted or transferred to another
+address space.
 
 ```cpp
 if (proxy.isMountable()) {

@@ -993,7 +993,10 @@ public:
     // Resolve immutable application payload data for a live frontier handle.
     // Returns kInvalidPayload for the normal async race with
     // unmount/collection. The reserved value can never be authored.
-    UserPayload tryGetPayload(NodeHandle h) const;
+    UserPayload tryGetPayload(NodeHandle h) const
+    {
+        return detail::decodePayload(tryGetPayloadWord(h));
+    }
 
     // ---- motion --------------------------------------------------------------
     // Record new local-space bounds for one node OF ONE INSTANCE: a bounds
@@ -1798,6 +1801,7 @@ private:
             static_cast<const SpatialDatabase*>(this)->resolve(h));
     }
     InstanceId resolveTlasRoot(NodeHandle h) const;
+    detail::PayloadWord tryGetPayloadWord(NodeHandle h) const;
 
     uint32_t allocSubtree();
     void destroySubtree(uint32_t definition);
@@ -1997,7 +2001,7 @@ private:
 
     std::vector<Instance> instances_;
     // Cold root identity stream. Payload exists after the first TLAS root.
-    std::vector<UserPayload> tlasRootPayloads_;
+    std::vector<detail::PayloadWord> tlasRootPayloads_;
     // Packed TLAS-root marker for exact one-node instances; a cold
     // high bit also records the common zero-error case. Keeping this as a
     // lazily allocated compact stream lets mixed forests bypass the 64-byte

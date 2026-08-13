@@ -34,9 +34,9 @@ detail::SubtreeLayout computeLayout(uint32_t nodeCount, uint32_t wideCount)
     layout.bbox = uint32_t(offset);
     offset += size_t(nodeCount) * sizeof(AABB);
 
-    offset = alignUp(offset, alignof(UserPayload));
+    offset = alignUp(offset, alignof(PayloadWord));
     layout.payload = uint32_t(offset);
-    offset += size_t(nodeCount) * sizeof(UserPayload);
+    offset += size_t(nodeCount) * sizeof(PayloadWord);
 
     offset = alignUp(offset, alignof(uint32_t));
     layout.parent = uint32_t(offset);
@@ -167,7 +167,11 @@ void validateSubtreeBytes(const SubtreeBytes& bytes)
                    "registerSubtree: header size mismatch");
     FRONTIER_CHECK(header->branchingFactor == kWide,
                    "registerSubtree: branching factor mismatch");
-    FRONTIER_CHECK(std::all_of(header->reserved, header->reserved + 18,
+    FRONTIER_CHECK(header->payloadBytes == sizeof(PayloadWord) &&
+                       header->invalidPayloadWord ==
+                           uint64_t(invalidPayloadWord()),
+                   "registerSubtree: payload configuration mismatch");
+    FRONTIER_CHECK(std::all_of(header->reserved, header->reserved + 15,
                                [](uint32_t value) { return value == 0; }),
                    "registerSubtree: reserved header fields are non-zero");
     FRONTIER_CHECK(header->nodeCount > 1,
@@ -194,9 +198,9 @@ void validateSubtreeBytes(const SubtreeBytes& bytes)
             layout.error == header->errorOffset,
         "registerSubtree: offsets inconsistent with subtree shape");
 
-    const auto* payload = reinterpret_cast<const UserPayload*>(
+    const auto* payload = reinterpret_cast<const PayloadWord*>(
         bytes.data() + header->payloadOffset);
-    FRONTIER_CHECK(payload[0] == kInvalidPayload,
+    FRONTIER_CHECK(payload[0] == invalidPayloadWord(),
                    "registerSubtree: missing implicit-parent sentinel");
 
     const auto* parent = reinterpret_cast<const uint32_t*>(
@@ -237,7 +241,7 @@ void validateSubtreeBytes(const SubtreeBytes& bytes)
         FRONTIER_CHECK(finiteNonEmptyBounds(bbox[node]),
                        "registerSubtree: invalid node bounds");
         if (node != 0)
-            FRONTIER_CHECK(payload[node] != kInvalidPayload,
+            FRONTIER_CHECK(payload[node] != invalidPayloadWord(),
                            "registerSubtree: reserved invalid payload");
         FRONTIER_CHECK(subtreeSize[node] != 0 &&
                            subtreeSize[node] <= nodeCount - node,
@@ -344,7 +348,8 @@ SubtreeView viewSubtreeBytes(const SubtreeBytes& bytes)
     view.wide_ = reinterpret_cast<const WideBlock*>(base + header->wideOffset);
     view.blockMask_ = reinterpret_cast<const uint32_t*>(base + header->maskOffset);
     view.bbox_ = reinterpret_cast<const AABB*>(base + header->bboxOffset);
-    view.payload_ = reinterpret_cast<const UserPayload*>(base + header->payloadOffset);
+    view.payload_ = reinterpret_cast<const PayloadWord*>(
+        base + header->payloadOffset);
     view.parent_ = reinterpret_cast<const uint32_t*>(base + header->parentOffset);
     view.subtreeSize_ = reinterpret_cast<const uint32_t*>(
         base + header->subtreeSizeOffset);

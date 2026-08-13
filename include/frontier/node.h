@@ -1,6 +1,8 @@
 #pragma once
 
+#include <bit>
 #include <concepts>
+#include <cstddef>
 #include <cstdint>
 #include <type_traits>
 
@@ -16,7 +18,9 @@ namespace frontier {
 //   FRONTIER_USER_PAYLOAD=void*
 //   FRONTIER_INVALID_PAYLOAD=nullptr
 //
-// The fixed eight-byte contract preserves NodeDesc and serialized layouts.
+// The payload must occupy one native 32- or 64-bit word. Public descriptors
+// retain the application type; internal and serialized storage use the
+// corresponding unsigned word through the bit-preserving codec below.
 #ifndef FRONTIER_USER_PAYLOAD
   #define FRONTIER_USER_PAYLOAD ::std::uint64_t
 #endif
@@ -28,15 +32,73 @@ using UserPayload = FRONTIER_USER_PAYLOAD;
 inline constexpr UserPayload kInvalidPayload = FRONTIER_INVALID_PAYLOAD;
 static_assert(std::is_trivially_copyable_v<UserPayload>,
               "UserPayload must be trivially copyable");
+static_assert(std::has_unique_object_representations_v<UserPayload>,
+              "UserPayload must have one object representation per value");
 static_assert(std::is_default_constructible_v<UserPayload>,
               "UserPayload must be default constructible");
 static_assert(requires(UserPayload a, UserPayload b) {
                   { a == b } -> std::convertible_to<bool>;
               }, "UserPayload must be equality comparable");
-static_assert(sizeof(UserPayload) == 8,
-              "UserPayload must be exactly eight bytes");
-static_assert(alignof(UserPayload) <= 8,
-              "UserPayload alignment must not exceed eight bytes");
+static_assert(sizeof(UserPayload) == 4 || sizeof(UserPayload) == 8,
+              "UserPayload must be exactly four or eight bytes");
+
+namespace detail {
+
+template <size_t Bytes>
+struct PayloadWordFor;
+
+template <>
+struct PayloadWordFor<4>
+{
+    using Type = uint32_t;
+};
+
+template <>
+struct PayloadWordFor<8>
+{
+    using Type = uint64_t;
+};
+
+template <class Payload>
+struct PayloadCodec
+{
+    static_assert(std::is_trivially_copyable_v<Payload>);
+    static_assert(sizeof(Payload) == 4 || sizeof(Payload) == 8);
+
+    using Word = typename PayloadWordFor<sizeof(Payload)>::Type;
+
+    static constexpr Word encode(Payload payload) noexcept
+    {
+        return std::bit_cast<Word>(payload);
+    }
+
+    static constexpr Payload decode(Word word) noexcept
+    {
+        return std::bit_cast<Payload>(word);
+    }
+};
+
+using PayloadWord = typename PayloadCodec<UserPayload>::Word;
+
+inline constexpr PayloadWord encodePayload(UserPayload payload) noexcept
+{
+    return PayloadCodec<UserPayload>::encode(payload);
+}
+
+inline constexpr UserPayload decodePayload(PayloadWord word) noexcept
+{
+    return PayloadCodec<UserPayload>::decode(word);
+}
+
+inline PayloadWord invalidPayloadWord() noexcept
+{
+    // std::bit_cast of a pointer is not a constant expression in C++20, but
+    // this inline conversion still folds to the configured bit pattern.
+    return encodePayload(kInvalidPayload);
+}
+
+} // namespace detail
+
 inline constexpr uint32_t kInvalidIndex = 0xFFFFFFFFu;
 
 // Translation plus positive uniform scale, the transform contract shared by
@@ -109,7 +171,7 @@ struct NodeDesc
         return (flags & FlagMountable) != 0;
     }
 };
-static_assert(sizeof(NodeDesc) == 40,
-              "NodeDesc must stay at five eight-byte words");
+static_assert(sizeof(NodeDesc) == sizeof(UserPayload) + 32,
+              "NodeDesc layout changed");
 
 } // namespace frontier

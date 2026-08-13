@@ -45,7 +45,8 @@ SubtreeBuilder::NodeId SubtreeBuilder::createNode(NodeId parent,
                    "SubtreeBuilder: node-count limit exceeded");
     FRONTIER_CHECK(parent == kInvalidIndex || parent < nodes_.size(),
                    "SubtreeBuilder: invalid parent");
-    FRONTIER_CHECK(node.payload != kInvalidPayload,
+    const PayloadWord nodePayload = encodePayload(node.payload);
+    FRONTIER_CHECK(nodePayload != invalidPayloadWord(),
                    "SubtreeBuilder: reserved invalid payload");
     FRONTIER_CHECK(node.geometricError >= 0.0f &&
                        std::isfinite(node.geometricError),
@@ -67,7 +68,7 @@ SubtreeBuilder::NodeId SubtreeBuilder::createNode(NodeId parent,
 
     BuildNode built;
     built.bounds = node.bounds;
-    built.payload = node.payload;
+    built.payload = nodePayload;
     built.geometricError = node.geometricError;
     built.parent = parent;
     built.setMountable(node.isMountable());
@@ -133,11 +134,13 @@ SubtreeBytes SubtreeBuilder::build(const FrontierContext& context)
     header->metaOffset = layout.meta;
     header->errorOffset = layout.error;
     header->branchingFactor = kWide;
+    header->invalidPayloadWord = uint64_t(invalidPayloadWord());
+    header->payloadBytes = sizeof(PayloadWord);
 
     auto* wide = reinterpret_cast<WideBlock*>(base + layout.wide);
     auto* blockMask = reinterpret_cast<uint32_t*>(base + layout.mask);
     auto* bbox = reinterpret_cast<AABB*>(base + layout.bbox);
-    auto* payload = reinterpret_cast<UserPayload*>(base + layout.payload);
+    auto* payload = reinterpret_cast<PayloadWord*>(base + layout.payload);
     auto* parent = reinterpret_cast<uint32_t*>(base + layout.parent);
     auto* subtreeSize = reinterpret_cast<uint32_t*>(base + layout.subtreeSize);
     auto* meta = reinterpret_cast<uint32_t*>(base + layout.meta);
@@ -146,7 +149,7 @@ SubtreeBytes SubtreeBuilder::build(const FrontierContext& context)
     uint32_t emitted = 0;
 
     const auto emit = [&](uint32_t parentIndex, uint32_t childCount,
-                          bool mountable, UserPayload nodePayload,
+                          bool mountable, PayloadWord nodePayload,
                           const AABB& nodeBounds, float error) -> uint32_t
     {
         const uint32_t index = emitted++;
@@ -159,7 +162,7 @@ SubtreeBytes SubtreeBuilder::build(const FrontierContext& context)
         return index;
     };
 
-    emit(0, uint32_t(roots_.size()), false, kInvalidPayload, AABB::empty(),
+    emit(0, uint32_t(roots_.size()), false, invalidPayloadWord(), AABB::empty(),
          FLT_MAX);
 
     std::vector<uint32_t> remap(nodes_.size(), kInvalidIndex);

@@ -1111,13 +1111,13 @@ bool SpatialDatabase::isNodeReady(NodeHandle node) const
            subtrees_[placement->definition].isNodeReady(node.index());
 }
 
-UserPayload SpatialDatabase::tryGetPayload(NodeHandle h) const
+detail::PayloadWord SpatialDatabase::tryGetPayloadWord(NodeHandle h) const
 {
     const InstanceId root = resolveTlasRoot(h);
     if (root != kInvalidInstanceId)
         return tlasRootPayloads_[root];
     const SubtreeInstanceRt* rt = resolve(h);
-    if (!rt) return kInvalidPayload;
+    if (!rt) return detail::invalidPayloadWord();
     return subtreeView(*rt).payload_[h.index()];
 }
 
@@ -1134,7 +1134,8 @@ InstanceHandle SpatialDatabase::addTlasRootInstance(
     FRONTIER_CHECK(root.geometricError >= 0.0f &&
                        std::isfinite(root.geometricError),
                    "SpatialDatabase::instantiate: invalid geometric error");
-    FRONTIER_CHECK(root.payload != kInvalidPayload,
+    const detail::PayloadWord rootPayload = detail::encodePayload(root.payload);
+    FRONTIER_CHECK(rootPayload != detail::invalidPayloadWord(),
                    "SpatialDatabase::instantiate: reserved invalid payload");
     FRONTIER_CHECK((root.flags & ~uint32_t(NodeDesc::FlagMountable)) == 0,
                    "SpatialDatabase::instantiate: unknown node flags");
@@ -1183,7 +1184,7 @@ InstanceHandle SpatialDatabase::addTlasRootInstance(
         tlasRootPayloads_.resize(instances_.size());
     Instance& inst = instances_[id];
     inst = Instance{};
-    tlasRootPayloads_[id] = root.payload;
+    tlasRootPayloads_[id] = rootPayload;
     inst.pos = desc.pos;
     inst.scale = desc.scale;
     inst.rootSlot = kInvalidIndex;
@@ -2478,7 +2479,7 @@ void SpatialDatabase::reorderInstancesByTlas()
     // memory and subsequent permutations scale with the live population,
     // rather than with the database's historical peak.
     std::vector<Instance> newInstances(liveCount);
-    std::vector<UserPayload> newTlasRootPayloads;
+    std::vector<detail::PayloadWord> newTlasRootPayloads;
     const bool hadTlasRootPayloads = !tlasRootPayloads_.empty();
     if (hadTlasRootPayloads) newTlasRootPayloads.resize(liveCount);
     std::vector<uint32_t> newFrontierVersions(liveCount);

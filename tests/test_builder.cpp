@@ -16,10 +16,10 @@ TEST(NodeDesc, ScalarBoundsRoundTripExactly)
 {
     EXPECT_EQ(sizeof(ScalarAABB), 24u);
     EXPECT_EQ(alignof(ScalarAABB), alignof(float));
-    EXPECT_EQ(sizeof(NodeDesc), 40u);
+    EXPECT_EQ(sizeof(NodeDesc), sizeof(UserPayload) + 32u);
     EXPECT_EQ(alignof(NodeDesc), alignof(UserPayload));
-    EXPECT_EQ(offsetof(NodeDesc, flags), 12u);
-    EXPECT_EQ(offsetof(NodeDesc, bounds), 16u);
+    EXPECT_EQ(offsetof(NodeDesc, flags), sizeof(UserPayload) + 4u);
+    EXPECT_EQ(offsetof(NodeDesc, bounds), sizeof(UserPayload) + 8u);
 
     ScalarAABB inverted = AABB::fromMinMax(float4::vec(0, 1, 0),
                                            float4::vec(1, 0, 1));
@@ -28,8 +28,13 @@ TEST(NodeDesc, ScalarBoundsRoundTripExactly)
     const AABB source = AABB::fromMinMax(
         float4::point(-0.0f, -12345.625f, 1.0e-20f),
         float4::point(98765.5f, 0.0f, 1.0e20f));
+    const detail::PayloadWord payloadWord =
+        sizeof(detail::PayloadWord) == 8
+            ? static_cast<detail::PayloadWord>(0xfedcba9876543210ull)
+            : static_cast<detail::PayloadWord>(0xfedcba98u);
+    const UserPayload authoredPayload = detail::decodePayload(payloadWord);
     const NodeDesc desc{
-        .payload = 0xfedcba9876543210ull,
+        .payload = authoredPayload,
         .geometricError = 7.25f,
         .flags = NodeDesc::FlagMountable,
         .bounds = source,
@@ -47,7 +52,7 @@ TEST(NodeDesc, ScalarBoundsRoundTripExactly)
     expectSameBits(decoded.mx.x, source.mx.x);
     expectSameBits(decoded.mx.y, source.mx.y);
     expectSameBits(decoded.mx.z, source.mx.z);
-    EXPECT_EQ(desc.payload, 0xfedcba9876543210ull);
+    EXPECT_EQ(desc.payload, authoredPayload);
     EXPECT_FLOAT_EQ(desc.geometricError, 7.25f);
     EXPECT_EQ(desc.flags, NodeDesc::FlagMountable);
     EXPECT_TRUE(desc.isMountable());
@@ -76,6 +81,9 @@ TEST(SubtreeBuilder, BuildsTraversalReadySerializableBytes)
     const auto* header = reinterpret_cast<const detail::SubtreeHeader*>(
         bytes.data());
     EXPECT_EQ(header->branchingFactor, kWide);
+    EXPECT_EQ(header->payloadBytes, sizeof(detail::PayloadWord));
+    EXPECT_EQ(header->invalidPayloadWord,
+              uint64_t(detail::invalidPayloadWord()));
     detail::validateSubtreeBytes(bytes);
     const detail::SubtreeView view = detail::viewSubtreeBytes(bytes);
     EXPECT_EQ(view.nodeCount(), 3u);

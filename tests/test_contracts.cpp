@@ -119,9 +119,9 @@ TEST(Contracts, SerializedSubtreeValidationMatchesBuildMode)
         SubtreeBytes bytes = makeHierarchy();
         const auto* header = reinterpret_cast<const detail::SubtreeHeader*>(
             bytes.data());
-        auto* payload = reinterpret_cast<UserPayload*>(
+        auto* payload = reinterpret_cast<detail::PayloadWord*>(
             bytes.data() + header->payloadOffset);
-        payload[1] = kInvalidPayload;
+        payload[1] = detail::invalidPayloadWord();
         registerStructurallyCorrupt(std::move(bytes));
     }
     {
@@ -147,6 +147,22 @@ TEST(Contracts, SerializedSubtreeValidationMatchesBuildMode)
         SubtreeBytes bytes = makeHierarchy();
         auto* header = reinterpret_cast<detail::SubtreeHeader*>(bytes.data());
         header->branchingFactor = kWide == 4 ? 8 : 4;
+        SpatialDatabase database;
+        EXPECT_THROW(database.registerSubtree(std::move(bytes)),
+                     std::logic_error);
+    }
+    {
+        SubtreeBytes bytes = makeHierarchy();
+        auto* header = reinterpret_cast<detail::SubtreeHeader*>(bytes.data());
+        header->payloadBytes = header->payloadBytes == 4 ? 8 : 4;
+        SpatialDatabase database;
+        EXPECT_THROW(database.registerSubtree(std::move(bytes)),
+                     std::logic_error);
+    }
+    {
+        SubtreeBytes bytes = makeHierarchy();
+        auto* header = reinterpret_cast<detail::SubtreeHeader*>(bytes.data());
+        header->invalidPayloadWord ^= 1;
         SpatialDatabase database;
         EXPECT_THROW(database.registerSubtree(std::move(bytes)),
                      std::logic_error);

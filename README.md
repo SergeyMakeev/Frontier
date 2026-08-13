@@ -49,9 +49,10 @@ million mountable house nodes, all populated from the same house handle.
 
 `UserPayload` defaults to `uint64_t`. Applications may instead define
 `FRONTIER_USER_PAYLOAD` and `FRONTIER_INVALID_PAYLOAD` build-wide; for example,
-`void*` and `nullptr`. The invalid value is reserved so `tryGetPayload()` can
-return a payload directly and report a stale handle without an out-parameter or
-`std::optional`. See the
+`uint32_t` and `UINT32_MAX`, or `void*` and `nullptr`. Four-byte payloads halve
+serialized and TLAS-root payload storage. The invalid value is reserved so
+`tryGetPayload()` can return a payload directly and report a stale handle
+without an out-parameter or `std::optional`. See the
 [API reference](docs/API_REFERENCE.md#3-node-authoring-types) for the exact type
 and serialization contract.
 
