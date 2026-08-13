@@ -88,8 +88,7 @@ default exception is caught.
 
 `FRONTIER_FORCE_SCALAR` disables intrinsic implementations. Otherwise the
 header selects AVX2, 64-bit NEON, SSE2, or the scalar backend from compiler
-target macros. `FRONTIER_PREFETCH(pointer)` exposes the selected best-effort
-prefetch operation.
+target macros.
 
 `FRONTIER_BVH_WIDTH` is a build-wide choice of `AUTO`, `4`, or `8` and defaults
 to `AUTO`. CMake resolves `AUTO` to BVH8 for the eight-lane AVX2 backend and

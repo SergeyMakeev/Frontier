@@ -50,18 +50,6 @@
   #endif
 #endif
 
-// Best-effort cache prefetch hint.
-#if FRONTIER_SIMD_AVX2 || FRONTIER_SIMD_SSE2
-  #define FRONTIER_PREFETCH(p) _mm_prefetch(reinterpret_cast<const char*>(p), _MM_HINT_T0)
-#elif defined(__GNUC__) || defined(__clang__)
-  #define FRONTIER_PREFETCH(p) __builtin_prefetch(p)
-#elif defined(_MSC_VER) && (defined(_M_ARM64) || defined(_M_ARM64EC))
-  #include <intrin.h>
-  #define FRONTIER_PREFETCH(p) __prefetch(reinterpret_cast<const void*>(p))
-#else
-  #define FRONTIER_PREFETCH(p) ((void)(p))
-#endif
-
 namespace frontier {
 
 // Fused multiply-add matching the active wide path. The unit tests require

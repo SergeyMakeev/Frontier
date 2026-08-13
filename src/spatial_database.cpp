@@ -3678,18 +3678,10 @@ void SpatialDatabase::selectFrontierUncached(const Camera& camera, const Selecti
 
         if (flatInstanceCount_ == liveInstances_.size())
         {
-            constexpr uint32_t kFlatPrefetchDistance = 8;
             if (tlasZeroErrorFlatInstanceCount_ == liveInstances_.size())
             {
                 for (uint32_t i = 0; i < nVis; ++i)
                 {
-                    if (i + kFlatPrefetchDistance < nVis)
-                    {
-                        const VisibleItem next =
-                            scratch.visible[i + kFlatPrefetchDistance];
-                        if (next.mask() != 0)
-                            FRONTIER_PREFETCH(&instances_[next.instance()]);
-                    }
                     const uint32_t instIdx = scratch.visible[i].instance();
                     runZeroErrorTlasFlatInstance(
                         instIdx, damped, scratch.visible[i].mask(), w);
@@ -3711,52 +3703,15 @@ void SpatialDatabase::selectFrontierUncached(const Camera& camera, const Selecti
             // no one-node instances pay only this call-level dispatch.
             for (uint32_t i = 0; i < nVis; ++i)
             {
-                if (i + 2 < nVis)
-                    FRONTIER_PREFETCH(&instances_[scratch.visible[i + 2].instance()]);
-                if (i + 1 < nVis)
-                {
-                    const Instance& next =
-                        instances_[scratch.visible[i + 1].instance()];
-                    if (next.rootSlot != kInvalidIndex)
-                    {
-                        const SubtreeInstanceRt& nrt = slots_[next.rootSlot];
-                        const SubtreeView& nextSubtree = subtreeView(nrt);
-                        FRONTIER_PREFETCH(nextSubtree.wide_);
-                        FRONTIER_PREFETCH(nextSubtree.meta_);
-                    }
-                }
                 runTlasRootInstance(scratch.visible[i].instance(), damped,
                                     params, scratch.visible[i].mask(), w);
             }
         }
         else
         {
-            // The hierarchical walk is a chain of dependent loads (Instance
-            // -> mount slot -> wide block). Pipeline it, but in a mixed forest
-            // do not fetch those records for flat objects that bypass them.
+            // Flat objects bypass the mounted hierarchy in a mixed forest.
             for (uint32_t i = 0; i < nVis; ++i)
             {
-                if (i + 2 < nVis)
-                {
-                    const uint32_t next = scratch.visible[i + 2].instance();
-                    if (instanceFlatSlots_[next] == kInvalidIndex)
-                        FRONTIER_PREFETCH(&instances_[next]);
-                }
-                if (i + 1 < nVis)
-                {
-                    const uint32_t nextIdx = scratch.visible[i + 1].instance();
-                    if (instanceFlatSlots_[nextIdx] == kInvalidIndex)
-                    {
-                        const Instance& next = instances_[nextIdx];
-                        if (next.rootSlot != kInvalidIndex)
-                        {
-                            const SubtreeInstanceRt& nrt = slots_[next.rootSlot];
-                            const SubtreeView& nextSubtree = subtreeView(nrt);
-                            FRONTIER_PREFETCH(nextSubtree.wide_);
-                            FRONTIER_PREFETCH(nextSubtree.meta_);
-                        }
-                    }
-                }
                 const uint32_t instIdx = scratch.visible[i].instance();
                 if (instanceFlatSlots_[instIdx] != kInvalidIndex)
                 {
@@ -4161,10 +4116,7 @@ void SpatialDatabase::selectFrontierCached(const Camera& camera, const Selection
         }
 
         // ---- walk it ----
-        // Hits deliberately never fetch the 80-byte Instance record. Once a
-        // miss is known, start that read before resetting the worker scratch;
-        // the bookkeeping below gives the cache line a little useful lead.
-        FRONTIER_PREFETCH(&instances_[instIdx]);
+        // Hits deliberately never fetch the 80-byte Instance record.
         const Instance& inst = instances_[instIdx];
         w.frontierBuffer.clear();
         w.result = makeSink(w.frontierBuffer);
