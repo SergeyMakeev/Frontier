@@ -9,6 +9,14 @@ with interprocedural optimization, statistics off, contract checks off, and
 complete serialized-subtree validation off. Benchmark inputs must therefore be
 trusted and valid. Correctness belongs to the separate Debug unit-test build.
 
+The end-to-end suite is compiled twice with otherwise identical settings:
+`frontier_bench` uses an eight-byte payload word and
+`frontier_bench_payload32` uses a four-byte payload word. The local runners and
+CI execute both by default, and every JSON result records
+`frontier_payload_bytes` as `8` or `4` in its context. This makes platform-level
+cache and bandwidth differences directly comparable without changing the
+library's macro-based public payload customization.
+
 ## End-to-end subtree benchmark
 
 `frontier_bench` contains the paired city/house experiment:
@@ -55,7 +63,15 @@ total memory, placement count, and frontier size.
 run_perf_bench.bat --benchmark_filter=BM_SubtreeAssembly --benchmark_repetitions=7 --benchmark_report_aggregates_only=true
 ```
 
-Run the executable directly after a build when preferred:
+These commands run both payload widths. Set `FRONTIER_PERF_PAYLOAD_BITS=32` or
+`FRONTIER_PERF_PAYLOAD_BITS=64` for a quick single-width run; the default is
+`both`. With no caller arguments, results are written to
+`real_world_perf_payload32.json` and `real_world_perf_payload64.json`. In
+both-width mode, do not pass `--benchmark_out` because one caller-provided path
+cannot hold both results; select one width or run the executables directly when
+custom output paths are required.
+
+Run either executable directly after a build when preferred:
 
 ```sh
 build/bench/frontier_bench \
@@ -63,6 +79,9 @@ build/bench/frontier_bench \
   --benchmark_out=result.json \
   --benchmark_out_format=json
 ```
+
+Replace `frontier_bench` with `frontier_bench_payload32` for the matched
+four-byte build.
 
 The repository retains the keyless serialized-bytes API comparison in:
 
@@ -120,7 +139,8 @@ power state matter.
 ## Cross-machine collector
 
 The unified collectors configure a dedicated Release build, run correctness,
-capture benchmarks and system/toolchain metadata, and package the result:
+capture both payload-width end-to-end suites plus system/toolchain metadata,
+and package the result:
 
 ```sh
 ./run_all_perf.sh m2-max
@@ -132,7 +152,8 @@ run_all_perf.bat i9
 
 Output is written below `perf_reports/`. `FRONTIER_PERF_LABEL`,
 `FRONTIER_ALL_PERF_BUILD_DIR`, and `FRONTIER_PERF_REPORT_ROOT` override the
-label and locations.
+label and locations. Each report contains `real_world_perf_payload32.json` and
+`real_world_perf_payload64.json`.
 
 ## macOS hardware counters
 

@@ -52,7 +52,7 @@ write_report()
     cat > "${report_dir}/REPORT.md" <<EOF
 # Frontier performance report
 
-- Format: frontier-perf-report-v1
+- Format: frontier-perf-report-v2
 - Status: ${run_status}
 - Failed stage: ${failure_stage}
 - Machine label: ${raw_label}
@@ -66,11 +66,13 @@ write_report()
 - Workload RNG: ${RNG_POLICY}
 - Benchmark order: registration order
 - Unit-test build: Debug
-- Performance build: Release with IPO; contract checks and subtree validation disabled
+- Performance builds: matched 4-byte and 8-byte payloads; Release with IPO;
+  contract checks and subtree validation disabled
 
 ## Result files
 
-- \`real_world_perf.json\`: end-to-end subtree assembly workloads
+- \`real_world_perf_payload64.json\`: end-to-end workloads with 8-byte payloads
+- \`real_world_perf_payload32.json\`: end-to-end workloads with 4-byte payloads
 - \`machine_perf.json\`: ALU, SIMD, branch, cache, latency, and bandwidth probes
 - \`arch_kernel_perf.json\`: focused production-kernel probes with longer sampling
 - \`tests.log\`: Debug BVH4 + BVH8 correctness-suite result
@@ -86,7 +88,7 @@ for the most useful cross-machine comparison.
 EOF
 
     cat > "${report_dir}/manifest.txt" <<EOF
-format=frontier-perf-report-v1
+format=frontier-perf-report-v2
 status=${run_status}
 failure_stage=${failure_stage}
 label=${raw_label}
@@ -98,6 +100,7 @@ host_os=${host_system}
 host_arch=${host_machine}
 unit_build_type=Debug
 perf_build_type=Release
+perf_payload_bytes=4,8
 affinity=scheduler-default
 rng_policy=${RNG_POLICY}
 benchmark_order=registration-order
@@ -205,7 +208,7 @@ Correctness:
   ctest --test-dir <unit-build> -C Debug --output-on-failure
 
 Real world:
-  frontier_bench
+  frontier_bench (8-byte payload) and frontier_bench_payload32 (4-byte payload)
     --benchmark_filter=BM_SubtreeAssembly
     --benchmark_repetitions=5
     --benchmark_report_aggregates_only=true
@@ -304,7 +307,7 @@ cmake "${configure_args[@]}" 2>&1 | tee "${report_dir}/configure.log"
 failure_stage=build-performance
 echo "Building performance executables..."
 cmake --build "${BUILD_DIR}" --config Release --parallel \
-    --target frontier_bench frontier_machine_bench 2>&1 |
+    --target frontier_bench frontier_bench_payload32 frontier_machine_bench 2>&1 |
     tee "${report_dir}/build.log"
 
 cache_file="${BUILD_DIR}/CMakeCache.txt"
@@ -320,8 +323,9 @@ else
 fi
 
 bench_exe="${binary_dir}/frontier_bench"
+bench32_exe="${binary_dir}/frontier_bench_payload32"
 machine_exe="${binary_dir}/frontier_machine_bench"
-if [[ ! -x "${bench_exe}" || ! -x "${machine_exe}" ]]; then
+if [[ ! -x "${bench_exe}" || ! -x "${bench32_exe}" || ! -x "${machine_exe}" ]]; then
     echo "ERROR: Release benchmark executables were not found under ${binary_dir}." >&2
     exit 1
 fi
@@ -339,14 +343,23 @@ fi
     file "${bench_exe}" 2>&1 || true
 } > "${report_dir}/toolchain.txt"
 
-failure_stage=real-world-benchmarks
-echo "Running real-world performance suite..."
+failure_stage=real-world-benchmarks-payload64
+echo "Running real-world performance suite with 8-byte payloads..."
 "${bench_exe}" \
     '--benchmark_filter=BM_SubtreeAssembly' \
     --benchmark_repetitions=5 \
     --benchmark_report_aggregates_only=true \
-    "--benchmark_out=${report_dir}/real_world_perf.json" \
-    --benchmark_out_format=json 2>&1 | tee "${report_dir}/real_world_perf.log"
+    "--benchmark_out=${report_dir}/real_world_perf_payload64.json" \
+    --benchmark_out_format=json 2>&1 | tee "${report_dir}/real_world_perf_payload64.log"
+
+failure_stage=real-world-benchmarks-payload32
+echo "Running real-world performance suite with 4-byte payloads..."
+"${bench32_exe}" \
+    '--benchmark_filter=BM_SubtreeAssembly' \
+    --benchmark_repetitions=5 \
+    --benchmark_report_aggregates_only=true \
+    "--benchmark_out=${report_dir}/real_world_perf_payload32.json" \
+    --benchmark_out_format=json 2>&1 | tee "${report_dir}/real_world_perf_payload32.log"
 
 failure_stage=machine-benchmarks
 echo "Running machine characterization suite..."
@@ -368,7 +381,8 @@ echo "Running focused production-kernel suite..."
     --benchmark_out_format=json 2>&1 | tee "${report_dir}/arch_kernel_perf.log"
 
 failure_stage=validate-results
-for result in real_world_perf.json machine_perf.json arch_kernel_perf.json; do
+for result in real_world_perf_payload64.json real_world_perf_payload32.json \
+              machine_perf.json arch_kernel_perf.json; do
     if [[ ! -s "${report_dir}/${result}" ]] ||
        ! grep -q '"name"' "${report_dir}/${result}"; then
         echo "ERROR: ${result} is missing or contains no benchmark records." >&2

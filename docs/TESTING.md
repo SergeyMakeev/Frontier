@@ -95,10 +95,13 @@ coverage.
 
 ## Performance coverage
 
-`frontier_bench` measures end-to-end public workflows: assembly versus
-flattening, raw and cached selection, mixed-readiness cut policy, shared
-readiness fanout, serialized registration, TLAS scale, instance lifecycle,
-mount lifecycle and retention, stable motion groups, and bounds overrides.
+`frontier_bench` and its matched `frontier_bench_payload32` companion measure
+end-to-end public workflows with eight- and four-byte payload words: assembly
+versus flattening, raw and cached selection, mixed-readiness cut policy,
+shared readiness fanout, serialized registration, TLAS scale, instance
+lifecycle, mount lifecycle and retention, stable motion groups, and bounds
+overrides. Each result records `frontier_payload_bytes` in its benchmark
+context so files remain self-describing after collection.
 `frontier_machine_bench` characterizes kernels and the machine independently.
 See [BENCHMARKING.md](BENCHMARKING.md) for the cases and collection procedure.
 

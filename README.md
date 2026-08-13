@@ -194,7 +194,7 @@ camera should influence retention.
 
 ```sh
 bash ./run_unit_tests.sh  # Debug, checks enabled, BVH4 + BVH8
-bash ./run_perf_bench.sh  # Release, checks/validation disabled, native width
+bash ./run_perf_bench.sh  # Release, native BVH width, 4/8-byte payload comparison
 ```
 
 On Windows, use `run_unit_tests.bat` and `run_perf_bench.bat`.

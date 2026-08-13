@@ -157,19 +157,26 @@ jobs:
           ${{ matrix.cmake_args }}
 
       - name: Build performance tests
-        run: cmake --build build-perf --config Release --parallel 4
+        run: >-
+          cmake --build build-perf --config Release --parallel 4
+          --target frontier_bench frontier_bench_payload32
 
       - name: Performance tests
         shell: bash
         run: |
           if [ -x build-perf/bench/frontier_bench ]; then
-            BENCH=build-perf/bench/frontier_bench
+            BENCH64=build-perf/bench/frontier_bench
+            BENCH32=build-perf/bench/frontier_bench_payload32
           else
-            BENCH=build-perf/bench/Release/frontier_bench.exe
+            BENCH64=build-perf/bench/Release/frontier_bench.exe
+            BENCH32=build-perf/bench/Release/frontier_bench_payload32.exe
           fi
-          "$BENCH" --benchmark_min_time=0.1s \
-                   --benchmark_out=bench-${{ matrix.name }}.json \
-                   --benchmark_out_format=json
+          "$BENCH64" --benchmark_min_time=0.1s \
+                      --benchmark_out=bench-${{ matrix.name }}-payload64.json \
+                      --benchmark_out_format=json
+          "$BENCH32" --benchmark_min_time=0.1s \
+                      --benchmark_out=bench-${{ matrix.name }}-payload32.json \
+                      --benchmark_out_format=json
 
       # Short retention: these are merged into the single bench-all artifact
       # by the collect-bench job below.
@@ -177,7 +184,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: bench-${{ matrix.name }}
-          path: bench-${{ matrix.name }}.json
+          path: bench-${{ matrix.name }}-payload*.json
           retention-days: 3
 
   sanitizers:

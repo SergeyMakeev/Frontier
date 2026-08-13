@@ -4,6 +4,15 @@ setlocal EnableExtensions EnableDelayedExpansion
 set "ROOT=%~dp0"
 if "%ROOT:~-1%"=="\" set "ROOT=%ROOT:~0,-1%"
 set "BUILD_DIR=%ROOT%\build-perf"
+if defined FRONTIER_PERF_PAYLOAD_BITS (
+    set "PAYLOAD_MODE=%FRONTIER_PERF_PAYLOAD_BITS%"
+) else (
+    set "PAYLOAD_MODE=both"
+)
+if /I not "%PAYLOAD_MODE%"=="both" if not "%PAYLOAD_MODE%"=="32" if not "%PAYLOAD_MODE%"=="64" (
+    echo ERROR: FRONTIER_PERF_PAYLOAD_BITS must be both, 32, or 64.
+    exit /b 2
+)
 
 where cmake >nul 2>nul
 if errorlevel 1 (
@@ -48,33 +57,73 @@ cmake -S "%ROOT%" -B "%BUILD_DIR%" !GENERATOR_ARGS! ^
     -DFRONTIER_VALIDATE_SUBTREES=OFF
 if errorlevel 1 exit /b 1
 
-echo Building frontier_bench...
-cmake --build "%BUILD_DIR%" --config Release --target frontier_bench --parallel
+set "BUILD_TARGETS="
+if /I not "%PAYLOAD_MODE%"=="32" set "BUILD_TARGETS=!BUILD_TARGETS! frontier_bench"
+if /I not "%PAYLOAD_MODE%"=="64" set "BUILD_TARGETS=!BUILD_TARGETS! frontier_bench_payload32"
+echo Building payload %PAYLOAD_MODE% performance benchmark^(s^)...
+cmake --build "%BUILD_DIR%" --config Release --target !BUILD_TARGETS! --parallel
 if errorlevel 1 exit /b 1
 
-set "BENCH_EXE=%BUILD_DIR%\bench\Release\frontier_bench.exe"
-if not exist "%BENCH_EXE%" set "BENCH_EXE=%BUILD_DIR%\bench\frontier_bench.exe"
-if not exist "%BENCH_EXE%" (
-    echo ERROR: Built benchmark executable was not found under "%BUILD_DIR%\bench".
+set "BENCH64_EXE=%BUILD_DIR%\bench\Release\frontier_bench.exe"
+set "BENCH32_EXE=%BUILD_DIR%\bench\Release\frontier_bench_payload32.exe"
+if not exist "%BENCH64_EXE%" set "BENCH64_EXE=%BUILD_DIR%\bench\frontier_bench.exe"
+if not exist "%BENCH32_EXE%" set "BENCH32_EXE=%BUILD_DIR%\bench\frontier_bench_payload32.exe"
+if /I not "%PAYLOAD_MODE%"=="32" if not exist "%BENCH64_EXE%" (
+    echo ERROR: The 8-byte payload benchmark was not found under "%BUILD_DIR%\bench".
+    exit /b 1
+)
+if /I not "%PAYLOAD_MODE%"=="64" if not exist "%BENCH32_EXE%" (
+    echo ERROR: The 4-byte payload benchmark was not found under "%BUILD_DIR%\bench".
     exit /b 1
 )
 
 if not "%~1"=="" goto custom_args
 
-echo Running the documented performance suite with five repetitions...
+echo Running payload %PAYLOAD_MODE% documented performance suite with five repetitions...
 echo Pass Google Benchmark arguments to this script to override the default suite.
-echo Writing %ROOT%\real_world_perf.json
-"%BENCH_EXE%" ^
-    --benchmark_filter="BM_SubtreeAssembly" ^
-    --benchmark_repetitions=5 ^
-    --benchmark_report_aggregates_only=true ^
-    --benchmark_out="%ROOT%\real_world_perf.json" ^
-    --benchmark_out_format=json
+if /I not "%PAYLOAD_MODE%"=="32" (
+    echo Writing %ROOT%\real_world_perf_payload64.json
+    "%BENCH64_EXE%" ^
+        --benchmark_filter="BM_SubtreeAssembly" ^
+        --benchmark_repetitions=5 ^
+        --benchmark_report_aggregates_only=true ^
+        --benchmark_out="%ROOT%\real_world_perf_payload64.json" ^
+        --benchmark_out_format=json
+    if errorlevel 1 exit /b 1
+)
+if /I not "%PAYLOAD_MODE%"=="64" (
+    echo Writing %ROOT%\real_world_perf_payload32.json
+    "%BENCH32_EXE%" ^
+        --benchmark_filter="BM_SubtreeAssembly" ^
+        --benchmark_repetitions=5 ^
+        --benchmark_report_aggregates_only=true ^
+        --benchmark_out="%ROOT%\real_world_perf_payload32.json" ^
+        --benchmark_out_format=json
+    if errorlevel 1 exit /b 1
+)
 goto done
 
 :custom_args
-echo Running frontier_bench with caller-supplied arguments...
-"%BENCH_EXE%" %*
+set "HAS_BENCHMARK_OUT=0"
+for %%A in (%*) do (
+    set "CURRENT_ARG=%%~A"
+    if /I "!CURRENT_ARG!"=="--benchmark_out" set "HAS_BENCHMARK_OUT=1"
+    if /I "!CURRENT_ARG:~0,16!"=="--benchmark_out=" set "HAS_BENCHMARK_OUT=1"
+)
+if /I "%PAYLOAD_MODE%"=="both" if "!HAS_BENCHMARK_OUT!"=="1" (
+    echo ERROR: --benchmark_out would be overwritten in both-width mode.
+    echo Set FRONTIER_PERF_PAYLOAD_BITS to 32 or 64, or omit --benchmark_out.
+    exit /b 2
+)
+echo Running payload %PAYLOAD_MODE% benchmark^(s^) with caller-supplied arguments...
+if /I not "%PAYLOAD_MODE%"=="32" (
+    "%BENCH64_EXE%" %*
+    if errorlevel 1 exit /b 1
+)
+if /I not "%PAYLOAD_MODE%"=="64" (
+    "%BENCH32_EXE%" %*
+    if errorlevel 1 exit /b 1
+)
 
 :done
 exit /b %errorlevel%

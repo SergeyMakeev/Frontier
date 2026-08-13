@@ -3,6 +3,14 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="${FRONTIER_PERF_BUILD_DIR:-${ROOT_DIR}/build-perf}"
+payload_mode="${FRONTIER_PERF_PAYLOAD_BITS:-both}"
+case "${payload_mode}" in
+    both|32|64) ;;
+    *)
+        echo "ERROR: FRONTIER_PERF_PAYLOAD_BITS must be both, 32, or 64." >&2
+        exit 2
+        ;;
+esac
 
 if ! command -v cmake >/dev/null 2>&1; then
     echo "ERROR: CMake was not found in PATH." >&2
@@ -64,8 +72,16 @@ if [[ -n "${target_architecture}" ]]; then
 fi
 cmake "${configure_args[@]}"
 
-echo "Building frontier_bench..."
-cmake --build "${BUILD_DIR}" --config Release --target frontier_bench --parallel
+build_targets=()
+if [[ "${payload_mode}" != 32 ]]; then
+    build_targets+=(frontier_bench)
+fi
+if [[ "${payload_mode}" != 64 ]]; then
+    build_targets+=(frontier_bench_payload32)
+fi
+echo "Building payload ${payload_mode} performance benchmark(s)..."
+cmake --build "${BUILD_DIR}" --config Release \
+    --target "${build_targets[@]}" --parallel
 
 # Multi-config generators (notably Xcode) put each configuration in its own
 # directory. Never fall back from Release/ to a top-level executable there: it
@@ -82,35 +98,67 @@ else
     bench_dir="${BUILD_DIR}/bench"
 fi
 
-bench_exe=""
-for candidate in \
-    "${bench_dir}/frontier_bench" \
-    "${bench_dir}/frontier_bench.exe"
-do
-    if [[ -x "${candidate}" || -f "${candidate}" ]]; then
-        bench_exe="${candidate}"
-        break
-    fi
-done
+find_benchmark()
+{
+    local name="$1" candidate
+    for candidate in "${bench_dir}/${name}" "${bench_dir}/${name}.exe"; do
+        if [[ -x "${candidate}" || -f "${candidate}" ]]; then
+            printf '%s' "${candidate}"
+            return 0
+        fi
+    done
+    return 1
+}
 
-if [[ -z "${bench_exe}" ]]; then
-    echo "ERROR: Release benchmark executable was not found under ${bench_dir}." >&2
+bench64_exe="$(find_benchmark frontier_bench || true)"
+bench32_exe="$(find_benchmark frontier_bench_payload32 || true)"
+if [[ "${payload_mode}" != 32 && -z "${bench64_exe}" ]]; then
+    echo "ERROR: The 8-byte payload benchmark was not found under ${bench_dir}." >&2
+    exit 1
+fi
+if [[ "${payload_mode}" != 64 && -z "${bench32_exe}" ]]; then
+    echo "ERROR: The 4-byte payload benchmark was not found under ${bench_dir}." >&2
     exit 1
 fi
 
-echo "Using Release benchmark: ${bench_exe}"
-
 if (( $# > 0 )); then
-    echo "Running frontier_bench with caller-supplied arguments..."
-    exec "${bench_exe}" "$@"
+    if [[ "${payload_mode}" == both ]]; then
+        for argument in "$@"; do
+            if [[ "${argument}" == --benchmark_out ||
+                  "${argument}" == --benchmark_out=* ]]; then
+                echo "ERROR: --benchmark_out would be overwritten in both-width mode." >&2
+                echo "Set FRONTIER_PERF_PAYLOAD_BITS to 32 or 64, or omit --benchmark_out." >&2
+                exit 2
+            fi
+        done
+    fi
+    echo "Running payload ${payload_mode} benchmark(s) with caller-supplied arguments..."
+    if [[ "${payload_mode}" != 32 ]]; then
+        "${bench64_exe}" "$@"
+    fi
+    if [[ "${payload_mode}" != 64 ]]; then
+        "${bench32_exe}" "$@"
+    fi
+    exit 0
 fi
 
-echo "Running the documented performance suite with five repetitions..."
+echo "Running payload ${payload_mode} documented performance suite with five repetitions..."
 echo "Pass Google Benchmark arguments to this script to override the default suite."
-echo "Writing ${ROOT_DIR}/real_world_perf.json"
-exec "${bench_exe}" \
-    '--benchmark_filter=BM_SubtreeAssembly' \
-    --benchmark_repetitions=5 \
-    --benchmark_report_aggregates_only=true \
-    "--benchmark_out=${ROOT_DIR}/real_world_perf.json" \
-    --benchmark_out_format=json
+if [[ "${payload_mode}" != 32 ]]; then
+    echo "Writing ${ROOT_DIR}/real_world_perf_payload64.json"
+    "${bench64_exe}" \
+        '--benchmark_filter=BM_SubtreeAssembly' \
+        --benchmark_repetitions=5 \
+        --benchmark_report_aggregates_only=true \
+        "--benchmark_out=${ROOT_DIR}/real_world_perf_payload64.json" \
+        --benchmark_out_format=json
+fi
+if [[ "${payload_mode}" != 64 ]]; then
+    echo "Writing ${ROOT_DIR}/real_world_perf_payload32.json"
+    "${bench32_exe}" \
+        '--benchmark_filter=BM_SubtreeAssembly' \
+        --benchmark_repetitions=5 \
+        --benchmark_report_aggregates_only=true \
+        "--benchmark_out=${ROOT_DIR}/real_world_perf_payload32.json" \
+        --benchmark_out_format=json
+fi

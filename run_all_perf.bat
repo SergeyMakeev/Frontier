@@ -104,7 +104,7 @@ powercfg /getactivescheme >> "%REPORT_DIR%\hardware.txt" 2>&1
     echo   ctest --test-dir ^<unit-build^> -C Debug --output-on-failure
     echo.
     echo Real world:
-    echo   frontier_bench
+    echo   frontier_bench ^(8-byte payload^) and frontier_bench_payload32 ^(4-byte payload^)
     echo     --benchmark_filter=BM_SubtreeAssembly
     echo     --benchmark_repetitions=5
     echo     --benchmark_report_aggregates_only=true
@@ -186,17 +186,23 @@ if not "!RUN_RC!"=="0" goto package
 set "FAILURE_STAGE=build-performance"
 echo Building performance executables...
 cmake --build "%BUILD_DIR%" --config Release --parallel ^
-    --target frontier_bench frontier_machine_bench > "%REPORT_DIR%\build.log" 2>&1
+    --target frontier_bench frontier_bench_payload32 frontier_machine_bench > "%REPORT_DIR%\build.log" 2>&1
 set "RUN_RC=!errorlevel!"
 type "%REPORT_DIR%\build.log"
 if not "!RUN_RC!"=="0" goto package
 
 set "BENCH_EXE=%BUILD_DIR%\bench\Release\frontier_bench.exe"
+set "BENCH32_EXE=%BUILD_DIR%\bench\Release\frontier_bench_payload32.exe"
 set "MACHINE_EXE=%BUILD_DIR%\bench\Release\frontier_machine_bench.exe"
 if not exist "%BENCH_EXE%" set "BENCH_EXE=%BUILD_DIR%\bench\frontier_bench.exe"
+if not exist "%BENCH32_EXE%" set "BENCH32_EXE=%BUILD_DIR%\bench\frontier_bench_payload32.exe"
 if not exist "%MACHINE_EXE%" set "MACHINE_EXE=%BUILD_DIR%\bench\frontier_machine_bench.exe"
 if not exist "%BENCH_EXE%" (
     echo ERROR: frontier_bench.exe was not found under "%BUILD_DIR%\bench".
+    goto package
+)
+if not exist "%BENCH32_EXE%" (
+    echo ERROR: frontier_bench_payload32.exe was not found under "%BUILD_DIR%\bench".
     goto package
 )
 if not exist "%MACHINE_EXE%" (
@@ -214,16 +220,28 @@ if not exist "%MACHINE_EXE%" (
     findstr /R /B "CMAKE_BUILD_TYPE: CMAKE_CXX_COMPILER: CMAKE_CXX_COMPILER_ID: CMAKE_CXX_COMPILER_VERSION: CMAKE_GENERATOR: CMAKE_OSX_ARCHITECTURES: FRONTIER_AVX2: FRONTIER_BVH_WIDTH: FRONTIER_CONTRACT_CHECKS: FRONTIER_FORCE_SCALAR: FRONTIER_IPO: FRONTIER_STATS: FRONTIER_VALIDATE_SUBTREES:" "%BUILD_DIR%\CMakeCache.txt"
 ) > "%REPORT_DIR%\toolchain.txt" 2>&1
 
-set "FAILURE_STAGE=real-world-benchmarks"
-echo Running real-world performance suite...
+set "FAILURE_STAGE=real-world-benchmarks-payload64"
+echo Running real-world performance suite with 8-byte payloads...
 "%BENCH_EXE%" ^
     --benchmark_filter="BM_SubtreeAssembly" ^
     --benchmark_repetitions=5 ^
     --benchmark_report_aggregates_only=true ^
-    --benchmark_out="%REPORT_DIR%\real_world_perf.json" ^
-    --benchmark_out_format=json > "%REPORT_DIR%\real_world_perf.log" 2>&1
+    --benchmark_out="%REPORT_DIR%\real_world_perf_payload64.json" ^
+    --benchmark_out_format=json > "%REPORT_DIR%\real_world_perf_payload64.log" 2>&1
 set "RUN_RC=!errorlevel!"
-type "%REPORT_DIR%\real_world_perf.log"
+type "%REPORT_DIR%\real_world_perf_payload64.log"
+if not "!RUN_RC!"=="0" goto package
+
+set "FAILURE_STAGE=real-world-benchmarks-payload32"
+echo Running real-world performance suite with 4-byte payloads...
+"%BENCH32_EXE%" ^
+    --benchmark_filter="BM_SubtreeAssembly" ^
+    --benchmark_repetitions=5 ^
+    --benchmark_report_aggregates_only=true ^
+    --benchmark_out="%REPORT_DIR%\real_world_perf_payload32.json" ^
+    --benchmark_out_format=json > "%REPORT_DIR%\real_world_perf_payload32.log" 2>&1
+set "RUN_RC=!errorlevel!"
+type "%REPORT_DIR%\real_world_perf_payload32.log"
 if not "!RUN_RC!"=="0" goto package
 
 set "FAILURE_STAGE=machine-benchmarks"
@@ -252,7 +270,7 @@ type "%REPORT_DIR%\arch_kernel_perf.log"
 if not "!RUN_RC!"=="0" goto package
 
 set "FAILURE_STAGE=validate-results"
-powershell -NoProfile -Command "$names='real_world_perf.json','machine_perf.json','arch_kernel_perf.json'; foreach($name in $names) { $path=Join-Path '%REPORT_DIR%' $name; if(-not (Test-Path -LiteralPath $path)) { Write-Error ($name + ' is missing'); exit 1 }; $json=$null; try { $json=Get-Content -Raw -LiteralPath $path | ConvertFrom-Json -ErrorAction Stop } catch { Write-Error ($name + ' is invalid JSON'); exit 1 }; if(@($json.benchmarks).Count -eq 0) { Write-Error ($name + ' contains no benchmark records'); exit 1 } }"
+powershell -NoProfile -Command "$names='real_world_perf_payload64.json','real_world_perf_payload32.json','machine_perf.json','arch_kernel_perf.json'; foreach($name in $names) { $path=Join-Path '%REPORT_DIR%' $name; if(-not (Test-Path -LiteralPath $path)) { Write-Error ($name + ' is missing'); exit 1 }; $json=$null; try { $json=Get-Content -Raw -LiteralPath $path | ConvertFrom-Json -ErrorAction Stop } catch { Write-Error ($name + ' is invalid JSON'); exit 1 }; if(@($json.benchmarks).Count -eq 0) { Write-Error ($name + ' contains no benchmark records'); exit 1 } }"
 if errorlevel 1 goto package
 
 set "RUN_STATUS=COMPLETE"
@@ -269,7 +287,7 @@ for /f "delims=" %%I in ('git -c "safe.directory=%GIT_ROOT%" -C "%ROOT%" status 
 (
     echo # Frontier performance report
     echo.
-    echo - Format: frontier-perf-report-v1
+    echo - Format: frontier-perf-report-v2
     echo - Status: %RUN_STATUS%
     echo - Failed stage: %FAILURE_STAGE%
     echo - Machine label: %RAW_LABEL%
@@ -283,11 +301,12 @@ for /f "delims=" %%I in ('git -c "safe.directory=%GIT_ROOT%" -C "%ROOT%" status 
     echo - Workload RNG: %RNG_POLICY%
     echo - Benchmark order: registration order
     echo - Unit-test build: Debug
-    echo - Performance build: Release, contract checks and subtree validation disabled
+    echo - Performance builds: matched 4-byte and 8-byte payloads; Release, contract checks and subtree validation disabled
     echo.
     echo ## Result files
     echo.
-    echo - real_world_perf.json: end-to-end subtree assembly workloads
+    echo - real_world_perf_payload64.json: end-to-end workloads with 8-byte payloads
+    echo - real_world_perf_payload32.json: end-to-end workloads with 4-byte payloads
     echo - machine_perf.json: ALU, SIMD, branch, cache, latency, and bandwidth probes
     echo - arch_kernel_perf.json: focused production-kernel probes with longer sampling
     echo - tests.log: Debug BVH4 + BVH8 correctness-suite result
@@ -301,7 +320,7 @@ for /f "delims=" %%I in ('git -c "safe.directory=%GIT_ROOT%" -C "%ROOT%" status 
 ) > "%REPORT_DIR%\REPORT.md"
 
 (
-    echo format=frontier-perf-report-v1
+    echo format=frontier-perf-report-v2
     echo status=%RUN_STATUS%
     echo failure_stage=%FAILURE_STAGE%
     echo label=%RAW_LABEL%
@@ -313,6 +332,7 @@ for /f "delims=" %%I in ('git -c "safe.directory=%GIT_ROOT%" -C "%ROOT%" status 
     echo host_arch=%PROCESSOR_ARCHITECTURE%
     echo unit_build_type=Debug
     echo perf_build_type=Release
+    echo perf_payload_bytes=4,8
     echo affinity=scheduler-default
     echo rng_policy=%RNG_POLICY%
     echo benchmark_order=registration-order
