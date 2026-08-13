@@ -144,6 +144,12 @@ struct QueryScratch
         {
             n += w.work.capacity() * sizeof(SpatialDatabase::WorkItem);
             n += w.nodeStack.capacity() * sizeof(SpatialDatabase::NodeItem);
+            n += w.workCandidates.capacity() * sizeof(uint32_t);
+            n += w.nodeCandidates.capacity() * sizeof(uint32_t);
+            n += w.ancestorCandidates.capacity() *
+                 sizeof(SpatialDatabase::Worker::AncestorCandidate);
+            n += w.ancestorIdeal.capacity() *
+                 sizeof(SpatialDatabase::Worker::AncestorIdealEntry);
             n += w.frontierBuffer.shared.capacity() * sizeof(FrontierEntry);
             n += w.frontierBuffer.currentOnly.capacity() * sizeof(FrontierEntry);
             n += w.frontierBuffer.idealOnly.capacity() * sizeof(FrontierEntry);
@@ -2809,11 +2815,12 @@ CollectResult SpatialDatabase::collect(std::span<SpatialQuery* const> queries,
 // Normal and dense-overlay bounds come through item.bounds() without a per-block
 // branch. The sparse-overlay instantiation consults its compact patch table;
 // template dispatch happens once per subtree rather than once per block.
-template<bool FullyReady, bool SparseOverlay>
+template<bool FullyReady, bool SparseOverlay, bool TrackAncestor>
 void SpatialDatabase::wideVisit(
     const WorkItem& item, const SubtreeView& pg, float errClamp, uint32_t gen,
     InstanceId instance, uint32_t node, uint8_t mask, uint8_t currentKids,
-    uint8_t idealKids, const Camera& local, Worker& w) const
+    uint8_t idealKids, const Camera& local, Worker& w,
+    uint32_t ancestorCandidate) const
 {
     const uint32_t cc = pg.childCount(node);
     uint32_t b = pg.wideOffset(node);
@@ -2869,7 +2876,13 @@ void SpatialDatabase::wideVisit(
             const FrontierEntry entry =
                 makeFrontierEntry(NodeHandle{item.slot(), c, gen}, errs.v[l], w.bar,
                              w.barInv, instance);
-            if constexpr (FullyReady)
+            if constexpr (TrackAncestor)
+            {
+                const bool ready =
+                    subtrees_[slots_[item.slot()].definition].isNodeReady(c);
+                w.addAncestorIdeal(entry, ancestorCandidate, ready);
+            }
+            else if constexpr (FullyReady)
                 w.result.shared.push(entry);
             else
                 w.emit(entry, currentKids != 0, idealKids != 0);
@@ -2887,6 +2900,8 @@ void SpatialDatabase::wideVisit(
             else
                 w.nodeStack.push_back(
                     {c, errs.v[l], planes, currentKids, idealKids});
+            if constexpr (TrackAncestor)
+                w.nodeCandidates.push_back(ancestorCandidate);
 
             // This lane is the only kind that gets DECIDED: runSubtree asks
             // whether its error clears the bar, and plain leaves (handled
@@ -3066,89 +3081,6 @@ bool SpatialDatabase::visibleDescendantsCovered(uint32_t slot, uint32_t node, ui
     return true;
 }
 
-// The compact current-cut policy may descend through unavailable nodes that
-// are still above the ideal frontier, but it must not descend below an
-// unavailable ideal choice. Prove that every visible branch reaches a ready
-// node before the ideal walk would stop. Ready nodes terminate the proof: the
-// main walk will decide later whether each one can refine further or must serve
-// as that branch's fallback.
-bool SpatialDatabase::visibleIdealBranchesReachReady(
-    uint32_t slot, uint32_t node, uint8_t mask, const Instance& inst,
-    const Camera& rootLocal, const SelectionParams& params,
-    Worker* dependencyWorker) const
-{
-    if (dependencyWorker)
-        recordTraversalDependency(*dependencyWorker, slot);
-
-    const SubtreeInstanceRt* rt = &slots_[slot];
-    if (node != 0 && subtreeView(*rt).isMountable(node))
-    {
-        const uint32_t child = mountedChildSlot(*rt, node);
-        if (child == kInvalidIndex) return false;
-        slot = child;
-        node = 0;
-        rt = &slots_[slot];
-        if (dependencyWorker)
-            recordTraversalDependency(*dependencyWorker, slot);
-    }
-
-    const Camera local = mountLocalCamera(rootLocal, slot, mask);
-    const SubtreeDefinitionRt& definition = subtrees_[rt->definition];
-    const SubtreeView& subtree = definition.view;
-    const WorkItem item = makeWorkItem(slot, inst, 0, 0, mask);
-    const uint32_t count = subtree.childCount(node);
-    if (count == 0) return false;
-
-    uint32_t block = subtree.wideOffset(node);
-    const float8 clamp = float8::splat(rt->errClamp);
-    const float4 qmn = local.queryMin(), qmx = local.queryMax();
-    for (uint32_t base = 0; base < count; base += kWide, ++block)
-    {
-        const WideBlock& children = subtree.wide_[block];
-        const WideBounds& bounds = [&]() -> const WideBounds&
-        {
-            if (item.sparseOverlay == kInvalidIndex)
-                return item.bounds(block);
-            const Overlay& overlay = overlays_[item.sparseOverlay];
-            const uint32_t patch = overlay.widePatch[block];
-            return patch == kInvalidIndex ? subtree.wide_[block].bounds
-                                          : overlay.patchedWide[patch];
-        }();
-
-        uint8_t childMasks[kWide];
-        const uint32_t lanes = subtree.blockMask_[block];
-        uint32_t survivors =
-            testWideAabb(bounds, local.frustum, mask, childMasks) & lanes;
-        if (!survivors) continue;
-
-        const float8 errors = min8(children.error, clamp);
-        const float8 distanceSq = distanceToBoxesSq(bounds, qmn, qmx);
-        const float8 screen =
-            screenErrorFromSq8(errors, local.k, distanceSq);
-        const uint32_t leafLanes = blockLeafLanes(lanes);
-
-        while (survivors)
-        {
-            const uint32_t lane = uint32_t(std::countr_zero(survivors));
-            survivors &= survivors - 1;
-            const uint32_t child = children.child[lane];
-            if (definition.isNodeReady(child)) continue;
-
-            // Plain leaves are always ideal choices. Interior and mountable
-            // nodes are ideal choices once their error reaches the bar.
-            if ((leafLanes & (1u << lane)) != 0 ||
-                !(screen.v[lane] > params.threshold))
-                return false;
-
-            if (!visibleIdealBranchesReachReady(
-                    slot, child, childMasks[lane], inst, rootLocal, params,
-                    dependencyWorker))
-                return false;
-        }
-    }
-    return true;
-}
-
 template<bool FullyReady>
 void SpatialDatabase::runSubtree(const WorkItem& item, const Instance& inst,
                     const Camera& local,
@@ -3158,6 +3090,93 @@ void SpatialDatabase::runSubtree(const WorkItem& item, const Instance& inst,
         runSubtreeImpl<FullyReady, false>(item, inst, local, params, w);
     else
         runSubtreeImpl<FullyReady, true>(item, inst, local, params, w);
+}
+
+void SpatialDatabase::runSubtreeAncestor(
+    const WorkItem& item, const Instance& inst, const Camera& local,
+    const SelectionParams& params, uint32_t ancestorCandidate, Worker& w) const
+{
+    if (item.sparseOverlay == kInvalidIndex)
+        runSubtreeAncestorImpl<false>(
+            item, inst, local, params, ancestorCandidate, w);
+    else
+        runSubtreeAncestorImpl<true>(
+            item, inst, local, params, ancestorCandidate, w);
+}
+
+template<bool SparseOverlay>
+void SpatialDatabase::runSubtreeAncestorImpl(
+    const WorkItem& item, const Instance& inst, const Camera& rootLocal,
+    const SelectionParams& params, uint32_t ancestorCandidate, Worker& w) const
+{
+    const SubtreeInstanceRt& rt = slots_[item.slot()];
+    const Camera local = mountLocalCamera(rootLocal, item.slot(), item.mask());
+    recordTraversalDependency(w, item.slot());
+
+    FRONTIER_STAT(w, subtreesVisited, 1);
+    const SubtreeDefinitionRt& definition = subtrees_[rt.definition];
+    const SubtreeView& pg = definition.view;
+    const uint32_t gen = rt.generation();
+    const InstanceId instance =
+        publicInstanceId(InstanceId(&inst - instances_.data()));
+    const float bar = params.threshold;
+
+    w.nodeStack.clear();
+    w.nodeCandidates.clear();
+    wideVisit<false, SparseOverlay, true>(
+        item, pg, rt.errClamp, gen, instance, 0, item.mask(), 0, 1, local, w,
+        ancestorCandidate);
+
+    while (!w.nodeStack.empty())
+    {
+        const NodeItem e = w.nodeStack.back();
+        w.nodeStack.pop_back();
+        FRONTIER_ASSERT(!w.nodeCandidates.empty(),
+                        "ancestor candidate stack underflow");
+        uint32_t candidate = w.nodeCandidates.back();
+        w.nodeCandidates.pop_back();
+
+        const uint32_t i = e.node();
+        FRONTIER_STAT(w, nodesVisited, 1);
+        const NodeHandle here{item.slot(), i, gen};
+        const bool ready = definition.isNodeReady(i);
+        const FrontierEntry entry =
+            makeFrontierEntry(here, e.err, bar, w.barInv, instance);
+
+        if (!(e.err > bar))
+        {
+            w.addAncestorIdeal(entry, candidate, ready);
+            continue;
+        }
+
+        const bool mountable = metaIsMountable(pg.meta_[i]);
+        const uint32_t childSlot =
+            mountable ? mountedChildSlot(rt, i) : kInvalidIndex;
+        if (mountable && childSlot == kInvalidIndex)
+        {
+            w.addAncestorIdeal(entry, candidate, ready);
+            continue;
+        }
+
+        if (ready)
+            candidate = w.addAncestorCandidate(candidate, entry);
+
+        if (mountable)
+        {
+            w.work.push_back(
+                makeWorkItem(childSlot, inst, 0, 1, e.planes()));
+            w.workCandidates.push_back(candidate);
+        }
+        else
+        {
+            wideVisit<false, SparseOverlay, true>(
+                item, pg, rt.errClamp, gen, instance, i, e.planes(), 0, 1,
+                local, w, candidate);
+        }
+    }
+
+    FRONTIER_ASSERT(w.nodeCandidates.empty(),
+                    "ancestor candidate stack mismatch");
 }
 
 template<bool FullyReady, bool SparseOverlay>
@@ -3303,21 +3322,12 @@ void SpatialDatabase::runSubtreeImpl(const WorkItem& item,
             }
             else if (!(e.err > bar))
             {
-                const bool ready = definition.isNodeReady(i);
-                const bool shared = current && ready;
+                const bool shared = current &&
+                                    definition.isNodeReady(i);
                 const FrontierEntry entry =
                     makeFrontierEntry(here, e.err, bar, w.barInv, instance);
                 w.emit(entry, shared, true);
                 if (!current || shared) continue;
-
-                // Ancestor-preferring traversal proves readiness before it
-                // descends from the nearest ready node. It can never carry the
-                // current walk onto an unavailable ideal choice.
-                FRONTIER_CHECK(
-                    params.currentCutPolicy ==
-                        CurrentCutPolicy::PreferReadyDescendants,
-                    "SpatialQuery::selectFrontier: compact current cut crossed "
-                    "an unavailable ideal node");
                 // The ideal proxy is unavailable, but a recursively complete
                 // ready descendant cut exists because the current walk reached it.
                 nextCurrent = 1;
@@ -3341,30 +3351,10 @@ void SpatialDatabase::runSubtreeImpl(const WorkItem& item,
 
             if (ideal && e.err > bar)
             {
-                bool canDescend = !current;
-                if (current)
-                {
-                    if (params.currentCutPolicy ==
-                        CurrentCutPolicy::PreferReadyDescendants)
-                    {
-                        canDescend = visibleDescendantsCovered(
-                            item.slot(), i, e.planes(), inst, rootLocal,
-                            w.trackTouches ? &w : nullptr);
-                    }
-                    else if (!definition.isNodeReady(i))
-                    {
-                        // A ready ancestor already proved this unavailable
-                        // path reaches another ready node before the ideal
-                        // frontier. Avoid proving the same segment again.
-                        canDescend = true;
-                    }
-                    else
-                    {
-                        canDescend = visibleIdealBranchesReachReady(
-                            item.slot(), i, e.planes(), inst, rootLocal,
-                            params, w.trackTouches ? &w : nullptr);
-                    }
-                }
+                const bool canDescend =
+                    !current ||
+                    visibleDescendantsCovered(item.slot(), i, e.planes(), inst, rootLocal,
+                                               w.trackTouches ? &w : nullptr);
                 if (current && !canDescend)
                 {
                     FRONTIER_CHECK(definition.isNodeReady(i),
@@ -3436,43 +3426,65 @@ void SpatialDatabase::runTlasRootInstance(
 
     const Camera local = toLocal(view, inst.pos, inst.scale);
     const bool fullyReady = mountedTreeFullyReady(childSlot);
-    const bool currentCanDescend = fullyReady ||
-        (params.currentCutPolicy ==
-                 CurrentCutPolicy::PreferReadyDescendants
-             ? visibleDescendantsCovered(
-                   childSlot, 0, mask, inst, local,
-                   w.trackTouches ? &w : nullptr)
-             : visibleIdealBranchesReachReady(
-                   childSlot, 0, mask, inst, local, params,
-                   w.trackTouches ? &w : nullptr));
-    if (!currentCanDescend)
-        w.result.currentOnly.push(makeFrontierEntry(
-            root, error, w.bar, w.barInv, outputInstance));
-
-    w.work.push_back(makeWorkItem(childSlot, inst,
-                                  uint8_t(currentCanDescend), 1, mask));
     if (fullyReady)
     {
+        w.work.push_back(makeWorkItem(childSlot, inst, 1, 1, mask));
         while (!w.work.empty())
         {
             const WorkItem item = w.work.back();
             w.work.pop_back();
             runSubtree<true>(item, inst, local, params, w);
         }
+        return;
     }
-    else
+
+    if (params.currentCutPolicy == CurrentCutPolicy::PreferReadyAncestors)
     {
+        w.work.clear();
+        w.workCandidates.clear();
+        w.ancestorCandidates.clear();
+        w.ancestorIdeal.clear();
+
+        const uint32_t rootCandidate = w.addAncestorCandidate(
+            kInvalidIndex,
+            makeFrontierEntry(root, error, w.bar, w.barInv, outputInstance));
+        w.work.push_back(makeWorkItem(childSlot, inst, 0, 1, mask));
+        w.workCandidates.push_back(rootCandidate);
         while (!w.work.empty())
         {
             const WorkItem item = w.work.back();
             w.work.pop_back();
-            const bool branchFullyReady = item.current() && item.ideal() &&
-                                          mountedTreeFullyReady(item.slot());
-            if (branchFullyReady)
-                runSubtree<true>(item, inst, local, params, w);
-            else
-                runSubtree<false>(item, inst, local, params, w);
+            FRONTIER_ASSERT(!w.workCandidates.empty(),
+                            "ancestor work stack underflow");
+            const uint32_t candidate = w.workCandidates.back();
+            w.workCandidates.pop_back();
+            runSubtreeAncestor(item, inst, local, params, candidate, w);
         }
+        FRONTIER_ASSERT(w.workCandidates.empty(),
+                        "ancestor work stack mismatch");
+        w.finishAncestorCut();
+        return;
+    }
+
+    const bool currentCanDescend = visibleDescendantsCovered(
+        childSlot, 0, mask, inst, local,
+        w.trackTouches ? &w : nullptr);
+    if (!currentCanDescend)
+        w.result.currentOnly.push(makeFrontierEntry(
+            root, error, w.bar, w.barInv, outputInstance));
+
+    w.work.push_back(makeWorkItem(childSlot, inst,
+                                  uint8_t(currentCanDescend), 1, mask));
+    while (!w.work.empty())
+    {
+        const WorkItem item = w.work.back();
+        w.work.pop_back();
+        const bool branchFullyReady = item.current() && item.ideal() &&
+                                      mountedTreeFullyReady(item.slot());
+        if (branchFullyReady)
+            runSubtree<true>(item, inst, local, params, w);
+        else
+            runSubtree<false>(item, inst, local, params, w);
     }
 }
 

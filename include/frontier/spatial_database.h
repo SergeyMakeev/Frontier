@@ -1602,8 +1602,47 @@ private:
     // instance order so results stay bit-identical either way.
     struct Worker
     {
+        struct AncestorCandidate
+        {
+            static constexpr uint32_t Collapsed = 1u << 31;
+            static constexpr uint32_t ValueMask = ~Collapsed;
+
+            FrontierEntry fallback;
+            // Before finishAncestorCut(), the low bits hold parent + 1.
+            // Afterwards they hold the selected covering candidate + 1.
+            // Zero means neither; the high bit records a failed ideal leaf.
+            uint32_t state = 0;
+        };
+        static_assert(sizeof(AncestorCandidate) == 16,
+                      "ancestor candidate must stay compact");
+
+        struct AncestorIdealEntry
+        {
+            static constexpr uint32_t Ready = 1u << 31;
+            static constexpr uint32_t CandidateMask = ~Ready;
+
+            FrontierEntry entry;
+            uint32_t candidateAndReady = 0;
+
+            uint32_t candidate() const
+            {
+                return candidateAndReady & CandidateMask;
+            }
+            bool ready() const { return (candidateAndReady & Ready) != 0; }
+        };
+        static_assert(sizeof(AncestorIdealEntry) == 16,
+                      "ancestor ideal entry must stay compact");
+
         std::vector<WorkItem> work;
         std::vector<NodeItem> nodeStack;
+
+        // Used only by PreferReadyAncestors. Candidate ids travel beside the
+        // unchanged hot work records, so the default traversal does not grow
+        // either stack item.
+        std::vector<uint32_t> workCandidates;
+        std::vector<uint32_t> nodeCandidates;
+        std::vector<AncestorCandidate> ancestorCandidates;
+        std::vector<AncestorIdealEntry> ancestorIdeal;
 
         // Backing storage for the parallel path, where each worker collects
         // into its own buffers; the serial path points the sinks straight at
@@ -1620,6 +1659,67 @@ private:
                 result.currentOnly.push(entry);
             else
                 result.idealOnly.push(entry);
+        }
+
+        uint32_t addAncestorCandidate(uint32_t parent,
+                                      const FrontierEntry& fallback)
+        {
+            const uint32_t id = uint32_t(ancestorCandidates.size());
+            FRONTIER_CHECK(id < AncestorCandidate::ValueMask,
+                           "ancestor candidate index overflow");
+            FRONTIER_ASSERT(parent == kInvalidIndex || parent < id,
+                            "ancestor candidate parent must precede child");
+            ancestorCandidates.push_back(AncestorCandidate{
+                fallback, parent == kInvalidIndex ? 0u : parent + 1u});
+            return id;
+        }
+
+        void addAncestorIdeal(const FrontierEntry& entry, uint32_t candidate,
+                              bool ready)
+        {
+            FRONTIER_ASSERT(candidate < ancestorCandidates.size(),
+                            "ideal entry has no ready ancestor");
+            ancestorIdeal.push_back(AncestorIdealEntry{
+                entry, candidate | (ready ? AncestorIdealEntry::Ready : 0u)});
+            if (!ready)
+                ancestorCandidates[candidate].state |=
+                    AncestorCandidate::Collapsed;
+        }
+
+        void finishAncestorCut()
+        {
+            // Parent ids are allocated first. One forward pass therefore
+            // propagates the outermost collapsed ancestor to every candidate.
+            for (uint32_t i = 0; i < ancestorCandidates.size(); ++i)
+            {
+                AncestorCandidate& candidate = ancestorCandidates[i];
+                const uint32_t parentPlusOne =
+                    candidate.state & AncestorCandidate::ValueMask;
+                const uint32_t inherited =
+                    parentPlusOne == 0
+                        ? 0u
+                        : ancestorCandidates[parentPlusOne - 1u].state &
+                              AncestorCandidate::ValueMask;
+                if (inherited != 0)
+                    candidate.state = inherited;
+                else if ((candidate.state & AncestorCandidate::Collapsed) != 0)
+                {
+                    candidate.state = i + 1u;
+                    result.currentOnly.push(candidate.fallback);
+                }
+                else
+                    candidate.state = 0;
+            }
+
+            for (const AncestorIdealEntry& ideal : ancestorIdeal)
+            {
+                const bool swallowed =
+                    ancestorCandidates[ideal.candidate()].state != 0;
+                if (ideal.ready() && !swallowed)
+                    result.shared.push(ideal.entry);
+                else
+                    result.idealOnly.push(ideal.entry);
+            }
         }
 
         std::vector<uint32_t> touched;      // tree dependencies or optional mount usage
@@ -1769,10 +1869,6 @@ private:
                                    const Instance& inst,
                                    const Camera& rootLocal,
                                    Worker* dependencyWorker = nullptr) const;
-    bool visibleIdealBranchesReachReady(
-        uint32_t slot, uint32_t node, uint8_t mask, const Instance& inst,
-        const Camera& rootLocal, const SelectionParams& params,
-        Worker* dependencyWorker = nullptr) const;
     Camera mountLocalCamera(const Camera& rootLocal, uint32_t slot,
                             uint8_t mask) const;
     bool mountedTreeFullyReady(uint32_t slot) const;
@@ -1792,12 +1888,22 @@ private:
     void runSubtreeImpl(const WorkItem& item, const Instance& inst,
                         const Camera& local,
                         const SelectionParams& params, Worker& w) const;
-    template<bool FullyReady, bool SparseOverlay>
+    template<bool SparseOverlay>
+    void runSubtreeAncestorImpl(const WorkItem& item, const Instance& inst,
+                                const Camera& local,
+                                const SelectionParams& params,
+                                uint32_t ancestorCandidate, Worker& w) const;
+    void runSubtreeAncestor(const WorkItem& item, const Instance& inst,
+                            const Camera& local,
+                            const SelectionParams& params,
+                            uint32_t ancestorCandidate, Worker& w) const;
+    template<bool FullyReady, bool SparseOverlay, bool TrackAncestor = false>
     void wideVisit(const WorkItem& item, const detail::SubtreeView& subtree,
                    float errClamp,
                    uint32_t gen, InstanceId instance, uint32_t node, uint8_t mask,
                    uint8_t currentKids, uint8_t idealKids,
-                   const Camera& local, Worker& w) const;
+                   const Camera& local, Worker& w,
+                   uint32_t ancestorCandidate = kInvalidIndex) const;
     void emitMountedRootLeavesInside(const WorkItem& item,
                                      const detail::SubtreeView& subtree,
                                      float errClamp,

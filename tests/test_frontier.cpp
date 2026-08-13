@@ -272,6 +272,55 @@ TEST(Frontier, CurrentCutPolicyChoosesAncestorOrDescendantFallback)
     EXPECT_EQ(query.walked(), 1u);
 }
 
+TEST(Frontier, AncestorPolicyTracksCandidatesAcrossMountedSubtrees)
+{
+    SpatialDatabase database;
+
+    SubtreeBuilder ownerBuilder;
+    const auto coarse =
+        ownerBuilder.createNode(node(20, 64.0f, box(4.0f)));       // C
+    ownerBuilder.createNode(coarse, node(21, 0.0f, box(4.0f)));    // F
+    ownerBuilder.createNode(coarse,
+                            node(22, 32.0f, box(4.0f), true));     // G
+    const SubtreeHandle owner =
+        database.registerSubtree(ownerBuilder.build());
+    const SubtreeHandle detail =
+        database.registerSubtree(makeLeafSubtree(23, 4.0f));       // H
+
+    const InstanceHandle root = database.instantiate(
+        node(1, 128.0f, box(4.0f), true));
+    const SubtreeInstanceHandle ownerPlacement =
+        database.mountSubtree(root.rootNode(), owner);
+    const NodeHandle mountPoint =
+        TestAccess::nodeAt(database, ownerPlacement, 3);
+    database.mountSubtree(mountPoint, detail);
+
+    for (const UserPayload ready : {20u, 21u, 22u})
+        database.markNodeReady(handleOf(database, ready));
+
+    SpatialQuery query;
+    SelectionParams params{
+        .threshold = 1.0f,
+        .currentCutPolicy = CurrentCutPolicy::PreferReadyAncestors,
+    };
+    const Camera camera = cameraAt(-20.0f);
+
+    FrontierResultView cut = select(database, query, camera, params);
+    EXPECT_EQ(payloads(database, cut, true),
+              (std::vector<UserPayload>{21, 23}));
+    EXPECT_EQ(payloads(database, cut, false),
+              (std::vector<UserPayload>{21, 22}));
+
+    // With G unavailable, its mounted ideal descendant must retreat to C.
+    // C then replaces the ready sibling F as well.
+    database.markNodeUnavailable(mountPoint);
+    cut = select(database, query, camera, params);
+    EXPECT_EQ(payloads(database, cut, true),
+              (std::vector<UserPayload>{21, 23}));
+    EXPECT_EQ(payloads(database, cut, false),
+              (std::vector<UserPayload>{20}));
+}
+
 TEST(Frontier, MountedCoverageStaysPlacementLocal)
 {
     SpatialDatabase database;

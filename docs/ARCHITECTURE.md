@@ -98,11 +98,14 @@ unseen missing branches without allowing a visible hole.
 
 That descendant-cover path implements
 `CurrentCutPolicy::PreferReadyDescendants`. Under
-`PreferReadyAncestors`, a query-local proof instead follows each unavailable
-branch only until the ideal frontier or the first ready node. Failure before a
-ready node stops current traversal at the nearest ready ancestor. This policy
-adds no persistent per-node state, and changing policy invalidates cached cuts
-through the existing query epoch.
+`PreferReadyAncestors`, the single ideal traversal carries the nearest ready
+ancestor candidate across both local children and mount boundaries. An
+unavailable ideal choice marks its candidate for fallback. A parent-first
+resolution pass selects the outermost marked candidates and partitions the
+recorded ideal entries into `shared` and `idealOnly`; it needs no speculative
+readiness walk. The compact candidate records are query scratch rather than
+persistent per-node state, and changing policy invalidates cached cuts through
+the existing query epoch.
 
 ## TLAS maintenance
 

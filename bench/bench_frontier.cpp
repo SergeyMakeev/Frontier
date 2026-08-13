@@ -390,6 +390,7 @@ static void BM_MixedReadinessFrontier(benchmark::State& state)
     state.counters["stored_entries"] = double(cut.size());
     state.counters["current"] = double(cut.currentSize());
     state.counters["ideal"] = double(cut.idealSize());
+    state.counters["query_bytes"] = double(query.bytes());
 }
 
 BENCHMARK(BM_MixedReadinessFrontier)
