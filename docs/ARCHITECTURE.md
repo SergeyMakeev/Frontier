@@ -26,9 +26,16 @@ single placement in one runtime tree.
 - a 128-byte header;
 - interleaved `WideBlock` data (128 bytes in BVH4, 256 bytes in BVH8);
 - valid/leaf lane masks;
-- authored bounds and payload arrays;
-- parent, contiguous-subtree-size, and packed metadata arrays;
-- geometric errors.
+- payload, parent, contiguous-subtree-size, metadata, and error arrays;
+- the definition aggregate bound in the header.
+
+Per-node bounds have no scalar duplicate. Each real node's canonical authored
+bound is its lane in its parent's `WideBlock`, so traversal consumes the
+serialized representation directly. The 32-bit parent word packs the 20-bit
+parent index with the node's sibling ordinal; this addresses the canonical
+wide lane in O(1) for inspection and copy-on-write refits. The implicit parent
+has no parent lane, so its aggregate bound occupies otherwise reserved header
+space.
 
 Mountability is one bit in packed node metadata. Definition targets and
 transforms are deliberately absent: they are supplied when a handle is mounted.
@@ -134,9 +141,10 @@ preserving those ids.
 
 Authored bounds are immutable and usually read directly from the definition.
 The first `setNodeBounds()` touching an `(instance, placement)` pair creates an
-overlay. Small definitions materialize dense wide bounds. Large definitions
-start with a dense block-to-patch index plus only modified wide blocks, then
-promote when edits reach the configured fraction.
+overlay. The overlay keeps only changed wide bounds; it does not create a
+parallel scalar-bounds array. Small definitions materialize dense wide bounds.
+Large definitions start with a dense block-to-patch index plus only modified
+wide blocks, then promote when edits reach the configured fraction.
 
 Queued edits retain caller order. Ancestor propagation stops as soon as an
 existing bound contains the change, crosses mount boundaries through owner

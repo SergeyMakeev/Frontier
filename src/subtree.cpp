@@ -30,10 +30,6 @@ detail::SubtreeLayout computeLayout(uint32_t nodeCount, uint32_t wideCount)
     layout.mask = uint32_t(offset);
     offset += size_t(wideCount) * sizeof(uint32_t);
 
-    offset = alignUp(offset, alignof(AABB));
-    layout.bbox = uint32_t(offset);
-    offset += size_t(nodeCount) * sizeof(AABB);
-
     offset = alignUp(offset, alignof(PayloadWord));
     layout.payload = uint32_t(offset);
     offset += size_t(nodeCount) * sizeof(PayloadWord);
@@ -61,12 +57,6 @@ bool finiteNonEmptyBounds(const AABB& bounds)
            bounds.mx.x - bounds.mn.x < FLT_MAX &&
            bounds.mx.y - bounds.mn.y < FLT_MAX &&
            bounds.mx.z - bounds.mn.z < FLT_MAX;
-}
-
-bool sameBounds(const AABB& a, const AABB& b)
-{
-    return a.mn.x == b.mn.x && a.mn.y == b.mn.y && a.mn.z == b.mn.z &&
-           a.mx.x == b.mx.x && a.mx.y == b.mx.y && a.mx.z == b.mx.z;
 }
 
 bool canonicalEmptyBounds(const AABB& bounds)
@@ -171,7 +161,9 @@ void validateSubtreeBytes(const SubtreeBytes& bytes)
                        header->invalidPayloadWord ==
                            uint64_t(invalidPayloadWord()),
                    "registerSubtree: payload configuration mismatch");
-    FRONTIER_CHECK(std::all_of(header->reserved, header->reserved + 15,
+    FRONTIER_CHECK(header->reservedOffset == 0,
+                   "registerSubtree: reserved offset is non-zero");
+    FRONTIER_CHECK(std::all_of(header->reserved, header->reserved + 9,
                                [](uint32_t value) { return value == 0; }),
                    "registerSubtree: reserved header fields are non-zero");
     FRONTIER_CHECK(header->nodeCount > 1,
@@ -190,7 +182,6 @@ void validateSubtreeBytes(const SubtreeBytes& bytes)
         layout.totalBytes == header->totalBytes &&
             layout.wide == header->wideOffset &&
             layout.mask == header->maskOffset &&
-            layout.bbox == header->bboxOffset &&
             layout.payload == header->payloadOffset &&
             layout.parent == header->parentOffset &&
             layout.subtreeSize == header->subtreeSizeOffset &&
@@ -213,7 +204,8 @@ void validateSubtreeBytes(const SubtreeBytes& bytes)
         bytes.data() + header->errorOffset);
 
     const uint32_t nodeCount = header->nodeCount;
-    FRONTIER_CHECK(parent[0] == 0 && subtreeSize[0] == nodeCount,
+    FRONTIER_CHECK(parent[0] == packParent(0, 0) &&
+                       subtreeSize[0] == nodeCount,
                    "registerSubtree: invalid implicit-parent extent");
     const uint32_t rootChildren = metaChildCount(meta[0]);
     FRONTIER_CHECK(!metaIsMountable(meta[0]) && rootChildren != 0,
@@ -230,16 +222,19 @@ void validateSubtreeBytes(const SubtreeBytes& bytes)
         bytes.data() + header->wideOffset);
     const auto* blockMask = reinterpret_cast<const uint32_t*>(
         bytes.data() + header->maskOffset);
-    const auto* bbox = reinterpret_cast<const AABB*>(
-        bytes.data() + header->bboxOffset);
+    const AABB rootBounds = AABB::fromMinMax(
+        float4::point(header->rootBoundsMin[0], header->rootBoundsMin[1],
+                      header->rootBoundsMin[2]),
+        float4::point(header->rootBoundsMax[0], header->rootBoundsMax[1],
+                      header->rootBoundsMax[2]));
+    FRONTIER_CHECK(finiteNonEmptyBounds(rootBounds),
+                   "registerSubtree: invalid aggregate bounds");
 
     // Validate all scalar arrays before using any serialized index. This is
     // deliberately linear: registration remains zero-copy, while malformed
     // persisted bytes can never become unchecked traversal pointers.
     for (uint32_t node = 0; node < nodeCount; ++node)
     {
-        FRONTIER_CHECK(finiteNonEmptyBounds(bbox[node]),
-                       "registerSubtree: invalid node bounds");
         if (node != 0)
             FRONTIER_CHECK(payload[node] != invalidPayloadWord(),
                            "registerSubtree: reserved invalid payload");
@@ -255,14 +250,15 @@ void validateSubtreeBytes(const SubtreeBytes& bytes)
                            "registerSubtree: leaf has descendants");
 
         if (node == 0) continue;
-        FRONTIER_CHECK(parent[node] < node,
+        const uint32_t parentIndex = packedParentIndex(parent[node]);
+        const uint32_t ordinal = packedParentOrdinal(parent[node]);
+        FRONTIER_CHECK(parentIndex < node &&
+                           ordinal < metaChildCount(meta[parentIndex]),
                        "registerSubtree: parent ordering violated");
         FRONTIER_CHECK(error[node] >= 0.0f &&
                            std::isfinite(error[node]) &&
-                           error[node] <= error[parent[node]],
+                           error[node] <= error[parentIndex],
                        "registerSubtree: invalid geometric error");
-        FRONTIER_CHECK(bbox[parent[node]].contains(bbox[node]),
-                       "registerSubtree: parent bounds do not contain child");
     }
 
     uint32_t expectedWide = 0;
@@ -284,6 +280,14 @@ void validateSubtreeBytes(const SubtreeBytes& bytes)
                        "registerSubtree: wide-block range escapes array");
 
         uint32_t child = node + 1;
+        const AABB nodeBounds = node == 0
+                                    ? rootBounds
+                                    : wide[metaWideOffset(
+                                          meta[packedParentIndex(parent[node])]) +
+                                          packedParentOrdinal(parent[node]) / kWide]
+                                          .bounds.lane(
+                                              packedParentOrdinal(parent[node]) &
+                                              (kWide - 1u));
         for (uint32_t blockIndex = 0; blockIndex < blocks; ++blockIndex)
         {
             const WideBlock& block = wide[expectedWide + blockIndex];
@@ -297,13 +301,16 @@ void validateSubtreeBytes(const SubtreeBytes& bytes)
             {
                 if (lane < lanes)
                 {
+                    const AABB childBounds = block.bounds.lane(lane);
                     FRONTIER_CHECK(child < nodeCount &&
-                                       parent[child] == node,
+                                       packedParentIndex(parent[child]) == node &&
+                                       packedParentOrdinal(parent[child]) ==
+                                           first + lane,
                                    "registerSubtree: invalid preorder topology");
                     FRONTIER_CHECK(block.child[lane] == child,
                                    "registerSubtree: wide child index mismatch");
-                    FRONTIER_CHECK(sameBounds(block.bounds.lane(lane),
-                                              bbox[child]) &&
+                    FRONTIER_CHECK(finiteNonEmptyBounds(childBounds) &&
+                                       nodeBounds.contains(childBounds) &&
                                        block.error.v[lane] == error[child],
                                    "registerSubtree: wide child data mismatch");
                     expectedValid |= 1u << lane;
@@ -347,7 +354,7 @@ SubtreeView viewSubtreeBytes(const SubtreeBytes& bytes)
     view.wideCount_ = header->wideCount;
     view.wide_ = reinterpret_cast<const WideBlock*>(base + header->wideOffset);
     view.blockMask_ = reinterpret_cast<const uint32_t*>(base + header->maskOffset);
-    view.bbox_ = reinterpret_cast<const AABB*>(base + header->bboxOffset);
+    view.rootBounds_ = header->rootBoundsMin;
     view.payload_ = reinterpret_cast<const PayloadWord*>(
         base + header->payloadOffset);
     view.parent_ = reinterpret_cast<const uint32_t*>(base + header->parentOffset);

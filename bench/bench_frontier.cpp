@@ -738,6 +738,7 @@ static void BM_BoundsOverrideBatch(benchmark::State& state)
     }
     state.counters["changed_nodes"] = double(changedCount);
     state.counters["overlays"] = double(world.overlayCount());
+    state.counters["overlay_KB"] = double(world.overlayBytes()) / 1024.0;
 }
 
 BENCHMARK(BM_BoundsOverrideBatch)

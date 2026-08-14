@@ -101,6 +101,26 @@ SubtreeBytes SubtreeBuilder::build(const FrontierContext& context)
     FRONTIER_CHECK(!roots_.empty(), "SubtreeBuilder: subtree has no nodes");
     built_ = true;
 
+    // Grow authored bounds bottom-up before packing. The builder nodes are
+    // edit-time storage and are consumed here, so this needs no temporary
+    // per-packed-node bounds array.
+    for (uint32_t source = uint32_t(nodes_.size()); source-- > 0;)
+    {
+        const AABB nodeBounds = nodes_[source].bounds.toAABB();
+        FRONTIER_CHECK(finiteNonEmptyBounds(nodeBounds),
+                       "SubtreeBuilder: empty or non-finite node bounds");
+        const NodeId owner = nodes_[source].parent;
+        if (owner != kInvalidIndex)
+        {
+            AABB ownerBounds = nodes_[owner].bounds.toAABB();
+            ownerBounds.expand(nodeBounds);
+            nodes_[owner].bounds = ownerBounds;
+        }
+    }
+    AABB rootBounds = AABB::empty();
+    for (const NodeId root : roots_)
+        rootBounds.expand(nodes_[root].bounds.toAABB());
+
     const uint32_t total = uint32_t(nodes_.size()) + 1;
     uint64_t wideCount64 = (roots_.size() + kWide - 1) / kWide;
     uint32_t maxChildren = 0;
@@ -127,7 +147,7 @@ SubtreeBytes SubtreeBuilder::build(const FrontierContext& context)
     header->wideCount = wideCount;
     header->wideOffset = layout.wide;
     header->maskOffset = layout.mask;
-    header->bboxOffset = layout.bbox;
+    header->reservedOffset = 0;
     header->payloadOffset = layout.payload;
     header->parentOffset = layout.parent;
     header->subtreeSizeOffset = layout.subtreeSize;
@@ -139,7 +159,6 @@ SubtreeBytes SubtreeBuilder::build(const FrontierContext& context)
 
     auto* wide = reinterpret_cast<WideBlock*>(base + layout.wide);
     auto* blockMask = reinterpret_cast<uint32_t*>(base + layout.mask);
-    auto* bbox = reinterpret_cast<AABB*>(base + layout.bbox);
     auto* payload = reinterpret_cast<PayloadWord*>(base + layout.payload);
     auto* parent = reinterpret_cast<uint32_t*>(base + layout.parent);
     auto* subtreeSize = reinterpret_cast<uint32_t*>(base + layout.subtreeSize);
@@ -148,67 +167,65 @@ SubtreeBytes SubtreeBuilder::build(const FrontierContext& context)
 
     uint32_t emitted = 0;
 
-    const auto emit = [&](uint32_t parentIndex, uint32_t childCount,
+    const auto emit = [&](uint32_t packedParent, uint32_t childCount,
                           bool mountable, PayloadWord nodePayload,
-                          const AABB& nodeBounds, float error) -> uint32_t
+                          float error, uint32_t source) -> uint32_t
     {
         const uint32_t index = emitted++;
-        parent[index] = parentIndex;
-        subtreeSize[index] = 1;
+        parent[index] = packedParent;
+        // Temporary packed->builder mapping. Replaced with subtree extents
+        // after the wide blocks have consumed the source sibling lists.
+        subtreeSize[index] = source;
         meta[index] = childCount | (mountable ? kMetaMountable : 0u);
         payload[index] = nodePayload;
-        bbox[index] = nodeBounds;
         geometricError[index] = error;
         return index;
     };
 
-    emit(0, uint32_t(roots_.size()), false, invalidPayloadWord(), AABB::empty(),
-         FLT_MAX);
+    emit(packParent(0, 0), uint32_t(roots_.size()), false,
+         invalidPayloadWord(), FLT_MAX, kInvalidIndex);
 
     std::vector<uint32_t> remap(nodes_.size(), kInvalidIndex);
+    // Source node and sibling ordinal fit the same 20+9-bit shape as a
+    // serialized parent word. Reusing it keeps the build stack at four bytes
+    // per node without adding another temporary structure.
     std::vector<uint32_t> stack;
     std::vector<uint32_t> siblingScratch;
     stack.reserve(nodes_.size());
     siblingScratch.reserve(maxChildren);
-    for (auto it = roots_.rbegin(); it != roots_.rend(); ++it)
-        stack.push_back(*it);
+    for (uint32_t ordinal = uint32_t(roots_.size()); ordinal-- > 0;)
+        stack.push_back(packParent(roots_[ordinal], ordinal));
 
     while (!stack.empty())
     {
-        const uint32_t source = stack.back();
+        const uint32_t queued = stack.back();
         stack.pop_back();
+        const uint32_t source = packedParentIndex(queued);
+        const uint32_t ordinal = packedParentOrdinal(queued);
         const BuildNode& node = nodes_[source];
         const uint32_t parentIndex =
             node.parent == kInvalidIndex ? 0 : remap[node.parent];
         const uint32_t packed =
-            emit(parentIndex, node.childCount(), node.mountable(),
-                 node.payload, node.bounds.toAABB(), node.geometricError);
+            emit(packParent(parentIndex, ordinal), node.childCount(),
+                 node.mountable(), node.payload, node.geometricError, source);
         remap[source] = packed;
         siblingScratch.clear();
         for (NodeId child = node.firstChild; child != kInvalidIndex;
              child = nodes_[child].nextSibling)
             siblingScratch.push_back(child);
-        for (auto child = siblingScratch.rbegin();
-             child != siblingScratch.rend(); ++child)
-            stack.push_back(*child);
+        for (uint32_t childOrdinal = uint32_t(siblingScratch.size());
+             childOrdinal-- > 0;)
+            stack.push_back(packParent(siblingScratch[childOrdinal],
+                                       childOrdinal));
     }
     FRONTIER_CHECK(emitted == total,
                    "SubtreeBuilder: internal emission count mismatch");
 
-    // Derive conservative bounds and contiguous subtree extents bottom-up.
-    for (uint32_t i = total; i-- > 1;)
-    {
-        subtreeSize[parent[i]] += subtreeSize[i];
-        bbox[parent[i]].expand(bbox[i]);
-    }
-    for (uint32_t i = 1; i < total; ++i)
-        FRONTIER_CHECK(finiteNonEmptyBounds(bbox[i]),
-                       "SubtreeBuilder: empty or non-finite node bounds");
-
     // Clamp error monotonically from the implicit parent down.
     for (uint32_t i = 1; i < total; ++i)
     {
-        const float parentError = geometricError[parent[i]];
+        const float parentError =
+            geometricError[packedParentIndex(parent[i])];
         if (geometricError[i] > parentError)
             geometricError[i] = parentError;
     }
@@ -221,7 +238,8 @@ SubtreeBytes SubtreeBuilder::build(const FrontierContext& context)
 
         meta[i] |= wideIndex << kMetaOffsetShift;
 
-        uint32_t child = i + 1;
+        NodeId childSource =
+            i == 0 ? kInvalidIndex : nodes_[subtreeSize[i]].firstChild;
         for (uint32_t first = 0; first < childCount; first += kWide)
         {
             WideBlock block;
@@ -234,33 +252,67 @@ SubtreeBytes SubtreeBuilder::build(const FrontierContext& context)
             for (uint32_t lane = 0;
                  lane < kWide && first + lane < childCount; ++lane)
             {
-                block.bounds.setLane(lane, bbox[child]);
+                const NodeId laneSource =
+                    i == 0 ? roots_[first + lane] : childSource;
+                FRONTIER_ASSERT(laneSource != kInvalidIndex,
+                                "builder child list ended early");
+                const uint32_t child = remap[laneSource];
+                block.bounds.setLane(
+                    lane, nodes_[laneSource].bounds.toAABB());
                 block.error.v[lane] = geometricError[child];
                 block.child[lane] = child;
                 valid |= 1u << lane;
                 if (metaChildCount(meta[child]) == 0 &&
                     !metaIsMountable(meta[child]))
                     leaf |= 1u << lane;
-                child += subtreeSize[child];
+                if (i != 0)
+                    childSource = nodes_[laneSource].nextSibling;
             }
             wide[wideIndex] = block;
             blockMask[wideIndex] = valid | (leaf << kBlockLeafShift);
             ++wideIndex;
         }
+        FRONTIER_ASSERT(i == 0 || childSource == kInvalidIndex,
+                        "builder child list exceeds metadata");
     }
     FRONTIER_CHECK(wideIndex == wideCount,
                    "SubtreeBuilder: internal wide-block count mismatch");
 
+    std::fill(subtreeSize, subtreeSize + total, 1u);
+    for (uint32_t i = total; i-- > 1;)
+        subtreeSize[packedParentIndex(parent[i])] += subtreeSize[i];
+
+    header->rootBoundsMin[0] = rootBounds.mn.x;
+    header->rootBoundsMin[1] = rootBounds.mn.y;
+    header->rootBoundsMin[2] = rootBounds.mn.z;
+    header->rootBoundsMax[0] = rootBounds.mx.x;
+    header->rootBoundsMax[1] = rootBounds.mx.y;
+    header->rootBoundsMax[2] = rootBounds.mx.z;
+
+    const auto packedNodeBounds = [&](uint32_t index)
+    {
+        if (index == 0) return rootBounds;
+        const uint32_t owner = packedParentIndex(parent[index]);
+        const uint32_t ordinal = packedParentOrdinal(parent[index]);
+        return wide[metaWideOffset(meta[owner]) + ordinal / kWide]
+            .bounds.lane(ordinal & (kWide - 1u));
+    };
+
     for (uint32_t i = 1; i < total; ++i)
     {
-        FRONTIER_CHECK(parent[i] < i, "SubtreeBuilder: parent ordering violated");
+        const uint32_t parentIndex = packedParentIndex(parent[i]);
+        FRONTIER_CHECK(parentIndex < i,
+                       "SubtreeBuilder: parent ordering violated");
         FRONTIER_CHECK(i + subtreeSize[i] <= total,
                        "SubtreeBuilder: subtree extent violated");
-        FRONTIER_CHECK(metaChildCount(meta[i]) == 0 || parent[i + 1] == i,
+        FRONTIER_CHECK(metaChildCount(meta[i]) == 0 ||
+                           packedParentIndex(parent[i + 1]) == i,
                        "SubtreeBuilder: first child is not adjacent");
-        FRONTIER_CHECK(bbox[parent[i]].contains(bbox[i]),
+        const AABB nodeBounds = packedNodeBounds(i);
+        const AABB parentBounds = packedNodeBounds(parentIndex);
+        FRONTIER_CHECK(parentBounds.contains(nodeBounds),
                        "SubtreeBuilder: bounds containment violated");
-        FRONTIER_CHECK(geometricError[i] <= geometricError[parent[i]],
+        FRONTIER_CHECK(geometricError[i] <= geometricError[parentIndex],
                        "SubtreeBuilder: error monotonicity violated");
         FRONTIER_CHECK(metaChildCount(meta[i]) == 0 ||
                            !metaIsMountable(meta[i]),

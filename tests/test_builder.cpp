@@ -89,6 +89,14 @@ TEST(SubtreeBuilder, BuildsTraversalReadySerializableBytes)
     EXPECT_EQ(view.nodeCount(), 3u);
     EXPECT_TRUE(view.isMountable(3));
     EXPECT_TRUE(view.bounds().contains(box(5.0f)));
+    EXPECT_EQ(view.parent(1), 0u);
+    EXPECT_EQ(view.siblingOrdinal(1), 0u);
+    EXPECT_EQ(view.parent(2), 1u);
+    EXPECT_EQ(view.siblingOrdinal(2), 0u);
+    EXPECT_EQ(view.parent(3), 1u);
+    EXPECT_EQ(view.siblingOrdinal(3), 1u);
+    EXPECT_TRUE(view.nodeBounds(1).contains(view.nodeBounds(2)));
+    EXPECT_TRUE(view.nodeBounds(1).contains(view.nodeBounds(3)));
 
     SubtreeBytes copy = bytes;
     EXPECT_NE(copy.data(), bytes.data());

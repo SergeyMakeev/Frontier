@@ -20,6 +20,28 @@ inline uint32_t metaChildCount(uint32_t m) { return m & kMaxChildren; }
 inline bool metaIsMountable(uint32_t m) { return (m & kMetaMountable) != 0; }
 inline uint32_t metaWideOffset(uint32_t m) { return m >> kMetaOffsetShift; }
 
+// A node index needs 20 bits. Nine of the remaining bits in the old parent
+// stream carry the node's ordinal among its siblings, making the canonical
+// bound in the parent's wide block directly addressable without another array.
+inline constexpr uint32_t kParentIndexBits = 20;
+inline constexpr uint32_t kParentIndexMask = (1u << kParentIndexBits) - 1u;
+inline constexpr uint32_t kParentOrdinalShift = kParentIndexBits;
+static_assert(kMaxSubtreeNodes == kParentIndexMask + 1u);
+static_assert(kParentOrdinalShift + kMetaChildBits <= 32);
+
+inline uint32_t packParent(uint32_t parent, uint32_t ordinal)
+{
+    return parent | (ordinal << kParentOrdinalShift);
+}
+inline uint32_t packedParentIndex(uint32_t value)
+{
+    return value & kParentIndexMask;
+}
+inline uint32_t packedParentOrdinal(uint32_t value)
+{
+    return value >> kParentOrdinalShift;
+}
+
 struct WideBlock
 {
     WideBounds bounds;
@@ -83,7 +105,7 @@ struct MutWideBoundsRef
 };
 
 inline constexpr uint32_t kSubtreeMagic = 0x42545346u; // 'FSTB'
-inline constexpr uint16_t kSubtreeVersion = 5;
+inline constexpr uint16_t kSubtreeVersion = 6;
 inline constexpr size_t kSubtreeAlign = kSubtreeByteAlignment;
 
 // The immutable in-memory layout is also the serialized format. It contains
@@ -99,7 +121,7 @@ struct SubtreeHeader
     uint32_t wideCount;
     uint32_t wideOffset;
     uint32_t maskOffset;
-    uint32_t bboxOffset;
+    uint32_t reservedOffset;
     uint32_t payloadOffset;
     uint32_t parentOffset;
     uint32_t subtreeSizeOffset;
@@ -108,7 +130,9 @@ struct SubtreeHeader
     uint32_t branchingFactor;
     uint64_t invalidPayloadWord;
     uint32_t payloadBytes;
-    uint32_t reserved[15];
+    float rootBoundsMin[3];
+    float rootBoundsMax[3];
+    uint32_t reserved[9];
 };
 static_assert(sizeof(SubtreeHeader) == 128,
               "SubtreeHeader must stay two cache lines");
@@ -117,7 +141,6 @@ struct SubtreeLayout
 {
     uint32_t wide = 0;
     uint32_t mask = 0;
-    uint32_t bbox = 0;
     uint32_t payload = 0;
     uint32_t parent = 0;
     uint32_t subtreeSize = 0;
@@ -136,7 +159,7 @@ struct SubtreeView
     const WideBlock* wide_ = nullptr;
     const uint32_t* blockMask_ = nullptr;
     const PayloadWord* payload_ = nullptr;
-    const AABB* bbox_ = nullptr;
+    const float* rootBounds_ = nullptr;
     const float* geometricError_ = nullptr;
     uint32_t packedNodeCount_ = 0;
     uint32_t wideCount_ = 0;
@@ -149,7 +172,24 @@ struct SubtreeView
     }
     uint32_t packedNodeCount() const { return packedNodeCount_; }
     uint32_t wideCount() const { return wideCount_; }
-    AABB bounds() const { return valid() ? bbox_[0] : AABB::empty(); }
+    AABB bounds() const
+    {
+        return valid()
+                   ? AABB::fromMinMax(
+                         float4::point(rootBounds_[0], rootBounds_[1],
+                                       rootBounds_[2]),
+                         float4::point(rootBounds_[3], rootBounds_[4],
+                                       rootBounds_[5]))
+                   : AABB::empty();
+    }
+    uint32_t parent(uint32_t i) const
+    {
+        return packedParentIndex(parent_[i]);
+    }
+    uint32_t siblingOrdinal(uint32_t i) const
+    {
+        return packedParentOrdinal(parent_[i]);
+    }
     uint32_t childCount(uint32_t i) const { return metaChildCount(meta_[i]); }
     bool isMountable(uint32_t i) const { return metaIsMountable(meta_[i]); }
     uint32_t wideOffset(uint32_t i) const { return metaWideOffset(meta_[i]); }
@@ -168,6 +208,23 @@ struct SubtreeView
     WideBoundsRef wideBounds() const
     {
         return WideBoundsRef::interleaved(wide_);
+    }
+    uint32_t nodeBlock(uint32_t i) const
+    {
+        return wideOffset(parent(i)) + siblingOrdinal(i) / kWide;
+    }
+    uint32_t nodeLane(uint32_t i) const
+    {
+        return siblingOrdinal(i) & (kWide - 1u);
+    }
+    AABB nodeBounds(uint32_t i, WideBoundsRef boundsRef) const
+    {
+        return i == 0 ? bounds()
+                      : boundsRef[nodeBlock(i)].lane(nodeLane(i));
+    }
+    AABB nodeBounds(uint32_t i) const
+    {
+        return nodeBounds(i, wideBounds());
     }
 };
 

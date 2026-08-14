@@ -45,7 +45,8 @@ library's macro-based public payload customization.
 - `BM_FlatInstanceLifecycle` measures steady-state TLAS spawn/remove plus its
   amortized maintenance barrier in a 1,024-object population.
 - `BM_BoundsOverrideBatch` measures sparse and promoted-dense copy-on-write
-  bound updates and flushes in batches of 1, 32, 64, and 256 definition nodes.
+  bound updates and flushes in batches of 1, 32, 64, and 256 definition nodes;
+  `overlay_KB` reports the retained COW storage after each batch.
 
 Both representations produce the same fully refined frontier. Cases cover 32,
 128, and 400 houses. Frontier selection runs both raw and with a stationary

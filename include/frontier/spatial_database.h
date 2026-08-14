@@ -1394,7 +1394,7 @@ private:
 
         uint32_t slot = kInvalidIndex;   // mount this shadows
         uint32_t generation = 0;         // that mount's generation when taken
-        std::vector<AABB>       bbox;    // nodeCount
+        ScalarAABB rootBounds = AABB::empty();
         // Large-subtree wide bounds begin sparse: a dense block->patch table plus
         // only the modified blocks. Once a sixteenth of the blocks change,
         // `wide` is materialized and the sparse storage is released. Smaller
@@ -1874,8 +1874,12 @@ private:
                                      uint32_t block);
     void           freeOverlays(Instance& inst);
     // Effective bounds for a walk of `slot` by `inst`.
-    const AABB* boundsFor(const Instance& inst, uint32_t slot,
-                          const SubtreeInstanceRt& instance) const;
+    AABB effectiveNodeBounds(const Instance& inst, uint32_t slot,
+                             const SubtreeInstanceRt& instance,
+                             uint32_t node) const;
+    AABB nodeBoundsFrom(const Overlay* overlay,
+                        const detail::SubtreeView& subtree,
+                        uint32_t node) const;
     detail::WideBoundsRef wideBoundsFor(
         const Instance& inst, uint32_t slot,
         const SubtreeInstanceRt& instance, uint32_t* sparseOverlay) const;
@@ -1886,9 +1890,9 @@ private:
     bool mountBelongsTo(const Instance& inst, uint32_t slot) const;
 
     void applyBoundsChange(InstanceId id, uint32_t slot, uint32_t index, const AABB& box);
-    void patchParentLane(const detail::SubtreeView& subtree, AABB* bbox,
-                         Overlay& overlay,
-                         uint32_t index);
+    void setOverlayNodeBounds(Overlay& overlay,
+                              const detail::SubtreeView& subtree,
+                              uint32_t index, const AABB& bounds);
 
     InstanceHandle addTlasRootInstance(const NodeDesc& root,
                                        const InstanceDesc& desc);

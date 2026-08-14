@@ -661,8 +661,8 @@ SubtreeInstanceHandle SpatialDatabase::mountTransformed(
     // definition. Author mount-point bounds that contain what attaches.
     const AABB childBounds = toWorld(subtrees_[definition].view.bounds(),
                                      transform.pos, transform.scale);
-    FRONTIER_CHECK(subtreeView(slots_[owner.slot]).bbox_[owner.index].contains(
-                   childBounds),
+    FRONTIER_CHECK(subtreeView(slots_[owner.slot]).nodeBounds(owner.index)
+                       .contains(childBounds),
                "SpatialDatabase: the mounted subtree escapes the mount point's "
                "authored bounds — author conservative bounds at build time");
 
@@ -953,7 +953,7 @@ void SpatialDatabase::propagateCoverage(uint32_t slot, uint32_t node)
             continue;
         }
 
-        const uint32_t parent = subtreeView(rt).parent_[node];
+        const uint32_t parent = subtreeView(rt).parent(node);
         if (now)
             rt.addCoveredChild(parent);
         else
@@ -990,7 +990,7 @@ void SpatialDatabase::propagateSharedCoverage(uint32_t definitionIndex,
             state[node] &= ~SubtreeInstanceRt::kCovered;
         if (node == 0) return;
 
-        const uint32_t parent = subtree.parent_[node];
+        const uint32_t parent = subtree.parent(node);
         FRONTIER_ASSERT(
             now ? ((uint32_t(state[parent]) >>
                     SubtreeInstanceRt::kCoveredChildShift) &
@@ -1460,7 +1460,7 @@ void SpatialDatabase::initOverlay(Overlay& ov, uint32_t slot,
 {
     const SubtreeView& pg = subtreeView(rt);
     ov.generation = mountStamps_[slot].generation();
-    ov.bbox.assign(pg.bbox_, pg.bbox_ + pg.packedNodeCount());
+    ov.rootBounds = pg.bounds();
     if (pg.wideCount() >= Overlay::kSparseWideMinBlocks)
     {
         std::vector<WideBounds>().swap(ov.wide);
@@ -1577,13 +1577,42 @@ void SpatialDatabase::freeOverlays(Instance& inst)
     inst.clearOverlayList();
 }
 
-const AABB* SpatialDatabase::boundsFor(
-    const Instance& inst, uint32_t slot,
-    const SubtreeInstanceRt& rt) const
+AABB SpatialDatabase::effectiveNodeBounds(
+    const Instance& inst, uint32_t slot, const SubtreeInstanceRt& rt,
+    uint32_t node) const
 {
-    if (const Overlay* ov = findOverlay(inst, slot))
-        return ov->bbox.data();
-    return subtreeView(rt).bbox_;
+    const SubtreeView& subtree = subtreeView(rt);
+    return nodeBoundsFrom(findOverlay(inst, slot), subtree, node);
+}
+
+AABB SpatialDatabase::nodeBoundsFrom(
+    const Overlay* overlay, const SubtreeView& subtree,
+    uint32_t node) const
+{
+    if (node == 0)
+    {
+        return overlay ? overlay->rootBounds.toAABB() : subtree.bounds();
+    }
+
+    const uint32_t block = subtree.nodeBlock(node);
+    const uint32_t lane = subtree.nodeLane(node);
+    if (overlay)
+    {
+        if (!overlay->sparseWide()) return overlay->wide[block].lane(lane);
+        const uint32_t patch = overlay->widePatch[block];
+        if (patch != kInvalidIndex)
+            return overlay->patchedWide[patch].lane(lane);
+    }
+    return subtree.wide_[block].bounds.lane(lane);
+}
+
+void SpatialDatabase::setOverlayNodeBounds(
+    Overlay& overlay, const SubtreeView& subtree, uint32_t index,
+    const AABB& bounds)
+{
+    FRONTIER_ASSERT(index != 0, "implicit-parent bounds use rootBounds");
+    mutableWideBounds(overlay, subtree, subtree.nodeBlock(index))
+        .setLane(subtree.nodeLane(index), bounds);
 }
 
 WideBoundsRef SpatialDatabase::wideBoundsFor(
@@ -1652,8 +1681,7 @@ size_t SpatialDatabase::overlayBytes() const
     size_t n = 0;
     for (const Overlay& ov : overlays_)
         if (ov.inUse())
-            n += ov.bbox.size() * sizeof(AABB) +
-                 ov.wide.size() * sizeof(WideBounds) +
+            n += ov.wide.size() * sizeof(WideBounds) +
                  ov.widePatch.size() * sizeof(uint32_t) +
                  ov.patchedWide.size() * sizeof(WideBounds);
     return n;
@@ -1788,25 +1816,38 @@ void SpatialDatabase::applyBoundsChange(InstanceId id, uint32_t slot, uint32_t i
         const uint32_t oi = ensureOverlay(instances_[id], curSlot);
         const SubtreeView& pg = subtreeView(slots_[curSlot]);
         Overlay& overlay = overlays_[oi];
-        AABB* bbox = overlay.bbox.data();
+        AABB nodeBox;
 
         if (exact)
         {
-            bbox[cur] = curBox;
+            nodeBox = curBox;
         }
         else
         {
-            if (bbox[cur].contains(curBox)) return;   // ancestors already conservative
-            bbox[cur].expand(curBox);
+            nodeBox = nodeBoundsFrom(&overlay, pg, cur);
+            if (nodeBox.contains(curBox)) return;   // ancestors already conservative
+            nodeBox.expand(curBox);
         }
-        if (cur != 0) patchParentLane(pg, bbox, overlay, cur);
+        setOverlayNodeBounds(overlay, pg, cur, nodeBox);
 
         while (cur != 0)
         {
-            const uint32_t p = pg.parent_[cur];
-            if (bbox[p].contains(bbox[cur])) return;
-            bbox[p].expand(bbox[cur]);             // grow immediately, shrink lazily
-            if (p != 0) patchParentLane(pg, bbox, overlay, p);
+            const uint32_t p = pg.parent(cur);
+            if (p == 0)
+            {
+                AABB rootBounds = overlay.rootBounds.toAABB();
+                if (rootBounds.contains(nodeBox)) return;
+                rootBounds.expand(nodeBox);
+                overlay.rootBounds = rootBounds;
+                cur = 0;
+                break;
+            }
+
+            AABB parentBox = nodeBoundsFrom(&overlay, pg, p);
+            if (parentBox.contains(nodeBox)) return;
+            parentBox.expand(nodeBox);             // grow immediately, shrink lazily
+            setOverlayNodeBounds(overlay, pg, p, parentBox);
+            nodeBox = parentBox;
             cur = p;
         }
 
@@ -1823,7 +1864,7 @@ void SpatialDatabase::applyBoundsChange(InstanceId id, uint32_t slot, uint32_t i
                 (root.worldBox.mx - root.pos) * invScale);
             const MountTransformRt& transform = mountTransforms_[curSlot];
             const AABB mountedRoot = toWorld(
-                bbox[0], transform.pos, transform.scale);
+                overlay.rootBounds.toAABB(), transform.pos, transform.scale);
             FRONTIER_CHECK(
                 finiteNonEmptyBounds(mountedRoot),
                 "SpatialDatabase::flushBounds: bounds overflow at root "
@@ -1845,7 +1886,7 @@ void SpatialDatabase::applyBoundsChange(InstanceId id, uint32_t slot, uint32_t i
         float4 relativePos =
             (mountedTransform.pos - parentTransform.pos) / parentTransform.scale;
         relativePos.w = 1.0f;
-        curBox = toWorld(bbox[0], relativePos, relativeScale);
+        curBox = toWorld(overlay.rootBounds.toAABB(), relativePos, relativeScale);
         FRONTIER_CHECK(
             finiteNonEmptyBounds(curBox),
             "SpatialDatabase::flushBounds: bounds overflow at mount "
@@ -1854,32 +1895,6 @@ void SpatialDatabase::applyBoundsChange(InstanceId id, uint32_t slot, uint32_t i
         cur     = owner.index;
         exact   = false;
     }
-}
-
-// Update a node's lane in its parent's wide block (the hot mirror of bbox).
-// Which lane holds the node is immutable authored data, so it is read from
-// the shared subtree; only the box is written into the instance overlay.
-void SpatialDatabase::patchParentLane(const SubtreeView& pg, AABB* bbox,
-                                      Overlay& overlay,
-                            uint32_t index)
-{
-    const uint32_t p = pg.parent_[index];
-    const uint32_t cc = pg.childCount(p);
-    uint32_t b = pg.wideOffset(p);
-    for (uint32_t base = 0; base < cc; base += kWide, ++b)
-    {
-        const WideBlock& blk = pg.wide_[b];
-        const uint32_t   valid = pg.validLanes(b);
-        for (uint32_t l = 0; l < kWide; ++l)
-        {
-            if ((valid & (1u << l)) && blk.child[l] == index)
-            {
-                mutableWideBounds(overlay, pg, b).setLane(l, bbox[index]);
-                return;
-            }
-        }
-    }
-    FRONTIER_FATAL("SpatialDatabase: internal: child lane not found");
 }
 
 AABB SpatialDatabase::nodeBounds(InstanceHandle ref, NodeHandle h)
@@ -1898,7 +1913,7 @@ AABB SpatialDatabase::nodeBounds(InstanceHandle ref, NodeHandle h)
     FRONTIER_CHECK(mountBelongsTo(*inst, h.slot()),
                    "SpatialDatabase::nodeBounds: node is not in this "
                    "instance's mounted tree");
-    return boundsFor(*inst, h.slot(), *rt)[h.index()];
+    return effectiveNodeBounds(*inst, h.slot(), *rt, h.index());
 }
 
 // ============================================================================
@@ -3157,13 +3172,14 @@ bool SpatialDatabase::visibleDescendantsCovered(uint32_t slot, uint32_t node, ui
     const SubtreeView& subtree = subtreeView(*rt);
     const uint32_t count = subtree.childCount(node);
     if (count == 0) return false;
-    const AABB* bounds = boundsFor(inst, slot, *rt);
+    const Overlay* overlay = findOverlay(inst, slot);
 
     uint32_t child = node + 1;
     for (uint32_t k = 0; k < count; ++k)
     {
         uint8_t childMask = mask;
-        if (testAabb(bounds[child], local.frustum, childMask) != CullState::Outside &&
+        const AABB childBounds = nodeBoundsFrom(overlay, subtree, child);
+        if (testAabb(childBounds, local.frustum, childMask) != CullState::Outside &&
             !rt->isCovered(child))
         {
             if (!visibleDescendantsCovered(slot, child, childMask, inst, rootLocal,

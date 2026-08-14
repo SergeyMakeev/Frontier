@@ -133,6 +133,21 @@ TEST(Contracts, SerializedSubtreeValidationMatchesBuildMode)
         parent[2] = header->nodeCount;
         registerStructurallyCorrupt(std::move(bytes));
     }
+    {
+        SubtreeBytes bytes = makeHierarchy();
+        const auto* header = reinterpret_cast<const detail::SubtreeHeader*>(
+            bytes.data());
+        auto* parent = reinterpret_cast<uint32_t*>(
+            bytes.data() + header->parentOffset);
+        parent[2] = detail::packParent(1, detail::kMaxChildren);
+        registerStructurallyCorrupt(std::move(bytes));
+    }
+    {
+        SubtreeBytes bytes = makeHierarchy();
+        auto* header = reinterpret_cast<detail::SubtreeHeader*>(bytes.data());
+        header->rootBoundsMax[0] = header->rootBoundsMin[0] - 1.0f;
+        registerStructurallyCorrupt(std::move(bytes));
+    }
     // Reserved header words are part of the constant-time format envelope and
     // remain checked even when the full traversal scan is compiled out.
     {
@@ -180,9 +195,9 @@ TEST(Contracts, SerializedSubtreeValidationMatchesBuildMode)
         SubtreeBytes bytes = makeHierarchy();
         const auto* header = reinterpret_cast<const detail::SubtreeHeader*>(
             bytes.data());
-        auto* bounds = reinterpret_cast<AABB*>(
-            bytes.data() + header->bboxOffset);
-        bounds[1].mx.y = bounds[1].mn.y - 1.0f;
+        auto* wide = reinterpret_cast<detail::WideBlock*>(
+            bytes.data() + header->wideOffset);
+        wide[0].bounds.mxy.v[0] = wide[0].bounds.mny.v[0] - 1.0f;
         registerStructurallyCorrupt(std::move(bytes));
     }
     {

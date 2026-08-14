@@ -630,6 +630,12 @@ interchange schema and carry no authentication or application-defined
 allocation limit; authenticate and size-limit untrusted files before allocating
 `SubtreeBytes` for them.
 
+Each real node's authored bound is stored once, in its lane of its parent's
+wide traversal block. The parent stream also carries the sibling ordinal needed
+to address that lane directly. The definition-wide aggregate bound is stored in
+the header because the implicit parent has no parent block. These are serialized
+layout details, not additional public objects or lifetime rules.
+
 ## 5. `SubtreeBuilder`
 
 Declared in `frontier/builder.h`.
