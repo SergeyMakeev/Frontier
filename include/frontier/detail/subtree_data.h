@@ -53,8 +53,16 @@ static_assert(sizeof(WideBlock) == kWide * 32,
 
 inline constexpr uint32_t kBlockLaneMask = (1u << kWide) - 1u;
 inline constexpr uint32_t kBlockLeafShift = kWide;
+inline constexpr uint32_t kBlockZeroErrorShift = kWide * 2u;
 inline uint32_t blockValidLanes(uint32_t m) { return m & kBlockLaneMask; }
-inline uint32_t blockLeafLanes(uint32_t m) { return m >> kBlockLeafShift; }
+inline uint32_t blockLeafLanes(uint32_t m)
+{
+    return (m >> kBlockLeafShift) & kBlockLaneMask;
+}
+inline uint32_t blockZeroErrorLanes(uint32_t m)
+{
+    return (m >> kBlockZeroErrorShift) & kBlockLaneMask;
+}
 
 struct WideBoundsRef
 {
@@ -105,7 +113,7 @@ struct MutWideBoundsRef
 };
 
 inline constexpr uint32_t kSubtreeMagic = 0x42545346u; // 'FSTB'
-inline constexpr uint16_t kSubtreeVersion = 6;
+inline constexpr uint16_t kSubtreeVersion = 7;
 inline constexpr size_t kSubtreeAlign = kSubtreeByteAlignment;
 
 // The immutable in-memory layout is also the serialized format. It contains

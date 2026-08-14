@@ -599,6 +599,55 @@ BENCHMARK(BM_FlatTlasSelectionScale)
     ->ArgNames({"instances", "cached"})
     ->Unit(benchmark::kMicrosecond);
 
+// Separates TLAS topology quality from BLAS work. The distant camera sees the
+// complete grid and measures traversal/occupancy; the close camera rejects
+// most instances and measures whether tighter bounds repay a larger tree.
+static void BM_TlasQualitySelection(benchmark::State& state)
+{
+    constexpr uint32_t count = 10000;
+    SpatialDatabaseConfig config;
+    config.tlasQuality = TlasQuality(state.range(0));
+    SpatialDatabase world(config);
+    constexpr uint32_t side = 100;
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        InstanceDesc desc;
+        desc.pos = float4::point(
+            float(int(i % side) - int(side / 2)) * 3.0f,
+            float(int(i / side) - int(side / 2)) * 3.0f, 0.0f);
+        world.instantiate(node(1000 + i, 0.0f, box(0.5f)), desc);
+    }
+    world.applyUpdates();
+    const bool closeCamera = state.range(1) != 0;
+    const Camera camera = cameraAt(closeCamera ? -50.0f : -2000.0f);
+    SpatialQuery query;
+    query.setReuseEnabled(false);
+
+    FrontierResultView result;
+    for (auto _ : state)
+    {
+        result = query.selectFrontier(world, camera, {});
+        consume(result);
+    }
+    state.counters["entries"] = double(result.size());
+    state.counters["tlas_nodes"] =
+        double(TestAccess::tlasNodeCount(world));
+    state.counters["tlas_KB"] =
+        double(TestAccess::tlasNodeCount(world) *
+               TestAccess::tlasNodeBytes()) /
+        1024.0;
+}
+
+BENCHMARK(BM_TlasQualitySelection)
+    ->Args({int64_t(TlasQuality::Morton), 0})
+    ->Args({int64_t(TlasQuality::Median), 0})
+    ->Args({int64_t(TlasQuality::BinnedSAH), 0})
+    ->Args({int64_t(TlasQuality::Morton), 1})
+    ->Args({int64_t(TlasQuality::Median), 1})
+    ->Args({int64_t(TlasQuality::BinnedSAH), 1})
+    ->ArgNames({"quality", "close_camera"})
+    ->Unit(benchmark::kMicrosecond);
+
 // Exercises the indexed/dependent-load pipelines between the TLAS result,
 // Instance records, mount slots, and shared subtree arrays. Reuse mode 0 is
 // uncached, 1 measures stable hits, and 2 alternates the current-cut policy to
@@ -664,6 +713,52 @@ BENCHMARK(BM_InstanceForestSelectionScale)
     ->Args({10000, 50, 0})->Args({10000, 50, 1})->Args({10000, 50, 2})
     ->Args({10000, 100, 0})->Args({10000, 100, 1})->Args({10000, 100, 2})
     ->ArgNames({"instances", "hierarchical_percent", "reuse_mode"})
+    ->Unit(benchmark::kMicrosecond);
+
+// Same mounted population as the refined forest, viewed far enough away that
+// selection stops at every renderable TLAS root. Together the two benchmarks
+// separate top-level query/dispatch from mounted BLAS traversal.
+static void BM_InstanceForestRootSelectionScale(benchmark::State& state)
+{
+    const uint32_t count = uint32_t(state.range(0));
+    SpatialDatabase world;
+    const SubtreeHandle definition =
+        world.registerSubtree(makeLodSubtree(50000, 50001, 50002));
+    const uint32_t side =
+        uint32_t(std::ceil(std::sqrt(double(count))));
+    constexpr float pitch = 12.0f;
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        InstanceDesc desc;
+        desc.pos = float4::point(
+            float(int(i % side) - int(side / 2)) * pitch,
+            float(int(i / side) - int(side / 2)) * pitch, 0.0f);
+        const InstanceHandle instance = world.instantiate(
+            node(1000 + i, 64.0f, box(4.0f), true), desc);
+        world.mountSubtree(instance.rootNode(), definition);
+    }
+    TestAccess::markAllNodesReady(world);
+    world.applyUpdates();
+
+    const Camera camera = makeLookAtCamera(
+        float4::point(0.0f, 0.0f, -20000.0f),
+        float4::point(0.0f, 0.0f, 0.0f));
+    SpatialQuery query;
+    query.setReuseEnabled(false);
+    FrontierResultView result;
+    for (auto _ : state)
+    {
+        result = query.selectFrontier(world, camera, {});
+        consume(result);
+    }
+    state.counters["entries"] = double(result.size());
+    state.counters["tlas_nodes"] =
+        double(TestAccess::tlasNodeCount(world));
+}
+
+BENCHMARK(BM_InstanceForestRootSelectionScale)
+    ->Arg(1000)->Arg(10000)
+    ->ArgName("instances")
     ->Unit(benchmark::kMicrosecond);
 
 static void BM_FlatInstanceLifecycle(benchmark::State& state)

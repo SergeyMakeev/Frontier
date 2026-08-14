@@ -1533,8 +1533,9 @@ private:
     void reorderInstancesByTlas();
 
     // Wide top-level BVH node; lanes are children (inner nodes or instances).
-    // Query-hot bounds, links and flags occupy two cache lines in BVH4 and
-    // four in BVH8. Error/layer metadata follows in the remaining cache line.
+    // The default query touches only this stream: two cache lines in BVH4 and
+    // four in BVH8. Optional contribution/layer data lives in TlasMeta so it
+    // does not inflate the stride of the common frustum-only traversal.
     struct alignas(64) TlasNode
     {
         static constexpr uint32_t kValidLaneMask = (1u << kWide) - 1u;
@@ -1543,8 +1544,6 @@ private:
         // Low kWide bits mark valid lanes.
         uint32_t   validMask = 0;
         int32_t    parent = -1;
-        float8     maxErr{};
-        uint32_t   laneMask[kWide]{};// union of lane subtree instance masks
 
         uint32_t validLanes() const { return validMask & kValidLaneMask; }
         void setLeafLane(uint32_t lane)
@@ -1556,10 +1555,16 @@ private:
             validMask &= ~(1u << lane);
         }
     };
-    static_assert(offsetof(TlasNode, maxErr) == kWide * 32,
-                  "cached TLAS query data must stay tightly packed");
-    static_assert(sizeof(TlasNode) == (kWide == 8 ? 320 : 192),
-                  "SIMD TLAS node has unexpected padding");
+    static_assert(sizeof(TlasNode) == (kWide == 8 ? 256 : 128),
+                  "hot SIMD TLAS node has unexpected padding");
+
+    struct TlasMeta
+    {
+        float8   maxErr{};
+        uint32_t laneMask[kWide]{}; // union of subtree instance masks
+    };
+    static_assert(sizeof(TlasMeta) == (kWide == 8 ? 64 : 32),
+                  "cold TLAS metadata has unexpected padding");
 
     struct TlasItem;
 
@@ -1921,7 +1926,8 @@ private:
     float tlasGrowUp(uint32_t nodeIdx, const AABB& box, float maxErr, uint32_t laneMask);
     int32_t tlasAllocNode();
     // Union of a node's valid lanes, which is what its parent's lane must hold.
-    AABB tlasNodeExtent(const TlasNode& n, float& maxErr, uint32_t& laneMask) const;
+    AABB tlasNodeExtent(uint32_t node, float& maxErr,
+                        uint32_t& laneMask) const;
     void tlasNoteEdit();
 
     bool visibleDescendantsCovered(uint32_t slot, uint32_t node, uint8_t mask,
@@ -1933,9 +1939,8 @@ private:
     bool mountedTreeFullyReady(uint32_t slot) const;
     void propagateFullReadiness(uint32_t slot, bool wasFullyReady);
     void runTlasFlatInstance(uint32_t instIdx, const Camera& view,
-                             uint8_t mask, Worker& w) const;
-    void runZeroErrorTlasFlatInstance(uint32_t instIdx, const Camera& view,
-                                      uint8_t mask, Worker& w) const;
+                             Worker& w) const;
+    void runZeroErrorTlasFlatInstance(uint32_t instIdx, Worker& w) const;
     void runTlasRootInstance(uint32_t instIdx, const Camera& view,
                              const SelectionParams& params, uint8_t mask,
                              Worker& w) const;
@@ -2034,6 +2039,7 @@ private:
     size_t                liveOverlays_ = 0;
 
     std::vector<TlasNode> tlasNodes_;
+    std::vector<TlasMeta> tlasMeta_;
     int32_t               tlasRoot_ = -1;
     bool                  tlasDirty_ = true;
     bool                  tlasQualityBuild_ = true;   // quality tier vs Morton

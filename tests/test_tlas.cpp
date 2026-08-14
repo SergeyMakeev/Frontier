@@ -95,6 +95,7 @@ TEST(Tlas, EveryQualityTierReturnsTheSameVisibleSet)
 {
     constexpr uint32_t count = 1200;
     std::vector<UserPayload> reference;
+    std::vector<size_t> nodeCounts;
     for (const TlasQuality quality : {TlasQuality::Morton,
                                       TlasQuality::Median,
                                       TlasQuality::BinnedSAH})
@@ -114,12 +115,15 @@ TEST(Tlas, EveryQualityTierReturnsTheSameVisibleSet)
         SpatialQuery query;
         const std::vector<UserPayload> selected = payloads(
             database, select(database, query, cameraAt(-1000.0f)), false);
+        nodeCounts.push_back(TestAccess::tlasNodeCount(database));
         ASSERT_EQ(selected.size(), count);
         if (reference.empty())
             reference = selected;
         else
             EXPECT_EQ(selected, reference);
     }
+    ASSERT_EQ(nodeCounts.size(), 3u);
+    EXPECT_LT(nodeCounts[0], nodeCounts[1]);
 }
 
 TEST(Tlas, CoincidentCentroidsStillBuildACompleteTree)

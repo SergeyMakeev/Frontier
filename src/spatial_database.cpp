@@ -5,6 +5,7 @@
 #include <bit>
 #include <cmath>
 #include <memory>
+#include <optional>
 
 namespace frontier {
 
@@ -13,6 +14,7 @@ using detail::SubtreeView;
 using detail::WideBlock;
 using detail::WideBoundsRef;
 using detail::blockLeafLanes;
+using detail::blockZeroErrorLanes;
 using detail::blockValidLanes;
 using detail::metaIsMountable;
 
@@ -1952,26 +1954,30 @@ float SpatialDatabase::tlasGrowUp(uint32_t nodeIdx, const AABB& box, float maxEr
         const int32_t childIdx = int32_t(nodeIdx);
         nodeIdx = uint32_t(node->parent);
         node = &tlasNodes_[nodeIdx];
+        TlasMeta& meta = tlasMeta_[nodeIdx];
         uint32_t l = 0;
         for (; l < kWide; ++l)
             if ((node->validMask & (1u << l)) && node->child[l] == childIdx) break;
         if (l == kWide) break;   // already unlinked; nothing above to grow
         AABB laneBox = node->bounds.lane(l);
-        if (laneBox.contains(box) && node->maxErr.v[l] >= maxErr &&
-            (node->laneMask[l] & laneMask) == laneMask)
+        if (laneBox.contains(box) && meta.maxErr.v[l] >= maxErr &&
+            (meta.laneMask[l] & laneMask) == laneMask)
             break;
         const float was = surfaceArea(laneBox);
         laneBox.expand(box);
         node->bounds.setLane(l, laneBox);
-        node->maxErr.v[l] = std::max(node->maxErr.v[l], maxErr);
-        node->laneMask[l] |= laneMask;
+        meta.maxErr.v[l] = std::max(meta.maxErr.v[l], maxErr);
+        meta.laneMask[l] |= laneMask;
         added += surfaceArea(laneBox) - was;
     }
     return added;
 }
 
-AABB SpatialDatabase::tlasNodeExtent(const TlasNode& n, float& maxErr, uint32_t& laneMask) const
+AABB SpatialDatabase::tlasNodeExtent(uint32_t node, float& maxErr,
+                                     uint32_t& laneMask) const
 {
+    const TlasNode& n = tlasNodes_[node];
+    const TlasMeta& meta = tlasMeta_[node];
     AABB u = AABB::empty();
     maxErr = 0.0f;
     laneMask = 0;
@@ -1979,8 +1985,8 @@ AABB SpatialDatabase::tlasNodeExtent(const TlasNode& n, float& maxErr, uint32_t&
     {
         if (!(n.validMask & (1u << l))) continue;
         u.expand(n.bounds.lane(l));
-        maxErr = std::max(maxErr, n.maxErr.v[l]);
-        laneMask |= n.laneMask[l];
+        maxErr = std::max(maxErr, meta.maxErr.v[l]);
+        laneMask |= meta.laneMask[l];
     }
     return u;
 }
@@ -1992,14 +1998,15 @@ int32_t SpatialDatabase::tlasAllocNode()
         const int32_t idx = tlasFreeNodes_.back();
         tlasFreeNodes_.pop_back();
         TlasNode& n = tlasNodes_[uint32_t(idx)];
+        TlasMeta& meta = tlasMeta_[uint32_t(idx)];
         n.bounds = WideBounds::allEmpty();
-        n.maxErr = float8::splat(0.0f);
+        meta.maxErr = float8::splat(0.0f);
         n.validMask = 0;
         n.parent = -1;
         for (uint32_t l = 0; l < kWide; ++l)
         {
             n.child[l] = 0;
-            n.laneMask[l] = 0;
+            meta.laneMask[l] = 0;
         }
         return idx;
     }
@@ -2007,13 +2014,14 @@ int32_t SpatialDatabase::tlasAllocNode()
                "SpatialDatabase: exhausted the 24-bit TLAS node space");
     const int32_t idx = int32_t(tlasNodes_.size());
     TlasNode& n = tlasNodes_.emplace_back();
+    TlasMeta& meta = tlasMeta_.emplace_back();
     n.bounds = WideBounds::allEmpty();
-    n.maxErr = float8::splat(0.0f);
+    meta.maxErr = float8::splat(0.0f);
     n.parent = -1;
     for (uint32_t l = 0; l < kWide; ++l)
     {
         n.child[l] = 0;
-        n.laneMask[l] = 0;
+        meta.laneMask[l] = 0;
     }
     return idx;
 }
@@ -2075,17 +2083,18 @@ void SpatialDatabase::tlasInsert(InstanceId id)
         // adopts it, so nothing above needs to know the difference.
         const int32_t mIdx = tlasAllocNode();
         TlasNode& m = tlasNodes_[uint32_t(mIdx)];
+        TlasMeta& mMeta = tlasMeta_[uint32_t(mIdx)];
         TlasNode& l0 = tlasNodes_[cur];
 
         float    childErr = 0.0f;
         uint32_t childMask = 0;
-        const AABB childBox = tlasNodeExtent(l0, childErr, childMask);
+        const AABB childBox = tlasNodeExtent(cur, childErr, childMask);
 
         m.parent = l0.parent;
         m.bounds.setLane(0, childBox);
-        m.maxErr.v[0] = childErr;
+        mMeta.maxErr.v[0] = childErr;
         m.child[0] = int32_t(cur);
-        m.laneMask[0] = childMask;
+        mMeta.laneMask[0] = childMask;
         m.validMask = 1u;
         l0.parent = mIdx;
 
@@ -2105,11 +2114,12 @@ void SpatialDatabase::tlasInsert(InstanceId id)
     }
 
     TlasNode& h = tlasNodes_[host];
+    TlasMeta& hMeta = tlasMeta_[host];
     const uint32_t lane = uint32_t(std::countr_zero(~h.validMask & full));
     h.bounds.setLane(lane, inst.worldBox);
-    h.maxErr.v[lane] = inst.maxErrWorld;
+    hMeta.maxErr.v[lane] = inst.maxErrWorld;
     h.child[lane] = ~int32_t(id);
-    h.laneMask[lane] = inst.mask;
+    hMeta.laneMask[lane] = inst.mask;
     h.setLeafLane(lane);
     inst.setTlasPlacement(host, lane);
     ++tlasLeafCount_;
@@ -2185,8 +2195,19 @@ void SpatialDatabase::tlasOnInstanceMoved(InstanceId id)
     const uint32_t nodeIdx = inst.tlasNode();
     const uint32_t lane = inst.tlasLane();
     TlasNode& node = tlasNodes_[nodeIdx];
-    if (node.bounds.lane(lane).contains(inst.worldBox) &&
-        node.maxErr.v[lane] >= inst.maxErrWorld)
+    TlasMeta& meta = tlasMeta_[nodeIdx];
+    const AABB oldLeafBounds = node.bounds.lane(lane);
+    const bool ancestorsAlreadyCover =
+        oldLeafBounds.contains(inst.worldBox) &&
+        meta.maxErr.v[lane] >= inst.maxErrWorld;
+
+    // Keep leaf lanes exact even though inner lanes remain grow-only. Querying
+    // the leaf block then performs the definitive SIMD cull for the instance;
+    // the per-instance walk does not have to repeat it scalarly. Shrinking a
+    // leaf cannot invalidate its conservative ancestors.
+    node.bounds.setLane(lane, inst.worldBox);
+    meta.maxErr.v[lane] = inst.maxErrWorld;
+    if (ancestorsAlreadyCover)
         return;
 
     if (!inst.escapedSinceBuild())
@@ -2194,14 +2215,8 @@ void SpatialDatabase::tlasOnInstanceMoved(InstanceId id)
         inst.setEscapedSinceBuild(true);
         ++tlasEscapes_;
     }
-    AABB grown = node.bounds.lane(lane);
-    const float wasArea = surfaceArea(grown);
-    grown.expand(inst.worldBox);
-    node.bounds.setLane(lane, grown);
-    node.maxErr.v[lane] = std::max(node.maxErr.v[lane], inst.maxErrWorld);
-
-    float added = surfaceArea(grown) - wasArea;
-    added += tlasGrowUp(nodeIdx, grown, inst.maxErrWorld, inst.mask);
+    const float added =
+        tlasGrowUp(nodeIdx, inst.worldBox, inst.maxErrWorld, inst.mask);
 
     tlasNoteGrowth(added);
     if (float(tlasEscapes_) > float(tlasLeafCount_) * config_.tlasEscapeFraction)
@@ -2385,12 +2400,61 @@ int32_t SpatialDatabase::tlasBuildRange(std::vector<uint32_t>& items, int lo, in
             const uint32_t instIdx = items[lo + k];
             Instance& inst = instances_[instIdx];
             TlasNode& n = tlasNodes_[idx];
+            TlasMeta& meta = tlasMeta_[idx];
             n.bounds.setLane(uint32_t(k), inst.worldBox);
-            n.maxErr.v[k] = inst.maxErrWorld;
+            meta.maxErr.v[k] = inst.maxErrWorld;
             n.child[k] = ~int32_t(instIdx);
-            n.laneMask[k] = inst.mask;
+            meta.laneMask[k] = inst.mask;
             n.setLeafLane(uint32_t(k));
             inst.setTlasPlacement(uint32_t(idx), uint32_t(k));
+        }
+        return idx;
+    }
+
+    // The fixed kWide-way splitter is excellent for large ranges, but using
+    // all kWide groups directly above the leaves creates mostly empty leaf
+    // nodes. Pack the final two levels explicitly: a 20-instance BVH8 range
+    // needs three leaf children, not eight children holding 2-3 instances
+    // each. The range is already spatially local; a longest-axis ordering
+    // keeps each packed leaf local as well.
+    if (count <= int(kWide * kWide))
+    {
+        AABB centroidBounds = AABB::empty();
+        for (int k = lo; k < hi; ++k)
+            centroidBounds.expand(
+                instances_[items[k]].worldBox.center());
+        const float4 extent = centroidBounds.extent();
+        const int axis =
+            (extent.x >= extent.y && extent.x >= extent.z)
+                ? 0
+                : (extent.y >= extent.z ? 1 : 2);
+        std::sort(items.begin() + lo, items.begin() + hi,
+                  [&](uint32_t a, uint32_t b)
+                  {
+                      const float av = axisOf(
+                          instances_[a].worldBox.center(), axis);
+                      const float bv = axisOf(
+                          instances_[b].worldBox.center(), axis);
+                      return av < bv || (av == bv && a < b);
+                  });
+
+        uint32_t lane = 0;
+        for (int begin = lo; begin < hi; begin += int(kWide), ++lane)
+        {
+            const int end = std::min(begin + int(kWide), hi);
+            const int32_t child =
+                tlasBuildRange(items, begin, end, idx);
+            float maxError = 0.0f;
+            uint32_t layerMask = 0;
+            const AABB bounds = tlasNodeExtent(
+                uint32_t(child), maxError, layerMask);
+            TlasNode& node = tlasNodes_[idx];
+            TlasMeta& meta = tlasMeta_[idx];
+            node.bounds.setLane(lane, bounds);
+            meta.maxErr.v[lane] = maxError;
+            node.child[lane] = child;
+            meta.laneMask[lane] = layerMask;
+            node.validMask |= 1u << lane;
         }
         return idx;
     }
@@ -2416,18 +2480,20 @@ int32_t SpatialDatabase::tlasBuildRange(std::vector<uint32_t>& items, int lo, in
         float me = 0.0f;
         uint32_t lm = 0;
         const TlasNode& cn = tlasNodes_[child];
+        const TlasMeta& childMeta = tlasMeta_[child];
         for (uint32_t l = 0; l < kWide; ++l)
         {
             if (!(cn.validMask & (1u << l))) continue;
             u.expand(cn.bounds.lane(l));
-            me = std::max(me, cn.maxErr.v[l]);
-            lm |= cn.laneMask[l];
+            me = std::max(me, childMeta.maxErr.v[l]);
+            lm |= childMeta.laneMask[l];
         }
         TlasNode& n = tlasNodes_[idx];
+        TlasMeta& meta = tlasMeta_[idx];
         n.bounds.setLane(g, u);
-        n.maxErr.v[g] = me;
+        meta.maxErr.v[g] = me;
         n.child[g] = child;
-        n.laneMask[g] = lm;
+        meta.laneMask[g] = lm;
         n.validMask |= 1u << g;
     }
     return idx;
@@ -2548,6 +2614,7 @@ void SpatialDatabase::reorderInstancesByTlas()
 void SpatialDatabase::tlasRebuild(bool reorderInstances)
 {
     tlasNodes_.clear();
+    tlasMeta_.clear();
     tlasFreeNodes_.clear();
     tlasRoot_ = -1;
     tlasEscapes_ = 0;
@@ -2555,7 +2622,9 @@ void SpatialDatabase::tlasRebuild(bool reorderInstances)
     tlasGrownArea_ = 0.0f;
     tlasDirty_ = false;
 
-    const bool quality = tlasQualityBuild_;
+    const bool promoted = tlasQualityBuild_;
+    const bool quality =
+        promoted && config_.tlasQuality != TlasQuality::Morton;
     tlasQualityBuild_ = false;
 
     if (quality)
@@ -2563,7 +2632,6 @@ void SpatialDatabase::tlasRebuild(bool reorderInstances)
         std::vector<uint32_t>& items = tlasItemsTmp_;
         items.assign(liveInstances_.begin(), liveInstances_.end());
         tlasLeafCount_ = uint32_t(items.size());
-        tlasQualityCount_ = tlasLeafCount_;
         if (!items.empty())
             tlasRoot_ = tlasBuildRange(items, 0, int(items.size()), -1);
     }
@@ -2603,6 +2671,7 @@ void SpatialDatabase::tlasRebuild(bool reorderInstances)
             {
                 const int32_t idx = tlasAllocNode();
                 TlasNode& n = tlasNodes_[idx];
+                TlasMeta& meta = tlasMeta_[idx];
                 const uint32_t cnt =
                     uint32_t(std::min<size_t>(kWide, tlasKeys_.size() - base));
                 for (uint32_t k = 0; k < cnt; ++k)
@@ -2610,9 +2679,9 @@ void SpatialDatabase::tlasRebuild(bool reorderInstances)
                     const uint32_t instIdx = tlasKeys_[base + k].instance;
                     Instance& inst = instances_[instIdx];
                     n.bounds.setLane(k, inst.worldBox);
-                    n.maxErr.v[k] = inst.maxErrWorld;
+                    meta.maxErr.v[k] = inst.maxErrWorld;
                     n.child[k] = ~int32_t(instIdx);
-                    n.laneMask[k] = inst.mask;
+                    meta.laneMask[k] = inst.mask;
                     n.setLeafLane(k);
                     inst.setTlasPlacement(uint32_t(idx), k);
                 }
@@ -2628,12 +2697,14 @@ void SpatialDatabase::tlasRebuild(bool reorderInstances)
                 {
                     const int32_t idx = tlasAllocNode();
                     TlasNode& n = tlasNodes_[idx];
+                    TlasMeta& meta = tlasMeta_[idx];
                     const uint32_t cnt =
                         uint32_t(std::min<size_t>(kWide, cur.size() - base));
                     for (uint32_t k = 0; k < cnt; ++k)
                     {
                         const int32_t childIdx = cur[base + k];
                         TlasNode& cn = tlasNodes_[childIdx];
+                        const TlasMeta& childMeta = tlasMeta_[childIdx];
                         cn.parent = idx;
                         AABB u = AABB::empty();
                         float me = 0.0f;
@@ -2642,13 +2713,13 @@ void SpatialDatabase::tlasRebuild(bool reorderInstances)
                         {
                             if (!(cn.validMask & (1u << l))) continue;
                             u.expand(cn.bounds.lane(l));
-                            me = std::max(me, cn.maxErr.v[l]);
-                            lm |= cn.laneMask[l];
+                            me = std::max(me, childMeta.maxErr.v[l]);
+                            lm |= childMeta.laneMask[l];
                         }
                         n.bounds.setLane(k, u);
-                        n.maxErr.v[k] = me;
+                        meta.maxErr.v[k] = me;
                         n.child[k] = childIdx;
-                        n.laneMask[k] = lm;
+                        meta.laneMask[k] = lm;
                         n.validMask |= 1u << k;
                     }
                     next.push_back(idx);
@@ -2658,6 +2729,10 @@ void SpatialDatabase::tlasRebuild(bool reorderInstances)
             tlasRoot_ = cur[0];
         }
     }
+
+    // Morton is itself the selected quality tier when configured explicitly.
+    // Record its population baseline just like median/SAH promoted builds.
+    if (promoted) tlasQualityCount_ = tlasLeafCount_;
 
     if (reorderInstances) reorderInstancesByTlas();
 
@@ -2702,15 +2777,17 @@ void SpatialDatabase::tlasQueryImpl(const Camera& view, float minPix,
         // all-ones view mask.
         if constexpr (UseMask)
         {
+            const TlasMeta& meta = tlasMeta_[it.node()];
             for (uint32_t l = 0; l < kWide; ++l)
-                if (!(n.laneMask[l] & view.viewMask)) survivors &= ~(1u << l);
+                if (!(meta.laneMask[l] & view.viewMask)) survivors &= ~(1u << l);
             if (!survivors) continue;
         }
 
         if constexpr (UseMinPix)
         {
+            const TlasMeta& meta = tlasMeta_[it.node()];
             const float8 d2 = distanceToBoxesSq(n.bounds, qmn, qmx);
-            const float8 errs = screenErrorFromSq8(n.maxErr, view.k, d2);
+            const float8 errs = screenErrorFromSq8(meta.maxErr, view.k, d2);
             for (uint32_t l = 0; l < kWide; ++l)
                 if (errs.v[l] < minPix) survivors &= ~(1u << l);
         }
@@ -2953,9 +3030,9 @@ void SpatialDatabase::wideVisit(
                                               : ov.patchedWide[patch];
             }
         }();
-        // One load carries both lane masks. `survivors` never exceeds kWide bits,
-        // so ANDing it with the whole word keeps exactly the valid lanes and
-        // the leaf lanes in the high half come along for free.
+        // One load carries the valid, terminal-leaf, and zero-error lane masks.
+        // `survivors` never exceeds kWide bits, so ANDing it with the whole
+        // word keeps exactly the valid lanes.
         const uint32_t lanes = pg.blockMask_[b];
         FRONTIER_STAT(w, wideBlocksTested, 1);
         uint8_t outMasks[kWide];
@@ -2963,6 +3040,35 @@ void SpatialDatabase::wideVisit(
             testWideAabb(wb, local.frustum, mask, outMasks) & lanes;
         if (!survivors) continue;
         FRONTIER_STAT(w, lanesSurvived, uint64_t(std::popcount(survivors)));
+
+        const uint32_t leafLanes = blockLeafLanes(lanes);
+        if ((survivors & ~leafLanes) == 0 &&
+            (errClamp <= 0.0f ||
+             (survivors & ~blockZeroErrorLanes(lanes)) == 0))
+        {
+            uint32_t zeroLeaves = survivors;
+            while (zeroLeaves)
+            {
+                const uint32_t l =
+                    uint32_t(std::countr_zero(zeroLeaves));
+                zeroLeaves &= zeroLeaves - 1;
+                const uint32_t c = blk.child[l];
+                const FrontierEntry entry{
+                    NodeHandle{item.slot(), c, gen}, uint8_t(0), instance};
+                if constexpr (TrackAncestor)
+                {
+                    const bool ready =
+                        subtrees_[slots_[item.slot()].definition]
+                            .isNodeReady(c);
+                    w.addAncestorIdeal(entry, ancestorCandidate, ready);
+                }
+                else if constexpr (FullyReady)
+                    w.result.shared.push(entry);
+                else
+                    w.emit(entry, currentKids != 0, idealKids != 0);
+            }
+            continue;
+        }
 
         // The clamp is invariant (D) across a mount boundary, applied here
         // rather than baked into the definition. One vminps; a no-op when
@@ -2975,7 +3081,6 @@ void SpatialDatabase::wideVisit(
         const float8 d2 = distanceToBoxesSq(wb, qmn, qmx);
         const float8 errs = screenErrorFromSq8(eff, local.k, d2);
 
-        const uint32_t leafLanes = blockLeafLanes(lanes);
         uint32_t leaves = survivors & leafLanes;
         while (leaves)
         {
@@ -3168,7 +3273,15 @@ bool SpatialDatabase::visibleDescendantsCovered(uint32_t slot, uint32_t node, ui
             recordTraversalDependency(*dependencyWorker, slot);
     }
 
-    const Camera local = mountLocalCamera(rootLocal, slot, mask);
+    const MountTransformRt& transform = mountTransforms_[slot];
+    const bool identityTransform =
+        transform.scale == 1.0f && transform.pos.x == 0.0f &&
+        transform.pos.y == 0.0f && transform.pos.z == 0.0f;
+    std::optional<Camera> transformed;
+    const Camera& local = identityTransform
+                              ? rootLocal
+                              : transformed.emplace(
+                                    mountLocalCamera(rootLocal, slot, mask));
     const SubtreeView& subtree = subtreeView(*rt);
     const uint32_t count = subtree.childCount(node);
     if (count == 0) return false;
@@ -3220,7 +3333,15 @@ void SpatialDatabase::runSubtreeAncestorImpl(
     const SelectionParams& params, uint32_t ancestorCandidate, Worker& w) const
 {
     const SubtreeInstanceRt& rt = slots_[item.slot()];
-    const Camera local = mountLocalCamera(rootLocal, item.slot(), item.mask());
+    const MountTransformRt& transform = mountTransforms_[item.slot()];
+    const bool identityTransform =
+        transform.scale == 1.0f && transform.pos.x == 0.0f &&
+        transform.pos.y == 0.0f && transform.pos.z == 0.0f;
+    std::optional<Camera> transformed;
+    const Camera& local = identityTransform
+                              ? rootLocal
+                              : transformed.emplace(mountLocalCamera(
+                                    rootLocal, item.slot(), item.mask()));
     recordTraversalDependency(w, item.slot());
 
     FRONTIER_STAT(w, subtreesVisited, 1);
@@ -3296,7 +3417,15 @@ void SpatialDatabase::runSubtreeImpl(const WorkItem& item,
                         Worker& w) const
 {
     const SubtreeInstanceRt& rt = slots_[item.slot()];
-    const Camera local = mountLocalCamera(rootLocal, item.slot(), item.mask());
+    const MountTransformRt& transform = mountTransforms_[item.slot()];
+    const bool identityTransform =
+        transform.scale == 1.0f && transform.pos.x == 0.0f &&
+        transform.pos.y == 0.0f && transform.pos.z == 0.0f;
+    std::optional<Camera> transformed;
+    const Camera& local = identityTransform
+                              ? rootLocal
+                              : transformed.emplace(mountLocalCamera(
+                                    rootLocal, item.slot(), item.mask()));
     recordTraversalDependency(w, item.slot());
 
     FRONTIER_STAT(w, subtreesVisited, 1);
@@ -3376,13 +3505,15 @@ void SpatialDatabase::runSubtreeImpl(const WorkItem& item,
                         FRONTIER_STAT(w, subtreesVisited, 1);
                         if (e.planes() == 0)
                         {
-                            const MountTransformRt& transform =
+                            const MountTransformRt& childTransform =
                                 mountTransforms_[childSlot];
-                            const float invScale = 1.0f / transform.scale;
+                            const float invScale = 1.0f / childTransform.scale;
                             const float4 qmn =
-                                (rootLocal.queryMin() - transform.pos) * invScale;
+                                (rootLocal.queryMin() - childTransform.pos) *
+                                invScale;
                             const float4 qmx =
-                                (rootLocal.queryMax() - transform.pos) * invScale;
+                                (rootLocal.queryMax() - childTransform.pos) *
+                                invScale;
                             emitMountedRootLeavesInside(
                                 childItem, childView, childMount.errClamp,
                                 childMount.generation, instance, qmn, qmx,
@@ -3500,10 +3631,6 @@ void SpatialDatabase::runTlasRootInstance(
     const Instance& inst = instances_[instIdx];
     FRONTIER_STAT(w, instancesVisited, 1);
 
-    if (mask != 0 &&
-        testAabb(inst.worldBox, view.frustum, mask) == CullState::Outside)
-        return;
-
     const float worldDistance =
         inst.maxErrWorld > 0.0f
             ? distanceToBox(inst.worldBox, view.queryMin(), view.queryMax())
@@ -3534,11 +3661,14 @@ void SpatialDatabase::runTlasRootInstance(
         return;
     }
 
-    const Camera local = toLocal(view, inst.pos, inst.scale);
+    const Camera local = toLocal(view, inst.pos, inst.scale, mask);
     const bool fullyReady = mountedTreeFullyReady(childSlot);
     if (fullyReady)
     {
-        w.work.push_back(makeWorkItem(childSlot, inst, 1, 1, mask));
+        // The first placement is already in hand. Enter it directly; the work
+        // stack is only needed for mounted descendants discovered by the walk.
+        runSubtree<true>(makeWorkItem(childSlot, inst, 1, 1, mask), inst,
+                         local, params, w);
         while (!w.work.empty())
         {
             const WorkItem item = w.work.back();
@@ -3558,8 +3688,8 @@ void SpatialDatabase::runTlasRootInstance(
         const uint32_t rootCandidate = w.addAncestorCandidate(
             kInvalidIndex,
             makeFrontierEntry(root, error, w.bar, w.barInv, outputInstance));
-        w.work.push_back(makeWorkItem(childSlot, inst, 0, 1, mask));
-        w.workCandidates.push_back(rootCandidate);
+        runSubtreeAncestor(makeWorkItem(childSlot, inst, 0, 1, mask), inst,
+                           local, params, rootCandidate, w);
         while (!w.work.empty())
         {
             const WorkItem item = w.work.back();
@@ -3583,8 +3713,9 @@ void SpatialDatabase::runTlasRootInstance(
         w.result.currentOnly.push(makeFrontierEntry(
             root, error, w.bar, w.barInv, outputInstance));
 
-    w.work.push_back(makeWorkItem(childSlot, inst,
-                                  uint8_t(currentCanDescend), 1, mask));
+    runSubtree<false>(makeWorkItem(childSlot, inst,
+                                  uint8_t(currentCanDescend), 1, mask),
+                      inst, local, params, w);
     while (!w.work.empty())
     {
         const WorkItem item = w.work.back();
@@ -3599,23 +3730,11 @@ void SpatialDatabase::runTlasRootInstance(
 }
 
 void SpatialDatabase::runTlasFlatInstance(uint32_t instIdx,
-                                          const Camera& view,
-                                          uint8_t mask, Worker& w) const
+                                          const Camera& view, Worker& w) const
 {
     const uint32_t marker = instanceFlatSlots_[instIdx];
     const bool zeroError = instances_[instIdx].hasZeroErrorRoot();
-    const Instance* spatial = nullptr;
-
-    uint8_t exactMask = mask;
-    if (exactMask != 0 || !zeroError)
-    {
-        spatial = &instances_[instIdx];
-        if (exactMask != 0 &&
-            testAabb(spatial->worldBox, view.frustum, exactMask) ==
-                CullState::Outside)
-            return;
-    }
-
+    const Instance* spatial = zeroError ? nullptr : &instances_[instIdx];
     FRONTIER_STAT(w, instancesVisited, 1);
     const float error = !zeroError && spatial->maxErrWorld > 0.0f
                             ? screenError(
@@ -3635,13 +3754,8 @@ void SpatialDatabase::runTlasFlatInstance(uint32_t instIdx,
 }
 
 void SpatialDatabase::runZeroErrorTlasFlatInstance(
-    uint32_t instIdx, const Camera& view, uint8_t mask, Worker& w) const
+    uint32_t instIdx, Worker& w) const
 {
-    if (mask != 0 &&
-        testAabb(instances_[instIdx].worldBox, view.frustum, mask) ==
-            CullState::Outside)
-        return;
-
     FRONTIER_STAT(w, instancesVisited, 1);
     const InstanceId outputInstance = publicInstanceId(instIdx);
     NodeHandle handle;
@@ -3699,8 +3813,7 @@ void SpatialDatabase::selectFrontierUncached(const Camera& camera, const Selecti
                 for (uint32_t i = 0; i < nVis; ++i)
                 {
                     const uint32_t instIdx = scratch.visible[i].instance();
-                    runZeroErrorTlasFlatInstance(
-                        instIdx, damped, scratch.visible[i].mask(), w);
+                    runZeroErrorTlasFlatInstance(instIdx, w);
                 }
             }
             else
@@ -3708,8 +3821,7 @@ void SpatialDatabase::selectFrontierUncached(const Camera& camera, const Selecti
                 for (uint32_t i = 0; i < nVis; ++i)
                 {
                     const uint32_t instIdx = scratch.visible[i].instance();
-                    runTlasFlatInstance(instIdx, damped,
-                                        scratch.visible[i].mask(), w);
+                    runTlasFlatInstance(instIdx, damped, w);
                 }
             }
         }
@@ -3732,11 +3844,9 @@ void SpatialDatabase::selectFrontierUncached(const Camera& camera, const Selecti
                 if (instanceFlatSlots_[instIdx] != kInvalidIndex)
                 {
                     if (instances_[instIdx].hasZeroErrorRoot())
-                        runZeroErrorTlasFlatInstance(
-                            instIdx, damped, scratch.visible[i].mask(), w);
+                        runZeroErrorTlasFlatInstance(instIdx, w);
                     else
-                        runTlasFlatInstance(instIdx, damped,
-                                            scratch.visible[i].mask(), w);
+                        runTlasFlatInstance(instIdx, damped, w);
                 }
                 else
                     runTlasRootInstance(instIdx, damped, params,
@@ -3817,9 +3927,7 @@ void SpatialDatabase::selectFrontierUncached(const Camera& camera, const Selecti
                 for (uint32_t i = lo; i < hi; ++i)
                 {
                     const uint32_t instIdx = c->scratch->visible[i].instance();
-                    database.runZeroErrorTlasFlatInstance(
-                        instIdx, *c->camera,
-                        c->scratch->visible[i].mask(), w);
+                    database.runZeroErrorTlasFlatInstance(instIdx, w);
                 }
             }
             else if (c->flatMode == 4)
@@ -3827,9 +3935,7 @@ void SpatialDatabase::selectFrontierUncached(const Camera& camera, const Selecti
                 for (uint32_t i = lo; i < hi; ++i)
                 {
                     const uint32_t instIdx = c->scratch->visible[i].instance();
-                    database.runTlasFlatInstance(
-                        instIdx, *c->camera,
-                        c->scratch->visible[i].mask(), w);
+                    database.runTlasFlatInstance(instIdx, *c->camera, w);
                 }
             }
             else
@@ -3840,13 +3946,9 @@ void SpatialDatabase::selectFrontierUncached(const Camera& camera, const Selecti
                     if (database.instanceFlatSlots_[instIdx] != kInvalidIndex)
                     {
                         if (database.instances_[instIdx].hasZeroErrorRoot())
-                            database.runZeroErrorTlasFlatInstance(
-                                instIdx, *c->camera,
-                                c->scratch->visible[i].mask(), w);
+                            database.runZeroErrorTlasFlatInstance(instIdx, w);
                         else
-                            database.runTlasFlatInstance(
-                                instIdx, *c->camera,
-                                c->scratch->visible[i].mask(), w);
+                            database.runTlasFlatInstance(instIdx, *c->camera, w);
                     }
                     else
                         database.runTlasRootInstance(
@@ -4144,9 +4246,9 @@ void SpatialDatabase::selectFrontierCached(const Camera& camera, const Selection
             instanceFlatSlots_[instIdx] != kInvalidIndex)
         {
             if (instances_[instIdx].hasZeroErrorRoot())
-                runZeroErrorTlasFlatInstance(instIdx, dv, mask, w);
+                runZeroErrorTlasFlatInstance(instIdx, w);
             else
-                runTlasFlatInstance(instIdx, dv, mask, w);
+                runTlasFlatInstance(instIdx, dv, w);
         }
         else
             runTlasRootInstance(instIdx, dv, params, mask, w);

@@ -483,7 +483,7 @@ TEST(Contracts, HotTypesStayCompact)
     EXPECT_EQ(sizeof(float8), size_t(kWide) * sizeof(float));
     EXPECT_EQ(sizeof(WideBounds), size_t(kWide) * 6 * sizeof(float));
     EXPECT_EQ(sizeof(detail::WideBlock), size_t(kWide) * 8 * sizeof(float));
-    EXPECT_EQ(TestAccess::tlasNodeBytes(), kWide == 8 ? 320u : 192u);
+    EXPECT_EQ(TestAccess::tlasNodeBytes(), kWide == 8 ? 320u : 160u);
     EXPECT_LE(TestAccess::definitionBytes(), 160u);
     EXPECT_LE(TestAccess::mountedStateBytes(), 64u);
     EXPECT_EQ(TestAccess::mountStampBytes(), 8u);

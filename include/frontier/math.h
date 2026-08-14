@@ -871,7 +871,8 @@ inline Camera makeLookAtCamera(float4 pos, float4 target,
 // Transform a world-space view into an instance's local space.
 // Instances are positioned by translation + uniform scale (no rotation).
 // The error ratio geomError / distance is scale-invariant, so k is unchanged.
-inline Camera toLocal(const Camera& v, float4 instPos, float instScale)
+inline Camera toLocal(const Camera& v, float4 instPos, float instScale,
+                      uint8_t activePlanes)
 {
     assert(instScale > 0.0f);
     const float invScale = 1.0f / instScale;
@@ -885,11 +886,17 @@ inline Camera toLocal(const Camera& v, float4 instPos, float instScale)
     local.envHi = v.envHi * invScale;
     for (uint32_t p = 0; p < 6; ++p)
     {
+        if (!(activePlanes & (1u << p))) continue;
         const float4 pl = v.frustum.plane[p];
         local.frustum.plane[p] = {pl.x, pl.y, pl.z,
                                   (dot3(pl, instPos) + pl.w) * invScale};
     }
     return local;
+}
+
+inline Camera toLocal(const Camera& v, float4 instPos, float instScale)
+{
+    return toLocal(v, instPos, instScale, kAllPlanes);
 }
 
 // Transform a local AABB to world space (translation + uniform scale).

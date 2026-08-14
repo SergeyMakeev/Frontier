@@ -51,7 +51,14 @@ library's macro-based public payload customization.
   10,000 TLAS-owned single-node objects. The reuse-enabled cases verify that
   the automatic all-flat direct path stays at raw-selection cost.
 - `BM_InstanceForestSelectionScale` covers raw and cached selection across
-  forests of mounted instance hierarchies.
+  forests of mounted instance hierarchies. Reuse mode 2 alternates cut policy
+  to force deterministic cache misses.
+- `BM_InstanceForestRootSelectionScale` uses the same mounted forest but a
+  distant camera that stops at renderable TLAS roots, separating top-level
+  query/dispatch cost from refined BLAS traversal.
+- `BM_TlasQualitySelection` compares Morton, median, and binned-SAH TLAS
+  selection with all-visible and close-camera views, and reports entry count,
+  node count, and TLAS bytes.
 - `BM_FlatInstanceLifecycle` measures steady-state TLAS spawn/remove plus its
   amortized maintenance barrier in a 1,024-object population.
 - `BM_BoundsOverrideBatch` measures sparse and promoted-dense copy-on-write
@@ -130,9 +137,10 @@ Run `BM_KernelWideAabb` and `BM_KernelDistanceErrorCurrent` to explain SIMD
 cost, then use `BM_SubtreeAssembly_FrontierCost`,
 `BM_MixedReadinessFrontier`, and `BM_FlatTlasSelectionScale` for the decision.
 The flat-TLAS cases report `tlas_nodes` and `tlas_KB`. BVH4 halves one
-`WideBlock` from 256 to 128 bytes and one `TlasNode` from 320 to 192 bytes, but
-can require more blocks and a deeper tree. Favor it only when target-scene lane
-occupancy, culling, and cache behavior compensate for that extra traversal.
+`WideBlock` from 256 to 128 bytes and reduces combined hot/cold TLAS-node
+storage from 320 to 160 bytes, but can require more blocks and a deeper tree.
+Favor it only when target-scene lane occupancy, culling, and cache behavior
+compensate for that extra traversal.
 
 ## Machine characterization
 

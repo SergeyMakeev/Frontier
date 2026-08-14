@@ -96,7 +96,10 @@ struct SpatialDatabase::TestAccess
     static size_t mountStampBytes() { return sizeof(MountStamp); }
     static size_t mountReadinessBytes() { return sizeof(MountReadiness); }
     static size_t instanceBytes() { return sizeof(Instance); }
-    static size_t tlasNodeBytes() { return sizeof(TlasNode); }
+    static size_t tlasNodeBytes()
+    {
+        return sizeof(TlasNode) + sizeof(TlasMeta);
+    }
     static size_t tlasNodeCount(const SpatialDatabase& database)
     {
         return database.tlasNodes_.size();

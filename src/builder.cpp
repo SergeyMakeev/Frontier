@@ -249,6 +249,7 @@ SubtreeBytes SubtreeBuilder::build(const FrontierContext& context)
                 block.child[lane] = kInvalidIndex;
             uint32_t valid = 0;
             uint32_t leaf = 0;
+            uint32_t zeroError = 0;
             for (uint32_t lane = 0;
                  lane < kWide && first + lane < childCount; ++lane)
             {
@@ -262,6 +263,8 @@ SubtreeBytes SubtreeBuilder::build(const FrontierContext& context)
                 block.error.v[lane] = geometricError[child];
                 block.child[lane] = child;
                 valid |= 1u << lane;
+                if (geometricError[child] == 0.0f)
+                    zeroError |= 1u << lane;
                 if (metaChildCount(meta[child]) == 0 &&
                     !metaIsMountable(meta[child]))
                     leaf |= 1u << lane;
@@ -269,7 +272,9 @@ SubtreeBytes SubtreeBuilder::build(const FrontierContext& context)
                     childSource = nodes_[laneSource].nextSibling;
             }
             wide[wideIndex] = block;
-            blockMask[wideIndex] = valid | (leaf << kBlockLeafShift);
+            blockMask[wideIndex] =
+                valid | (leaf << kBlockLeafShift) |
+                (zeroError << kBlockZeroErrorShift);
             ++wideIndex;
         }
         FRONTIER_ASSERT(i == 0 || childSource == kInvalidIndex,

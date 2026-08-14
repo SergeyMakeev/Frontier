@@ -9,10 +9,11 @@ the [API guide](API.md), exact signatures are in the
 
 The dynamic TLAS uses the build-wide `FRONTIER_BVH_WIDTH`: four or eight lanes.
 Every leaf lane names a live top-level instance whose permanent renderable root
-data is stored in dense instance streams. Internal TLAS nodes contain wide
-bounds, maximum error, layer masks, child references, and a flag indicating
-whether a hierarchical root can be tested directly. A BVH4 `TlasNode` is 192
-bytes; a BVH8 node is 320 bytes.
+data is stored in dense instance streams. Query-hot TLAS nodes contain wide
+bounds, child references, valid/leaf flags, and the parent index. Maximum error
+and layer masks live in a parallel cold metadata stream used only when the
+query requests contribution or layer filtering. BVH4 uses 128 hot + 32 cold
+bytes per node; BVH8 uses 256 hot + 64 cold bytes per node.
 
 Each mounted definition is a BLAS fragment below one renderable parent. A
 definition can have several direct roots because the parent is external. A
@@ -25,7 +26,7 @@ single placement in one runtime tree.
 
 - a 128-byte header;
 - interleaved `WideBlock` data (128 bytes in BVH4, 256 bytes in BVH8);
-- valid/leaf lane masks;
+- valid/leaf/zero-error lane masks;
 - payload, parent, contiguous-subtree-size, metadata, and error arrays;
 - the definition aggregate bound in the header.
 

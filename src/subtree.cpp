@@ -296,6 +296,7 @@ void validateSubtreeBytes(const SubtreeBytes& bytes)
                 std::min(kWide, children - first);
             uint32_t expectedValid = 0;
             uint32_t expectedLeaf = 0;
+            uint32_t expectedZeroError = 0;
 
             for (uint32_t lane = 0; lane < kWide; ++lane)
             {
@@ -314,6 +315,8 @@ void validateSubtreeBytes(const SubtreeBytes& bytes)
                                        block.error.v[lane] == error[child],
                                    "registerSubtree: wide child data mismatch");
                     expectedValid |= 1u << lane;
+                    if (error[child] == 0.0f)
+                        expectedZeroError |= 1u << lane;
                     if (metaChildCount(meta[child]) == 0 &&
                         !metaIsMountable(meta[child]))
                         expectedLeaf |= 1u << lane;
@@ -331,7 +334,8 @@ void validateSubtreeBytes(const SubtreeBytes& bytes)
 
             FRONTIER_CHECK(
                 blockMask[expectedWide + blockIndex] ==
-                    (expectedValid | (expectedLeaf << kBlockLeafShift)),
+                    (expectedValid | (expectedLeaf << kBlockLeafShift) |
+                     (expectedZeroError << kBlockZeroErrorShift)),
                 "registerSubtree: invalid wide-block lane mask");
         }
 

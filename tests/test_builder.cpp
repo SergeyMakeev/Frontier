@@ -97,6 +97,11 @@ TEST(SubtreeBuilder, BuildsTraversalReadySerializableBytes)
     EXPECT_EQ(view.siblingOrdinal(3), 1u);
     EXPECT_TRUE(view.nodeBounds(1).contains(view.nodeBounds(2)));
     EXPECT_TRUE(view.nodeBounds(1).contains(view.nodeBounds(3)));
+    const uint32_t rootBlock = view.wideOffset(0);
+    const uint32_t childBlock = view.wideOffset(1);
+    EXPECT_EQ(detail::blockZeroErrorLanes(view.blockMask_[rootBlock]), 0u);
+    EXPECT_EQ(detail::blockZeroErrorLanes(view.blockMask_[childBlock]), 1u);
+    EXPECT_EQ(view.leafLanes(childBlock), 1u);
 
     SubtreeBytes copy = bytes;
     EXPECT_NE(copy.data(), bytes.data());

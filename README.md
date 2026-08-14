@@ -227,4 +227,7 @@ included with `add_subdirectory()`, both default off and the
 See the progressive [API guide](docs/API.md) for the integration flow, the
 exhaustive [API reference](docs/API_REFERENCE.md) for exact contracts,
 [ARCHITECTURE.md](docs/ARCHITECTURE.md) for implementation details, and
-[BENCHMARKING.md](docs/BENCHMARKING.md) for measurement guidance.
+[BENCHMARKING.md](docs/BENCHMARKING.md) for measurement guidance. The latest
+optimization campaign, including rejected experiments and raw-result names,
+is recorded in
+[PERFORMANCE_OPTIMIZATION_2026.md](docs/PERFORMANCE_OPTIMIZATION_2026.md).
