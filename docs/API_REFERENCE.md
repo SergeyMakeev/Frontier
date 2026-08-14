@@ -77,8 +77,9 @@ FRONTIER_ASSERT(condition, message)
 
 `FRONTIER_FATAL` handles caller-visible contract failures and must not return.
 Define it before including any Frontier header to replace the default
-exception. `FRONTIER_CHECK` is always enabled. `FRONTIER_ASSERT` is disabled
-under `NDEBUG` unless the host overrides it. Normal streaming races involving
+exception. `FRONTIER_CHECK` is enabled by default and compiles out when
+`FRONTIER_CONTRACT_CHECKS=0`. `FRONTIER_ASSERT` is disabled under `NDEBUG`
+unless the host overrides it. Normal streaming races involving
 stale handles do not use these macros. Contract failures are programmer errors,
 not a recoverable result channel; unless a function explicitly documents an
 early preflight guarantee, no transactional rollback is promised if the
@@ -87,14 +88,16 @@ default exception is caught.
 ### SIMD and vector configuration
 
 `FRONTIER_FORCE_SCALAR` disables intrinsic implementations. Otherwise the
-header selects AVX2, 64-bit NEON, SSE2, or the scalar backend from compiler
+header selects AVX2, AArch64 NEON, SSE2, or the scalar backend from compiler
 target macros.
 
-`FRONTIER_BVH_WIDTH` is a build-wide choice of `AUTO`, `4`, or `8` and defaults
-to `AUTO`. CMake resolves `AUTO` to BVH8 for the eight-lane AVX2 backend and
-BVH4 for four-lane SSE2/NEON or forced-scalar builds, then propagates the
-resolved numeric value to consumers. An explicit `4` or `8` overrides that
-policy. The result changes public wide-type sizes, internal TLAS/BLAS layouts,
+The `FRONTIER_BVH_WIDTH` preprocessor macro is a build-wide numeric choice of
+`4` or `8`. The CMake setting of the same name additionally accepts `AUTO` and
+defaults to it. CMake resolves `AUTO` to BVH8 for the eight-lane AVX2 backend
+and BVH4 for four-lane SSE2/NEON or forced-scalar builds, then propagates the
+resolved numeric value to consumers. Without CMake, the header default follows
+the same target-macro policy. An explicit `4` or `8` overrides automatic
+selection. The result changes public wide-type sizes, internal TLAS/BLAS layouts,
 and the serialized subtree format; the library and every consumer translation
 unit must use the same value. BVH4 uses one 128-bit SIMD group. BVH8 uses AVX2
 when enabled, or two 128-bit SSE2/NEON groups.

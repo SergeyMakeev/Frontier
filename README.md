@@ -207,16 +207,17 @@ Important options are `FRONTIER_BUILD_TESTS`, `FRONTIER_BUILD_BENCH`,
 `FRONTIER_IPO`, `FRONTIER_STATS`, `FRONTIER_CONTRACT_CHECKS`, and
 `FRONTIER_VALIDATE_SUBTREES`.
 
-`FRONTIER_BVH_WIDTH` accepts `AUTO`, `4`, or `8` and defaults to `AUTO`.
-Automatic selection uses BVH8 with AVX2's eight-lane backend and BVH4 with
-four-lane SSE2/NEON. Forced-scalar builds also default to the compact BVH4
-layout. An explicit `4` or `8` always overrides this policy. Branch width is a
-build-wide layout choice, including serialized subtrees.
+The CMake setting `FRONTIER_BVH_WIDTH` accepts `AUTO`, `4`, or `8` and defaults
+to `AUTO`. CMake resolves `AUTO` to BVH8 with AVX2's eight-lane backend and
+BVH4 with four-lane SSE2/NEON. Forced-scalar builds also default to the compact
+BVH4 layout. An explicit `4` or `8` always overrides this policy. The resulting
+preprocessor macro is numeric (`4` or `8`), and branch width is a build-wide
+layout choice, including serialized subtrees.
 
-On x86-64, `FRONTIER_AVX2=ON` produces an AVX2/FMA-targeted BVH8 binary without
-runtime dispatch. Set it to `OFF` when the executable must run on the SSE2
-baseline or when the host performs its own per-ISA library dispatch. BVH4 uses
-the 128-bit backend and does not require AVX2.
+On x86-64, `FRONTIER_AVX2=ON` with BVH8 produces an AVX2/FMA-targeted binary
+without runtime dispatch. Set it to `OFF` when the executable must run on the
+SSE2 baseline or when the host performs its own per-ISA library dispatch. BVH4
+uses the 128-bit backend and does not require AVX2.
 
 Tests default on only for a standalone Frontier checkout; benchmarks default
 off because they require a separate optimized build. When the project is

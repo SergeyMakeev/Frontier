@@ -82,8 +82,8 @@ normally validates one exact dependency rather than every house placement.
 
 ## Traversal
 
-Selection first queries the TLAS using 8-lane bound/error tests. Flat roots use
-a direct path that does not read mounted-state arrays. An all-flat snapshot
+Selection first queries the TLAS using build-width bound/error tests. Flat
+roots use a direct path that does not read mounted-state arrays. An all-flat snapshot
 also bypasses per-instance frontier caching even when reuse is enabled: there
 is no hierarchy walk to save, so recording and copying one cached entry would
 only add work. Hierarchical roots either terminate in the TLAS or enqueue their
@@ -92,8 +92,8 @@ first mounted placement.
 A `WorkItem` carries placement slot, effective wide bounds, current/ideal
 liveness, and narrowed frustum mask. One dispatch selects dense authored/COW
 bounds or sparse-overlay lookup for the whole subtree walk. `wideVisit()` tests
-up to eight children together. Plain leaves emit immediately; other survivors
-go onto a compact DFS stack.
+up to `kWide` children (four or eight) together. Plain leaves emit immediately;
+other survivors go onto a compact DFS stack.
 
 Reusable definitions whose direct roots are all leaves have a batched
 fully-ready path. Consecutive placements of the same definition reuse the
@@ -170,35 +170,29 @@ After publication, distinct queries may read concurrently until the next write.
 ## Memory and performance checkpoints
 
 The city/house benchmark compares 400 houses with eight fully refined detail
-nodes each. The current assembled representation reports 93.7 KiB of serialized
-bytes plus mounted-placement state versus 318.6 KiB flattened, about 71% less.
-The placement-state counter includes definition-local shared readiness/coverage
-words and retained private coverage slabs; it measures the same byte and
-placement categories as the retained historical comparisons.
+nodes each. In the latest local MSVC Release, AVX2, BVH8, eight-byte-payload
+run, the flattened and assembled representations measured:
 
-Against the immediately preceding per-placement-readiness build, the assembled
-placement figure increased from 91.8 KiB to 93.7 KiB (2.0%). The net four bytes
-per retained mount-capacity slot come from adding intrusive definition-list
-links while shrinking the hot readiness summary from eight bytes to four.
-Targeted 400-house runs put raw traversal at approximately 10.5 us before and
-after; cached traversal remained in the 1.3--1.4 us range. These differences are
-within run-to-run noise.
+| Representation | Immutable definitions | Placement state | Total retained | Raw selection | Cached selection | Complete construction |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Flattened | 198.8 KiB | 7.2 KiB | 206.0 KiB | 11.6 us | 0.695 us | 70.2 us |
+| Assembled | 22.9 KiB | 50.4 KiB | 73.3 KiB | 10.8 us | 0.690 us | 36.6 us |
 
-`BM_SharedNodeReadinessFanout` measures one definition-node transition across
-32, 128, or 400 placements. One API call resolves the node's definition bit and
-walks only that definition's intrusive placement list; there is no payload hash
-lookup or per-registered-node inverted-index record. The retained shared state
-is one readiness bit per definition node. The latest five-run measurement was
-3.29 us at 400 placements, slightly below the approximately 3.4 us measured for
-the discarded payload-index implementation.
+Assembly therefore retained about 64% fewer total bytes in this scene while
+also reducing complete construction time by about 48%. The placement-state
+counter includes definition-local shared readiness/coverage words and retained
+private coverage slabs; it is intentionally larger for the 400 mounted house
+placements even though their immutable definition bytes are shared.
 
-In the same verification run, the 400-house assembled median was 10.4 us for
-uncached traversal, 0.683 us for cached selection, and 74.4 us for construction.
-The flattened construction median was 181 us. Treat these local microbenchmark
-figures as checkpoints, not cross-machine guarantees.
+Canonical wide-lane bounds are responsible for much of the current immutable
+footprint. Every real node bound is stored once in its parent's `WideBlock`
+lane, with the aggregate definition bound in the serialized header; there is
+no duplicate scalar bound stream. In the local before/after experiment this
+reduced immutable bytes by about 36%, improved construction by roughly
+32--48%, and improved batched copy-on-write bound updates by 25--77% for
+32--256 edits. Selection moved by at most about 3%, within run-to-run noise.
 
-The older keyless-bytes comparison remains under
-`bench_results/bytes_api_before.json` and
-`bench_results/bytes_api_after.json`; it predates definition-node readiness and
-should be read as historical data rather than a measurement of the current
-layout.
+These numbers are implementation checkpoints rather than cross-machine
+guarantees. Reproduce them with the matched profiles in
+[BENCHMARKING.md](BENCHMARKING.md); historical API and layout measurements are
+kept in [HISTORY.md](HISTORY.md) and `bench_results/`.

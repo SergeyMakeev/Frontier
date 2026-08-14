@@ -62,8 +62,9 @@ keeps world movement out of shared local topology, lets many placements reuse
 one definition, and makes a one-node object require no bottom-level hierarchy
 at all.
 
-Both levels use the build-wide `FRONTIER_BVH_WIDTH`. Its `AUTO` default chooses
-BVH8 for AVX2's eight-lane backend and BVH4 for four-lane SSE2/NEON (and for
+Both levels use the build-wide `FRONTIER_BVH_WIDTH`. The CMake setting accepts
+`AUTO`, `4`, or `8`; its `AUTO` default resolves the numeric preprocessor macro
+to BVH8 for AVX2's eight-lane backend and BVH4 for four-lane SSE2/NEON (and for
 forced scalar). An application can explicitly select `4` or `8` after profiling
 its target content and hardware. Serialized subtree bytes record the selected
 width and must be rebuilt when it changes.
@@ -358,11 +359,11 @@ SubtreeHandle building = database.registerSubtree(std::move(bytes));
 Persisted bytes are a versioned native traversal format, not a long-term
 interchange schema. With full validation enabled, registration rejects
 incompatible or structurally invalid format versions, layout, size, alignment,
-topology, traversal mirrors, or byte order. The payload type and invalid-value
-configuration must also match the build that authored the bytes; rebuild assets
-when any of these change. Registration does not authenticate content or choose
-an allocation limit, so verify file origin and size before allocating
-`SubtreeBytes`.
+topology, canonical wide traversal data, or byte order. The payload type and
+invalid-value configuration must also match the build that authored the bytes;
+rebuild assets when any of these change. Registration does not authenticate
+content or choose an allocation limit, so verify file origin and size before
+allocating `SubtreeBytes`.
 
 Important ownership rules:
 

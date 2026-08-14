@@ -1761,7 +1761,7 @@ void SpatialDatabase::flushBounds()
     // Applied in submission order, so the last box per node is the final
     // state (last write wins). There is deliberately NO dedup structure:
     // with grow-only refit, a repeated move of the same node rewrites the
-    // same hot bbox, patches the same hot lane and early-outs at the parent
+    // same hot wide lane and early-outs at the parent
     // (~hot-cache cost) — while every dedup scheme we measured (per-node
     // stamps, per-mount dirty chains, a transient hash set) paid more in
     // cold cache lines than the walks it skipped. Movers sharing ancestors

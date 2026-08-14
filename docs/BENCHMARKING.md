@@ -36,12 +36,22 @@ library's macro-based public payload customization.
   bucket-entry counts, and retained query bytes.
 - `BM_SharedNodeReadinessLargeFanout` extends shared-readiness propagation to
   1,024 and 10,000 placements of one definition node.
+- `BM_MountUnmountLifecycle` measures steady-state mount/unmount operations in
+  an assembled hierarchy.
+- `BM_MountUsageConsumption` measures consumption of query-recorded mount use
+  for streaming and collapse decisions.
+- `BM_MotionGroupSteady` measures repeated batched root motion through a stable
+  `MotionGroup`.
+- `BM_SubtreeBuilder_ConstructCost` isolates serialized definition building
+  before registration and instantiation.
 - `BM_SubtreeRegistration` isolates validation and zero-copy registration for
   128- and 4,096-node serialized definitions; input copying and release are
   outside the timed region.
 - `BM_FlatTlasSelectionScale` covers raw and cached selection at 1,000 and
   10,000 TLAS-owned single-node objects. The reuse-enabled cases verify that
   the automatic all-flat direct path stays at raw-selection cost.
+- `BM_InstanceForestSelectionScale` covers raw and cached selection across
+  forests of mounted instance hierarchies.
 - `BM_FlatInstanceLifecycle` measures steady-state TLAS spawn/remove plus its
   amortized maintenance barrier in a 1,024-object population.
 - `BM_BoundsOverrideBatch` measures sparse and promoted-dense copy-on-write
@@ -75,11 +85,15 @@ custom output paths are required.
 Run either executable directly after a build when preferred:
 
 ```sh
-build/bench/frontier_bench \
+build-perf/bench/frontier_bench \
   --benchmark_filter=BM_SubtreeAssembly \
   --benchmark_out=result.json \
   --benchmark_out_format=json
 ```
+
+Multi-config generators place the executable under the configuration
+directory instead, for example
+`build-perf/bench/Release/frontier_bench.exe` with Visual Studio.
 
 Replace `frontier_bench` with `frontier_bench_payload32` for the matched
 four-byte build.

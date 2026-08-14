@@ -64,8 +64,8 @@ Builder output and every mount boundary maintain:
 3. a parent bound contains every local child bound;
 4. effective error never increases below a parent;
 5. a node has local children or a mounted child, never both;
-6. a transformed mounted definition fits inside the mount point's authored
-   bound.
+6. a transformed mounted definition fits inside the shared authored bound of a
+   definition node, or the current instance-local root bound of a TLAS root.
 
 The runtime carries the parent's effective error ceiling as a per-placement
 scalar. It does not modify shared error arrays.

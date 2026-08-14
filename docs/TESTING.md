@@ -1,11 +1,11 @@
 # Testing Frontier
 
 Frontier's tests are organized around the distinction between caller
-contracts, internal invariants, selection correctness, and performance. A
-unit-test run is always a Debug build with caller checks, internal assertions,
-and serialized-subtree validation enabled. SIMD backends, instrumented builds,
-randomized lifecycle models, and sanitizers catch different classes of
-failure.
+contracts, internal invariants, selection correctness, and performance. The
+repository unit-test runners use Debug builds with caller checks, internal
+assertions, and serialized-subtree validation enabled. SIMD backends,
+instrumented builds, randomized lifecycle models, and sanitizers catch
+different classes of failure.
 
 ## Correctness suite
 
