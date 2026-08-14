@@ -5,6 +5,8 @@ project(Frontier VERSION 0.7.0 LANGUAGES CXX)
 # embedded with add_subdirectory(), do not fetch or build its test-only
 # dependencies unless the parent explicitly opts in.
 option(FRONTIER_BUILD_TESTS "Build unit tests" ${PROJECT_IS_TOP_LEVEL})
+option(FRONTIER_TEST_PAYLOAD32
+       "Build additional BVH4/BVH8 unit tests with four-byte payload words" OFF)
 option(FRONTIER_BUILD_BENCH "Build performance tests" OFF)
 option(FRONTIER_AVX2 "Enable AVX2 code generation for BVH8 (x86-64 only)" ON)
 option(FRONTIER_FORCE_SCALAR "Disable SIMD intrinsics; use the portable scalar paths" OFF)
@@ -157,6 +159,22 @@ if(FRONTIER_BUILD_TESTS)
     add_library(frontier_test_alternate STATIC ${FRONTIER_SOURCES})
     frontier_configure_library(frontier_test_alternate
                                ${FRONTIER_ALTERNATE_BVH_WIDTH})
+
+    if(FRONTIER_TEST_PAYLOAD32)
+        add_library(frontier_test_payload32 STATIC ${FRONTIER_SOURCES})
+        frontier_configure_library(frontier_test_payload32
+                                   ${FRONTIER_EFFECTIVE_BVH_WIDTH})
+        target_compile_definitions(frontier_test_payload32 PUBLIC
+            FRONTIER_USER_PAYLOAD=::std::uint32_t
+            FRONTIER_INVALID_PAYLOAD=UINT32_MAX)
+
+        add_library(frontier_test_payload32_alternate STATIC ${FRONTIER_SOURCES})
+        frontier_configure_library(frontier_test_payload32_alternate
+                                   ${FRONTIER_ALTERNATE_BVH_WIDTH})
+        target_compile_definitions(frontier_test_payload32_alternate PUBLIC
+            FRONTIER_USER_PAYLOAD=::std::uint32_t
+            FRONTIER_INVALID_PAYLOAD=UINT32_MAX)
+    endif()
 endif()
 
 # ---- external deps via FetchContent ------------------------------------------

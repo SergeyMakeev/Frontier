@@ -932,11 +932,17 @@ one worker, `parallelFor` must be non-null. Selection likewise rejects invalid
 cameras, thresholds, culling limits, and current-cut policy values before
 traversal begins.
 
-Contract violations route through `FRONTIER_FATAL`, which throws
-`std::logic_error` by default. Exception-free hosts can define it before any
-Frontier include. Treat this as a panic hook for programmer errors, not a
-recoverable input-error channel: unless a function explicitly says otherwise,
-Frontier does not promise transactional rollback after a contract failure.
+Contract violations route through `FRONTIER_FATAL`. With compiler exception
+support enabled, the default throws `std::logic_error`; under
+`-fno-exceptions`, the default aborts. A host can define the macro before any
+Frontier include to use its own non-returning panic handler. Treat this as a
+programmer-error hook, not a recoverable input-error channel: unless a function
+explicitly says otherwise, Frontier does not promise transactional rollback
+after a contract failure.
+
+Internal retained-storage exhaustion is separate from caller contracts. The
+append buffer preserves the standard `std::length_error`/`std::bad_alloc`
+behavior when exceptions are enabled and aborts when they are disabled.
 
 ## 13. End-to-end example: reusable houses in a streamed city
 

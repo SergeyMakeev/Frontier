@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstddef>
 #include <limits>
+#include <stdexcept>
 #include <utility>
 
 #include "frontier/detail/subtree_data.h"
@@ -51,6 +52,13 @@ TEST(Contracts, DefaultAllocatorRejectsInvalidOrOverflowingRequests)
     EXPECT_EQ(defaultAlloc(16, 3, nullptr), nullptr);
     EXPECT_EQ(defaultAlloc(std::numeric_limits<size_t>::max(), 64, nullptr),
               nullptr);
+}
+
+TEST(Contracts, AppendBufferRejectsUnrepresentableCapacity)
+{
+    detail::AppendBuffer<uint64_t> buffer;
+    EXPECT_THROW(buffer.reserve(std::numeric_limits<size_t>::max()),
+                 std::length_error);
 }
 
 TEST(Contracts, SubtreeBytesPreserveCustomAllocatorOwnershipAcrossCopiesAndMoves)

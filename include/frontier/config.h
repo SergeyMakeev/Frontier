@@ -5,7 +5,7 @@
 // Everything here is designed to be overridden by the embedding project by
 // defining the macro BEFORE including any frontier header:
 //
-//   #define FRONTIER_FATAL(msg) MyEngine::Panic(msg)   // exceptions-off builds
+//   #define FRONTIER_FATAL(msg) MyEngine::Panic(msg)   // optional host panic
 //   #include "frontier/spatial_database.h"
 
 #include <cstddef>
@@ -71,15 +71,25 @@
 // quiet no-ops and queries report absent. That distinction is the whole
 // reason streaming callers can be written without locks.
 //
-// The default throws, which keeps the contract tests expressive. Projects
-// building without exceptions should define FRONTIER_FATAL to abort or to their
-// own panic handler.
+// With C++ exceptions enabled, the default throws, which keeps the contract
+// tests expressive. With compiler exception support disabled, the default
+// aborts. Projects may define FRONTIER_FATAL to their own non-returning panic
+// handler in either build mode.
 // ---------------------------------------------------------------------------
 
 #ifndef FRONTIER_FATAL
-  #include <stdexcept>
-  #include <string>
-  #define FRONTIER_FATAL(msg) throw ::std::logic_error(::std::string("frontier: ") + (msg))
+  #if defined(__cpp_exceptions) || defined(__EXCEPTIONS) || defined(_CPPUNWIND)
+    #include <stdexcept>
+    #include <string>
+    #define FRONTIER_FATAL(msg) throw ::std::logic_error(::std::string("frontier: ") + (msg))
+  #else
+    #define FRONTIER_FATAL(msg)                                               \
+        do                                                                    \
+        {                                                                     \
+            (void)sizeof(msg);                                                \
+            ::std::abort();                                                   \
+        } while (false)
+  #endif
 #endif
 
 #if FRONTIER_CONTRACT_CHECKS

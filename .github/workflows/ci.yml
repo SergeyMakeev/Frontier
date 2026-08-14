@@ -27,7 +27,7 @@ jobs:
             cmake_args: -DCMAKE_CXX_COMPILER=g++ -DFRONTIER_AVX2=OFF -DFRONTIER_FORCE_SCALAR=ON
           - name: linux-x64-clang-avx2
             os: ubuntu-latest
-            cmake_args: -DCMAKE_CXX_COMPILER=clang++ -DFRONTIER_AVX2=ON
+            cmake_args: -DCMAKE_CXX_COMPILER=clang++ -DFRONTIER_AVX2=ON -DFRONTIER_TEST_PAYLOAD32=ON
           - name: linux-x64-clang-sse2
             os: ubuntu-latest
             cmake_args: -DCMAKE_CXX_COMPILER=clang++ -DFRONTIER_AVX2=OFF
@@ -225,6 +225,26 @@ jobs:
       - name: Sanitized tests
         run: ctest --test-dir build-sanitize --output-on-failure --parallel 4
 
+  no-exceptions:
+    name: linux-clang-no-exceptions
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: >-
+          cmake -S . -B build-no-exceptions
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_CXX_COMPILER=clang++
+          -DCMAKE_CXX_FLAGS="-fno-exceptions"
+          -DFRONTIER_BUILD_TESTS=OFF
+          -DFRONTIER_BUILD_BENCH=OFF
+          -DFRONTIER_AVX2=OFF
+
+      - name: Build
+        run: cmake --build build-no-exceptions --parallel 4
+
   coverage:
     name: linux-clang-coverage
     runs-on: ubuntu-latest
@@ -236,6 +256,7 @@ jobs:
         run: >-
           cmake -S . -B build-coverage
           -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_C_COMPILER=clang
           -DCMAKE_CXX_COMPILER=clang++
           -DCMAKE_CXX_FLAGS="-fprofile-instr-generate -fcoverage-mapping"
           -DCMAKE_EXE_LINKER_FLAGS="-fprofile-instr-generate -fcoverage-mapping"

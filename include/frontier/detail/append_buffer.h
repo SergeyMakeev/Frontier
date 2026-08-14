@@ -13,6 +13,24 @@
 
 namespace frontier::detail {
 
+[[noreturn]] inline void appendBufferCapacityFailure()
+{
+#if defined(__cpp_exceptions) || defined(__EXCEPTIONS) || defined(_CPPUNWIND)
+    throw std::length_error("AppendBuffer capacity exceeded");
+#else
+    std::abort();
+#endif
+}
+
+[[noreturn]] inline void appendBufferAllocationFailure()
+{
+#if defined(__cpp_exceptions) || defined(__EXCEPTIONS) || defined(_CPPUNWIND)
+    throw std::bad_alloc();
+#else
+    std::abort();
+#endif
+}
+
 // Retained-capacity, append-only storage for trivially copyable hot-path
 // output. It deliberately omits middle insertion, erasure, and shrinking.
 template <class T>
@@ -66,7 +84,7 @@ public:
     void reserve(size_t requested)
     {
         if (requested > maxCapacity())
-            throw std::length_error("AppendBuffer capacity exceeded");
+            appendBufferCapacityFailure();
         if (requested > capacity_)
             reallocate(uint32_t(requested));
     }
@@ -76,7 +94,7 @@ public:
     void resize_uninitialized(size_t requested)
     {
         if (requested > maxCapacity())
-            throw std::length_error("AppendBuffer capacity exceeded");
+            appendBufferCapacityFailure();
         if (requested > capacity_)
             reallocate(uint32_t(requested));
         size_ = uint32_t(requested);
@@ -159,7 +177,7 @@ private:
     uint32_t checkedSize(size_t added) const
     {
         if (added > size_t(maxCapacity() - size_))
-            throw std::length_error("AppendBuffer capacity exceeded");
+            appendBufferCapacityFailure();
         return size_ + uint32_t(added);
     }
 
@@ -175,7 +193,7 @@ private:
     void growForOne()
     {
         if (size_ == maxCapacity())
-            throw std::length_error("AppendBuffer capacity exceeded");
+            appendBufferCapacityFailure();
         uint64_t grown = capacity_ ? uint64_t(capacity_) * 3 / 2 : 8;
         if (grown <= size_) grown = uint64_t(size_) + 1;
         if (grown > maxCapacity()) grown = maxCapacity();
@@ -185,7 +203,7 @@ private:
     void reallocate(uint32_t newCapacity)
     {
         void* next = std::realloc(data_, size_t(newCapacity) * sizeof(T));
-        if (!next) throw std::bad_alloc();
+        if (!next) appendBufferAllocationFailure();
         data_ = static_cast<T*>(next);
         capacity_ = newCapacity;
     }

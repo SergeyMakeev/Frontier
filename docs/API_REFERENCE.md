@@ -76,14 +76,20 @@ FRONTIER_ASSERT(condition, message)
 ```
 
 `FRONTIER_FATAL` handles caller-visible contract failures and must not return.
-Define it before including any Frontier header to replace the default
-exception. `FRONTIER_CHECK` is enabled by default and compiles out when
+With compiler exception support enabled, the default throws
+`std::logic_error`; with exceptions disabled, it aborts. Define it before
+including any Frontier header to install a host panic handler.
+`FRONTIER_CHECK` is enabled by default and compiles out when
 `FRONTIER_CONTRACT_CHECKS=0`. `FRONTIER_ASSERT` is disabled under `NDEBUG`
 unless the host overrides it. Normal streaming races involving
 stale handles do not use these macros. Contract failures are programmer errors,
 not a recoverable result channel; unless a function explicitly documents an
 early preflight guarantee, no transactional rollback is promised if the
 default exception is caught.
+
+Internal `AppendBuffer` capacity and allocation failures are not caller
+contracts. They throw `std::length_error` or `std::bad_alloc` when compiler
+exception support is enabled and abort when it is disabled.
 
 ### SIMD and vector configuration
 

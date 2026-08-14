@@ -39,6 +39,12 @@ The suite contains:
 The randomized tests use fixed seeds. A failure is therefore reproducible and
 does not introduce CI flakiness.
 
+One Clang AVX2 CI configuration additionally enables
+`FRONTIER_TEST_PAYLOAD32`. It repeats the complete BVH4/BVH8 suite with
+four-byte payload words, producing four matched correctness executables in that
+build. Normal local test builds keep this option off to avoid doubling compile
+time.
+
 ## Defensive checks
 
 `FRONTIER_CHECK` enforces caller-visible contracts when
@@ -61,6 +67,9 @@ branch results for library code while excluding tests and third-party sources.
 
 CI builds GCC, Clang, MSVC, clang-cl, and AppleClang configurations across
 x86-64, ARM64, BVH4, BVH8, AVX2, SSE2, NEON, and forced-scalar backends.
+It also compiles the Release library with Clang `-fno-exceptions`; contract
+failures and retained-storage exhaustion use their documented non-returning
+fallbacks in that configuration.
 Locally, the most important additional configurations are:
 
 ```sh
