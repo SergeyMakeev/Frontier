@@ -817,6 +817,7 @@ private:
     uint32_t used_ = 0;
     uint32_t garbage_ = 0;
     uint32_t instanceLayoutVersion_ = 0;
+    uint32_t visibleMappingVersion_ = 0;
     uint32_t databaseGeneration_ = 0;
     uint32_t wholeEpoch_ = 0;
     // Bumped when the error threshold or current-cut policy changes,
@@ -1925,6 +1926,7 @@ private:
     void tlasQuery(const Camera& view, float minPix,
                    std::vector<VisibleItem>& outVisible,
                    std::vector<TlasItem>& stack) const;
+    bool tlasRootContainsPopulation(const Camera& view) const;
     template<bool UseMask, bool UseMinPix>
     void tlasQueryImpl(const Camera& view, float minPix,
                        std::vector<VisibleItem>& outVisible,

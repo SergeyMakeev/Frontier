@@ -1127,6 +1127,10 @@ void selectFrontier(const SpatialDatabase& database,
   non-negative. `params` must satisfy the contracts documented above.
 - **Reuse:** cached entries reproduce the exact node set but may retain their
   earlier quantized magnitude within the proven reuse margin.
+  With default masks and no contribution culling, a previously all-visible
+  stream is retained when the conservative TLAS root remains wholly inside the
+  frustum and the instance mapping epoch is unchanged; otherwise the exact
+  TLAS query rebuilds it.
 
 ### Reset and storage
 

@@ -480,6 +480,13 @@ decision margins remain valid. A snapshot containing only TLAS-owned
 single-node objects automatically uses the direct selection path instead;
 there is no hierarchy walk for a cache hit to avoid.
 
+For the common overview case with no layer or contribution filter, a query
+whose conservative TLAS root lanes remain wholly inside the frustum retains
+its complete visible-instance stream. Revalidation then tests only those root
+lanes instead of rewriting and comparing one item per instance. Instance
+addition, removal, slot reuse, or physical reorder advances a mapping epoch and
+forces an exact stream rebuild.
+
 `currentCutPolicy` controls how an unavailable ideal choice is replaced:
 
 - `PreferReadyDescendants` uses a complete ready descendant cut when one

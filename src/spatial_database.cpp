@@ -175,6 +175,7 @@ struct QueryScratch
     std::vector<SpatialDatabase::TlasItem>    tlasStack;
     detail::FrontierBuffers              output;
     bool retainedVisible = false;
+    bool retainedAllVisible = false;
 
     size_t bytes() const
     {
@@ -2786,29 +2787,12 @@ void SpatialDatabase::tlasQueryImpl(const Camera& view, float minPix,
     // population is visible with no active planes.
     if constexpr (!UseMask && !UseMinPix)
     {
-        const TlasNode& root = tlasNodes_[uint32_t(tlasRoot_)];
-        uint8_t rootMasks[kWide];
-        const uint32_t valid = root.validLanes();
-        const uint32_t inside =
-            testWideAabb(root.bounds, view.frustum, kAllPlanes, rootMasks) &
-            valid;
-        if (inside == valid)
+        if (tlasRootContainsPopulation(view))
         {
-            bool allInside = true;
-            uint32_t lanes = valid;
-            while (lanes)
-            {
-                const uint32_t lane = uint32_t(std::countr_zero(lanes));
-                lanes &= lanes - 1;
-                allInside &= rootMasks[lane] == 0;
-            }
-            if (allInside)
-            {
-                outVisible.reserve(liveInstances_.size());
-                for (const InstanceId instance : liveInstances_)
-                    outVisible.emplace_back(instance, uint8_t(0));
-                return;
-            }
+            outVisible.reserve(liveInstances_.size());
+            for (const InstanceId instance : liveInstances_)
+                outVisible.emplace_back(instance, uint8_t(0));
+            return;
         }
     }
 
@@ -2904,6 +2888,29 @@ void SpatialDatabase::consumeMountUsage(SpatialQuery& query)
 {
     SpatialQuery* queries[] = {&query};
     consumeMountUsage(queries);
+}
+
+bool SpatialDatabase::tlasRootContainsPopulation(const Camera& view) const
+{
+    FRONTIER_CHECK(!tlasDirty_ && pendingMoves_.empty(),
+               "SpatialQuery::selectFrontier: call applyUpdates() after database changes");
+    if (tlasRoot_ < 0) return true;
+
+    const TlasNode& root = tlasNodes_[uint32_t(tlasRoot_)];
+    uint8_t rootMasks[kWide];
+    const uint32_t valid = root.validLanes();
+    const uint32_t inside =
+        testWideAabb(root.bounds, view.frustum, kAllPlanes, rootMasks) & valid;
+    if (inside != valid) return false;
+
+    uint32_t lanes = valid;
+    while (lanes)
+    {
+        const uint32_t lane = uint32_t(std::countr_zero(lanes));
+        lanes &= lanes - 1;
+        if (rootMasks[lane] != 0) return false;
+    }
+    return true;
 }
 
 void SpatialDatabase::consumeMountUsage(std::span<SpatialQuery* const> queries)
@@ -4064,6 +4071,7 @@ void SpatialQuery::reset()
 #endif
     database_ = nullptr;
     instanceLayoutVersion_ = 0;
+    visibleMappingVersion_ = 0;
     databaseGeneration_ = wholeEpoch_ = 0;
     wholeReusable_ = false;
     resetMountUsage();
@@ -4073,6 +4081,7 @@ void SpatialQuery::reset()
         scratch_->visible.clear();
         scratch_->previousVisible.clear();
         scratch_->retainedVisible = false;
+        scratch_->retainedAllVisible = false;
     }
     ++epoch_;
     // The half-life is configuration and survives; the accumulated window is
@@ -4168,10 +4177,19 @@ void SpatialDatabase::selectFrontierCached(const Camera& camera, const Selection
     // rather than about the camera.
     const Camera dv = query.damper_.damp(camera);
 
-    // Whole-cut cache hits already avoid the BLAS walk. Keep the universal
-    // TLAS query lean and test the root only on the smaller miss population.
-    scratch.visible.swap(scratch.previousVisible);
-    tlasQuery(dv, params.minPix, scratch.visible, scratch.tlasStack);
+    // An all-visible stream is exactly `liveInstances_` with zero plane masks.
+    // If the root lanes remain wholly inside, one BVH-width test proves that
+    // the retained stream is still exact; do not rewrite and compare 40 KiB.
+    const bool allVisible = params.minPix == 0.0f && dv.viewMask == ~0u &&
+                            tlasRootContainsPopulation(dv);
+    const bool retainVisible = allVisible && scratch.retainedAllVisible &&
+                               query.visibleMappingVersion_ ==
+                                   instanceMappingVersion_;
+    if (!retainVisible)
+    {
+        scratch.visible.swap(scratch.previousVisible);
+        tlasQuery(dv, params.minPix, scratch.visible, scratch.tlasStack);
+    }
 
     const uint32_t nVis = uint32_t(scratch.visible.size());
 
@@ -4232,12 +4250,12 @@ void SpatialDatabase::selectFrontierCached(const Camera& camera, const Selection
     // tiny range appends just to reconstruct identical bytes.
     const float wholeTravel = query.travel_ - query.wholeTravel_;
     const float wholeKTravel = query.kTravel_ - query.wholeKTravel_;
-    const bool sameVisible =
-        scratch.retainedVisible &&
+    const bool sameVisible = retainVisible ||
+        (scratch.retainedVisible &&
         scratch.visible.size() == scratch.previousVisible.size() &&
         (scratch.visible.empty() ||
          std::memcmp(scratch.visible.data(), scratch.previousVisible.data(),
-                     scratch.visible.size() * sizeof(VisibleItem)) == 0);
+                     scratch.visible.size() * sizeof(VisibleItem)) == 0));
     if (outResult.retainsExisting_ && usage == nullptr &&
         query.wholeReusable_ && sameVisible &&
         query.databaseGeneration_ == generationCounter_ &&
@@ -4570,6 +4588,8 @@ void SpatialDatabase::selectFrontierCached(const Camera& camera, const Selection
     query.wholeEpoch_ = query.epoch_;
     query.databaseGeneration_ = generationCounter_;
     scratch.retainedVisible = outResult.retainsExisting_;
+    scratch.retainedAllVisible = outResult.retainsExisting_ && allVisible;
+    query.visibleMappingVersion_ = instanceMappingVersion_;
 #ifdef FRONTIER_STATS
     query.stats_ = w.stats;
 #endif
