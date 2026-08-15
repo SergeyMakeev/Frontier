@@ -61,8 +61,8 @@ TEST(QueryCache, RetainsWholeInternalResultButStillFillsExternalSinks)
         query.selectFrontier(database, camera, {});
     EXPECT_EQ(patched.shared.data(), retained);
     EXPECT_EQ(patched.shared.size(), 32u);
-    EXPECT_EQ(query.reused(), 31u);
-    EXPECT_EQ(query.walked(), 1u);
+    EXPECT_EQ(query.reused(), 32u);
+    EXPECT_EQ(query.walked(), 0u);
 
     std::array<FrontierEntry, 32> shared{};
     FrontierResultSink sink{Sink<FrontierEntry>{shared},

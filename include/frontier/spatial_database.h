@@ -2035,8 +2035,13 @@ private:
     size_t                flatInstanceCount_ = 0;
     size_t                tlasZeroErrorFlatInstanceCount_ = 0;
     // Cache hits need only this stamp, not the 80-byte Instance record. It is
-    // parallel to instances_ and bumped for transform or deformation changes.
+    // parallel to instances_ and bumped for scale, topology, or deformation
+    // changes. Translation is charged to the distance budget below instead.
     std::vector<uint32_t> instanceFrontierVersions_;
+    // Monotonic translation path length per instance. Moving an object by d
+    // changes every relative camera distance by at most d, so cached LOD cuts
+    // remain exact while this plus query travel stays inside their margin.
+    std::vector<float> instanceMotionTravel_;
     std::vector<InstanceId> liveInstances_;
     std::vector<uint32_t> freeInstances_;
     // Public InstanceHandle/FrontierEntry ids remain stable while optimize() or the

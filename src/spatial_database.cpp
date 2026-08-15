@@ -1164,6 +1164,7 @@ InstanceHandle SpatialDatabase::addTlasRootInstance(
         instances_.emplace_back();
         if (!tlasRootPayloads_.empty()) tlasRootPayloads_.emplace_back();
         instanceFrontierVersions_.emplace_back();
+        instanceMotionTravel_.emplace_back();
         instanceDenseToHandle_.push_back(kInvalidInstanceId);
         id = InstanceId(instances_.size() - 1);
     }
@@ -1202,6 +1203,7 @@ InstanceHandle SpatialDatabase::addTlasRootInstance(
     inst.worldBox = worldBounds;
     inst.maxErrWorld = worldError;
     instanceFrontierVersions_[id] = ++generationCounter_;
+    instanceMotionTravel_[id] = 0.0f;
     inst.liveIndex = uint32_t(liveInstances_.size());
     liveInstances_.push_back(id);
     if (!instanceFlatSlots_.empty())
@@ -1359,11 +1361,17 @@ void SpatialDatabase::moveInstanceDense(InstanceId dense, float4 pos, float scal
         return;
     AABB worldBox;
     float maxErrWorld = inst.maxErrWorld;
+    float nextTravel = instanceMotionTravel_[dense];
     if (scale == inst.scale)
     {
         const float4 delta = pos - inst.pos;
         worldBox = AABB::fromMinMax(inst.worldBox.mn + delta,
                                     inst.worldBox.mx + delta);
+        // L1 distance conservatively bounds Euclidean translation while
+        // avoiding a square root per moved root. It is exact for the common
+        // single-axis animation/streaming shifts.
+        nextTravel += std::fabs(delta.x) + std::fabs(delta.y) +
+                      std::fabs(delta.z);
     }
     else
     {
@@ -1378,11 +1386,22 @@ void SpatialDatabase::moveInstanceDense(InstanceId dense, float4 pos, float scal
     FRONTIER_CHECK(finiteNonEmptyBounds(worldBox) &&
                        std::isfinite(maxErrWorld),
                    "SpatialDatabase::moveInstance: transformed root overflows");
+    if (scale != inst.scale || !std::isfinite(nextTravel))
+    {
+        // Scale changes alter the error field itself. Extremely long-running
+        // translation odometers also restart safely by invalidating once.
+        instanceMotionTravel_[dense] = 0.0f;
+        instanceFrontierVersions_[dense] = ++generationCounter_;
+    }
+    else
+    {
+        instanceMotionTravel_[dense] = nextTravel;
+        ++generationCounter_;
+    }
     inst.pos = pos;
     inst.scale = scale;
     inst.worldBox = worldBox;
     inst.maxErrWorld = maxErrWorld;
-    instanceFrontierVersions_[dense] = ++generationCounter_;
     tlasOnInstanceMoved(dense);
 }
 
@@ -2561,6 +2580,7 @@ void SpatialDatabase::reorderInstancesByTlas()
     const bool hadTlasRootPayloads = !tlasRootPayloads_.empty();
     if (hadTlasRootPayloads) newTlasRootPayloads.resize(liveCount);
     std::vector<uint32_t> newFrontierVersions(liveCount);
+    std::vector<float> newMotionTravel(liveCount);
     std::vector<InstanceId> newDenseToHandle(liveCount, kInvalidInstanceId);
     std::vector<uint32_t> newFlat;
     const bool hadFlatStream = !instanceFlatSlots_.empty();
@@ -2573,6 +2593,7 @@ void SpatialDatabase::reorderInstancesByTlas()
         if (hadTlasRootPayloads)
             newTlasRootPayloads[next] = tlasRootPayloads_[old];
         newFrontierVersions[next] = instanceFrontierVersions_[old];
+        newMotionTravel[next] = instanceMotionTravel_[old];
         newDenseToHandle[next] = instanceDenseToHandle_[old];
         if (hadFlatStream) newFlat[next] = instanceFlatSlots_[old];
         if (newInstances[next].rootSlot != kInvalidIndex)
@@ -2582,6 +2603,7 @@ void SpatialDatabase::reorderInstancesByTlas()
     if (hadTlasRootPayloads)
         tlasRootPayloads_.swap(newTlasRootPayloads);
     instanceFrontierVersions_.swap(newFrontierVersions);
+    instanceMotionTravel_.swap(newMotionTravel);
     instanceDenseToHandle_.swap(newDenseToHandle);
     if (hadFlatStream) instanceFlatSlots_.swap(newFlat);
 
@@ -4276,7 +4298,9 @@ void SpatialDatabase::selectFrontierCached(const Camera& camera, const Selection
         // inside, so no plane was tested anywhere within it and camera
         // rotation cannot matter. `travel_ < validUntil` is the margin.
         bool hit = mask == 0 &&
-                   query.travel_ + r.kSlope * query.kTravel_ < r.validUntil &&
+                   query.travel_ + instanceMotionTravel_[instIdx] +
+                           r.kSlope * query.kTravel_ <
+                       r.validUntil &&
                    r.epoch == query.epoch_ &&
                    r.frontierVersion == instanceFrontierVersions_[instIdx];
         if (hit && depCount != 0)
@@ -4321,7 +4345,9 @@ void SpatialDatabase::selectFrontierCached(const Camera& camera, const Selection
                 outResult.idealOnly.pushRange(entries + shared + current, ideal);
             }
             const float remaining =
-                r.validUntil - query.travel_ - r.kSlope * query.kTravel_;
+                r.validUntil - query.travel_ -
+                instanceMotionTravel_[instIdx] -
+                r.kSlope * query.kTravel_;
             wholeMargin = std::min(wholeMargin, remaining);
             wholeMaxSlope = std::max(wholeMaxSlope, r.kSlope);
             ++query.reused_;
@@ -4426,7 +4452,9 @@ void SpatialDatabase::selectFrontierCached(const Camera& camera, const Selection
             // so nothing can flip) becomes an unbounded budget.
             const float m = w.margin * inst.scale;
             r.kSlope = w.maxError * inst.scale / params.threshold;
-            const float consumed = query.travel_ + r.kSlope * query.kTravel_;
+            const float consumed = query.travel_ +
+                                   instanceMotionTravel_[instIdx] +
+                                   r.kSlope * query.kTravel_;
             r.validUntil = m >= FLT_MAX - consumed ? FLT_MAX : consumed + m;
             r.epoch = query.epoch_;
             r.frontierVersion = instanceFrontierVersions_[instIdx];
@@ -4450,7 +4478,9 @@ void SpatialDatabase::selectFrontierCached(const Camera& camera, const Selection
         if (eligible)
         {
             const float remaining =
-                r.validUntil - query.travel_ - r.kSlope * query.kTravel_;
+                r.validUntil - query.travel_ -
+                instanceMotionTravel_[instIdx] -
+                r.kSlope * query.kTravel_;
             wholeMargin = std::min(wholeMargin, remaining);
             wholeMaxSlope = std::max(wholeMaxSlope, r.kSlope);
         }

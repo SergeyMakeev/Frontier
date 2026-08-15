@@ -218,3 +218,45 @@ Stationary and 0.1-unit camera cases retained their 4.1-4.3x speedups. The
 pre-change measurement. `RecCold` grows from 4 to 16 bytes, adding 120 KiB at
 10,000 record slots; these offsets are never fetched by the hit-validation
 path. Raw result: `experiment5-a.json`.
+
+## Experiment 6: charge object translation to cache validity margins
+
+**Status: retained.**
+
+### Theory
+
+The cache invalidated a root's cut on every transform version change. For a
+pure translation, that discards information the cache already computed: moving
+an object by distance `d` changes its relative distance to the camera by at
+most `d`, exactly the same Lipschitz bound used for camera travel. The exact
+TLAS leaf is still updated and queried, so frustum visibility remains current.
+
+Maintain a monotonic translation path length per instance and include it in
+the record's consumed validity budget. Translation no longer changes the
+frontier-content version; a root is re-walked only when its accumulated motion
+actually reaches an LOD decision boundary. Scale, deformation, topology, and
+readiness changes still invalidate by version. Odometer overflow also bumps
+the version and restarts from zero.
+
+### Result
+
+Pinned 0.40-second samples, nine repetitions:
+
+| Workload | Initial baseline | Motion-budget cache | Speedup |
+|---|---:|---:|---:|
+| Move/publish/select 10% of 10k | 157 us | 70.3 us | 2.23x |
+| Move/publish/select 100% of 10k | 1,167 us | 230 us | 5.07x |
+
+Both workloads retain essentially 100% of root cuts; the 10% case averaged
+0.084 walked roots per call and the mass-motion median walked none. Replacing
+Euclidean travel with its conservative L1 bound improved the initial version
+of this experiment from 71.5 to 70.3 us and from 236 to 230 us, while avoiding
+one square root per moved root.
+
+The translation odometer costs one four-byte float per root. The standalone
+400-root changed `MotionGroup` microbenchmark rises from the pre-campaign
+2.13 us to 3.16 us because it measures the new bound accounting but no
+selection benefit; unchanged submissions remain 1.28 us versus 2.17 us
+initially. In the complete dynamic frame, the avoided BLAS/cache rebuild work
+dwarfs that accounting cost. Raw results: `experiment6-a.json` and
+`experiment6-l1.json`.

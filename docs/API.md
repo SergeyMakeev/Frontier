@@ -762,12 +762,19 @@ originally stored at `i`—while Frontier updates the corresponding dense
 instance records in physical database order.
 
 Physical ordering matters because a movement writes the instance record, its
-frontier-version entry, and one TLAS leaf-to-root path. After spatial
+translation-travel odometer, and one TLAS leaf-to-root path. After spatial
 optimization, nearby dense records also tend to occupy nearby TLAS branches.
 Walking the cached order therefore turns otherwise scattered instance writes
 into a mostly sequential stream and reuses nearby TLAS cache lines. It also
 avoids resolving every public handle through the handle-to-dense table on every
 frame; the cached dense id is validated directly, so stale handles remain safe.
+
+Pure translation does not automatically discard a reusable frontier. Frontier
+charges the translation's conservative L1 distance against the same exact
+decision margin used for camera travel, while the updated exact TLAS leaf
+continues to enforce current frustum visibility. A scale change still
+invalidates the affected record because it changes geometric error as well as
+distance.
 
 The first update after construction or `reset()` resolves and sorts the cohort.
 The database automatically rebuilds that cache after `optimize()` or another

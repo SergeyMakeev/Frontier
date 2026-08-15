@@ -1295,7 +1295,8 @@ void moveInstance(InstanceHandle instance, const Transform& transform);
 
 - **Parameters:** new world translation and scale for the whole instance.
 - **Effects:** moves the TLAS root and every mounted descendant as one object;
-  invalidates affected query reuse records but not public handles.
+  pure translation consumes affected query records' exact distance margins,
+  while scale changes invalidate those records. Public handles remain valid.
 - **Stale behavior:** no-op.
 - **Contract:** position and scale are finite, with positive scale and finite
   reciprocal. The transformed root bound and error must remain representable
@@ -1318,7 +1319,7 @@ the corresponding physical database order. The cache refreshes automatically
 after `optimize()` or another layout change.
 
 The cached order is intended for cohorts updated repeatedly. It keeps dense
-instance and version writes sequential and improves reuse of nearby TLAS paths,
+instance and motion-odometer writes sequential and improves reuse of nearby TLAS paths,
 especially after instances have been spatially reordered. It also avoids a
 fresh public-handle-to-dense lookup for every member on every update. The first
 update after construction or `reset()`, and any update after a layout change,
