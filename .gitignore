@@ -6,3 +6,4 @@ profile_results/
 *.trace.zip
 *.user
 .vs/
+_reports_
