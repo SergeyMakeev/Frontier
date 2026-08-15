@@ -73,3 +73,34 @@ versus 850 us (1.37x) and showed no material change in camera selection,
 stable cache hits, raw traversal, or `MotionGroup`. Debug BVH4 and BVH8 both
 passed all 180 tests. Raw results: `experiment1-a.json`,
 `experiment1-baseline-b.json`, and `experiment1-b.json`.
+
+## Experiment 2: reject unchanged transforms before derived-state work
+
+**Status: retained.**
+
+### Theory
+
+`MotionGroup` is deliberately a persistent caller cohort, so real animation
+systems can submit transforms for objects that are paused or unchanged. The
+old path translated the world bound, rewrote the instance, bumped its frontier
+version, rewrote its exact TLAS leaf, and checked ancestor bounds even when the
+new transform was bit-for-bit identical to the stored transform. An exact
+position/scale comparison before all derived-state work makes unchanged
+submissions true no-ops and, crucially, keeps their cached cuts valid.
+
+### Result
+
+Pinned 0.40-second samples, nine repetitions:
+
+| `MotionGroup` workload | Before | After | Speedup |
+|---|---:|---:|---:|
+| 128 unchanged roots | 0.718 us | 0.387 us | 1.86x |
+| 400 unchanged roots | 2.17 us | 1.18 us | 1.84x |
+| 400 changed roots | 2.13 us | 2.28 us | 7.0% slower |
+
+The exact equality gate adds four predictable comparisons to genuinely changed
+roots, costing about 0.10 us per 400 submissions, but saves 1.04 us when the
+cohort is unchanged and prevents needless cache invalidation. Complete
+10%- and 100%-moving frame medians remained within the existing run-to-run
+noise (155 us and 869 us). Raw results: `experiment2-baseline.json` and
+`experiment2-a.json`.

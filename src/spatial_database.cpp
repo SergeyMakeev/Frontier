@@ -1348,6 +1348,12 @@ void SpatialDatabase::moveInstanceDense(InstanceId dense, float4 pos, float scal
     FRONTIER_CHECK(representableScale(scale) &&
                        finitePosition(pos),
                    "SpatialDatabase::moveInstance: invalid transform");
+    // Animation systems commonly submit a stable cohort every frame even
+    // when many members did not move. Preserve their frontier records and
+    // avoid touching the exact TLAS leaf or ancestor chain at all.
+    if (scale == inst.scale && pos.x == inst.pos.x &&
+        pos.y == inst.pos.y && pos.z == inst.pos.z)
+        return;
     AABB worldBox;
     float maxErrWorld = inst.maxErrWorld;
     if (scale == inst.scale)
