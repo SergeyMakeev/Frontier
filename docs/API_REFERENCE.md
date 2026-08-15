@@ -1315,8 +1315,9 @@ public:
 ```
 
 A motion group owns a copy of a stable caller-order instance cohort and caches
-the corresponding physical database order. The cache refreshes automatically
-after `optimize()` or another layout change.
+the corresponding physical database order. A database mapping epoch validates
+the cohort once per call; the cache refreshes automatically after instance
+addition, removal, slot reuse, `optimize()`, or another layout change.
 
 The cached order is intended for cohorts updated repeatedly. It keeps dense
 instance and motion-odometer writes sequential and improves reuse of nearby TLAS paths,

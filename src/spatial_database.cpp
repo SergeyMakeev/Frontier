@@ -1206,6 +1206,7 @@ InstanceHandle SpatialDatabase::addTlasRootInstance(
     instanceMotionTravel_[id] = 0.0f;
     inst.liveIndex = uint32_t(liveInstances_.size());
     liveInstances_.push_back(id);
+    if (++instanceMappingVersion_ == 0) ++instanceMappingVersion_;
     if (!instanceFlatSlots_.empty())
         if (instanceFlatSlots_.size() < instances_.size())
             instanceFlatSlots_.resize(instances_.size(), kInvalidIndex);
@@ -1274,7 +1275,7 @@ void SpatialDatabase::MotionGroup::reset(
     instances_.clear();
     instances_.append(instances.data(), instances.size());
     physicalOrder_.clear();
-    layoutVersion_ = 0;
+    mappingVersion_ = 0;
     physicalOrderValid_ = false;
 }
 
@@ -1327,6 +1328,7 @@ void SpatialDatabase::removeInstance(InstanceHandle ref)
     liveInstances_[liveIndex] = moved;
     instances_[moved].liveIndex = liveIndex;
     liveInstances_.pop_back();
+    if (++instanceMappingVersion_ == 0) ++instanceMappingVersion_;
     if (liveInstances_.empty()) instanceLayoutSpatialized_ = false;
     instances_[id].liveIndex = kInvalidIndex;
     instances_[id].setAlive(false);
@@ -1431,7 +1433,7 @@ void SpatialDatabase::refreshMotionGroup(MotionGroup& group) const
         i = last + 1;
     }
     group.physicalOrder_.resize_uninitialized(out);
-    group.layoutVersion_ = instanceLayoutVersion_;
+    group.mappingVersion_ = instanceMappingVersion_;
     group.physicalOrderValid_ = true;
 }
 
@@ -1444,19 +1446,11 @@ void SpatialDatabase::moveInstances(MotionGroup& group,
     FRONTIER_CHECK(representableScale(scale),
                    "SpatialDatabase::moveInstances: invalid scale");
     if (!group.physicalOrderValid_ ||
-        group.layoutVersion_ != instanceLayoutVersion_)
+        group.mappingVersion_ != instanceMappingVersion_)
         refreshMotionGroup(group);
 
     for (const MotionGroup::Slot slot : group.physicalOrder_)
-    {
-        if (slot.dense >= instances_.size()) continue;
-        const InstanceHandle ref = group.instances_[slot.source];
-        const Instance& inst = instances_[slot.dense];
-        if (!inst.alive() || inst.generation != ref.generation ||
-            instanceDenseToHandle_[slot.dense] != ref.id)
-            continue;
         moveInstanceDense(slot.dense, positions[slot.source], scale);
-    }
 }
 
 // ============================================================================
@@ -2621,6 +2615,7 @@ void SpatialDatabase::reorderInstancesByTlas()
 
     instanceLayoutSpatialized_ = liveCount != 0;
     if (++instanceLayoutVersion_ == 0) ++instanceLayoutVersion_;
+    if (++instanceMappingVersion_ == 0) ++instanceMappingVersion_;
 }
 
 // Two-tier rebuild policy:

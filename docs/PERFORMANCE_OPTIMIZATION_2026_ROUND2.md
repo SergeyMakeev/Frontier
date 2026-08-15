@@ -260,3 +260,37 @@ selection benefit; unchanged submissions remain 1.28 us versus 2.17 us
 initially. In the complete dynamic frame, the avoided BLAS/cache rebuild work
 dwarfs that accounting cost. Raw results: `experiment6-a.json` and
 `experiment6-l1.json`.
+
+## Experiment 7: validate a cached motion cohort once
+
+**Status: retained.**
+
+### Theory
+
+A persistent `MotionGroup` already resolves, filters, deduplicates, and sorts
+its public handles when its physical-order cache is built. Nevertheless, every
+later frame revalidated every cached dense id with a bounds check, instance
+generation comparison, and reverse-map lookup. Those checks can only change
+when an instance is added, removed, reuses a slot, or dense storage is
+reordered.
+
+Maintain one database mapping epoch across exactly those operations. A single
+epoch comparison before the loop proves the whole cached cohort valid; on a
+mismatch the existing refresh path resolves every public handle again. The hot
+loop then contains only the dense instance update. A regression test primes a
+group, removes one member, reuses its dense slot for a new instance, and proves
+the stale group cannot move the replacement.
+
+### Result
+
+Pinned 0.40-second samples, nine repetitions:
+
+| Workload | Per-root validation | Cohort epoch | Speedup |
+|---|---:|---:|---:|
+| `MotionGroup`, 400 changed roots | 3.16 us | 2.94 us | 1.08x |
+| `MotionGroup`, 400 unchanged roots | 1.28 us | 0.894 us | 1.43x |
+| Move/publish/select 10% of 10k | 70.3 us | 67.6 us | 1.04x |
+| Move/publish/select 100% of 10k | 230 us | 228 us | 1.01x |
+
+The full Debug BVH4/BVH8 matrix passes 184/184 tests. Raw result:
+`experiment7-a.json`.

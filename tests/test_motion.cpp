@@ -154,6 +154,33 @@ TEST(Motion, MotionGroupIgnoresStaleHandles)
     EXPECT_NEAR(moved.center().x, 20.0f, 0.001f);
 }
 
+TEST(Motion, CachedMotionGroupRefreshesBeforeDenseSlotReuse)
+{
+    SpatialDatabase database;
+    const InstanceHandle old = database.instantiate(node(1, 0.0f, box()));
+    const InstanceHandle survivor =
+        database.instantiate(node(2, 0.0f, box()));
+    const std::array<InstanceHandle, 2> handles{old, survivor};
+    SpatialDatabase::MotionGroup group(handles);
+
+    const std::array<float4, 2> firstPositions{
+        float4::point(10, 0, 0), float4::point(20, 0, 0)};
+    database.moveInstances(group, firstPositions);
+
+    database.removeInstance(old);
+    const InstanceHandle replacement = database.instantiate(
+        node(3, 0.0f, box()), InstanceDesc{.pos = float4::point(7, 0, 0)});
+    const std::array<float4, 2> secondPositions{
+        float4::point(100, 0, 0), float4::point(30, 0, 0)};
+    database.moveInstances(group, secondPositions);
+    database.applyUpdates();
+
+    EXPECT_NEAR(TestAccess::instanceBounds(database, survivor).center().x,
+                30.0f, 0.001f);
+    EXPECT_NEAR(TestAccess::instanceBounds(database, replacement).center().x,
+                7.0f, 0.001f);
+}
+
 TEST(Motion, MotionGroupDuplicateHandlesUseTheFinalCallerPosition)
 {
     SpatialDatabase database;

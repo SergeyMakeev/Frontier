@@ -960,7 +960,7 @@ public:
 
         detail::AppendBuffer<InstanceHandle> instances_;
         detail::AppendBuffer<Slot> physicalOrder_;
-        uint32_t layoutVersion_ = 0;
+        uint32_t mappingVersion_ = 0;
         bool physicalOrderValid_ = false;
     };
 
@@ -2050,6 +2050,11 @@ private:
     std::vector<InstanceId> instanceDenseToHandle_;
     std::vector<InstanceId> freeInstanceHandles_;
     uint32_t                instanceLayoutVersion_ = 0;
+    // Add/remove/reorder are the only operations that can invalidate a
+    // MotionGroup's cached public-handle-to-dense mapping. One cohort-level
+    // epoch proof lets the hot motion loop use dense ids without rechecking
+    // every generation stamp and reverse-map entry.
+    uint32_t                instanceMappingVersion_ = 1;
     bool                    instanceLayoutSpatialized_ = false;
 
     std::vector<Overlay>  overlays_;

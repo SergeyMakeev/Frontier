@@ -766,8 +766,9 @@ translation-travel odometer, and one TLAS leaf-to-root path. After spatial
 optimization, nearby dense records also tend to occupy nearby TLAS branches.
 Walking the cached order therefore turns otherwise scattered instance writes
 into a mostly sequential stream and reuses nearby TLAS cache lines. It also
-avoids resolving every public handle through the handle-to-dense table on every
-frame; the cached dense id is validated directly, so stale handles remain safe.
+avoids resolving or validating every public handle on every frame. One database
+mapping epoch proves the complete cached order valid; add, remove, slot reuse,
+and physical reorder advance that epoch and force a safe group refresh.
 
 Pure translation does not automatically discard a reusable frontier. Frontier
 charges the translation's conservative L1 distance against the same exact
