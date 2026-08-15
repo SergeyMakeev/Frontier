@@ -455,6 +455,90 @@ BENCHMARK(BM_MotionGroupSteady)
     ->ArgNames({"instances", "unchanged"})
     ->Unit(benchmark::kMicrosecond);
 
+// End-to-end dynamic-frame cost: move a distributed subset of TLAS roots,
+// publish the exact leaf changes, then select a mounted hierarchy. Static
+// roots remain eligible for exact-cut reuse while moved roots are invalidated
+// by their frontier version.
+static void BM_MovingObjectsSelectionScale(benchmark::State& state)
+{
+    const uint32_t count = uint32_t(state.range(0));
+    const uint32_t movingPercent = uint32_t(state.range(1));
+
+    SpatialDatabase world;
+    const SubtreeHandle definition =
+        world.registerSubtree(makeLodSubtree(50000, 50001, 50002));
+    const uint32_t side =
+        uint32_t(std::ceil(std::sqrt(double(count))));
+    constexpr float pitch = 12.0f;
+    std::vector<InstanceHandle> movingHandles;
+    std::vector<float4> lowPositions;
+    std::vector<float4> highPositions;
+    movingHandles.reserve(size_t(count) * movingPercent / 100u);
+    lowPositions.reserve(movingHandles.capacity());
+    highPositions.reserve(movingHandles.capacity());
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        const float4 position = float4::point(
+            float(int(i % side) - int(side / 2)) * pitch,
+            float(int(i / side) - int(side / 2)) * pitch, 0.0f);
+        InstanceDesc desc;
+        desc.pos = position;
+        const InstanceHandle instance = world.instantiate(
+            node(1000 + i, 64.0f, box(4.0f), true), desc);
+        world.mountSubtree(instance.rootNode(), definition);
+        if ((i % 100u) < movingPercent)
+        {
+            movingHandles.push_back(instance);
+            lowPositions.push_back(position);
+            highPositions.push_back(position + float4::vec(0.0f, 0.25f, 0.0f));
+        }
+    }
+    TestAccess::markAllNodesReady(world);
+    world.applyUpdates();
+
+    SpatialDatabase::MotionGroup motion(movingHandles);
+    const float span = float(side) * pitch;
+    const Camera camera = makeLookAtCamera(
+        float4::point(0.0f, 0.0f, -span),
+        float4::point(0.0f, 0.0f, 0.0f));
+    SpatialQuery query;
+    consume(query.selectFrontier(world, camera, {}));
+
+    bool raised = false;
+    uint64_t calls = 0;
+    uint64_t totalReused = 0;
+    uint64_t totalWalked = 0;
+    FrontierResultView result;
+    for (auto _ : state)
+    {
+        raised = !raised;
+        world.moveInstances(motion,
+            raised ? std::span<const float4>(highPositions)
+                   : std::span<const float4>(lowPositions));
+        world.applyUpdates();
+        result = query.selectFrontier(world, camera, {});
+        consume(result);
+        ++calls;
+        totalReused += query.reused();
+        totalWalked += query.walked();
+    }
+
+    const double callCount = double(calls);
+    const double visited = double(totalReused + totalWalked);
+    state.counters["entries"] = double(result.size());
+    state.counters["moved"] = double(movingHandles.size());
+    state.counters["reused_per_call"] = double(totalReused) / callCount;
+    state.counters["walked_per_call"] = double(totalWalked) / callCount;
+    state.counters["reuse_percent"] =
+        visited == 0.0 ? 0.0 : 100.0 * double(totalReused) / visited;
+}
+
+BENCHMARK(BM_MovingObjectsSelectionScale)
+    ->Args({1000, 10})->Args({1000, 100})
+    ->Args({10000, 10})->Args({10000, 100})
+    ->ArgNames({"instances", "moving_percent"})
+    ->Unit(benchmark::kMicrosecond);
+
 static void BM_MixedReadinessFrontier(benchmark::State& state)
 {
     const uint32_t count = uint32_t(state.range(0));
@@ -713,6 +797,77 @@ BENCHMARK(BM_InstanceForestSelectionScale)
     ->Args({10000, 50, 0})->Args({10000, 50, 1})->Args({10000, 50, 2})
     ->Args({10000, 100, 0})->Args({10000, 100, 1})->Args({10000, 100, 2})
     ->ArgNames({"instances", "hierarchical_percent", "reuse_mode"})
+    ->Unit(benchmark::kMicrosecond);
+
+// Measures actual camera motion rather than forcing cache invalidation through
+// a parameter change. Two prebuilt, identically oriented cameras alternate by
+// the requested translation, so the timed region contains selection only.
+// Accumulated travel periodically exhausts exact-cut validity margins; the
+// counters expose the resulting steady mixture of reused and walked roots.
+static void BM_MovingCameraSelectionScale(benchmark::State& state)
+{
+    const uint32_t count = uint32_t(state.range(0));
+    const float cameraStep = float(state.range(1)) * 0.01f;
+
+    SpatialDatabase world;
+    const SubtreeHandle definition =
+        world.registerSubtree(makeLodSubtree(50000, 50001, 50002));
+    const uint32_t side =
+        uint32_t(std::ceil(std::sqrt(double(count))));
+    constexpr float pitch = 12.0f;
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        InstanceDesc desc;
+        desc.pos = float4::point(
+            float(int(i % side) - int(side / 2)) * pitch,
+            float(int(i / side) - int(side / 2)) * pitch, 0.0f);
+        const InstanceHandle instance = world.instantiate(
+            node(1000 + i, 64.0f, box(4.0f), true), desc);
+        world.mountSubtree(instance.rootNode(), definition);
+    }
+    TestAccess::markAllNodesReady(world);
+    world.applyUpdates();
+
+    const float span = float(side) * pitch;
+    const float4 baseEye = float4::point(0.0f, 0.0f, -span);
+    const float4 baseTarget = float4::point(0.0f, 0.0f, 0.0f);
+    const float4 offset = float4::vec(cameraStep, 0.0f, 0.0f);
+    const Camera cameras[2] = {
+        makeLookAtCamera(baseEye, baseTarget),
+        makeLookAtCamera(baseEye + offset, baseTarget + offset),
+    };
+
+    SpatialQuery query;
+    consume(query.selectFrontier(world, cameras[0], {}));
+
+    uint64_t calls = 0;
+    uint64_t totalReused = 0;
+    uint64_t totalWalked = 0;
+    FrontierResultView result;
+    for (auto _ : state)
+    {
+        result = query.selectFrontier(world, cameras[++calls & 1u], {});
+        consume(result);
+        totalReused += query.reused();
+        totalWalked += query.walked();
+    }
+
+    const double callCount = double(calls);
+    const double visited = double(totalReused + totalWalked);
+    state.counters["camera_step"] = double(cameraStep);
+    state.counters["entries"] = double(result.size());
+    state.counters["reused_per_call"] = double(totalReused) / callCount;
+    state.counters["walked_per_call"] = double(totalWalked) / callCount;
+    state.counters["reuse_percent"] =
+        visited == 0.0 ? 0.0 : 100.0 * double(totalReused) / visited;
+}
+
+BENCHMARK(BM_MovingCameraSelectionScale)
+    ->Args({1000, 0})->Args({1000, 10})
+    ->Args({1000, 1600})->Args({1000, 25600})
+    ->Args({10000, 0})->Args({10000, 10})
+    ->Args({10000, 1600})->Args({10000, 25600})
+    ->ArgNames({"instances", "step_x100"})
     ->Unit(benchmark::kMicrosecond);
 
 // Same mounted population as the refined forest, viewed far enough away that

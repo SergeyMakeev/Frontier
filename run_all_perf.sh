@@ -52,7 +52,7 @@ write_report()
     cat > "${report_dir}/REPORT.md" <<EOF
 # Frontier performance report
 
-- Format: frontier-perf-report-v2
+- Format: frontier-perf-report-v3
 - Status: ${run_status}
 - Failed stage: ${failure_stage}
 - Machine label: ${raw_label}
@@ -65,7 +65,8 @@ write_report()
 - CPU affinity: scheduler default
 - Workload RNG: ${RNG_POLICY}
 - Benchmark order: registration order
-- Unit-test build: Debug
+- End-to-end scope: complete registered frontier_bench suite
+- Unit-test build: Debug; BVH4/BVH8 and 4-byte/8-byte payloads
 - Performance builds: matched 4-byte and 8-byte payloads; Release with IPO;
   contract checks and subtree validation disabled
 
@@ -73,9 +74,11 @@ write_report()
 
 - \`real_world_perf_payload64.json\`: end-to-end workloads with 8-byte payloads
 - \`real_world_perf_payload32.json\`: end-to-end workloads with 4-byte payloads
+- \`benchmark_inventory_payload64.txt\`: expected 8-byte end-to-end cases
+- \`benchmark_inventory_payload32.txt\`: expected 4-byte end-to-end cases
 - \`machine_perf.json\`: ALU, SIMD, branch, cache, latency, and bandwidth probes
 - \`arch_kernel_perf.json\`: focused production-kernel probes with longer sampling
-- \`tests.log\`: Debug BVH4 + BVH8 correctness-suite result
+- \`tests.log\`: Debug BVH4/BVH8 and payload32/payload64 correctness result
 - \`hardware.txt\`: CPU, memory, topology, OS, and power information
 - \`toolchain.txt\`: compiler, CMake, and build configuration
 - \`source.txt\`: exact Git revision and working-tree state
@@ -88,7 +91,7 @@ for the most useful cross-machine comparison.
 EOF
 
     cat > "${report_dir}/manifest.txt" <<EOF
-format=frontier-perf-report-v2
+format=frontier-perf-report-v3
 status=${run_status}
 failure_stage=${failure_stage}
 label=${raw_label}
@@ -99,8 +102,10 @@ git_dirty=${dirty}
 host_os=${host_system}
 host_arch=${host_machine}
 unit_build_type=Debug
+unit_payload_bytes=4,8
 perf_build_type=Release
 perf_payload_bytes=4,8
+end_to_end_scope=complete
 affinity=scheduler-default
 rng_policy=${RNG_POLICY}
 benchmark_order=registration-order
@@ -207,9 +212,13 @@ cat > "${report_dir}/commands.txt" <<EOF
 Correctness:
   ctest --test-dir <unit-build> -C Debug --output-on-failure
 
+Inventory:
+  frontier_bench and frontier_bench_payload32 --benchmark_list_tests=true
+
 Real world:
   frontier_bench (8-byte payload) and frontier_bench_payload32 (4-byte payload)
-    --benchmark_filter=BM_SubtreeAssembly
+    complete registered benchmark suite (no benchmark filter)
+    --benchmark_min_time=0.5s
     --benchmark_repetitions=5
     --benchmark_report_aggregates_only=true
 
@@ -253,6 +262,7 @@ test_configure_args=(
     -B "${TEST_BUILD_DIR}"
     -DCMAKE_BUILD_TYPE=Debug
     -DFRONTIER_BUILD_TESTS=ON
+    -DFRONTIER_TEST_PAYLOAD32=ON
     -DFRONTIER_BUILD_BENCH=OFF
     -DFRONTIER_AVX2="${avx2}"
     -DFRONTIER_BVH_WIDTH=AUTO
@@ -330,6 +340,14 @@ if [[ ! -x "${bench_exe}" || ! -x "${bench32_exe}" || ! -x "${machine_exe}" ]]; 
     exit 1
 fi
 
+failure_stage=benchmark-inventory
+"${bench_exe}" --benchmark_list_tests=true \
+    > "${report_dir}/benchmark_inventory_payload64.txt" \
+    2> "${report_dir}/benchmark_inventory_payload64.log"
+"${bench32_exe}" --benchmark_list_tests=true \
+    > "${report_dir}/benchmark_inventory_payload32.txt" \
+    2> "${report_dir}/benchmark_inventory_payload32.log"
+
 {
     cmake --version
     echo
@@ -346,7 +364,7 @@ fi
 failure_stage=real-world-benchmarks-payload64
 echo "Running real-world performance suite with 8-byte payloads..."
 "${bench_exe}" \
-    '--benchmark_filter=BM_SubtreeAssembly' \
+    --benchmark_min_time=0.5s \
     --benchmark_repetitions=5 \
     --benchmark_report_aggregates_only=true \
     "--benchmark_out=${report_dir}/real_world_perf_payload64.json" \
@@ -355,7 +373,7 @@ echo "Running real-world performance suite with 8-byte payloads..."
 failure_stage=real-world-benchmarks-payload32
 echo "Running real-world performance suite with 4-byte payloads..."
 "${bench32_exe}" \
-    '--benchmark_filter=BM_SubtreeAssembly' \
+    --benchmark_min_time=0.5s \
     --benchmark_repetitions=5 \
     --benchmark_report_aggregates_only=true \
     "--benchmark_out=${report_dir}/real_world_perf_payload32.json" \
@@ -388,6 +406,38 @@ for result in real_world_perf_payload64.json real_world_perf_payload32.json \
         echo "ERROR: ${result} is missing or contains no benchmark records." >&2
         exit 1
     fi
+done
+
+required_families=(
+    BM_SubtreeAssembly_
+    BM_SharedNodeReadiness
+    BM_MotionGroupSteady
+    BM_MovingObjectsSelectionScale
+    BM_MovingCameraSelectionScale
+    BM_FlatTlasSelectionScale
+    BM_InstanceForestSelectionScale
+    BM_FlatInstanceLifecycle
+    BM_BoundsOverrideBatch
+)
+for result in real_world_perf_payload64.json real_world_perf_payload32.json; do
+    for family in "${required_families[@]}"; do
+        if ! grep -q "\"name\": \"${family}" "${report_dir}/${result}"; then
+            echo "ERROR: ${result} is missing required family ${family}." >&2
+            exit 1
+        fi
+    done
+done
+
+for payload in 64 32; do
+    result="${report_dir}/real_world_perf_payload${payload}.json"
+    inventory="${report_dir}/benchmark_inventory_payload${payload}.txt"
+    while IFS= read -r benchmark; do
+        [[ -z "${benchmark}" ]] && continue
+        if ! grep -Fq "\"run_name\": \"${benchmark}\"" "${result}"; then
+            echo "ERROR: payload${payload} result is missing listed case ${benchmark}." >&2
+            exit 1
+        fi
+    done < "${inventory}"
 done
 
 failure_stage=none

@@ -109,8 +109,10 @@ end-to-end public workflows with eight- and four-byte payload words: assembly
 versus flattening, raw and cached selection, mixed-readiness cut policy,
 shared readiness fanout, serialized registration, TLAS scale, instance
 lifecycle, mount lifecycle and retention, stable motion groups, and bounds
-overrides. Each result records `frontier_payload_bytes` in its benchmark
-context so files remain self-describing after collection.
+overrides. It also measures complete move/publish/select frames and translated
+cameras at zero, sub-unit, and large per-frame steps while reporting the
+resulting reuse/walk ratio. Each result records `frontier_payload_bytes` in its
+benchmark context so files remain self-describing after collection.
 `frontier_machine_bench` characterizes kernels and the machine independently.
 See [BENCHMARKING.md](BENCHMARKING.md) for the cases and collection procedure.
 

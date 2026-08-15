@@ -42,6 +42,9 @@ library's macro-based public payload customization.
   for streaming and collapse decisions.
 - `BM_MotionGroupSteady` measures repeated batched root motion through a stable
   `MotionGroup`.
+- `BM_MovingObjectsSelectionScale` moves a distributed 10% or 100% of a
+  mounted 1,000/10,000-root forest, publishes the update, and selects the next
+  frontier. Counters separate roots reused from roots re-walked.
 - `BM_SubtreeBuilder_ConstructCost` isolates serialized definition building
   before registration and instantiation.
 - `BM_SubtreeRegistration` isolates validation and zero-copy registration for
@@ -53,6 +56,10 @@ library's macro-based public payload customization.
 - `BM_InstanceForestSelectionScale` covers raw and cached selection across
   forests of mounted instance hierarchies. Reuse mode 2 alternates cut policy
   to force deterministic cache misses.
+- `BM_MovingCameraSelectionScale` alternates between two translated cameras
+  over a fully hierarchical forest. It covers stationary, 0.1-unit, 16-unit,
+  and 256-unit steps and reports average reused/walked roots and the reuse
+  rate.
 - `BM_InstanceForestRootSelectionScale` uses the same mounted forest but a
   distant camera that stops at renderable TLAS roots, separating top-level
   query/dispatch cost from refined BLAS traversal.
@@ -161,9 +168,10 @@ power state matter.
 
 ## Cross-machine collector
 
-The unified collectors configure a dedicated Release build, run correctness,
-capture both payload-width end-to-end suites plus system/toolchain metadata,
-and package the result:
+The unified collectors configure a dedicated Release build, run the complete
+BVH4/BVH8 and payload32/payload64 Debug correctness matrix, capture the entire
+registered end-to-end benchmark suite for both payload widths, add machine and
+focused-kernel characterization, and package the result:
 
 ```sh
 ./run_all_perf.sh m2-max
@@ -176,7 +184,20 @@ run_all_perf.bat i9
 Output is written below `perf_reports/`. `FRONTIER_PERF_LABEL`,
 `FRONTIER_ALL_PERF_BUILD_DIR`, and `FRONTIER_PERF_REPORT_ROOT` override the
 label and locations. Each report contains `real_world_perf_payload32.json` and
-`real_world_perf_payload64.json`.
+`real_world_perf_payload64.json`. Report format v3 marks
+`end_to_end_scope=complete` in `manifest.txt` and verifies that assembly,
+readiness, root motion, moving-camera selection, flat and hierarchical
+selection, combined moving-object frames, instance lifecycle, and bound-update
+families are present before a report can be `COMPLETE`. The collector also
+records each executable's `--benchmark_list_tests` inventory and proves that
+every listed case appears in the corresponding JSON. Performance uses the
+platform's native `AUTO` BVH width; use the explicit configurations above for
+a full alternate-width performance comparison.
+
+The current registry contains 83 cases per payload build. With five
+0.5-second-minimum repetitions plus correctness and machine characterization,
+a complete report normally takes roughly 10-20 minutes depending on build and
+host speed.
 
 The latest analyzed release snapshot covers M2 Max, RK3399, i9-12900K, and
 EPYC 9654 results from commit `d3f12a0`; see

@@ -23,8 +23,13 @@ complete serialized-subtree validation. Each machine also passed all 180
 Debug correctness tests for the native and alternate BVH widths: 720 test
 executions across the four reports.
 
-The end-to-end collector ran the `BM_SubtreeAssembly` family five times and
-the focused production kernels eleven times. Tables below use the aggregate
+These format-v2 bundles were captured before the cross-machine collector was
+corrected: `run_all_perf.sh` and `.bat` hard-coded the
+`BM_SubtreeAssembly` filter despite describing their output as the end-to-end
+suite. Consequently, the bundles contain that family only; format-v3
+collectors run and validate the complete registered suite. The old collector
+ran the assembly family five times and the focused production kernels eleven
+times. Tables below use the aggregate
 median of Google Benchmark real time. No affinity mask was applied. This
 matches normal scheduler behavior but makes absolute cross-machine rankings
 less controlled, particularly on the heterogeneous i9-12900K and RK3399.
