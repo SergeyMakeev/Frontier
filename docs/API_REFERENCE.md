@@ -1357,6 +1357,24 @@ void moveInstances(MotionGroup& group,
   finite. Each transformed root bound and error must remain representable as
   finite floats.
 
+```cpp
+void translateInstances(MotionGroup& group, float4 delta);
+```
+
+- **Parameters:** one finite world-space translation applied to every live,
+  unique group member.
+- **Effects:** translates the cohort without changing scale. A group covering
+  the complete live population updates a deferred global offset in O(1).
+  Subsets update exact instance state in cached physical order and retain
+  conservative swept TLAS leaf envelopes across bounded repeated motion.
+- **Exactness:** a query that cannot prove a loose leaf wholly visible retests
+  that instance's current bound for frustum and contribution culling.
+- **Reuse accounting:** the L1 delta is charged once to the whole-cut motion
+  odometer and to each affected fallback record (or one shared uniform
+  odometer for a complete population).
+- **Contract:** the translated cohort bounds, positions, and motion odometers
+  must remain finite and representable.
+
 ### Runtime topology assembly
 
 ```cpp

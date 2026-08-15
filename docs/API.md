@@ -758,6 +758,19 @@ SpatialDatabase::MotionGroup trafficGroup(trafficInstances);
 database.moveInstances(trafficGroup, positions, 1.0f);
 ```
 
+When the complete cohort shares one translation, submit that fact directly:
+
+```cpp
+database.translateInstances(trafficGroup, frameDelta);
+```
+
+`translateInstances()` is the preferred rigid-motion path. A group covering
+the complete live population updates one deferred world offset in O(1), without
+rewriting instance records or TLAS nodes. A differential edit, addition, or
+rebuild materializes that offset transparently. Subsets update their exact
+instance transforms, but bounded repeated motion reuses grow-only swept TLAS
+leaf envelopes instead of rewriting the same leaves every frame.
+
 Here **dense order** means Frontier's compact internal instance-slot order. It
 may change during `optimize()`, unlike public `InstanceHandle` identity and the
 caller order retained by `MotionGroup`.
@@ -768,8 +781,9 @@ can keep its natural stable order—`positions[i]` always belongs to the handle
 originally stored at `i`—while Frontier updates the corresponding dense
 instance records in physical database order.
 
-Physical ordering matters because a movement writes the instance record, its
-translation-travel odometer, and one TLAS leaf-to-root path. After spatial
+Physical ordering matters for non-global movement because it writes the
+instance record, its translation-travel odometer, and potentially one TLAS
+leaf-to-root path. After spatial
 optimization, nearby dense records also tend to occupy nearby TLAS branches.
 Walking the cached order therefore turns otherwise scattered instance writes
 into a mostly sequential stream and reuses nearby TLAS cache lines. It also
@@ -779,8 +793,9 @@ and physical reorder advance that epoch and force a safe group refresh.
 
 Pure translation does not automatically discard a reusable frontier. Frontier
 charges the translation's conservative L1 distance against the same exact
-decision margin used for camera travel, while the updated exact TLAS leaf
-continues to enforce current frustum visibility. A scale change still
+decision margin used for camera travel. TLAS leaf envelopes remain
+conservative; queries that reach a loose leaf retest its current instance bound
+exactly. A scale change still
 invalidates the affected record because it changes geometric error as well as
 distance.
 
@@ -797,6 +812,8 @@ Keep a `MotionGroup` alive across frames to amortize the sort—recreating it ea
 frame throws away the benefit. Use individual `moveInstance()` calls for
 occasional movement, changing cohorts, or objects that require different
 scales, since one `moveInstances()` call applies one scale to the whole group.
+Use `translateInstances()` whenever a cohort shares one delta; use
+`moveInstances()` for absolute positions or a shared scale change.
 
 ### Place a mounted definition
 

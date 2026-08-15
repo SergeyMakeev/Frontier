@@ -962,6 +962,10 @@ public:
 
         detail::AppendBuffer<InstanceHandle> instances_;
         detail::AppendBuffer<Slot> physicalOrder_;
+        AABB worldBounds_ = AABB::empty();
+        AABB positionBounds_ = AABB::empty();
+        float maxMotionTravel_ = 0.0f;
+        uint64_t spatialVersion_ = 0;
         uint32_t mappingVersion_ = 0;
         bool physicalOrderValid_ = false;
     };
@@ -980,6 +984,12 @@ public:
     void moveInstances(MotionGroup& group,
                        std::span<const float4> positions,
                        float scale = 1.0f);
+
+    // Translate every live member of a persistent cohort by the same world-
+    // space delta. Unlike submitting N absolute positions, this API carries
+    // the rigid-motion proof explicitly. A cohort covering the complete live
+    // population is therefore an O(1) database mutation.
+    void translateInstances(MotionGroup& group, float4 delta);
 
     // ---- topology streaming -------------------------------------------------
     // A mount-point handle normally comes from a high-error ideal-side
@@ -1546,6 +1556,7 @@ private:
     void invalidateInstanceFrontier(InstanceId dense,
                                     uint32_t generation = 0);
     void refreshMotionGroup(MotionGroup& group) const;
+    void materializeTlasGlobalOffset();
     void reorderInstancesByTlas();
 
     // Wide top-level BVH node; lanes are children (inner nodes or instances).
@@ -2049,11 +2060,19 @@ private:
     // changes every relative camera distance by at most d, so cached LOD cuts
     // remain exact while this plus query travel stays inside their margin.
     std::vector<float> instanceMotionTravel_;
+    // One byte only for roots whose exact bounds are a strict subset of their
+    // grow-only TLAS leaf envelope. Traversal retests those roots exactly when
+    // a query cannot prove the envelope wholly visible.
+    std::vector<uint8_t> instanceTlasLoose_;
     // Sum of the maximum translation submitted in each motion batch. For any
     // individual instance, travel since a query snapshot cannot exceed this
     // global delta. It is deliberately double precision so long-running worlds
     // do not need an O(instance-count) reset.
     double                  instanceMotionTravelGlobal_ = 0.0;
+    // Uniform whole-population translations are represented by one deferred
+    // spatial offset. Charge the same monotonic path length to every record
+    // without rewriting the per-instance odometer stream.
+    float                   instanceUniformTravel_ = 0.0f;
     // Changes that cannot be represented by translation travel (scale,
     // deformation, topology, readiness) advance this whole-query epoch.
     uint32_t                frontierContentGeneration_ = 1;
@@ -2070,6 +2089,9 @@ private:
     // epoch proof lets the hot motion loop use dense ids without rechecking
     // every generation stamp and reverse-map entry.
     uint32_t                instanceMappingVersion_ = 1;
+    // Effective instance transforms/bounds epoch. MotionGroup aggregate
+    // bounds snapshot this to validate rigid translations in O(1).
+    uint64_t                instanceSpatialVersion_ = 1;
     bool                    instanceLayoutSpatialized_ = false;
 
     std::vector<Overlay>  overlays_;
@@ -2080,6 +2102,10 @@ private:
 
     std::vector<TlasNode> tlasNodes_;
     std::vector<TlasMeta> tlasMeta_;
+    // A uniform translation of the complete live population changes neither
+    // TLAS topology nor relative bounds. Nodes and instances remain in their
+    // common base space until a differential edit materializes the offset.
+    float4                tlasGlobalOffset_{};
     int32_t               tlasRoot_ = -1;
     bool                  tlasDirty_ = true;
     bool                  tlasQualityBuild_ = true;   // quality tier vs Morton

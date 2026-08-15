@@ -74,7 +74,11 @@ struct SpatialDatabase::TestAccess
     {
         database.flushBounds();
         const Instance* instance = database.resolveInstance(handle);
-        return instance ? instance->worldBox : AABB::empty();
+        return instance
+                   ? AABB::fromMinMax(
+                         instance->worldBox.mn + database.tlasGlobalOffset_,
+                         instance->worldBox.mx + database.tlasGlobalOffset_)
+                   : AABB::empty();
     }
 
     static AABB unflushedInstanceBounds(SpatialDatabase& database,

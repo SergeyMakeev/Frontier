@@ -40,11 +40,12 @@ library's macro-based public payload customization.
   an assembled hierarchy.
 - `BM_MountUsageConsumption` measures consumption of query-recorded mount use
   for streaming and collapse decisions.
-- `BM_MotionGroupSteady` measures repeated batched root motion through a stable
-  `MotionGroup`.
+- `BM_MotionGroupSteady` measures repeated rigid translation through a stable
+  `MotionGroup` and the explicit `translateInstances()` path.
 - `BM_MovingObjectsSelectionScale` moves a distributed 10% or 100% of a
   mounted 1,000/10,000-root forest, publishes the update, and selects the next
-  frontier. Counters separate roots reused from roots re-walked.
+  frontier through the same rigid-translation API. Counters separate roots
+  reused from roots re-walked.
 - `BM_SubtreeBuilder_ConstructCost` isolates serialized definition building
   before registration and instantiation.
 - `BM_SubtreeRegistration` isolates validation and zero-copy registration for

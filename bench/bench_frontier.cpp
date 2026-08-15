@@ -423,9 +423,7 @@ static void BM_MotionGroupSteady(benchmark::State& state)
     const bool unchanged = state.range(1) != 0;
     SpatialDatabase world;
     std::vector<InstanceHandle> handles;
-    std::vector<float4> positions;
     handles.reserve(count);
-    positions.reserve(count);
     for (uint32_t i = 0; i < count; ++i)
     {
         const float4 position = float4::point(float(i) * 2.0f, 0, 0);
@@ -433,17 +431,19 @@ static void BM_MotionGroupSteady(benchmark::State& state)
         desc.pos = position;
         handles.push_back(world.instantiate(
             node(1000 + i, 0.0f, box(0.5f)), desc));
-        positions.push_back(position);
     }
     SpatialDatabase::MotionGroup group(handles);
 
     bool raised = false;
     for (auto _ : state)
     {
-        if (!unchanged) raised = !raised;
-        const float y = raised ? 0.25f : 0.0f;
-        for (float4& position : positions) position.y = y;
-        world.moveInstances(group, positions);
+        float dy = 0.0f;
+        if (!unchanged)
+        {
+            raised = !raised;
+            dy = raised ? 0.25f : -0.25f;
+        }
+        world.translateInstances(group, float4::vec(0.0f, dy, 0.0f));
         benchmark::ClobberMemory();
     }
     state.counters["instances"] = double(count);
@@ -471,11 +471,7 @@ static void BM_MovingObjectsSelectionScale(benchmark::State& state)
         uint32_t(std::ceil(std::sqrt(double(count))));
     constexpr float pitch = 12.0f;
     std::vector<InstanceHandle> movingHandles;
-    std::vector<float4> lowPositions;
-    std::vector<float4> highPositions;
     movingHandles.reserve(size_t(count) * movingPercent / 100u);
-    lowPositions.reserve(movingHandles.capacity());
-    highPositions.reserve(movingHandles.capacity());
     for (uint32_t i = 0; i < count; ++i)
     {
         const float4 position = float4::point(
@@ -487,11 +483,7 @@ static void BM_MovingObjectsSelectionScale(benchmark::State& state)
             node(1000 + i, 64.0f, box(4.0f), true), desc);
         world.mountSubtree(instance.rootNode(), definition);
         if ((i % 100u) < movingPercent)
-        {
             movingHandles.push_back(instance);
-            lowPositions.push_back(position);
-            highPositions.push_back(position + float4::vec(0.0f, 0.25f, 0.0f));
-        }
     }
     TestAccess::markAllNodesReady(world);
     world.applyUpdates();
@@ -512,9 +504,8 @@ static void BM_MovingObjectsSelectionScale(benchmark::State& state)
     for (auto _ : state)
     {
         raised = !raised;
-        world.moveInstances(motion,
-            raised ? std::span<const float4>(highPositions)
-                   : std::span<const float4>(lowPositions));
+        world.translateInstances(
+            motion, float4::vec(0.0f, raised ? 0.25f : -0.25f, 0.0f));
         world.applyUpdates();
         result = query.selectFrontier(world, camera, {});
         consume(result);

@@ -1151,6 +1151,10 @@ InstanceHandle SpatialDatabase::addTlasRootInstance(
                        std::isfinite(worldError),
                    "SpatialDatabase::instantiate: transformed root overflows");
 
+    // A new instance is authored in current world space and therefore cannot
+    // join an older population's deferred base-space translation.
+    materializeTlasGlobalOffset();
+
     InstanceId id;
     if (!freeInstances_.empty())
     {
@@ -1165,6 +1169,7 @@ InstanceHandle SpatialDatabase::addTlasRootInstance(
         if (!tlasRootPayloads_.empty()) tlasRootPayloads_.emplace_back();
         instanceFrontierVersions_.emplace_back();
         instanceMotionTravel_.emplace_back();
+        instanceTlasLoose_.emplace_back();
         instanceDenseToHandle_.push_back(kInvalidInstanceId);
         id = InstanceId(instances_.size() - 1);
     }
@@ -1204,6 +1209,7 @@ InstanceHandle SpatialDatabase::addTlasRootInstance(
     inst.maxErrWorld = worldError;
     invalidateInstanceFrontier(id);
     instanceMotionTravel_[id] = 0.0f;
+    instanceTlasLoose_[id] = 0;
     inst.liveIndex = uint32_t(liveInstances_.size());
     liveInstances_.push_back(id);
     if (++instanceMappingVersion_ == 0) ++instanceMappingVersion_;
@@ -1283,6 +1289,10 @@ void SpatialDatabase::MotionGroup::reset(
     instances_.clear();
     instances_.append(instances.data(), instances.size());
     physicalOrder_.clear();
+    worldBounds_ = AABB::empty();
+    positionBounds_ = AABB::empty();
+    maxMotionTravel_ = 0.0f;
+    spatialVersion_ = 0;
     mappingVersion_ = 0;
     physicalOrderValid_ = false;
 }
@@ -1354,11 +1364,13 @@ void SpatialDatabase::moveInstance(InstanceHandle ref,
 {
     const InstanceId dense = denseInstanceId(ref);
     if (dense == kInvalidInstanceId) return;
+    materializeTlasGlobalOffset();
     uint32_t mutationGeneration = 0;
     float batchMaxTravel = 0.0f;
     moveInstanceDense(dense, transform.pos, transform.scale,
                       mutationGeneration, batchMaxTravel);
     instanceMotionTravelGlobal_ += batchMaxTravel;
+    ++instanceSpatialVersion_;
 }
 
 void SpatialDatabase::moveInstanceDense(InstanceId dense, float4 pos, float scale,
@@ -1453,6 +1465,21 @@ void SpatialDatabase::refreshMotionGroup(MotionGroup& group) const
     group.physicalOrder_.resize_uninitialized(out);
     group.mappingVersion_ = instanceMappingVersion_;
     group.physicalOrderValid_ = true;
+
+    group.worldBounds_ = AABB::empty();
+    group.positionBounds_ = AABB::empty();
+    group.maxMotionTravel_ = 0.0f;
+    for (const MotionGroup::Slot slot : group.physicalOrder_)
+    {
+        const Instance& inst = instances_[slot.dense];
+        group.worldBounds_.expand(AABB::fromMinMax(
+            inst.worldBox.mn + tlasGlobalOffset_,
+            inst.worldBox.mx + tlasGlobalOffset_));
+        group.positionBounds_.expand(inst.pos + tlasGlobalOffset_);
+        group.maxMotionTravel_ = std::max(
+            group.maxMotionTravel_, instanceMotionTravel_[slot.dense]);
+    }
+    group.spatialVersion_ = instanceSpatialVersion_;
 }
 
 void SpatialDatabase::moveInstances(MotionGroup& group,
@@ -1467,6 +1494,58 @@ void SpatialDatabase::moveInstances(MotionGroup& group,
         group.mappingVersion_ != instanceMappingVersion_)
         refreshMotionGroup(group);
 
+    // A complete population translated by one common delta can keep the TLAS
+    // byte-for-byte unchanged. Validate the whole batch before mutating so
+    // contract failures and a differential fallback remain transactional.
+    if (!tlasDirty_ && !group.physicalOrder_.empty() &&
+        group.physicalOrder_.size() == liveInstances_.size())
+    {
+        const MotionGroup::Slot first = group.physicalOrder_[0];
+        const Instance& firstInst = instances_[first.dense];
+        const float4 delta =
+            positions[first.source] - (firstInst.pos + tlasGlobalOffset_);
+        const bool sameScale = scale == firstInst.scale;
+        const float travel = std::fabs(delta.x) + std::fabs(delta.y) +
+                             std::fabs(delta.z);
+        const float4 nextOffset = tlasGlobalOffset_ + delta;
+        bool common = sameScale && finitePosition(positions[first.source]) &&
+                      std::isfinite(travel) &&
+                      std::isfinite(instanceUniformTravel_ + travel) &&
+                      finitePosition(nextOffset);
+        for (const MotionGroup::Slot slot : group.physicalOrder_)
+        {
+            const Instance& inst = instances_[slot.dense];
+            const float4 candidateDelta =
+                positions[slot.source] - (inst.pos + tlasGlobalOffset_);
+            const AABB candidateBox = AABB::fromMinMax(
+                inst.worldBox.mn + nextOffset, inst.worldBox.mx + nextOffset);
+            common = common && scale == inst.scale &&
+                     finitePosition(positions[slot.source]) &&
+                     candidateDelta.x == delta.x &&
+                     candidateDelta.y == delta.y &&
+                     candidateDelta.z == delta.z &&
+                     finiteNonEmptyBounds(candidateBox);
+        }
+        if (common)
+        {
+            if (travel == 0.0f) return;
+            tlasGlobalOffset_ = nextOffset;
+            tlasGlobalOffset_.w = 0.0f;
+            instanceUniformTravel_ += travel;
+            instanceMotionTravelGlobal_ += travel;
+            ++instanceSpatialVersion_;
+            group.worldBounds_ = AABB::fromMinMax(
+                group.worldBounds_.mn + delta, group.worldBounds_.mx + delta);
+            group.positionBounds_ = AABB::fromMinMax(
+                group.positionBounds_.mn + delta,
+                group.positionBounds_.mx + delta);
+            group.spatialVersion_ = instanceSpatialVersion_;
+            return;
+        }
+    }
+
+    materializeTlasGlobalOffset();
+
     // All members belong to one writer mutation batch. They may share a
     // frontier version: cache validity only compares each instance's current
     // stamp with its own recorded stamp. Advancing the database generation
@@ -1477,6 +1556,122 @@ void SpatialDatabase::moveInstances(MotionGroup& group,
         moveInstanceDense(slot.dense, positions[slot.source], scale,
                           mutationGeneration, batchMaxTravel);
     instanceMotionTravelGlobal_ += batchMaxTravel;
+    if (!group.physicalOrder_.empty()) ++instanceSpatialVersion_;
+}
+
+void SpatialDatabase::translateInstances(MotionGroup& group, float4 delta)
+{
+    FRONTIER_CHECK(finitePosition(delta),
+                   "SpatialDatabase::translateInstances: invalid delta");
+    if (!group.physicalOrderValid_ ||
+        group.mappingVersion_ != instanceMappingVersion_)
+        refreshMotionGroup(group);
+    if (group.physicalOrder_.empty()) return;
+    if (group.spatialVersion_ != instanceSpatialVersion_)
+        refreshMotionGroup(group);
+
+    delta.w = 0.0f;
+    const float travel = std::fabs(delta.x) + std::fabs(delta.y) +
+                         std::fabs(delta.z);
+    FRONTIER_CHECK(std::isfinite(travel),
+                   "SpatialDatabase::translateInstances: invalid delta");
+    if (travel == 0.0f) return;
+
+    // The MotionGroup mapping is unique and dense-sorted. Equal cardinality
+    // therefore proves that it contains every live instance exactly once;
+    // the API contract itself proves their common delta. Validate overflow
+    // against one aggregate root box and commit only two scalars.
+    if (group.physicalOrder_.size() == liveInstances_.size())
+    {
+        const float4 nextOffset = tlasGlobalOffset_ + delta;
+        bool valid = finitePosition(nextOffset) &&
+                     std::isfinite(instanceUniformTravel_ + travel) &&
+                     finiteNonEmptyBounds(AABB::fromMinMax(
+                         group.worldBounds_.mn + delta,
+                         group.worldBounds_.mx + delta)) &&
+                     finiteNonEmptyBounds(AABB::fromMinMax(
+                         group.positionBounds_.mn + delta,
+                         group.positionBounds_.mx + delta));
+        FRONTIER_CHECK(valid,
+                       "SpatialDatabase::translateInstances: transformed "
+                       "population overflows");
+        tlasGlobalOffset_ = nextOffset;
+        tlasGlobalOffset_.w = 0.0f;
+        instanceUniformTravel_ += travel;
+        instanceMotionTravelGlobal_ += travel;
+        ++instanceSpatialVersion_;
+        group.worldBounds_ = AABB::fromMinMax(
+            group.worldBounds_.mn + delta, group.worldBounds_.mx + delta);
+        group.positionBounds_ = AABB::fromMinMax(
+            group.positionBounds_.mn + delta,
+            group.positionBounds_.mx + delta);
+        group.spatialVersion_ = instanceSpatialVersion_;
+        return;
+    }
+
+    materializeTlasGlobalOffset();
+
+    // The aggregate snapshot proves every destination and odometer before the
+    // first instance or TLAS lane changes, retaining transactional failure
+    // while removing a redundant validation pass over the cohort.
+    FRONTIER_CHECK(
+        finiteNonEmptyBounds(AABB::fromMinMax(
+            group.worldBounds_.mn + delta, group.worldBounds_.mx + delta)) &&
+            finiteNonEmptyBounds(AABB::fromMinMax(
+                group.positionBounds_.mn + delta,
+                group.positionBounds_.mx + delta)) &&
+            std::isfinite(group.maxMotionTravel_ + travel),
+        "SpatialDatabase::translateInstances: transformed group overflows");
+
+    for (const MotionGroup::Slot slot : group.physicalOrder_)
+    {
+        Instance& inst = instances_[slot.dense];
+        inst.pos = inst.pos + delta;
+        inst.pos.w = 1.0f;
+        inst.worldBox = AABB::fromMinMax(inst.worldBox.mn + delta,
+                                         inst.worldBox.mx + delta);
+        instanceMotionTravel_[slot.dense] += travel;
+        tlasOnInstanceMoved(slot.dense);
+    }
+    instanceMotionTravelGlobal_ += travel;
+    ++instanceSpatialVersion_;
+    group.worldBounds_ = AABB::fromMinMax(
+        group.worldBounds_.mn + delta, group.worldBounds_.mx + delta);
+    group.positionBounds_ = AABB::fromMinMax(
+        group.positionBounds_.mn + delta,
+        group.positionBounds_.mx + delta);
+    group.maxMotionTravel_ += travel;
+    group.spatialVersion_ = instanceSpatialVersion_;
+}
+
+void SpatialDatabase::materializeTlasGlobalOffset()
+{
+    if (tlasGlobalOffset_.x == 0.0f && tlasGlobalOffset_.y == 0.0f &&
+        tlasGlobalOffset_.z == 0.0f)
+        return;
+    for (const InstanceId dense : liveInstances_)
+    {
+        Instance& inst = instances_[dense];
+        inst.pos = inst.pos + tlasGlobalOffset_;
+        inst.pos.w = 1.0f;
+        inst.worldBox = AABB::fromMinMax(
+            inst.worldBox.mn + tlasGlobalOffset_,
+            inst.worldBox.mx + tlasGlobalOffset_);
+    }
+    for (TlasNode& node : tlasNodes_)
+    {
+        uint32_t lanes = node.validLanes();
+        while (lanes)
+        {
+            const uint32_t lane = uint32_t(std::countr_zero(lanes));
+            lanes &= lanes - 1;
+            const AABB box = node.bounds.lane(lane);
+            node.bounds.setLane(
+                lane, AABB::fromMinMax(box.mn + tlasGlobalOffset_,
+                                       box.mx + tlasGlobalOffset_));
+        }
+    }
+    tlasGlobalOffset_ = float4::vec(0.0f, 0.0f, 0.0f);
 }
 
 // ============================================================================
@@ -1817,6 +2012,8 @@ void SpatialDatabase::flushBounds()
     // that already contains the change, so a shared parent is grown once
     // and merely re-checked by the rest. Stale entries (instance removed,
     // mount removed, slot reused) self-invalidate via generation stamps.
+    const bool hadPendingMoves = !pendingMoves_.empty();
+    if (hadPendingMoves) materializeTlasGlobalOffset();
     for (const PendingMove& m : pendingMoves_)
     {
         if (m.instance >= instanceHandleToDense_.size()) continue;
@@ -1840,6 +2037,7 @@ void SpatialDatabase::flushBounds()
         applyBoundsChange(dense, m.node.slot(), m.node.index(), m.box);
     }
     pendingMoves_.clear();
+    if (hadPendingMoves) ++instanceSpatialVersion_;
 }
 
 void SpatialDatabase::applyBoundsChange(InstanceId id, uint32_t slot, uint32_t index,
@@ -2090,6 +2288,7 @@ void SpatialDatabase::tlasNoteEdit()
 void SpatialDatabase::tlasInsert(InstanceId id)
 {
     if (tlasDirty_) return;   // the pending rebuild will enumerate this instance
+    materializeTlasGlobalOffset();
     Instance& inst = instances_[id];
     if (tlasRoot_ < 0)
     {
@@ -2230,31 +2429,39 @@ void SpatialDatabase::tlasOnInstanceMoved(InstanceId id)
         return;
     }
 
-    // Keep leaf lanes exact while ancestor lanes grow only when necessary.
-    // Rebuilds are driven by accumulated ancestor-area growth, not by the
-    // number of exact leaves that changed: counting exact-leaf escapes makes
-    // a coherently moving population rebuild every frame even when its
-    // ancestors already cover the complete motion envelope.
+    // Leaf lanes retain a grow-only motion envelope. After the first excursion
+    // a bounded oscillator stays inside that envelope and no longer writes
+    // either its leaf or ancestors. Non-overview queries retest the small set
+    // of loose roots against their exact Instance bounds in tlasQueryImpl.
     const uint32_t nodeIdx = inst.tlasNode();
     const uint32_t lane = inst.tlasLane();
     TlasNode& node = tlasNodes_[nodeIdx];
     TlasMeta& meta = tlasMeta_[nodeIdx];
     const AABB oldLeafBounds = node.bounds.lane(lane);
-    const bool ancestorsAlreadyCover =
+    const bool envelopeAlreadyCovers =
         oldLeafBounds.contains(inst.worldBox) &&
         meta.maxErr.v[lane] >= inst.maxErrWorld;
-
-    // Keep leaf lanes exact even though inner lanes remain grow-only. Querying
-    // the leaf block then performs the definitive SIMD cull for the instance;
-    // the per-instance walk does not have to repeat it scalarly. Shrinking a
-    // leaf cannot invalidate its conservative ancestors.
-    node.bounds.setLane(lane, inst.worldBox);
-    meta.maxErr.v[lane] = inst.maxErrWorld;
-    if (ancestorsAlreadyCover)
+    if (envelopeAlreadyCovers)
+    {
+        if (oldLeafBounds.mn.x != inst.worldBox.mn.x ||
+            oldLeafBounds.mn.y != inst.worldBox.mn.y ||
+            oldLeafBounds.mn.z != inst.worldBox.mn.z ||
+            oldLeafBounds.mx.x != inst.worldBox.mx.x ||
+            oldLeafBounds.mx.y != inst.worldBox.mx.y ||
+            oldLeafBounds.mx.z != inst.worldBox.mx.z ||
+            meta.maxErr.v[lane] != inst.maxErrWorld)
+            instanceTlasLoose_[id] = 1;
         return;
+    }
+
+    AABB envelope = oldLeafBounds;
+    envelope.expand(inst.worldBox);
+    node.bounds.setLane(lane, envelope);
+    meta.maxErr.v[lane] = std::max(meta.maxErr.v[lane], inst.maxErrWorld);
+    instanceTlasLoose_[id] = 1;
 
     const float added =
-        tlasGrowUp(nodeIdx, inst.worldBox, inst.maxErrWorld, inst.mask);
+        tlasGrowUp(nodeIdx, envelope, inst.maxErrWorld, inst.mask);
 
     tlasNoteGrowth(added);
 }
@@ -2601,6 +2808,7 @@ void SpatialDatabase::reorderInstancesByTlas()
     if (hadTlasRootPayloads) newTlasRootPayloads.resize(liveCount);
     std::vector<uint32_t> newFrontierVersions(liveCount);
     std::vector<float> newMotionTravel(liveCount);
+    std::vector<uint8_t> newTlasLoose(liveCount);
     std::vector<InstanceId> newDenseToHandle(liveCount, kInvalidInstanceId);
     std::vector<uint32_t> newFlat;
     const bool hadFlatStream = !instanceFlatSlots_.empty();
@@ -2614,6 +2822,7 @@ void SpatialDatabase::reorderInstancesByTlas()
             newTlasRootPayloads[next] = tlasRootPayloads_[old];
         newFrontierVersions[next] = instanceFrontierVersions_[old];
         newMotionTravel[next] = instanceMotionTravel_[old];
+        newTlasLoose[next] = instanceTlasLoose_[old];
         newDenseToHandle[next] = instanceDenseToHandle_[old];
         if (hadFlatStream) newFlat[next] = instanceFlatSlots_[old];
         if (newInstances[next].rootSlot != kInvalidIndex)
@@ -2624,6 +2833,7 @@ void SpatialDatabase::reorderInstancesByTlas()
         tlasRootPayloads_.swap(newTlasRootPayloads);
     instanceFrontierVersions_.swap(newFrontierVersions);
     instanceMotionTravel_.swap(newMotionTravel);
+    instanceTlasLoose_.swap(newTlasLoose);
     instanceDenseToHandle_.swap(newDenseToHandle);
     if (hadFlatStream) instanceFlatSlots_.swap(newFlat);
 
@@ -2653,6 +2863,9 @@ void SpatialDatabase::reorderInstancesByTlas()
 //    grow-only ancestor bloat bounded.
 void SpatialDatabase::tlasRebuild(bool reorderInstances)
 {
+    // Rebuild enumerates instance bounds, so first bring a deferred uniform
+    // translation into those records and the old TLAS nodes.
+    materializeTlasGlobalOffset();
     tlasNodes_.clear();
     tlasMeta_.clear();
     tlasFreeNodes_.clear();
@@ -2660,6 +2873,8 @@ void SpatialDatabase::tlasRebuild(bool reorderInstances)
     tlasEdits_ = 0;
     tlasGrownArea_ = 0.0f;
     tlasDirty_ = false;
+    for (const InstanceId dense : liveInstances_)
+        instanceTlasLoose_[dense] = 0;
 
     const bool promoted = tlasQualityBuild_;
     const bool quality =
@@ -2855,8 +3070,25 @@ void SpatialDatabase::tlasQueryImpl(const Camera& view, float minPix,
                 stack.push_back({c, inMask ? outMasks[l] : uint8_t(0)});
             else
             {
-                outVisible.emplace_back(uint32_t(~c),
-                                        inMask ? outMasks[l] : uint8_t(0));
+                const uint32_t instance = uint32_t(~c);
+                uint8_t exactMask = inMask ? outMasks[l] : uint8_t(0);
+                if (instanceTlasLoose_[instance])
+                {
+                    const Instance& inst = instances_[instance];
+                    if (exactMask != 0 &&
+                        testAabb(inst.worldBox, view.frustum, exactMask) ==
+                            CullState::Outside)
+                        continue;
+                    if constexpr (UseMinPix)
+                    {
+                        const float distance =
+                            distanceToBox(inst.worldBox, qmn, qmx);
+                        if (screenError(inst.maxErrWorld, view.k, distance) <
+                            minPix)
+                            continue;
+                    }
+                }
+                outVisible.emplace_back(instance, exactMask);
             }
         }
     }
@@ -3865,7 +4097,12 @@ void SpatialDatabase::selectFrontierUncached(const Camera& camera, const Selecti
     }
 
     const Camera damped = query.damper_.damp(camera);
-    tlasQuery(damped, params.minPix, scratch.visible, scratch.tlasStack);
+    const Camera tlasView =
+        (tlasGlobalOffset_.x == 0.0f && tlasGlobalOffset_.y == 0.0f &&
+         tlasGlobalOffset_.z == 0.0f)
+            ? damped
+            : toLocal(damped, tlasGlobalOffset_, 1.0f);
+    tlasQuery(tlasView, params.minPix, scratch.visible, scratch.tlasStack);
 
     const uint32_t nVis = uint32_t(scratch.visible.size());
     query.walked_ = nVis;
@@ -3903,7 +4140,7 @@ void SpatialDatabase::selectFrontierUncached(const Camera& camera, const Selecti
                 for (uint32_t i = 0; i < nVis; ++i)
                 {
                     const uint32_t instIdx = scratch.visible[i].instance();
-                    runTlasFlatInstance(instIdx, damped, w);
+                    runTlasFlatInstance(instIdx, tlasView, w);
                 }
             }
         }
@@ -3913,7 +4150,7 @@ void SpatialDatabase::selectFrontierUncached(const Camera& camera, const Selecti
             // no one-node instances pay only this call-level dispatch.
             for (uint32_t i = 0; i < nVis; ++i)
             {
-                runTlasRootInstance(scratch.visible[i].instance(), damped,
+                runTlasRootInstance(scratch.visible[i].instance(), tlasView,
                                     params, scratch.visible[i].mask(), w);
             }
         }
@@ -3928,10 +4165,10 @@ void SpatialDatabase::selectFrontierUncached(const Camera& camera, const Selecti
                     if (instances_[instIdx].hasZeroErrorRoot())
                         runZeroErrorTlasFlatInstance(instIdx, w);
                     else
-                        runTlasFlatInstance(instIdx, damped, w);
+                        runTlasFlatInstance(instIdx, tlasView, w);
                 }
                 else
-                    runTlasRootInstance(instIdx, damped, params,
+                    runTlasRootInstance(instIdx, tlasView, params,
                                         scratch.visible[i].mask(), w);
             }
         }
@@ -3962,7 +4199,7 @@ void SpatialDatabase::selectFrontierUncached(const Camera& camera, const Selecti
         uint32_t         workerCount;
         uint32_t         flatMode;   // 0 none, 1 mixed,
                                      // 3 all zero-error, 4 all flat
-    } chunk{this, &scratch, &damped, &params, nVis, workerCount,
+    } chunk{this, &scratch, &tlasView, &params, nVis, workerCount,
             flatInstanceCount_ == liveInstances_.size()
                 ? (tlasZeroErrorFlatInstanceCount_ == liveInstances_.size()
                        ? 3u
@@ -4196,15 +4433,20 @@ void SpatialDatabase::selectFrontierCached(const Camera& camera, const Selection
     // An all-visible stream is exactly `liveInstances_` with zero plane masks.
     // If the root lanes remain wholly inside, one BVH-width test proves that
     // the retained stream is still exact; do not rewrite and compare 40 KiB.
+    const Camera tlasView =
+        (tlasGlobalOffset_.x == 0.0f && tlasGlobalOffset_.y == 0.0f &&
+         tlasGlobalOffset_.z == 0.0f)
+            ? dv
+            : toLocal(dv, tlasGlobalOffset_, 1.0f);
     const bool allVisible = params.minPix == 0.0f && dv.viewMask == ~0u &&
-                            tlasRootContainsPopulation(dv);
+                            tlasRootContainsPopulation(tlasView);
     const bool retainVisible = allVisible && scratch.retainedAllVisible &&
                                query.visibleMappingVersion_ ==
                                    instanceMappingVersion_;
     if (!retainVisible)
     {
         scratch.visible.swap(scratch.previousVisible);
-        tlasQuery(dv, params.minPix, scratch.visible, scratch.tlasStack);
+        tlasQuery(tlasView, params.minPix, scratch.visible, scratch.tlasStack);
     }
 
     const uint32_t nVis = uint32_t(scratch.visible.size());
@@ -4341,7 +4583,8 @@ void SpatialDatabase::selectFrontierCached(const Camera& camera, const Selection
         // inside, so no plane was tested anywhere within it and camera
         // rotation cannot matter. `travel_ < validUntil` is the margin.
         bool hit = mask == 0 &&
-                   query.travel_ + instanceMotionTravel_[instIdx] +
+                   query.travel_ + instanceUniformTravel_ +
+                           instanceMotionTravel_[instIdx] +
                            r.kSlope * query.kTravel_ <
                        r.validUntil &&
                    r.epoch == query.epoch_ &&
@@ -4389,6 +4632,7 @@ void SpatialDatabase::selectFrontierCached(const Camera& camera, const Selection
             }
             const float remaining =
                 r.validUntil - query.travel_ -
+                instanceUniformTravel_ -
                 instanceMotionTravel_[instIdx] -
                 r.kSlope * query.kTravel_;
             wholeMargin = std::min(wholeMargin, remaining);
@@ -4412,10 +4656,10 @@ void SpatialDatabase::selectFrontierCached(const Camera& camera, const Selection
             if (instances_[instIdx].hasZeroErrorRoot())
                 runZeroErrorTlasFlatInstance(instIdx, w);
             else
-                runTlasFlatInstance(instIdx, dv, w);
+                runTlasFlatInstance(instIdx, tlasView, w);
         }
         else
-            runTlasRootInstance(instIdx, dv, params, mask, w);
+            runTlasRootInstance(instIdx, tlasView, params, mask, w);
         w.trackMargin = false;
         for (const uint32_t slot : w.touched) recordUsage(slot);
 
@@ -4496,6 +4740,7 @@ void SpatialDatabase::selectFrontierCached(const Camera& camera, const Selection
             const float m = w.margin * inst.scale;
             r.kSlope = w.maxError * inst.scale / params.threshold;
             const float consumed = query.travel_ +
+                                   instanceUniformTravel_ +
                                    instanceMotionTravel_[instIdx] +
                                    r.kSlope * query.kTravel_;
             r.validUntil = m >= FLT_MAX - consumed ? FLT_MAX : consumed + m;
@@ -4522,6 +4767,7 @@ void SpatialDatabase::selectFrontierCached(const Camera& camera, const Selection
         {
             const float remaining =
                 r.validUntil - query.travel_ -
+                instanceUniformTravel_ -
                 instanceMotionTravel_[instIdx] -
                 r.kSlope * query.kTravel_;
             wholeMargin = std::min(wholeMargin, remaining);

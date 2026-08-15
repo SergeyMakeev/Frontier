@@ -228,6 +228,64 @@ TEST(Motion, MotionGroupResetReplacesTheCallerCohort)
                 20.0f, 0.001f);
 }
 
+TEST(Motion, RigidPopulationTranslationMaterializesBeforeDifferentialEdits)
+{
+    SpatialDatabase database;
+    const InstanceHandle first =
+        database.instantiate(node(1, 0.0f, box()));
+    const InstanceHandle second = database.instantiate(
+        node(2, 0.0f, box()),
+        InstanceDesc{.pos = float4::point(10, 0, 0)});
+    database.applyUpdates();
+
+    const std::array<InstanceHandle, 2> handles{first, second};
+    SpatialDatabase::MotionGroup all(handles);
+    database.translateInstances(all, float4::vec(100, 0, 0));
+    database.applyUpdates();
+
+    EXPECT_NEAR(TestAccess::instanceBounds(database, first).center().x,
+                100.0f, 0.001f);
+    EXPECT_NEAR(TestAccess::instanceBounds(database, second).center().x,
+                110.0f, 0.001f);
+
+    database.moveInstance(
+        first, Transform{float4::point(200, 0, 0), 1.0f});
+    const InstanceHandle added = database.instantiate(
+        node(3, 0.0f, box()),
+        InstanceDesc{.pos = float4::point(7, 0, 0)});
+    database.applyUpdates();
+
+    EXPECT_NEAR(TestAccess::instanceBounds(database, first).center().x,
+                200.0f, 0.001f);
+    EXPECT_NEAR(TestAccess::instanceBounds(database, second).center().x,
+                110.0f, 0.001f);
+    EXPECT_NEAR(TestAccess::instanceBounds(database, added).center().x,
+                7.0f, 0.001f);
+}
+
+TEST(Motion, SweptTlasLeafRetestsItsExactCurrentBounds)
+{
+    SpatialDatabase database;
+    const InstanceHandle moving =
+        database.instantiate(node(1, 0.0f, box()));
+    database.instantiate(
+        node(2, 0.0f, box()),
+        InstanceDesc{.pos = float4::point(3, 0, 0)});
+    database.applyUpdates();
+
+    const std::array<InstanceHandle, 1> handles{moving};
+    SpatialDatabase::MotionGroup group(handles);
+    SpatialQuery query;
+
+    database.translateInstances(group, float4::vec(100, 0, 0));
+    EXPECT_EQ(payloads(database, select(database, query, cameraAt(-20.0f))),
+              (std::vector<UserPayload>{2}));
+
+    database.translateInstances(group, float4::vec(-100, 0, 0));
+    EXPECT_EQ(payloads(database, select(database, query, cameraAt(-20.0f))),
+              (std::vector<UserPayload>{1, 2}));
+}
+
 TEST(Motion, RejectsInvalidTransformsWithoutCorruptingTlas)
 {
     SpatialDatabase database;

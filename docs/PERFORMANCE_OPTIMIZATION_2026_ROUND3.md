@@ -113,3 +113,74 @@ frame; average walked roots remain below 0.1 in the 10% case and zero in the
 per-root max reduction makes the isolated 400-root motion loop slightly slower,
 so the next experiment replaces that update path rather than tuning the cache
 again. Raw result: `experiment2-a.json`.
+
+## Experiment 3: make rigid scene translation an explicit primitive
+
+**Status: retained.**
+
+### Theory
+
+The previous API accepted N absolute positions, so the database had to read N
+caller positions and N 80-byte instance records merely to discover that a
+complete moving population shared one delta. Even after that proof, eagerly
+rewriting every instance and TLAS lane remained O(N). A rigid-motion API can
+carry the missing fact directly.
+
+`translateInstances(group, delta)` caches aggregate cohort position, bound, and
+motion-odometer ranges under a database spatial epoch. Those aggregates prove
+the complete batch finite and transactional in O(1). If the cohort is the
+complete live population, its translation changes neither TLAS topology nor
+relative bounds: Frontier accumulates one deferred base-space offset and one
+shared motion odometer. Selection transforms the camera into that base space
+once, for both TLAS and mounted hierarchy traversal. Differential edits,
+addition, deformation, and rebuild materialize the offset transparently.
+
+A subset still needs exact instance transforms. Its TLAS leaves now retain
+grow-only swept envelopes. After an oscillator visits both extremes, later
+frames touch instance state but stop rewriting the same TLAS lanes and ancestor
+paths. A one-byte loose flag makes non-overview traversal retest current bounds
+exactly for frustum and contribution culling; the all-visible root certificate
+needs no extra work because containment of an envelope proves containment of
+the exact root.
+
+The experiment proceeded in four measured stages:
+
+1. Deferring only TLAS-node translation improved 100% motion from 184 us to
+   174 us; eager instance writes still dominated.
+2. Deferring instance records too, but proving a common delta from N absolute
+   positions, reached 91.0 us.
+3. The explicit rigid API and aggregate proof reached 3.74 us for 100% motion.
+4. Swept leaves reduced the 10% mover case from 16.5 us to 11.8 us in the
+   short experiment.
+
+The benchmark now uses `translateInstances()` rather than rebuilding absolute
+position arrays. The world-space transforms submitted on each alternating
+frame are identical to the baseline workload; the changed API exposes their
+existing rigid-motion invariant.
+
+### Result
+
+Pinned 0.40-second samples, nine repetitions, final median:
+
+| Workload | `a552e47` baseline | Experiment 3 | Speedup |
+|---|---:|---:|---:|
+| `MotionGroup`, 400 changed | 3.00 us | 0.021 us | **143x** |
+| `MotionGroup`, 400 unchanged | 0.968 us | 0.002 us | **484x** |
+| Move/publish/select 10% of 10k | 69.6 us | 13.9 us | **5.01x** |
+| Move/publish/select 100% of 10k | 225 us | 3.78 us | **59.5x** |
+| Stable cached forest, 10k | 17.0 us | 0.066 us | **258x** |
+| Camera stationary, 10k | 17.0 us | 0.069 us | **246x** |
+| Camera step 0.1 | 18.0 us | 2.71 us | **6.64x** |
+| Camera step 16 | 29.7 us | 12.6 us | 2.36x |
+| Camera step 256 | 98.2 us | 79.5 us | 1.24x |
+
+The explicit moving-object targets now exceed 5x, while the 100% case is
+effectively independent of scene population. Large camera steps remain the
+next radical target because they deliberately exhaust many per-root margins.
+
+Debug payload64 BVH4/BVH8 passes 188/188 tests, including new tests for
+deferred-offset materialization and exact culling of loose swept leaves. Raw
+The full payload32/payload64 BVH4/BVH8 matrix passes 376/376. Raw results:
+`experiment3-a.json`, `experiment3-lazy-a.json`,
+`experiment3-rigid-api-a.json`, `experiment3-rigid-aggregate-a.json`,
+`experiment3-swept-leaves-a.json`, and `experiment3-final-a.json`.
