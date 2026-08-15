@@ -55,8 +55,9 @@ library's macro-based public payload customization.
   10,000 TLAS-owned single-node objects. The reuse-enabled cases verify that
   the automatic all-flat direct path stays at raw-selection cost.
 - `BM_InstanceForestSelectionScale` covers raw and cached selection across
-  forests of mounted instance hierarchies. Reuse mode 2 alternates cut policy
-  to force deterministic cache misses.
+  forests of mounted instance hierarchies. Reuse mode 2 cycles three thresholds
+  to force deterministic record-cache misses without admitting any of those
+  keys to the two-entry exact-view memo.
 - `BM_MovingCameraSelectionScale` alternates between two translated cameras
   over a fully hierarchical forest. It covers stationary, 0.1-unit, 16-unit,
   and 256-unit steps and reports average reused/walked roots and the reuse
@@ -194,6 +195,22 @@ records each executable's `--benchmark_list_tests` inventory and proves that
 every listed case appears in the corresponding JSON. Performance uses the
 platform's native `AUTO` BVH width; use the explicit configurations above for
 a full alternate-width performance comparison.
+
+On Linux, the collector uses `taskset` by default to pin every performance
+process to one allowed CPU. `FRONTIER_PERF_CPU=auto` selects the highest CPU
+capacity and then the highest advertised maximum frequency, which keeps a
+heterogeneous SBC on a deterministic performance core. Set an explicit logical
+CPU number to override that choice, or `FRONTIER_PERF_CPU=none` to retain normal
+scheduler placement.
+
+Every case receives a 0.25-second untimed warmup before measurement so an
+`ondemand` or `schedutil` governor can raise frequency. Override it with
+`FRONTIER_PERF_WARMUP_SECONDS`. The collector deliberately does not change the
+machine-wide governor; for authoritative small-delta comparisons, select the
+platform's performance governor before running the collector. The report
+records the chosen CPU, capacity, maximum frequency, governor, warmup, and
+before/after frequency, load, and thermal snapshots in `manifest.txt`,
+`REPORT.md`, and `performance_state.txt`.
 
 The current registry contains 83 cases per payload build. With five
 0.5-second-minimum repetitions plus correctness and machine characterization,
