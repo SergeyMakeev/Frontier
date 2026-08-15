@@ -72,3 +72,44 @@ margins expire; the next experiments target that residual work separately.
 Debug payload64 BVH4/BVH8 passes 184/184 tests and the full
 payload32/payload64 BVH4/BVH8 matrix passes 368/368. Raw results:
 `experiment1-baseline.json` and `experiment1-a.json`.
+
+## Experiment 2: certify a whole cut across object translation
+
+**Status: retained.**
+
+### Theory
+
+Round 2 proved each root reusable by charging its translation odometer against
+its own LOD margin, but selection still probed all 10,000 records after any
+database generation change. A single stronger bound can prove them all.
+
+For each `MotionGroup` submission, add the largest member translation—not the
+sum of all member translations—to a database-wide double-precision odometer.
+No individual instance can have travelled farther than the sum of those batch
+maxima. A query snapshots that odometer alongside the minimum remaining margin
+of its complete cut. If camera travel, projection-scale travel, and global
+object travel together remain below that minimum, every root record remains
+valid without reading any of them.
+
+Scale, deformation, mounted topology, and readiness are not translations. A
+separate whole-content generation advances on those changes and rejects the
+proof in O(1). Instance add/remove/reuse remains covered by the mapping epoch,
+and the current TLAS root certificate continues to prove exact visibility.
+Individual `moveInstance()` calls are conservatively one-item batches; a
+persistent `MotionGroup` obtains the tight max-per-batch bound.
+
+### Result
+
+Pinned 0.40-second samples, nine repetitions:
+
+| Workload | Root certificate only | Translation certificate | Incremental speedup | `a552e47` speedup |
+|---|---:|---:|---:|---:|
+| Move/publish/select 10% of 10k | 52.9 us | 19.1 us | **2.76x** | **3.52x** |
+| Move/publish/select 100% of 10k | 205 us | 184 us | 1.11x | 1.21x |
+
+The result is now returned without scanning the record array on almost every
+frame; average walked roots remain below 0.1 in the 10% case and zero in the
+100% case. The residual is transform and exact-TLAS update work. The extra
+per-root max reduction makes the isolated 400-root motion loop slightly slower,
+so the next experiment replaces that update path rather than tuning the cache
+again. Raw result: `experiment2-a.json`.

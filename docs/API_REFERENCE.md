@@ -1348,6 +1348,10 @@ void moveInstances(MotionGroup& group,
 - **Effects:** moves live instances in cached physical order. Stale handles are
   ignored. If the group contains the same live instance more than once, the
   final caller-order position wins.
+- **Reuse accounting:** the largest L1 translation in the effective batch is
+  added once to the database-wide conservative motion path. This lets a query
+  validate a retained complete cut in O(1); individual per-instance odometers
+  remain the exact fallback when that global proof expires.
 - **Contract:** position and group sizes match, scale is finite and positive
   with finite reciprocal, and every position belonging to a live instance is
   finite. Each transformed root bound and error must remain representable as

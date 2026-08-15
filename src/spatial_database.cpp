@@ -346,7 +346,7 @@ void SpatialDatabase::bumpContentVersion(uint32_t slot)
     if (root != slot) ++mountStamps_[root].contentVersion;
     const NodeRef owner = slots_[root].owner;
     if (owner.isTlasRoot() && owner.index < instanceFrontierVersions_.size())
-        instanceFrontierVersions_[owner.index] = ++generationCounter_;
+        invalidateInstanceFrontier(owner.index);
 }
 
 // ============================================================================
@@ -773,7 +773,7 @@ SubtreeInstanceHandle SpatialDatabase::mountTlasRoot(
     mounted.scale = transform.scale;
     mounted.errClamp = childClamp;
     inst.rootSlot = slot;
-    instanceFrontierVersions_[dense] = ++generationCounter_;
+    invalidateInstanceFrontier(dense);
     return SubtreeInstanceHandle{slot, mountStamps_[slot].generation()};
 }
 
@@ -839,7 +839,7 @@ void SpatialDatabase::unmountSlot(uint32_t slot)
             instances_[root].rootSlot == slot)
         {
             instances_[root].rootSlot = kInvalidIndex;
-            instanceFrontierVersions_[root] = ++generationCounter_;
+            invalidateInstanceFrontier(root);
         }
     }
     lruUnlink(slot);
@@ -946,7 +946,7 @@ void SpatialDatabase::propagateCoverage(uint32_t slot, uint32_t node)
             {
                 const InstanceId root = rt.owner.index;
                 if (root < instanceFrontierVersions_.size())
-                    instanceFrontierVersions_[root] = ++generationCounter_;
+                    invalidateInstanceFrontier(root);
                 return;
             }
             if (!rt.owner.valid()) return;
@@ -1023,7 +1023,7 @@ void SpatialDatabase::propagateSharedRootCoverage(uint32_t slot,
     {
         const InstanceId root = instance.owner.index;
         if (root < instanceFrontierVersions_.size())
-            instanceFrontierVersions_[root] = ++generationCounter_;
+            invalidateInstanceFrontier(root);
         return;
     }
     if (!instance.owner.valid()) return;
@@ -1078,8 +1078,7 @@ void SpatialDatabase::setDefinitionNodeReadiness(
             const NodeRef rootOwner = slots_[root].owner;
             if (rootOwner.isTlasRoot() &&
                 rootOwner.index < instanceFrontierVersions_.size())
-                instanceFrontierVersions_[rootOwner.index] =
-                    ++generationCounter_;
+                invalidateInstanceFrontier(rootOwner.index);
             lastRoot = root;
         }
         refreshMountDefinitionReadiness(slot);
@@ -1203,7 +1202,7 @@ InstanceHandle SpatialDatabase::addTlasRootInstance(
     inst.mask = desc.mask;
     inst.worldBox = worldBounds;
     inst.maxErrWorld = worldError;
-    instanceFrontierVersions_[id] = ++generationCounter_;
+    invalidateInstanceFrontier(id);
     instanceMotionTravel_[id] = 0.0f;
     inst.liveIndex = uint32_t(liveInstances_.size());
     liveInstances_.push_back(id);
@@ -1262,6 +1261,14 @@ InstanceId SpatialDatabase::publicInstanceId(InstanceId dense) const
                     instanceDenseToHandle_[dense] != kInvalidInstanceId,
                 "SpatialDatabase: live dense instance has no public handle");
     return instanceDenseToHandle_[dense];
+}
+
+void SpatialDatabase::invalidateInstanceFrontier(InstanceId dense,
+                                                 uint32_t generation)
+{
+    if (generation == 0) generation = ++generationCounter_;
+    instanceFrontierVersions_[dense] = generation;
+    if (++frontierContentGeneration_ == 0) ++frontierContentGeneration_;
 }
 
 SpatialDatabase::MotionGroup::MotionGroup(
@@ -1348,12 +1355,15 @@ void SpatialDatabase::moveInstance(InstanceHandle ref,
     const InstanceId dense = denseInstanceId(ref);
     if (dense == kInvalidInstanceId) return;
     uint32_t mutationGeneration = 0;
+    float batchMaxTravel = 0.0f;
     moveInstanceDense(dense, transform.pos, transform.scale,
-                      mutationGeneration);
+                      mutationGeneration, batchMaxTravel);
+    instanceMotionTravelGlobal_ += batchMaxTravel;
 }
 
 void SpatialDatabase::moveInstanceDense(InstanceId dense, float4 pos, float scale,
-                                        uint32_t& mutationGeneration)
+                                        uint32_t& mutationGeneration,
+                                        float& batchMaxTravel)
 {
     Instance& inst = instances_[dense];
     FRONTIER_CHECK(representableScale(scale) &&
@@ -1368,6 +1378,7 @@ void SpatialDatabase::moveInstanceDense(InstanceId dense, float4 pos, float scal
     AABB worldBox;
     float maxErrWorld = inst.maxErrWorld;
     float nextTravel = instanceMotionTravel_[dense];
+    float translationTravel = 0.0f;
     if (scale == inst.scale)
     {
         const float4 delta = pos - inst.pos;
@@ -1376,8 +1387,9 @@ void SpatialDatabase::moveInstanceDense(InstanceId dense, float4 pos, float scal
         // L1 distance conservatively bounds Euclidean translation while
         // avoiding a square root per moved root. It is exact for the common
         // single-axis animation/streaming shifts.
-        nextTravel += std::fabs(delta.x) + std::fabs(delta.y) +
-                      std::fabs(delta.z);
+        translationTravel = std::fabs(delta.x) + std::fabs(delta.y) +
+                            std::fabs(delta.z);
+        nextTravel += translationTravel;
     }
     else
     {
@@ -1392,18 +1404,19 @@ void SpatialDatabase::moveInstanceDense(InstanceId dense, float4 pos, float scal
     FRONTIER_CHECK(finiteNonEmptyBounds(worldBox) &&
                        std::isfinite(maxErrWorld),
                    "SpatialDatabase::moveInstance: transformed root overflows");
-    if (mutationGeneration == 0)
-        mutationGeneration = ++generationCounter_;
     if (scale != inst.scale || !std::isfinite(nextTravel))
     {
         // Scale changes alter the error field itself. Extremely long-running
         // translation odometers also restart safely by invalidating once.
         instanceMotionTravel_[dense] = 0.0f;
-        instanceFrontierVersions_[dense] = mutationGeneration;
+        if (mutationGeneration == 0)
+            mutationGeneration = ++generationCounter_;
+        invalidateInstanceFrontier(dense, mutationGeneration);
     }
     else
     {
         instanceMotionTravel_[dense] = nextTravel;
+        batchMaxTravel = std::max(batchMaxTravel, translationTravel);
     }
     inst.pos = pos;
     inst.scale = scale;
@@ -1459,9 +1472,11 @@ void SpatialDatabase::moveInstances(MotionGroup& group,
     // stamp with its own recorded stamp. Advancing the database generation
     // once also removes a serialized increment from every translated root.
     uint32_t mutationGeneration = 0;
+    float batchMaxTravel = 0.0f;
     for (const MotionGroup::Slot slot : group.physicalOrder_)
         moveInstanceDense(slot.dense, positions[slot.source], scale,
-                          mutationGeneration);
+                          mutationGeneration, batchMaxTravel);
+    instanceMotionTravelGlobal_ += batchMaxTravel;
 }
 
 // ============================================================================
@@ -1817,7 +1832,7 @@ void SpatialDatabase::flushBounds()
                 "SpatialDatabase::flushBounds: transformed root bounds "
                 "overflow");
             instances_[dense].worldBox = worldBox;
-            instanceFrontierVersions_[dense] = ++generationCounter_;
+            invalidateInstanceFrontier(dense);
             tlasOnInstanceMoved(dense);
             continue;
         }
@@ -1839,7 +1854,7 @@ void SpatialDatabase::applyBoundsChange(InstanceId id, uint32_t slot, uint32_t i
     // never reach another instance -- one counter on the instance is the whole
     // invalidation. Bumped here rather than deeper because a change that stops
     // early (the ancestor box already contained it) still moved this node.
-    instanceFrontierVersions_[id] = ++generationCounter_;
+    invalidateInstanceFrontier(id);
 
     while (true)
     {
@@ -4063,6 +4078,7 @@ void SpatialQuery::reset()
     used_ = garbage_ = reused_ = walked_ = 0;
     travel_ = kTravel_ = 0.0f;
     wholeMargin_ = wholeTravel_ = wholeKTravel_ = wholeMaxSlope_ = 0.0f;
+    wholeInstanceTravel_ = 0.0;
     primed_ = false;
     k_ = bar_ = 0.0f;
     currentCutPolicy_ = CurrentCutPolicy::PreferReadyDescendants;
@@ -4072,7 +4088,7 @@ void SpatialQuery::reset()
     database_ = nullptr;
     instanceLayoutVersion_ = 0;
     visibleMappingVersion_ = 0;
-    databaseGeneration_ = wholeEpoch_ = 0;
+    wholeContentGeneration_ = wholeEpoch_ = 0;
     wholeReusable_ = false;
     resetMountUsage();
     if (scratch_)
@@ -4250,6 +4266,8 @@ void SpatialDatabase::selectFrontierCached(const Camera& camera, const Selection
     // tiny range appends just to reconstruct identical bytes.
     const float wholeTravel = query.travel_ - query.wholeTravel_;
     const float wholeKTravel = query.kTravel_ - query.wholeKTravel_;
+    const double wholeInstanceTravel =
+        instanceMotionTravelGlobal_ - query.wholeInstanceTravel_;
     const bool sameVisible = retainVisible ||
         (scratch.retainedVisible &&
         scratch.visible.size() == scratch.previousVisible.size() &&
@@ -4258,9 +4276,11 @@ void SpatialDatabase::selectFrontierCached(const Camera& camera, const Selection
                      scratch.visible.size() * sizeof(VisibleItem)) == 0));
     if (outResult.retainsExisting_ && usage == nullptr &&
         query.wholeReusable_ && sameVisible &&
-        query.databaseGeneration_ == generationCounter_ &&
+        query.visibleMappingVersion_ == instanceMappingVersion_ &&
+        query.wholeContentGeneration_ == frontierContentGeneration_ &&
         query.wholeEpoch_ == query.epoch_ &&
-        wholeTravel + query.wholeMaxSlope_ * wholeKTravel <
+        double(wholeTravel + query.wholeMaxSlope_ * wholeKTravel) +
+                wholeInstanceTravel <
             query.wholeMargin_)
     {
         query.reused_ = nVis;
@@ -4585,8 +4605,9 @@ void SpatialDatabase::selectFrontierCached(const Camera& camera, const Selection
     query.wholeMaxSlope_ = wholeMaxSlope;
     query.wholeTravel_ = query.travel_;
     query.wholeKTravel_ = query.kTravel_;
+    query.wholeInstanceTravel_ = instanceMotionTravelGlobal_;
     query.wholeEpoch_ = query.epoch_;
-    query.databaseGeneration_ = generationCounter_;
+    query.wholeContentGeneration_ = frontierContentGeneration_;
     scratch.retainedVisible = outResult.retainsExisting_;
     scratch.retainedAllVisible = outResult.retainsExisting_ && allVisible;
     query.visibleMappingVersion_ = instanceMappingVersion_;

@@ -814,11 +814,12 @@ private:
     float    wholeTravel_ = 0.0f;
     float    wholeKTravel_ = 0.0f;
     float    wholeMaxSlope_ = 0.0f;
+    double   wholeInstanceTravel_ = 0.0;
     uint32_t used_ = 0;
     uint32_t garbage_ = 0;
     uint32_t instanceLayoutVersion_ = 0;
     uint32_t visibleMappingVersion_ = 0;
-    uint32_t databaseGeneration_ = 0;
+    uint32_t wholeContentGeneration_ = 0;
     uint32_t wholeEpoch_ = 0;
     // Bumped when the error threshold or current-cut policy changes,
     // invalidating every record in O(1). Projection-scale changes consume
@@ -1540,7 +1541,10 @@ private:
     InstanceId denseInstanceId(InstanceHandle instance) const;
     InstanceId publicInstanceId(InstanceId dense) const;
     void moveInstanceDense(InstanceId dense, float4 pos, float scale,
-                           uint32_t& mutationGeneration);
+                           uint32_t& mutationGeneration,
+                           float& batchMaxTravel);
+    void invalidateInstanceFrontier(InstanceId dense,
+                                    uint32_t generation = 0);
     void refreshMotionGroup(MotionGroup& group) const;
     void reorderInstancesByTlas();
 
@@ -2045,6 +2049,14 @@ private:
     // changes every relative camera distance by at most d, so cached LOD cuts
     // remain exact while this plus query travel stays inside their margin.
     std::vector<float> instanceMotionTravel_;
+    // Sum of the maximum translation submitted in each motion batch. For any
+    // individual instance, travel since a query snapshot cannot exceed this
+    // global delta. It is deliberately double precision so long-running worlds
+    // do not need an O(instance-count) reset.
+    double                  instanceMotionTravelGlobal_ = 0.0;
+    // Changes that cannot be represented by translation travel (scale,
+    // deformation, topology, readiness) advance this whole-query epoch.
+    uint32_t                frontierContentGeneration_ = 1;
     std::vector<InstanceId> liveInstances_;
     std::vector<uint32_t> freeInstances_;
     // Public InstanceHandle/FrontierEntry ids remain stable while optimize() or the

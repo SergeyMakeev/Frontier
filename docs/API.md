@@ -784,6 +784,12 @@ continues to enforce current frustum visibility. A scale change still
 invalidates the affected record because it changes geometric error as well as
 distance.
 
+For a retained complete cut, `MotionGroup` also contributes the largest member
+translation to a database-wide motion odometer. The query's minimum remaining
+margin can then certify every root at once without probing the per-instance
+record array. Scale, deformation, topology, readiness, mapping changes, and a
+failed TLAS-root visibility proof reject this shortcut conservatively.
+
 The first update after construction or `reset()` resolves and sorts the cohort.
 The database automatically rebuilds that cache after `optimize()` or another
 physical layout change; ordinary frames only perform the ordered O(n) update.
