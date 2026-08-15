@@ -98,6 +98,44 @@ TEST(QueryCache, MountedStateMutationInvalidatesRecordedCut)
     EXPECT_GT(query.walked(), 0u);
 }
 
+TEST(QueryCache, RecurringViewMemoReturnsExactCutsAndTracksSceneVersions)
+{
+    SpatialDatabase database;
+    const SubtreeHandle subtree =
+        database.registerSubtree(makeLodSubtree());
+    instantiateFor(database, subtree, box(5.0f));
+    database.applyUpdates();
+
+    const Camera nearView = cameraAt(-8.0f);
+    const Camera farView = cameraAt(-1000.0f);
+    SpatialQuery reference;
+    reference.setReuseEnabled(false);
+    const std::vector<UserPayload> nearExpected = payloads(
+        database, reference.selectFrontier(database, nearView, {}), false);
+    const std::vector<UserPayload> farExpected = payloads(
+        database, reference.selectFrontier(database, farView, {}), false);
+
+    SpatialQuery query;
+    const Camera sequence[] = {
+        nearView, farView, nearView, farView, nearView, farView};
+    for (const Camera& camera : sequence)
+    {
+        const FrontierResultView result =
+            query.selectFrontier(database, camera, {});
+        EXPECT_EQ(payloads(database, result, false),
+                  camera.pos.z == nearView.pos.z ? nearExpected : farExpected);
+    }
+    EXPECT_EQ(query.walked(), 0u);
+
+    database.markNodeReady(handleOf(database, 11));
+    database.markNodeReady(handleOf(database, 12));
+    database.applyUpdates();
+    const FrontierResultView updated =
+        query.selectFrontier(database, nearView, {});
+    EXPECT_EQ(payloads(database, updated, false),
+              (std::vector<UserPayload>{11, 12}));
+}
+
 TEST(QueryCache, QueriesOwnIndependentDampingAndReuseState)
 {
     SpatialDatabase database;

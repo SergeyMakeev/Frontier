@@ -1131,6 +1131,13 @@ void selectFrontier(const SpatialDatabase& database,
   stream is retained when the conservative TLAS root remains wholly inside the
   frustum and the instance mapping epoch is unchanged; otherwise the exact
   TLAS query rebuilds it.
+- **Recurring views:** the query-owned `FrontierResultView` overload admits up
+  to two exact recurring camera/parameter keys after their second occurrence.
+  With zero damping, reuse enabled, and mount-usage tracking disabled, later
+  matches return the memoized complete cut directly. Mapping, spatial, and
+  content generations guard every snapshot. Unique camera streams retain only
+  two small candidate keys and never copy a cut; damping, usage tracking,
+  caller sinks, and owning-result overloads use the normal path.
 
 ### Reset and storage
 
@@ -1142,7 +1149,8 @@ size_t bytes() const;
 `reset()` releases database binding and clears damping history, reuse records,
 pending usage, last counters, and current output while retaining allocations,
 reuse mode, and configured half-life. Call it for camera cuts or teleports.
-`bytes()` returns retained query/cache/scratch capacity in bytes.
+`bytes()` returns retained query/cache/scratch capacity in bytes, including
+any recurring-view output snapshots.
 
 ## 9. Database configuration
 

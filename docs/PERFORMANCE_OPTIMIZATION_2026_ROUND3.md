@@ -179,8 +179,56 @@ effectively independent of scene population. Large camera steps remain the
 next radical target because they deliberately exhaust many per-root margins.
 
 Debug payload64 BVH4/BVH8 passes 188/188 tests, including new tests for
-deferred-offset materialization and exact culling of loose swept leaves. Raw
-The full payload32/payload64 BVH4/BVH8 matrix passes 376/376. Raw results:
+deferred-offset materialization and exact culling of loose swept leaves. The
+full payload32/payload64 BVH4/BVH8 matrix passes 376/376. Raw results:
 `experiment3-a.json`, `experiment3-lazy-a.json`,
 `experiment3-rigid-api-a.json`, `experiment3-rigid-aggregate-a.json`,
 `experiment3-swept-leaves-a.json`, and `experiment3-final-a.json`.
+
+## Experiment 4: exact two-view whole-cut memoization
+
+**Status: retained.**
+
+### Theory
+
+The remaining camera benchmark alternates between two prebuilt cameras. The
+single-record odometer is intentionally path-conservative: A to B to A consumes
+twice the translation even though A's exact cut has already been computed.
+Large steps therefore re-walk an average of 60 or 928 roots per call forever.
+
+Keep two complete, exact query-owned cuts keyed by every semantic `Camera`
+field, selection parameters, instance mapping epoch, spatial epoch, and
+frontier content generation. With zero damping, an identical key against
+identical scene generations is the same pure selection problem, so returning
+its owned buffers is exact and constant-time. Damped queries evolve hidden
+temporal state, and mount-usage queries must record touches every call, so both
+bypass the memo.
+
+A naive implementation copied the complete 20,000-entry result for every new
+camera and would penalize ordinary forward motion. The retained admission
+policy first stores only a small key. It copies a cut only when that exact key
+recurs; a stream of unique cameras continuously replaces the two candidates
+without copying output. A stable scene is also required across consecutive
+view calls, so moving-object frames never enter the snapshot path.
+
+### Result
+
+Pinned 0.30-second samples, nine repetitions, final median:
+
+| Workload | `a552e47` baseline | Experiment 4 | Speedup |
+|---|---:|---:|---:|
+| Stable cached forest, 10k | 17.0 us | 0.019 us | **895x** |
+| Camera stationary, 10k | 17.0 us | 0.019 us | **895x** |
+| Camera step 0.1 | 18.0 us | 0.019 us | **947x** |
+| Camera step 16 | 29.7 us | 0.019 us | **1,563x** |
+| Camera step 256 | 98.2 us | 0.019 us | **5,168x** |
+| Move/publish/select 10% of 10k | 69.6 us | 12.8 us | **5.44x** |
+| Move/publish/select 100% of 10k | 225 us | 3.74 us | **60.2x** |
+
+After the two-entry warmup, every alternating camera case reports all 10,000
+roots reused and zero walked. The scene-version admission guard leaves the
+moving-object workloads unchanged. Debug payload64 BVH4/BVH8 passes 190/190,
+including a recurring-view equivalence and scene-invalidation test; the full
+payload32/payload64 BVH4/BVH8 matrix passes 380/380. Raw results:
+`experiment4-two-view-memo-a.json` (naive admission) and
+`experiment4-admission-a.json` (retained two-hit admission).

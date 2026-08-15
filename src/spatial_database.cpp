@@ -169,11 +169,30 @@ inline FrontierEntry makeFrontierEntry(NodeHandle node, float error, float thres
 // ownership by SpatialQuery is what makes every query a read-only SpatialDatabase operation.
 struct QueryScratch
 {
+    struct ViewMemo
+    {
+        Camera camera{};
+        SelectionParams params{};
+        detail::FrontierBuffers output;
+        uint32_t mappingVersion = 0;
+        uint32_t contentGeneration = 0;
+        uint64_t spatialVersion = 0;
+        uint64_t lastUsed = 0;
+        uint32_t visibleCount = 0;
+        bool valid = false;
+    };
+
     std::vector<SpatialDatabase::Worker>      workers{1};
     std::vector<SpatialDatabase::VisibleItem> visible;
     std::vector<SpatialDatabase::VisibleItem> previousVisible;
     std::vector<SpatialDatabase::TlasItem>    tlasStack;
     detail::FrontierBuffers              output;
+    ViewMemo viewMemo[2];
+    uint64_t memoClock = 0;
+    uint32_t lastSceneMappingVersion = 0;
+    uint32_t lastSceneContentGeneration = 0;
+    uint64_t lastSceneSpatialVersion = 0;
+    bool haveLastScene = false;
     bool retainedVisible = false;
     bool retainedAllVisible = false;
 
@@ -186,6 +205,12 @@ struct QueryScratch
                    output.shared.capacity() * sizeof(FrontierEntry) +
                    output.currentOnly.capacity() * sizeof(FrontierEntry) +
                    output.idealOnly.capacity() * sizeof(FrontierEntry);
+        for (const ViewMemo& memo : viewMemo)
+        {
+            n += memo.output.shared.capacity() * sizeof(FrontierEntry);
+            n += memo.output.currentOnly.capacity() * sizeof(FrontierEntry);
+            n += memo.output.idealOnly.capacity() * sizeof(FrontierEntry);
+        }
         for (const SpatialDatabase::Worker& w : workers)
         {
             n += w.work.capacity() * sizeof(SpatialDatabase::WorkItem);
@@ -204,6 +229,34 @@ struct QueryScratch
         return n;
     }
 };
+
+namespace {
+
+inline bool sameFloat4(float4 a, float4 b)
+{
+    return a.x == b.x && a.y == b.y && a.z == b.z && a.w == b.w;
+}
+
+bool sameMemoCamera(const Camera& a, const Camera& b)
+{
+    if (!sameFloat4(a.pos, b.pos) || a.k != b.k ||
+        a.viewMask != b.viewMask || !sameFloat4(a.envLo, b.envLo) ||
+        !sameFloat4(a.envHi, b.envHi))
+        return false;
+    for (uint32_t plane = 0; plane < 6; ++plane)
+        if (!sameFloat4(a.frustum.plane[plane], b.frustum.plane[plane]))
+            return false;
+    return true;
+}
+
+inline bool sameMemoParams(const SelectionParams& a,
+                           const SelectionParams& b)
+{
+    return a.threshold == b.threshold && a.minPix == b.minPix &&
+           a.currentCutPolicy == b.currentCutPolicy;
+}
+
+} // namespace
 
 SpatialQuery::SpatialQuery()
     : scratch_(std::make_unique<QueryScratch>())
@@ -4335,6 +4388,14 @@ void SpatialQuery::reset()
         scratch_->previousVisible.clear();
         scratch_->retainedVisible = false;
         scratch_->retainedAllVisible = false;
+        for (QueryScratch::ViewMemo& memo : scratch_->viewMemo)
+        {
+            memo.output.clear();
+            memo.valid = false;
+            memo.lastUsed = 0;
+        }
+        scratch_->memoClock = 0;
+        scratch_->haveLastScene = false;
     }
     ++epoch_;
     // The half-life is configuration and survives; the accumulated window is
@@ -4907,9 +4968,119 @@ void SpatialQuery::selectFrontier(const SpatialDatabase& database, const Camera&
 FrontierResultView SpatialQuery::selectFrontier(const SpatialDatabase& database, const Camera& camera,
                                       const SelectionParams& params)
 {
+    FRONTIER_CHECK(database_ == nullptr || database_ == &database,
+               "SpatialQuery::selectFrontier: SpatialQuery belongs to another SpatialDatabase; call reset()");
+    FRONTIER_CHECK(params.threshold > 0.0f &&
+                       std::isfinite(params.threshold),
+                   "SpatialQuery::selectFrontier: threshold must be finite "
+                   "and positive");
+    FRONTIER_CHECK(params.minPix >= 0.0f && std::isfinite(params.minPix),
+                   "SpatialQuery::selectFrontier: minPix must be finite and "
+                   "non-negative");
+    FRONTIER_CHECK(
+        params.currentCutPolicy ==
+                CurrentCutPolicy::PreferReadyDescendants ||
+            params.currentCutPolicy ==
+                CurrentCutPolicy::PreferReadyAncestors,
+        "SpatialQuery::selectFrontier: invalid current-cut policy");
+    FRONTIER_CHECK(validSelectionCamera(camera),
+                   "SpatialQuery::selectFrontier: invalid camera");
+
+    QueryScratch& scratch = *scratch_;
+    const bool memoEligible =
+        reuseEnabled_ && !mountUsageEnabled_ && damper_.halfLife() == 0.0f &&
+        database.flatInstanceCount_ != database.liveInstances_.size();
+    const bool stableScene = scratch.haveLastScene &&
+        scratch.lastSceneMappingVersion == database.instanceMappingVersion_ &&
+        scratch.lastSceneContentGeneration ==
+            database.frontierContentGeneration_ &&
+        scratch.lastSceneSpatialVersion == database.instanceSpatialVersion_;
+    if (memoEligible)
+    {
+        for (QueryScratch::ViewMemo& memo : scratch.viewMemo)
+        {
+            if (!memo.valid ||
+                memo.mappingVersion != database.instanceMappingVersion_ ||
+                memo.contentGeneration !=
+                    database.frontierContentGeneration_ ||
+                memo.spatialVersion != database.instanceSpatialVersion_ ||
+                !sameMemoCamera(memo.camera, camera) ||
+                !sameMemoParams(memo.params, params))
+                continue;
+            database_ = &database;
+            reused_ = memo.visibleCount;
+            walked_ = 0;
+#ifdef FRONTIER_STATS
+            stats_ = SelectionStats{};
+#endif
+            memo.lastUsed = ++scratch.memoClock;
+            scratch.lastSceneMappingVersion = database.instanceMappingVersion_;
+            scratch.lastSceneContentGeneration =
+                database.frontierContentGeneration_;
+            scratch.lastSceneSpatialVersion = database.instanceSpatialVersion_;
+            scratch.haveLastScene = true;
+            return memo.output.view();
+        }
+    }
+
     detail::FrontierBuffers& output = scratch_->output;
     FrontierResultSink sink = SpatialDatabase::makeSink(output, true);
     selectFrontier(database, camera, params, sink);
+
+    if (memoEligible && stableScene)
+    {
+        QueryScratch::ViewMemo* destination = nullptr;
+        for (QueryScratch::ViewMemo& memo : scratch.viewMemo)
+            if (memo.lastUsed != 0 &&
+                memo.mappingVersion == database.instanceMappingVersion_ &&
+                memo.contentGeneration ==
+                    database.frontierContentGeneration_ &&
+                memo.spatialVersion == database.instanceSpatialVersion_ &&
+                sameMemoCamera(memo.camera, camera) &&
+                sameMemoParams(memo.params, params))
+            {
+                destination = &memo;
+                break;
+            }
+        if (!destination)
+            destination = scratch.viewMemo[0].lastUsed == 0
+                              ? &scratch.viewMemo[0]
+                              : (scratch.viewMemo[1].lastUsed == 0
+                                     ? &scratch.viewMemo[1]
+                                     : (scratch.viewMemo[0].lastUsed <=
+                                                scratch.viewMemo[1].lastUsed
+                                            ? &scratch.viewMemo[0]
+                                            : &scratch.viewMemo[1]));
+        const bool recurring =
+            destination->lastUsed != 0 &&
+            destination->mappingVersion == database.instanceMappingVersion_ &&
+            destination->contentGeneration ==
+                database.frontierContentGeneration_ &&
+            destination->spatialVersion == database.instanceSpatialVersion_ &&
+            sameMemoCamera(destination->camera, camera) &&
+            sameMemoParams(destination->params, params);
+        if (recurring)
+        {
+            destination->output = output;
+            destination->visibleCount = reused_ + walked_;
+            destination->valid = true;
+        }
+        else
+        {
+            destination->camera = camera;
+            destination->params = params;
+            destination->mappingVersion = database.instanceMappingVersion_;
+            destination->contentGeneration =
+                database.frontierContentGeneration_;
+            destination->spatialVersion = database.instanceSpatialVersion_;
+            destination->valid = false;
+        }
+        destination->lastUsed = ++scratch.memoClock;
+    }
+    scratch.lastSceneMappingVersion = database.instanceMappingVersion_;
+    scratch.lastSceneContentGeneration = database.frontierContentGeneration_;
+    scratch.lastSceneSpatialVersion = database.instanceSpatialVersion_;
+    scratch.haveLastScene = memoEligible;
     return output.view();
 }
 

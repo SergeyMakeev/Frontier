@@ -487,6 +487,16 @@ lanes instead of rewriting and comparing one item per instance. Instance
 addition, removal, slot reuse, or physical reorder advances a mapping epoch and
 forces an exact stream rebuild.
 
+The normal query-owned-view overload also recognizes up to two recurring exact
+camera/parameter states when damping and mount-usage tracking are disabled. A
+view must recur before Frontier snapshots its complete cut, so continuously
+moving one-off cameras do not copy output. Later exact matches return that
+snapshot directly while instance mapping, spatial, and content generations are
+unchanged. This targets stereo/portal pairs, alternating shadow views, editor
+bookmarks, and deterministic camera oscillation; any scene mutation or query
+parameter change falls back to ordinary exact selection automatically. The
+memoized output capacity is included in `SpatialQuery::bytes()`.
+
 `currentCutPolicy` controls how an unavailable ideal choice is replaced:
 
 - `PreferReadyDescendants` uses a complete ready descendant cut when one
