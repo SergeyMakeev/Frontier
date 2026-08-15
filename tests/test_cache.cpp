@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
 
+#include <array>
+
 #include "helpers.h"
 
 using namespace frontier;
@@ -23,6 +25,43 @@ TEST(QueryCache, ReusesStableFrontiers)
     EXPECT_GT(query.walked(), 0u);
     (void)query.selectFrontier(database, cameraAt(-100), {});
     EXPECT_GT(query.reused(), 0u);
+}
+
+TEST(QueryCache, RetainsWholeInternalResultButStillFillsExternalSinks)
+{
+    SpatialDatabase database;
+    const SubtreeHandle subtree =
+        database.registerSubtree(makeLeafSubtree(1000));
+    for (uint32_t i = 0; i < 32; ++i)
+    {
+        InstanceDesc desc;
+        desc.pos = float4::point(float(i) * 2.0f, 0.0f, 0.0f);
+        instantiateFor(database, subtree, box(), 64.0f, desc);
+    }
+    TestAccess::markAllNodesReady(database);
+    database.applyUpdates();
+
+    SpatialQuery query;
+    const Camera camera = cameraAt(-1000.0f);
+    const FrontierResultView first =
+        query.selectFrontier(database, camera, {});
+    const FrontierEntry* retained = first.shared.data();
+    const FrontierResultView second =
+        query.selectFrontier(database, camera, {});
+    EXPECT_EQ(second.shared.data(), retained);
+    EXPECT_EQ(query.reused(), 32u);
+
+    std::array<FrontierEntry, 32> shared{};
+    FrontierResultSink sink{Sink<FrontierEntry>{shared},
+                            Sink<FrontierEntry>{{}},
+                            Sink<FrontierEntry>{{}}};
+    query.selectFrontier(database, camera, {}, sink);
+    EXPECT_EQ(sink.shared.count(), shared.size());
+    EXPECT_EQ(sink.shared.dropped(), 0u);
+
+    const FrontierResultView afterExternal =
+        query.selectFrontier(database, camera, {});
+    EXPECT_EQ(afterExternal.shared.size(), shared.size());
 }
 
 TEST(QueryCache, MountedStateMutationInvalidatesRecordedCut)

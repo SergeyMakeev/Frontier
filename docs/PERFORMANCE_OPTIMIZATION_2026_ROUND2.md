@@ -136,3 +136,49 @@ baseline run:
 The all-visible shortcut also reduced the flat 10k case to 36.5 us and was
 neutral within noise for traversal-dominated raw/forced-miss cases. Raw
 result: `experiment3-a.json`.
+
+## Experiment 4: retain an unchanged complete cached result
+
+**Status: retained.**
+
+### Theory
+
+On a stable cached frame, the query already owns the exact three contiguous
+output buckets from the previous call. The old hit path still probed every
+32-byte root record and appended each root's usually two-entry run back into
+those same buckets. This made a 100%-reused cut scale with root count and
+performed thousands of tiny copies.
+
+Retain the previous output when a conservative whole-result proof succeeds:
+
+- the database generation and selection-policy epoch are unchanged;
+- the packed visible-root/mask stream is byte-identical;
+- every record was cacheable on the previous completed pass; and
+- camera plus projection travel remains below the minimum residual validity
+  margin, using the maximum recorded projection slope.
+
+The internal view-returning API can then return its existing spans immediately.
+Caller-provided sinks and owning-result copies still receive freshly written
+output. A failed proof clears the internal buffers and takes the original
+per-root exact path.
+
+### Result
+
+Pinned 0.30-second samples, nine repetitions:
+
+| Workload | Initial baseline | Retained output | Speedup |
+|---|---:|---:|---:|
+| Forest 10k, stable cached | 71.4 us | 17.2 us | 4.15x |
+| Camera stationary | 72.3 us | 17.0 us | 4.25x |
+| Camera step 0.1 | 72.2 us | 17.6 us | 4.10x |
+| Camera step 16 | 76.7 us | 32.5 us | 2.36x |
+| Camera step 256 | 135 us | 98.5 us | 1.37x |
+
+The 10%-moving fallback remained at 156 us, matching the 156-157 us initial
+baseline, and mass motion remained far ahead of the original baseline at
+925 us versus 1,167-1,197 us. Raw results: `experiment4-a.json` and
+`experiment4-fallbacks.json`.
+
+The Debug BVH4/BVH8 suite passes 182/182 tests after adding direct coverage
+that the internal view keeps its storage address on a whole-result hit while a
+caller-provided fixed sink is still populated on every call.

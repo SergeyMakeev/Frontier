@@ -171,12 +171,15 @@ struct QueryScratch
 {
     std::vector<SpatialDatabase::Worker>      workers{1};
     std::vector<SpatialDatabase::VisibleItem> visible;
+    std::vector<SpatialDatabase::VisibleItem> previousVisible;
     std::vector<SpatialDatabase::TlasItem>    tlasStack;
     detail::FrontierBuffers              output;
+    bool retainedVisible = false;
 
     size_t bytes() const
     {
         size_t n = visible.capacity() * sizeof(visible[0]) +
+                   previousVisible.capacity() * sizeof(previousVisible[0]) +
                    tlasStack.capacity() * sizeof(tlasStack[0]) +
                    workers.capacity() * sizeof(SpatialDatabase::Worker) +
                    output.shared.capacity() * sizeof(FrontierEntry) +
@@ -3796,6 +3799,11 @@ void SpatialDatabase::selectFrontierUncached(const Camera& camera, const Selecti
                               FrontierResultSink& outResult) const
 {
     QueryScratch& scratch = *query.scratch_;
+    outResult.shared.clear();
+    outResult.currentOnly.clear();
+    outResult.idealOnly.clear();
+    scratch.retainedVisible = false;
+    query.wholeReusable_ = false;
 #ifdef FRONTIER_STATS
     query.stats_ = SelectionStats{};
 #endif
@@ -4020,6 +4028,7 @@ void SpatialQuery::reset()
     store_.clear();
     used_ = garbage_ = reused_ = walked_ = 0;
     travel_ = kTravel_ = 0.0f;
+    wholeMargin_ = wholeTravel_ = wholeKTravel_ = wholeMaxSlope_ = 0.0f;
     primed_ = false;
     k_ = bar_ = 0.0f;
     currentCutPolicy_ = CurrentCutPolicy::PreferReadyDescendants;
@@ -4028,8 +4037,16 @@ void SpatialQuery::reset()
 #endif
     database_ = nullptr;
     instanceLayoutVersion_ = 0;
+    databaseGeneration_ = wholeEpoch_ = 0;
+    wholeReusable_ = false;
     resetMountUsage();
-    if (scratch_) scratch_->output.clear();
+    if (scratch_)
+    {
+        scratch_->output.clear();
+        scratch_->visible.clear();
+        scratch_->previousVisible.clear();
+        scratch_->retainedVisible = false;
+    }
     ++epoch_;
     // The half-life is configuration and survives; the accumulated window is
     // state and does not. This is the half that reset() exists for: records
@@ -4126,6 +4143,7 @@ void SpatialDatabase::selectFrontierCached(const Camera& camera, const Selection
 
     // Whole-cut cache hits already avoid the BLAS walk. Keep the universal
     // TLAS query lean and test the root only on the smaller miss population.
+    scratch.visible.swap(scratch.previousVisible);
     tlasQuery(dv, params.minPix, scratch.visible, scratch.tlasStack);
 
     const uint32_t nVis = uint32_t(scratch.visible.size());
@@ -4180,6 +4198,36 @@ void SpatialDatabase::selectFrontierCached(const Camera& camera, const Selection
         query.kTravel_ += std::fabs(dv.k - query.k_);
     query.k_ = dv.k;
 
+    // The normal view-returning API owns its output inside this query. If the
+    // complete visible stream is unchanged and the conservative global
+    // validity budget still covers camera/zoom travel, those contiguous
+    // buffers are already the exact answer. Avoid 10k record probes and 10k
+    // tiny range appends just to reconstruct identical bytes.
+    const float wholeTravel = query.travel_ - query.wholeTravel_;
+    const float wholeKTravel = query.kTravel_ - query.wholeKTravel_;
+    const bool sameVisible =
+        scratch.retainedVisible &&
+        scratch.visible.size() == scratch.previousVisible.size() &&
+        (scratch.visible.empty() ||
+         std::memcmp(scratch.visible.data(), scratch.previousVisible.data(),
+                     scratch.visible.size() * sizeof(VisibleItem)) == 0);
+    if (outResult.retainsExisting_ && usage == nullptr &&
+        query.wholeReusable_ && sameVisible &&
+        query.databaseGeneration_ == generationCounter_ &&
+        query.wholeEpoch_ == query.epoch_ &&
+        wholeTravel + query.wholeMaxSlope_ * wholeKTravel <
+            query.wholeMargin_)
+    {
+        query.reused_ = nVis;
+        query.walked_ = 0;
+        return;
+    }
+
+    outResult.shared.clear();
+    outResult.currentOnly.clear();
+    outResult.idealOnly.clear();
+    scratch.retainedVisible = false;
+
     // The one safe moment to squeeze the slab: before any offset recorded this
     // pass could be moved out from under us.
     if (query.garbage_ > query.used_ / 2) query.compact();
@@ -4195,6 +4243,10 @@ void SpatialDatabase::selectFrontierCached(const Camera& camera, const Selection
     w.coalesceMountTreeDependencies = usage == nullptr;
     w.bar = params.threshold;
     w.barInv = params.threshold > 0.0f ? 1.0f / params.threshold : 0.0f;
+
+    bool wholeReusable = usage == nullptr;
+    float wholeMargin = FLT_MAX;
+    float wholeMaxSlope = 0.0f;
 
     const auto recordUsage = [&](uint32_t slot)
     {
@@ -4254,6 +4306,10 @@ void SpatialDatabase::selectFrontierCached(const Camera& camera, const Selection
             outResult.shared.pushRange(entries, shared);
             outResult.currentOnly.pushRange(entries + shared, current);
             outResult.idealOnly.pushRange(entries + shared + current, ideal);
+            const float remaining =
+                r.validUntil - query.travel_ - r.kSlope * query.kTravel_;
+            wholeMargin = std::min(wholeMargin, remaining);
+            wholeMaxSlope = std::max(wholeMaxSlope, r.kSlope);
             ++query.reused_;
             continue;
         }
@@ -4375,6 +4431,16 @@ void SpatialDatabase::selectFrontierCached(const Camera& camera, const Selection
             r.validUntil = 0.0f;
         }
 
+        if (eligible)
+        {
+            const float remaining =
+                r.validUntil - query.travel_ - r.kSlope * query.kTravel_;
+            wholeMargin = std::min(wholeMargin, remaining);
+            wholeMaxSlope = std::max(wholeMaxSlope, r.kSlope);
+        }
+        else
+            wholeReusable = false;
+
         // From the walk buffer, not from the slab: same bytes, still hot.
         outResult.shared.pushRange(w.frontierBuffer.shared.data(), nShared);
         outResult.currentOnly.pushRange(w.frontierBuffer.currentOnly.data(), nCurrent);
@@ -4383,6 +4449,14 @@ void SpatialDatabase::selectFrontierCached(const Camera& camera, const Selection
     }
 
     w.result = FrontierResultSink{};
+    query.wholeReusable_ = wholeReusable;
+    query.wholeMargin_ = wholeMargin;
+    query.wholeMaxSlope_ = wholeMaxSlope;
+    query.wholeTravel_ = query.travel_;
+    query.wholeKTravel_ = query.kTravel_;
+    query.wholeEpoch_ = query.epoch_;
+    query.databaseGeneration_ = generationCounter_;
+    scratch.retainedVisible = outResult.retainsExisting_;
 #ifdef FRONTIER_STATS
     query.stats_ = w.stats;
 #endif
@@ -4434,7 +4508,7 @@ FrontierResultView SpatialQuery::selectFrontier(const SpatialDatabase& database,
                                       const SelectionParams& params)
 {
     detail::FrontierBuffers& output = scratch_->output;
-    FrontierResultSink sink = SpatialDatabase::makeSink(output);
+    FrontierResultSink sink = SpatialDatabase::makeSink(output, true);
     selectFrontier(database, camera, params, sink);
     return output.view();
 }

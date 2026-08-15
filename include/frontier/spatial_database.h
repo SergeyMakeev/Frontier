@@ -470,12 +470,19 @@ public:
     uint32_t dropped() const { return dropped_; }
     bool     overflowed() const { return dropped_ != 0; }
 
+    void clear()
+    {
+        if (vec_) vec_->clear();
+        count_ = 0;
+        dropped_ = 0;
+    }
+
 private:
     friend class SpatialQuery;
     friend class SpatialDatabase;
 
     // Internal growable sink. Public callers see only fixed spans.
-    explicit Sink(detail::AppendBuffer<T>& v) : vec_(&v) { v.clear(); }
+    explicit Sink(detail::AppendBuffer<T>& v) : vec_(&v) {}
 
     detail::AppendBuffer<T>* vec_ = nullptr;
     T*              data_ = nullptr;
@@ -496,6 +503,10 @@ struct FrontierResultSink
                   Sink<FrontierEntry> idealOnlySink)
         : shared(sharedSink), currentOnly(currentOnlySink), idealOnly(idealOnlySink)
     {}
+
+private:
+    friend class SpatialDatabase;
+    bool retainsExisting_ = false;
 };
 
 // Traversal counters, filled only when the library is built with FRONTIER_STATS.
@@ -797,9 +808,15 @@ private:
     float    kTravel_ = 0.0f;
     float    k_ = 0.0f;
     float    bar_ = 0.0f;
+    float    wholeMargin_ = 0.0f;
+    float    wholeTravel_ = 0.0f;
+    float    wholeKTravel_ = 0.0f;
+    float    wholeMaxSlope_ = 0.0f;
     uint32_t used_ = 0;
     uint32_t garbage_ = 0;
     uint32_t instanceLayoutVersion_ = 0;
+    uint32_t databaseGeneration_ = 0;
+    uint32_t wholeEpoch_ = 0;
     // Bumped when the error threshold or current-cut policy changes,
     // invalidating every record in O(1). Projection-scale changes consume
     // kTravel_ instead.
@@ -819,6 +836,7 @@ private:
     CurrentCutPolicy currentCutPolicy_ =
         CurrentCutPolicy::PreferReadyDescendants;
     bool primed_ = false;
+    bool wholeReusable_ = false;
     bool reuseEnabled_ = true;
     bool mountUsageEnabled_ = false;
 };
@@ -1847,11 +1865,16 @@ private:
     void lruTouch(uint32_t slot, uint32_t epoch);
     void consumeMountUsage(SpatialQuery& query);
     void consumeMountUsage(std::span<SpatialQuery* const> queries);
-    static FrontierResultSink makeSink(detail::FrontierBuffers& buffers)
+    static FrontierResultSink makeSink(detail::FrontierBuffers& buffers,
+                                       bool retainExisting = false)
     {
-        return {Sink<FrontierEntry>(buffers.shared),
-                Sink<FrontierEntry>(buffers.currentOnly),
-                Sink<FrontierEntry>(buffers.idealOnly)};
+        if (!retainExisting) buffers.clear();
+        FrontierResultSink sink{
+            Sink<FrontierEntry>(buffers.shared),
+            Sink<FrontierEntry>(buffers.currentOnly),
+            Sink<FrontierEntry>(buffers.idealOnly)};
+        sink.retainsExisting_ = retainExisting;
+        return sink;
     }
 
     // ---- copy-on-write bounds ----
