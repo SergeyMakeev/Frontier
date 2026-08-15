@@ -200,10 +200,16 @@ a complete report normally takes roughly 10-20 minutes depending on build and
 host speed.
 
 The latest analyzed release snapshot covers M2 Max, RK3399, i9-12900K, and
-EPYC 9654 results from commit `d3f12a0`; see
+EPYC 9654 format-v3 results from commit `35e7b3f`; see
 [PERFORMANCE_RESULTS_2026_08_15.md](PERFORMANCE_RESULTS_2026_08_15.md). It
 uses median real time and keeps cross-machine current-state results separate
 from the pinned before/after optimization score.
+
+At a high level, its eight-byte-payload 10,000-root hierarchical workload
+emits 20,000 entries in 108-524 us on a stable cached cut, 112-575 us after a
+16-unit camera step, and 171-1,084 us for a complete frame that moves 10% of
+roots, publishes, and selects. Those ranges span very different processors and
+are portability evidence, not a cross-machine ranking or latency guarantee.
 
 ## macOS hardware counters
 

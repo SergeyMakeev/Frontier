@@ -157,6 +157,14 @@ Reuse is exact for node membership. A cached record is valid only while:
 Compact encoded error magnitude can age within that proven interval, but its
 above/below-threshold classification remains correct.
 
+The four-platform Release snapshot confirms the intended payoff: stable reuse
+is 3.7-8.5 times faster than raw traversal for a 10,000-root hierarchical
+scene, and a 16-unit camera step still reuses about 99.4% of roots. A caller
+that knows every record is invalid should disable reuse; deliberately forcing
+all cache records to miss costs 37-51% more than a reuse-disabled raw walk in
+the same snapshot. See
+[PERFORMANCE_RESULTS_2026_08_15.md](PERFORMANCE_RESULTS_2026_08_15.md).
+
 ## 11. Collection
 
 Mount retention is an application policy. A query records usage only when
@@ -183,3 +191,8 @@ after all placements are gone.
 | insert/remove/move instance | O(TLAS depth), excluding scheduled rebuild |
 | selection | output-sensitive TLAS plus surviving hierarchy work |
 | cache hit | O(recorded output plus dependency validation) |
+
+The complexity bounds describe scaling, not constants. Current representative
+latencies and the measured split between TLAS work, mounted refinement,
+publication, and selection are maintained in the
+[cross-platform performance snapshot](PERFORMANCE_RESULTS_2026_08_15.md).

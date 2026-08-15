@@ -190,6 +190,28 @@ statistics, and optional mount-retention feedback. Enable the latter with
 `query.setMountUsageEnabled(true)` and pass the query to `collect()` when its
 camera should influence retention.
 
+## Measured release performance
+
+The current format-v3 release snapshot measures an eight-byte-payload,
+fully hierarchical 10,000-instance scene that emits 20,000 frontier entries:
+
+| Platform | Stable cached selection | 16-unit camera step | Move 10% + publish + select |
+|---|---:|---:|---:|
+| Apple M2 Max | 108 us | 112 us | 171 us |
+| RK3399 | 524 us | 575 us | 1,084 us |
+| Intel i9-12900K | 125 us | 137 us | 263 us |
+| AMD EPYC 9654 | 112 us | 123 us | 245 us |
+
+The 16-unit step retains about 99.4% root reuse. Moving and invalidating all
+10,000 roots costs 0.913-9.243 ms across these targets. In a separate
+400-house scene, reusable assembly reduces construction latency by 55-81% and
+retained memory by 63-64%. Payload32 saves memory but is not consistently
+faster. These medians describe specific Release workloads, not latency
+guarantees; see the
+[cross-platform performance snapshot](docs/PERFORMANCE_RESULTS_2026_08_15.md)
+for raw traversal, forced misses, stage attribution, payload comparison, and
+measurement conditions.
+
 ## Building
 
 ```sh

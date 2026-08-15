@@ -178,6 +178,23 @@ Four rules explain most of the architecture:
 3. Definitions are immutable and shareable; placements are mutable and unique.
 4. Topology availability and render readiness are independent.
 
+### Measured release behavior
+
+In the current four-platform Release snapshot, a stable cached selection over
+10,000 fully hierarchical instances emits 20,000 entries in 108-524 us and is
+3.7-8.5 times faster than raw traversal. A 16-unit camera step still reuses
+about 99.4% of roots and completes in 112-575 us. Moving 10% of roots,
+publishing, and selecting the complete cut takes 171-1,084 us; moving all
+10,000 takes 913-9,243 us.
+
+These figures explain the intended integration pattern: keep one
+`SpatialQuery` per coherent view, use `MotionGroup` for stable moving cohorts,
+publish once after a mutation batch, and disable reuse when the caller knows
+every cached record must miss. Absolute time depends on output size, scene
+shape, compiler, and processor. The complete workloads, per-machine tables,
+and caveats are in the
+[cross-platform performance snapshot](PERFORMANCE_RESULTS_2026_08_15.md).
+
 ## 3. Describe one renderable node
 
 `NodeDesc` is used both for TLAS roots and for nodes authored by a

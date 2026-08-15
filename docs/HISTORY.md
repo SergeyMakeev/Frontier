@@ -7,6 +7,8 @@
 > [API reference](API_REFERENCE.md) for exact signatures,
 > [ARCHITECTURE.md](ARCHITECTURE.md) for the current implementation, and
 > [frontier_design.md](frontier_design.md) for the current behavioral contract.
+> Current measurements are in the
+> [cross-platform performance snapshot](PERFORMANCE_RESULTS_2026_08_15.md).
 
 This document preserves the optimization experiments and measurements that
 shaped the library. It is evidence and rationale, not integration guidance.
@@ -142,7 +144,7 @@ booleans, halves the counter, and removes one allocation. A mount also no
 longer copies the asset's 88-byte `PageView`; lookup through the already-stored
 asset index happens once when a page walk begins.
 
-### Current measurements
+### Measurements at the time of this journal
 
 Point estimates below were rerun on 2026-08-05 with MSVC 19.51, Release
 `/O2 /arch:AVX2`, on a noisy shared 64-hardware-thread 2.4 GHz EPYC.

@@ -116,6 +116,12 @@ benchmark context so files remain self-describing after collection.
 `frontier_machine_bench` characterizes kernels and the machine independently.
 See [BENCHMARKING.md](BENCHMARKING.md) for the cases and collection procedure.
 
+The current format-v3 release snapshot contains all 83 inventoried cases for
+both payload widths on each of four machines, and every machine passed the
+360-test payload32/payload64 by BVH4/BVH8 Debug matrix. Its representative
+10,000-root results, dynamic-frame breakdown, and measurement caveats are in
+[PERFORMANCE_RESULTS_2026_08_15.md](PERFORMANCE_RESULTS_2026_08_15.md).
+
 Benchmarks are measurements, not correctness tests. Repository performance
 runners build Release with `FRONTIER_STATS=OFF`,
 `FRONTIER_CONTRACT_CHECKS=OFF`, and `FRONTIER_VALIDATE_SUBTREES=OFF`, then use

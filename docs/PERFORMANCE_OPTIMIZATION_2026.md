@@ -437,18 +437,31 @@ and `final-*-updates-pinned.json` files.
 
 ### Cross-platform release snapshot
 
-The optimized commit `d3f12a0` was subsequently collected on an Apple M2 Max,
-an RK3399, an Intel i9-12900K, and an AMD EPYC 9654. All four reports completed
-and passed 180 Debug BVH4/BVH8 tests. Their matched assembly workload found a
-53-82% construction-latency reduction and a 63-64% retained-memory reduction
-for a shared 400-house scene. Cached flattened and assembled selection differed
-by at most 0.7%; uncached assembly ranged from 39% faster to 44% slower as the
-mount-indirection versus working-set tradeoff changed by target.
+The optimized `d3f12a0` library implementation was subsequently collected on
+an Apple M2 Max, an RK3399, an Intel i9-12900K, and an AMD EPYC 9654. The
+latest format-v3 bundles report commit `35e7b3f`; the intervening changes add
+documentation, benchmark coverage, the comprehensive collector, and an
+ignore-list entry rather than changing the library. All four reports completed
+and passed the 360-test payload32/payload64 by BVH4/BVH8 Debug matrix. Their
+matched assembly workload found a 55-81% construction-latency reduction and a
+63-64% retained-memory reduction for a shared 400-house scene. A cached
+assembled cut differed from the flattened cut by at most 0.275 us; uncached
+assembly ranged from 39% faster to 43% slower as the mount-indirection versus
+working-set tradeoff changed by target.
+
+The comprehensive suite also measured a fully hierarchical 10,000-root scene
+that emits 20,000 entries. Stable cached selection takes 108-524 us across the
+four targets; a 16-unit camera step retains about 99.4% reuse and takes
+112-575 us. Moving 10% of roots, publishing, and selecting takes 171-1,084 us,
+while moving every root takes 913-9,243 us. These absolute ranges are
+cross-platform current-state context, not part of the pinned optimization
+score.
 
 Those bundles contain only the final implementation and ran without affinity,
 so they are a current-state portability snapshot, not an independent
 recalculation of the pinned 22.7% before/after score above. Complete per-machine
-tables, payload-width analysis, kernel context, and measurement caveats are in
+selection, moving-camera, moving-object, assembly, payload-width, kernel, and
+lifecycle tables plus measurement caveats are in
 [PERFORMANCE_RESULTS_2026_08_15.md](PERFORMANCE_RESULTS_2026_08_15.md).
 
 ## Final validation

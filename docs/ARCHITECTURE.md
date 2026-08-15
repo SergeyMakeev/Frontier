@@ -181,13 +181,20 @@ eight-byte-payload footprints:
 | BVH8 | Flattened | 198.8 KiB | 7.2 KiB | 206.0 KiB | - |
 | BVH8 | Assembled | 22.9 KiB | 50.4 KiB | 73.3 KiB | 64.4% |
 
-Assembly also reduced complete construction latency by 53-82% across the M2
-Max, RK3399, i9-12900K, and EPYC 9654 reports. Cached selection differed by at
-most 0.7%. Raw uncached traversal was target-sensitive: assembly was 39%
-faster on the EPYC, 14% slower on the M2 Max, and 43-44% slower on the RK3399
-and i9. Definition sharing reduces the immutable working set but adds mount
+Assembly also reduced complete construction latency by 55-81% across the M2
+Max, RK3399, i9-12900K, and EPYC 9654 reports. Once the assembly cut was
+cached, its absolute cost relative to the flattened cut differed by at most
+0.275 us. Raw uncached traversal was target-sensitive: assembly was 39% faster
+on the EPYC, 14% slower on the M2 Max, and 40-43% slower on the RK3399 and i9.
+Definition sharing reduces the immutable working set but adds mount
 indirection, so shipping targets should measure that uncached balance rather
-than assuming one direction. See the full
+than assuming one direction. The comprehensive format-v3 reports also show
+that a stable 10,000-root hierarchical cut is 3.7-8.5 times faster than raw
+traversal, and real 16-unit camera motion retains about 99.4% root reuse while
+taking 112-575 us. Moving 10% of 10,000 roots, publishing, and selecting takes
+171-1,084 us; moving every root takes 913-9,243 us. Modeled stage attribution
+puts about 87-90% of the 10%-motion frame in complete-cut selection, while
+large-scale motion makes TLAS publication a second major cost. See the full
 [cross-platform snapshot](PERFORMANCE_RESULTS_2026_08_15.md).
 
 The placement-state counter includes definition-local shared

@@ -1063,6 +1063,11 @@ const SelectionStats& lastSelectionStats() const;
 - `reuseEnabled()` reports whether exact frontier-record reuse is requested.
   An all-flat TLAS snapshot still takes the faster direct path automatically
   because it has no hierarchy walk to cache.
+- On the measured 10,000-root hierarchical workload, stable reuse is 3.7-8.5
+  times faster than a raw walk, while a deliberately forced miss on every
+  record is 37-51% slower than selecting with reuse disabled. Keep reuse for
+  coherent views; disable it when the host knows no record can survive. See the
+  [cross-platform snapshot](PERFORMANCE_RESULTS_2026_08_15.md) for conditions.
 - `setReuseEnabled()` resets damping/reuse/usage state when the value changes,
   while retaining allocations and the configured half-life.
 - `reused()` and `walked()` report instance counts from the most recent
