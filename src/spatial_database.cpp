@@ -4223,10 +4223,17 @@ void SpatialDatabase::selectFrontierCached(const Camera& camera, const Selection
         return;
     }
 
-    outResult.shared.clear();
-    outResult.currentOnly.clear();
-    outResult.idealOnly.clear();
-    scratch.retainedVisible = false;
+    bool patchOutput = outResult.retainsExisting_ && usage == nullptr &&
+                       query.wholeReusable_ && sameVisible &&
+                       query.wholeEpoch_ == query.epoch_;
+    bool rebuildOutput = false;
+    if (!patchOutput)
+    {
+        outResult.shared.clear();
+        outResult.currentOnly.clear();
+        outResult.idealOnly.clear();
+        scratch.retainedVisible = false;
+    }
 
     // The one safe moment to squeeze the slab: before any offset recorded this
     // pass could be moved out from under us.
@@ -4302,10 +4309,17 @@ void SpatialDatabase::selectFrontierCached(const Camera& camera, const Selection
                                               : frontierCount(r.counts, 1);
             const uint32_t ideal = overflow ? fullCounts->ideal
                                             : frontierCount(r.counts, 2);
-            const FrontierEntry* entries = query.store_.data() + r.begin;
-            outResult.shared.pushRange(entries, shared);
-            outResult.currentOnly.pushRange(entries + shared, current);
-            outResult.idealOnly.pushRange(entries + shared + current, ideal);
+            if (!patchOutput && !rebuildOutput)
+            {
+                SpatialQuery::RecCold& cold = query.recCold_[instIdx];
+                cold.output[0] = outResult.shared.count();
+                cold.output[1] = outResult.currentOnly.count();
+                cold.output[2] = outResult.idealOnly.count();
+                const FrontierEntry* entries = query.store_.data() + r.begin;
+                outResult.shared.pushRange(entries, shared);
+                outResult.currentOnly.pushRange(entries + shared, current);
+                outResult.idealOnly.pushRange(entries + shared + current, ideal);
+            }
             const float remaining =
                 r.validUntil - query.travel_ - r.kSlope * query.kTravel_;
             wholeMargin = std::min(wholeMargin, remaining);
@@ -4343,6 +4357,12 @@ void SpatialDatabase::selectFrontierCached(const Camera& camera, const Selection
         const bool eligible = mask == 0 &&
                               w.touched.size() <= SpatialQuery::kMaxDeps;
         SpatialQuery::RecCold& cold = query.recCold_[instIdx];
+        const uint32_t oldShared = overflow ? fullCounts->shared
+                                            : frontierCount(r.counts, 0);
+        const uint32_t oldCurrent = overflow ? fullCounts->current
+                                             : frontierCount(r.counts, 1);
+        const uint32_t oldIdeal = overflow ? fullCounts->ideal
+                                           : frontierCount(r.counts, 2);
         if (cold.capacity < n)
         {
             query.garbage_ += cold.capacity;
@@ -4356,20 +4376,15 @@ void SpatialDatabase::selectFrontierCached(const Camera& camera, const Selection
         if (eligible && w.touched.size() == 2 && query.secondDep_.empty())
             query.secondDep_.resize_uninitialized(instances_.size());
         const uint32_t oldCounts = r.counts;
-        if (!eligible)
-        {
-            if (frontierCountsOverflow(oldCounts))
-                query.freeOverflowCounts_.push_back(
-                    frontierOverflowIndex(oldCounts));
-            r.counts = 0;
-        }
-        else if (nShared <= 0x3ffu && nCurrent <= 0x3ffu && nIdeal <= 0x3ffu)
+        if (nShared <= 0x3ffu && nCurrent <= 0x3ffu && nIdeal <= 0x3ffu)
         {
             if (frontierCountsOverflow(oldCounts))
                 query.freeOverflowCounts_.push_back(
                     frontierOverflowIndex(oldCounts));
             r.counts = packFrontierCounts(nShared, nCurrent, nIdeal,
-                                          uint32_t(w.touched.size()));
+                                          eligible
+                                              ? uint32_t(w.touched.size())
+                                              : 0u);
         }
         else
         {
@@ -4388,7 +4403,8 @@ void SpatialDatabase::selectFrontierCached(const Camera& camera, const Selection
                 query.overflowCounts_.emplace_back();
             }
             query.overflowCounts_[overflowIndex] = {
-                nShared, nCurrent, nIdeal, uint32_t(w.touched.size())};
+                nShared, nCurrent, nIdeal,
+                eligible ? uint32_t(w.touched.size()) : 0u};
             r.counts = packFrontierOverflow(overflowIndex);
         }
         FrontierEntry* dst = query.store_.data() + r.begin;
@@ -4441,11 +4457,73 @@ void SpatialDatabase::selectFrontierCached(const Camera& camera, const Selection
         else
             wholeReusable = false;
 
-        // From the walk buffer, not from the slab: same bytes, still hot.
-        outResult.shared.pushRange(w.frontierBuffer.shared.data(), nShared);
-        outResult.currentOnly.pushRange(w.frontierBuffer.currentOnly.data(), nCurrent);
-        outResult.idealOnly.pushRange(w.frontierBuffer.idealOnly.data(), nIdeal);
+        if (patchOutput)
+        {
+            if (oldShared == nShared && oldCurrent == nCurrent &&
+                oldIdeal == nIdeal)
+            {
+                if (nShared)
+                    std::memcpy(scratch.output.shared.data() + cold.output[0],
+                                w.frontierBuffer.shared.data(),
+                                size_t(nShared) * sizeof(FrontierEntry));
+                if (nCurrent)
+                    std::memcpy(
+                        scratch.output.currentOnly.data() + cold.output[1],
+                        w.frontierBuffer.currentOnly.data(),
+                        size_t(nCurrent) * sizeof(FrontierEntry));
+                if (nIdeal)
+                    std::memcpy(scratch.output.idealOnly.data() + cold.output[2],
+                                w.frontierBuffer.idealOnly.data(),
+                                size_t(nIdeal) * sizeof(FrontierEntry));
+            }
+            else
+            {
+                patchOutput = false;
+                rebuildOutput = true;
+            }
+        }
+        else if (!rebuildOutput)
+        {
+            // From the walk buffer, not from the slab: same bytes, still hot.
+            cold.output[0] = outResult.shared.count();
+            cold.output[1] = outResult.currentOnly.count();
+            cold.output[2] = outResult.idealOnly.count();
+            outResult.shared.pushRange(w.frontierBuffer.shared.data(), nShared);
+            outResult.currentOnly.pushRange(w.frontierBuffer.currentOnly.data(), nCurrent);
+            outResult.idealOnly.pushRange(w.frontierBuffer.idealOnly.data(), nIdeal);
+        }
         ++query.walked_;
+    }
+
+    if (rebuildOutput)
+    {
+        outResult.shared.clear();
+        outResult.currentOnly.clear();
+        outResult.idealOnly.clear();
+        for (const VisibleItem visible : scratch.visible)
+        {
+            const uint32_t instIdx = visible.instance();
+            const SpatialQuery::Rec& r = query.rec_[instIdx];
+            const bool overflow = frontierCountsOverflow(r.counts);
+            const SpatialQuery::OverflowCounts* fullCounts =
+                overflow
+                    ? &query.overflowCounts_[frontierOverflowIndex(r.counts)]
+                    : nullptr;
+            const uint32_t shared = overflow ? fullCounts->shared
+                                             : frontierCount(r.counts, 0);
+            const uint32_t current = overflow ? fullCounts->current
+                                              : frontierCount(r.counts, 1);
+            const uint32_t ideal = overflow ? fullCounts->ideal
+                                            : frontierCount(r.counts, 2);
+            SpatialQuery::RecCold& cold = query.recCold_[instIdx];
+            cold.output[0] = outResult.shared.count();
+            cold.output[1] = outResult.currentOnly.count();
+            cold.output[2] = outResult.idealOnly.count();
+            const FrontierEntry* entries = query.store_.data() + r.begin;
+            outResult.shared.pushRange(entries, shared);
+            outResult.currentOnly.pushRange(entries + shared, current);
+            outResult.idealOnly.pushRange(entries + shared + current, ideal);
+        }
     }
 
     w.result = FrontierResultSink{};

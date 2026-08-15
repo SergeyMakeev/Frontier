@@ -32,11 +32,14 @@ TEST(QueryCache, RetainsWholeInternalResultButStillFillsExternalSinks)
     SpatialDatabase database;
     const SubtreeHandle subtree =
         database.registerSubtree(makeLeafSubtree(1000));
+    InstanceHandle moved;
     for (uint32_t i = 0; i < 32; ++i)
     {
         InstanceDesc desc;
         desc.pos = float4::point(float(i) * 2.0f, 0.0f, 0.0f);
-        instantiateFor(database, subtree, box(), 64.0f, desc);
+        const InstanceHandle instance =
+            instantiateFor(database, subtree, box(), 64.0f, desc);
+        if (i == 0) moved = instance;
     }
     TestAccess::markAllNodesReady(database);
     database.applyUpdates();
@@ -50,6 +53,16 @@ TEST(QueryCache, RetainsWholeInternalResultButStillFillsExternalSinks)
         query.selectFrontier(database, camera, {});
     EXPECT_EQ(second.shared.data(), retained);
     EXPECT_EQ(query.reused(), 32u);
+
+    database.moveInstance(
+        moved, Transform{float4::point(0.0f, 0.25f, 0.0f), 1.0f});
+    database.applyUpdates();
+    const FrontierResultView patched =
+        query.selectFrontier(database, camera, {});
+    EXPECT_EQ(patched.shared.data(), retained);
+    EXPECT_EQ(patched.shared.size(), 32u);
+    EXPECT_EQ(query.reused(), 31u);
+    EXPECT_EQ(query.walked(), 1u);
 
     std::array<FrontierEntry, 32> shared{};
     FrontierResultSink sink{Sink<FrontierEntry>{shared},

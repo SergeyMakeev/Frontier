@@ -182,3 +182,39 @@ baseline, and mass motion remained far ahead of the original baseline at
 The Debug BVH4/BVH8 suite passes 182/182 tests after adding direct coverage
 that the internal view keeps its storage address on a whole-result hit while a
 caller-provided fixed sink is still populated on every call.
+
+## Experiment 5: patch changed root runs in place
+
+**Status: retained.**
+
+### Theory
+
+Object motion invalidates the changed roots' frontier versions, so the
+whole-result fast path correctly declines the frame. The previous fallback
+then cleared all output buckets and copied every unchanged root's cached run
+back into them. In the 10%-moving workload, 9,000 valid roots were recopied to
+reconstruct bytes the query already owned.
+
+Store each record's three output offsets as cold allocation state. When the
+visible root/mask stream and policy epoch are unchanged, leave hit runs in
+place and overwrite only walked runs whose bucket counts are unchanged. If a
+walk changes any bucket length, finish updating the per-root slab and perform
+one exact full assembly pass from that slab. This preserves contiguous result
+spans and exact cuts while making the common fixed-topology motion frame
+proportional to the changed cohort.
+
+### Result
+
+Pinned 0.30-second samples, nine repetitions:
+
+| Workload | Before in-place patching | Patched | Incremental gain | Initial-baseline speedup |
+|---|---:|---:|---:|---:|
+| Move/publish/select 10% of 10k | 156 us | 137 us | 1.14x | 1.15x |
+| Camera step 16 | 32.5 us | 29.6 us | 1.10x | 2.59x |
+| Camera step 256 | 98.5 us | 95.4 us | 1.03x | 1.42x |
+
+Stationary and 0.1-unit camera cases retained their 4.1-4.3x speedups. The
+100%-moving case has no hit runs to preserve and remained within 2% of its
+pre-change measurement. `RecCold` grows from 4 to 16 bytes, adding 120 KiB at
+10,000 record slots; these offsets are never fetched by the hit-validation
+path. Raw result: `experiment5-a.json`.

@@ -732,8 +732,10 @@ private:
     struct RecCold
     {
         uint32_t capacity = 0;
+        uint32_t output[3]{};
     };
-    static_assert(sizeof(RecCold) == 4, "SpatialQuery cold record must stay 4 bytes");
+    static_assert(sizeof(RecCold) == 16,
+                  "SpatialQuery cold record must stay 16 bytes");
 
     struct SecondDep
     {
