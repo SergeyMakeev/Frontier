@@ -20,7 +20,8 @@ preserved there as `frontier_bench_baseline.exe`.
 - Process pinned to logical processor 0.
 - Google Benchmark real time, seven repetitions, 0.20-second minimum samples,
   aggregate median.
-- The final result will use longer interleaved baseline/current runs.
+- The final result uses a longer paired baseline/current run from preserved
+  executables under the same affinity and build settings.
 
 ## Baseline
 
@@ -327,3 +328,62 @@ The unchanged motion path does not reach the new stamping branch and matched
 the prior long audit at 0.958 versus 0.957 us. The 10%-moving frame remained
 inside its observed 64-69 us run-to-run band. Debug BVH4/BVH8 passes 184/184
 tests. Raw result: `experiment8-a.json`.
+
+## Final paired audit
+
+The preserved `15d8e65` executable and final `484ef41` executable were each
+measured with 0.30-second minimum samples and 11 repetitions, pinned to the
+same logical processor. Values below are real-time medians from
+`final-baseline.json` and `final-current.json`.
+
+| Workload | Baseline | Final | Speedup |
+|---|---:|---:|---:|
+| `MotionGroup`, 400 changed roots | 2.20 us | 3.00 us | 0.73x |
+| `MotionGroup`, 400 unchanged roots | 2.19 us | 0.968 us | 2.27x |
+| Move/publish/select 10% of 10k | 159 us | 69.6 us | **2.28x** |
+| Move/publish/select 100% of 10k | 1,106 us | 225 us | **4.92x** |
+| Forest 10k, uncached | 499 us | 468 us | 1.07x |
+| Forest 10k, stable cached | 74.1 us | 17.0 us | **4.37x** |
+| Forest 10k, forced cache miss | 750 us | 792 us | 0.95x |
+| Camera stationary | 72.6 us | 17.0 us | **4.28x** |
+| Camera step 0.1 | 73.9 us | 18.0 us | **4.11x** |
+| Camera step 16 | 78.0 us | 29.7 us | **2.62x** |
+| Camera step 256 | 135 us | 98.2 us | 1.38x |
+
+The geometric mean across the seven real dynamic/cache-hit workloads (the two
+complete object-motion frames, stable cached forest, and four camera steps) is
+**3.15x**. The geometric mean across all eleven audit rows, including raw and
+deliberately adversarial paths, is **2.18x**.
+
+### Tradeoffs
+
+- The standalone changed-transform loop is 36% slower because it now computes
+  and stores the exact conservative translation budget that enables root-cut
+  reuse. Once publication and selection are included, that cost buys 2.28x to
+  4.92x faster complete moving-object frames. Unchanged batches are 2.27x
+  faster.
+- The forced-miss cached path is 5.6% slower because in-place patching stores
+  output-run offsets that hits use to avoid reconstructing 20,000 entries.
+  Callers that know every root must miss should disable reuse; the uncached
+  path is 6.7% faster than baseline.
+- A 256-unit camera jump re-walks about 928 of 10,000 roots per call and is
+  therefore traversal-dominated. Coherent stationary through 16-unit motion,
+  which reuses at least 99.4% of roots, improves by 2.62x to 4.28x.
+
+### Retained commits
+
+1. `c4a47e5` - avoid TLAS rebuild thrashing under coherent motion.
+2. `24a2684` - skip redundant instance transform updates.
+3. `af1eef7` - skip TLAS descent for fully visible scenes.
+4. `a0281d5` - retain unchanged cached frontier output.
+5. `c55d199` - patch changed cached frontier runs in place.
+6. `558bf84` - reuse cached cuts across bounded object motion.
+7. `1edd571` - validate cached motion groups once per batch.
+8. `484ef41` - stamp batched instance motion once.
+
+### Final validation
+
+- Debug payload64 BVH4/BVH8: 184/184 tests passed.
+- Debug payload32/payload64 BVH4/BVH8 matrix: 368/368 tests passed.
+- Release benchmark build completed with MSVC AVX2/BVH8 and IPO.
+- `git diff --check` passed before every retained commit.
