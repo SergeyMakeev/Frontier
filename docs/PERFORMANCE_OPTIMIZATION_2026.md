@@ -435,6 +435,22 @@ fanout, mount/unmount, and bounds-override medians all remained within 3.4% of
 baseline. Raw peripheral results use the `final-*-construction-pinned.json`
 and `final-*-updates-pinned.json` files.
 
+### Cross-platform release snapshot
+
+The optimized commit `d3f12a0` was subsequently collected on an Apple M2 Max,
+an RK3399, an Intel i9-12900K, and an AMD EPYC 9654. All four reports completed
+and passed 180 Debug BVH4/BVH8 tests. Their matched assembly workload found a
+53-82% construction-latency reduction and a 63-64% retained-memory reduction
+for a shared 400-house scene. Cached flattened and assembled selection differed
+by at most 0.7%; uncached assembly ranged from 39% faster to 44% slower as the
+mount-indirection versus working-set tradeoff changed by target.
+
+Those bundles contain only the final implementation and ran without affinity,
+so they are a current-state portability snapshot, not an independent
+recalculation of the pinned 22.7% before/after score above. Complete per-machine
+tables, payload-width analysis, kernel context, and measurement caveats are in
+[PERFORMANCE_RESULTS_2026_08_15.md](PERFORMANCE_RESULTS_2026_08_15.md).
+
 ## Final validation
 
 - Debug BVH8/BVH4: 180/180 tests passed.

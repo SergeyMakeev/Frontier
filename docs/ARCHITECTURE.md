@@ -171,19 +171,29 @@ After publication, distinct queries may read concurrently until the next write.
 ## Memory and performance checkpoints
 
 The city/house benchmark compares 400 houses with eight fully refined detail
-nodes each. In the latest local MSVC Release, AVX2, BVH8, eight-byte-payload
-run, the flattened and assembled representations measured:
+nodes each. The 2026-08-15 cross-platform Release reports measured these
+eight-byte-payload footprints:
 
-| Representation | Immutable definitions | Placement state | Total retained | Raw selection | Cached selection | Complete construction |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Flattened | 198.8 KiB | 7.2 KiB | 206.0 KiB | 11.6 us | 0.695 us | 70.2 us |
-| Assembled | 22.9 KiB | 50.4 KiB | 73.3 KiB | 10.8 us | 0.690 us | 36.6 us |
+| Native layout | Representation | Immutable definitions | Placement state | Total retained | Reduction vs flat |
+| --- | --- | ---: | ---: | ---: | ---: |
+| BVH4 | Flattened | 200.6 KiB | 7.2 KiB | 207.8 KiB | - |
+| BVH4 | Assembled | 23.1 KiB | 54.1 KiB | 77.2 KiB | 62.8% |
+| BVH8 | Flattened | 198.8 KiB | 7.2 KiB | 206.0 KiB | - |
+| BVH8 | Assembled | 22.9 KiB | 50.4 KiB | 73.3 KiB | 64.4% |
 
-Assembly therefore retained about 64% fewer total bytes in this scene while
-also reducing complete construction time by about 48%. The placement-state
-counter includes definition-local shared readiness/coverage words and retained
-private coverage slabs; it is intentionally larger for the 400 mounted house
-placements even though their immutable definition bytes are shared.
+Assembly also reduced complete construction latency by 53-82% across the M2
+Max, RK3399, i9-12900K, and EPYC 9654 reports. Cached selection differed by at
+most 0.7%. Raw uncached traversal was target-sensitive: assembly was 39%
+faster on the EPYC, 14% slower on the M2 Max, and 43-44% slower on the RK3399
+and i9. Definition sharing reduces the immutable working set but adds mount
+indirection, so shipping targets should measure that uncached balance rather
+than assuming one direction. See the full
+[cross-platform snapshot](PERFORMANCE_RESULTS_2026_08_15.md).
+
+The placement-state counter includes definition-local shared
+readiness/coverage words and retained private coverage slabs; it is
+intentionally larger for the 400 mounted house placements even though their
+immutable definition bytes are shared.
 
 Canonical wide-lane bounds are responsible for much of the current immutable
 footprint. Every real node bound is stored once in its parent's `WideBlock`
@@ -193,7 +203,7 @@ reduced immutable bytes by about 36%, improved construction by roughly
 32--48%, and improved batched copy-on-write bound updates by 25--77% for
 32--256 edits. Selection moved by at most about 3%, within run-to-run noise.
 
-These numbers are implementation checkpoints rather than cross-machine
-guarantees. Reproduce them with the matched profiles in
+These numbers are implementation checkpoints rather than guarantees for a new
+scene or machine. Reproduce them with the matched profiles in
 [BENCHMARKING.md](BENCHMARKING.md); historical API and layout measurements are
 kept in [HISTORY.md](HISTORY.md) and `bench_results/`.

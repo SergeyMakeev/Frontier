@@ -231,3 +231,6 @@ exhaustive [API reference](docs/API_REFERENCE.md) for exact contracts,
 optimization campaign, including rejected experiments and raw-result names,
 is recorded in
 [PERFORMANCE_OPTIMIZATION_2026.md](docs/PERFORMANCE_OPTIMIZATION_2026.md).
+The current release candidate's M2 Max, RK3399, i9-12900K, and EPYC 9654
+results are summarized separately in the
+[cross-platform performance snapshot](docs/PERFORMANCE_RESULTS_2026_08_15.md).

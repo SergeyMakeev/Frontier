@@ -178,6 +178,12 @@ Output is written below `perf_reports/`. `FRONTIER_PERF_LABEL`,
 label and locations. Each report contains `real_world_perf_payload32.json` and
 `real_world_perf_payload64.json`.
 
+The latest analyzed release snapshot covers M2 Max, RK3399, i9-12900K, and
+EPYC 9654 results from commit `d3f12a0`; see
+[PERFORMANCE_RESULTS_2026_08_15.md](PERFORMANCE_RESULTS_2026_08_15.md). It
+uses median real time and keeps cross-machine current-state results separate
+from the pinned before/after optimization score.
+
 ## macOS hardware counters
 
 `profile_macos_cpu.sh` records a selected end-to-end case with optimized source
