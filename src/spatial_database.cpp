@@ -2750,6 +2750,38 @@ void SpatialDatabase::tlasQueryImpl(const Camera& view, float minPix,
 
     const float4 qmn = view.queryMin(), qmx = view.queryMax();
 
+    // A convex frustum that contains every root lane contains every instance
+    // below those lanes. Avoid visiting every internal node merely to
+    // rediscover the common overview/shadow-view case where the complete
+    // population is visible with no active planes.
+    if constexpr (!UseMask && !UseMinPix)
+    {
+        const TlasNode& root = tlasNodes_[uint32_t(tlasRoot_)];
+        uint8_t rootMasks[kWide];
+        const uint32_t valid = root.validLanes();
+        const uint32_t inside =
+            testWideAabb(root.bounds, view.frustum, kAllPlanes, rootMasks) &
+            valid;
+        if (inside == valid)
+        {
+            bool allInside = true;
+            uint32_t lanes = valid;
+            while (lanes)
+            {
+                const uint32_t lane = uint32_t(std::countr_zero(lanes));
+                lanes &= lanes - 1;
+                allInside &= rootMasks[lane] == 0;
+            }
+            if (allInside)
+            {
+                outVisible.reserve(liveInstances_.size());
+                for (const InstanceId instance : liveInstances_)
+                    outVisible.emplace_back(instance, uint8_t(0));
+                return;
+            }
+        }
+    }
+
     stack.clear();
     stack.push_back({tlasRoot_, kAllPlanes});
     while (!stack.empty())

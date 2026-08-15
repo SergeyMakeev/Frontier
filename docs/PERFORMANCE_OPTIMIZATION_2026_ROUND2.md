@@ -104,3 +104,35 @@ cohort is unchanged and prevents needless cache invalidation. Complete
 10%- and 100%-moving frame medians remained within the existing run-to-run
 noise (155 us and 869 us). Raw results: `experiment2-baseline.json` and
 `experiment2-a.json`.
+
+## Experiment 3: prove full visibility at the TLAS root
+
+**Status: retained.**
+
+### Theory
+
+The dynamic-scene benchmarks view the complete root population. The old TLAS
+walk nevertheless descended every internal node and emitted roots one leaf at
+a time. If every valid lane of the TLAS root is fully inside all frustum
+planes, convexity proves every descendant instance is visible with a zero
+active-plane mask. With default all-layer selection and no minimum-pixel cull,
+the query can emit the dense live-instance stream directly after one wide root
+test. Selective views retain the existing hierarchical walk.
+
+### Result
+
+Pinned 0.25-second samples, seven repetitions, compared with the initial
+baseline run:
+
+| Workload | Baseline | Experiment | Speedup |
+|---|---:|---:|---:|
+| Forest 10k, stable cached | 71.4 us | 64.8 us | 1.10x |
+| Camera stationary | 72.3 us | 67.2 us | 1.08x |
+| Camera step 0.1 | 72.2 us | 66.4 us | 1.09x |
+| Camera step 16 | 76.7 us | 70.6 us | 1.09x |
+| Camera step 256 | 135 us | 127 us | 1.06x |
+| Move/publish/select 10% of 10k | 156 us | 147 us | 1.06x |
+
+The all-visible shortcut also reduced the flat 10k case to 36.5 us and was
+neutral within noise for traversal-dominated raw/forced-miss cases. Raw
+result: `experiment3-a.json`.
