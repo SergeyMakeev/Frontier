@@ -859,10 +859,6 @@ struct SpatialDatabaseConfig
     // bloat that a steady population hides from tlasCountDrift.
     float tlasAreaDrift = 0.5f;
 
-    // Fraction of distinct leaves that may escape their build-time lane before
-    // a rebuild. Repeated growth of the same moving leaf is charged once.
-    float tlasEscapeFraction = 0.25f;
-
     // Fraction of the population that may be spawned or removed INCREMENTALLY
     // before the tree is rebuilt. An incremental insert descends to the leaf
     // whose box grows least and either takes a free lane or splits the leaf,
@@ -1449,8 +1445,8 @@ private:
         uint32_t rootSlot = kInvalidIndex;
         uint32_t generation = 0;   // stamps InstanceHandles; bumped per reuse
         uint32_t overlayListAndAlive = kOverlayListMask;
-        // TLAS node[24] | lane[3] | escaped[1]. Node count is bounded by the
-        // same 24-bit population limit as InstanceId.
+        // TLAS node[24] | lane[3]. Node count is bounded by the same 24-bit
+        // population limit as InstanceId.
         uint32_t tlasPlacement = kInvalidInstanceId;
         uint32_t liveIndex = kInvalidIndex;
 
@@ -1508,18 +1504,12 @@ private:
         {
             return (tlasPlacement >> 24) & (kWide - 1u);
         }
-        bool escapedSinceBuild() const { return (tlasPlacement & (1u << 27)) != 0; }
         void setTlasPlacement(uint32_t node, uint32_t lane)
         {
             tlasPlacement = (node & kInstanceIdMask) |
                             ((lane & (kWide - 1u)) << 24);
         }
         void clearTlasPlacement() { tlasPlacement = kInvalidInstanceId; }
-        void setEscapedSinceBuild(bool escaped)
-        {
-            if (escaped) tlasPlacement |= 1u << 27;
-            else tlasPlacement &= ~(1u << 27);
-        }
     };
     static_assert(sizeof(Instance) == 80,
                   "coupled instance state must stay 80 bytes");
@@ -2043,7 +2033,6 @@ private:
     int32_t               tlasRoot_ = -1;
     bool                  tlasDirty_ = true;
     bool                  tlasQualityBuild_ = true;   // quality tier vs Morton
-    uint32_t              tlasEscapes_ = 0;
     uint32_t              tlasEdits_ = 0;           // incremental inserts + removes
     std::vector<int32_t>  tlasFreeNodes_;           // nodes emptied by removal
     uint32_t              tlasLeafCount_ = 0;

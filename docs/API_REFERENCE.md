@@ -1168,7 +1168,6 @@ struct SpatialDatabaseConfig {
     float tlasIntersectCost = 1.0f;
     float tlasCountDrift = 0.2f;
     float tlasAreaDrift = 0.5f;
-    float tlasEscapeFraction = 0.25f;
     float tlasEditFraction = 0.05f;
     uint32_t parallelInstanceThreshold = 0;
 };
@@ -1182,8 +1181,6 @@ struct SpatialDatabaseConfig {
   rebuild.
 - `tlasAreaDrift` is the allowed grow-only refit area relative to the last
   quality build.
-- `tlasEscapeFraction` is the allowed fraction of distinct leaves that escape
-  their build-time lanes.
 - `tlasEditFraction` bounds accumulated incremental spawn/removal edits before
   rebuild.
 - `parallelInstanceThreshold` is the minimum visible-instance count for

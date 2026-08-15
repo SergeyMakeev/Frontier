@@ -131,7 +131,8 @@ escape.
 
 The TLAS stores exact world bounds and maximum root error for live instances.
 It supports incremental insertion, removal, and grow-only refit. Population
-drift, edit count, escaped leaves, and accumulated area growth schedule repair.
+drift, edit count, and accumulated ancestor-area growth schedule repair. Exact
+leaf changes alone do not schedule a rebuild.
 `optimize()` performs explicit compaction and a quality rebuild while retaining
 public instance ids.
 

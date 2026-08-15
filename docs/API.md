@@ -920,7 +920,6 @@ SpatialDatabaseConfig config{
     .tlasIntersectCost = 1.0f,
     .tlasCountDrift = 0.2f,
     .tlasAreaDrift = 0.5f,
-    .tlasEscapeFraction = 0.25f,
     .tlasEditFraction = 0.05f,
     .parallelInstanceThreshold = 4096,
 };

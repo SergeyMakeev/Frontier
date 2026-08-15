@@ -129,8 +129,9 @@ the existing query epoch.
 Initial and quality builds use the configured `BinnedSAH`, `Median`, or `Morton`
 tier. Incremental insertion descends by least bound growth and splits a full
 leaf. Removal invalidates a lane. Motion grows ancestor lanes until already
-contained. Population drift, escapes, edit fraction, and added surface area
-schedule rebuilds.
+contained. Population drift, edit fraction, and added surface area schedule
+rebuilds. Motion does not rebuild merely because many exact leaf lanes changed;
+only measured ancestor-bound growth consumes the motion rebuild budget.
 
 An 80-byte `Instance` keeps transform, exact world bound, maximum root error,
 mask, mounted-root slot, generation, overlay-list index, TLAS back-pointer, and

@@ -242,8 +242,6 @@ SpatialDatabase::SpatialDatabase(const SpatialDatabaseConfig& config) : config_(
             std::isfinite(config_.tlasCountDrift) &&
             config_.tlasAreaDrift >= 0.0f &&
             std::isfinite(config_.tlasAreaDrift) &&
-            config_.tlasEscapeFraction >= 0.0f &&
-            std::isfinite(config_.tlasEscapeFraction) &&
             config_.tlasEditFraction >= 0.0f &&
             std::isfinite(config_.tlasEditFraction),
         "SpatialDatabase: TLAS costs and maintenance thresholds must be "
@@ -2147,11 +2145,6 @@ void SpatialDatabase::tlasRemove(InstanceId id)
         return;
     }
 
-    if (inst.escapedSinceBuild())
-    {
-        if (tlasEscapes_) --tlasEscapes_;
-        inst.setEscapedSinceBuild(false);
-    }
     tlasNodes_[nodeIdx].clearLane(lane);
     inst.clearTlasPlacement();
     if (tlasLeafCount_) --tlasLeafCount_;
@@ -2189,9 +2182,11 @@ void SpatialDatabase::tlasOnInstanceMoved(InstanceId id)
         return;
     }
 
-    // Grow-only lane refit up the parent chain. The rebuild budget counts
-    // distinct escaped leaves, not escape events: a bounded moving cohort
-    // should not force periodic rebuilds merely because it moves every frame.
+    // Keep leaf lanes exact while ancestor lanes grow only when necessary.
+    // Rebuilds are driven by accumulated ancestor-area growth, not by the
+    // number of exact leaves that changed: counting exact-leaf escapes makes
+    // a coherently moving population rebuild every frame even when its
+    // ancestors already cover the complete motion envelope.
     const uint32_t nodeIdx = inst.tlasNode();
     const uint32_t lane = inst.tlasLane();
     TlasNode& node = tlasNodes_[nodeIdx];
@@ -2210,17 +2205,10 @@ void SpatialDatabase::tlasOnInstanceMoved(InstanceId id)
     if (ancestorsAlreadyCover)
         return;
 
-    if (!inst.escapedSinceBuild())
-    {
-        inst.setEscapedSinceBuild(true);
-        ++tlasEscapes_;
-    }
     const float added =
         tlasGrowUp(nodeIdx, inst.worldBox, inst.maxErrWorld, inst.mask);
 
     tlasNoteGrowth(added);
-    if (float(tlasEscapes_) > float(tlasLeafCount_) * config_.tlasEscapeFraction)
-        tlasDirty_ = true;
 }
 
 // 21 bits per axis -> 63-bit Morton key.
@@ -2608,16 +2596,15 @@ void SpatialDatabase::reorderInstancesByTlas()
 //  - structural rebuilds (add/remove) take the quality path: rare,
 //    long-lived, quality matters (contribution culling leans on tight
 //    maxErr/bounds lanes);
-//  - motion rebuilds (escape/area threshold) take the Morton path: one sort
-//    plus contiguous groups of kWide per level, ~5x faster to build, letting
-//    the escape policy rebuild eagerly and keep bloat low under heavy motion.
+//  - motion rebuilds (area threshold) take the Morton path: one sort plus
+//    contiguous groups of kWide per level, ~5x faster to build while keeping
+//    grow-only ancestor bloat bounded.
 void SpatialDatabase::tlasRebuild(bool reorderInstances)
 {
     tlasNodes_.clear();
     tlasMeta_.clear();
     tlasFreeNodes_.clear();
     tlasRoot_ = -1;
-    tlasEscapes_ = 0;
     tlasEdits_ = 0;
     tlasGrownArea_ = 0.0f;
     tlasDirty_ = false;
