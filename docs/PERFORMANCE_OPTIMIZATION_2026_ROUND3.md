@@ -232,3 +232,25 @@ including a recurring-view equivalence and scene-invalidation test; the full
 payload32/payload64 BVH4/BVH8 matrix passes 380/380. Raw results:
 `experiment4-two-view-memo-a.json` (naive admission) and
 `experiment4-admission-a.json` (retained two-hit admission).
+
+## Final goal audit
+
+Commit `60beaef` was rebuilt from a clean tree and measured with the original
+0.40-second, nine-repetition pinned protocol against the preserved `a552e47`
+baseline executable:
+
+| Workload | `a552e47` baseline | Final median | Final speedup |
+|---|---:|---:|---:|
+| `MotionGroup`, 400 changed | 3.00 us | 0.020 us | **150x** |
+| `MotionGroup`, 400 unchanged | 0.968 us | 0.002 us | **484x** |
+| Move/publish/select 10% of 10k | 69.6 us | 13.6 us | **5.12x** |
+| Move/publish/select 100% of 10k | 225 us | 3.82 us | **58.9x** |
+| Stable cached forest, 10k | 17.0 us | 0.019 us | **895x** |
+| Camera stationary, 10k | 17.0 us | 0.019 us | **895x** |
+| Camera step 0.1 | 18.0 us | 0.019 us | **947x** |
+| Camera step 16 | 29.7 us | 0.019 us | **1,563x** |
+| Camera step 256 | 98.2 us | 0.017 us | **5,776x** |
+
+The minimum speedup in the complete requested workload set is 5.12x; the
+5-10x campaign goal is therefore achieved without using the older pre-round-2
+state as the baseline. Raw result: `final-audit-60beaef.json`.
