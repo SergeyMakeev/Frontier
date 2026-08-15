@@ -725,8 +725,11 @@ BENCHMARK(BM_TlasQualitySelection)
 
 // Exercises the indexed/dependent-load pipelines between the TLAS result,
 // Instance records, mount slots, and shared subtree arrays. Reuse mode 0 is
-// uncached, 1 measures stable hits, and 2 alternates the current-cut policy to
-// invalidate every record and force the cached-miss path deterministically.
+// uncached, 1 measures stable whole-view hits, and 2 cycles three thresholds
+// to invalidate every record and force the cached-miss path deterministically.
+// Three distinct keys are intentional: the exact-view memo owns two entries,
+// so a two-state policy cycle would memoize both complete results and stop
+// exercising record validation or hierarchy traversal.
 static void BM_InstanceForestSelectionScale(benchmark::State& state)
 {
     const uint32_t count = uint32_t(state.range(0));
@@ -771,9 +774,11 @@ static void BM_InstanceForestSelectionScale(benchmark::State& state)
     for (auto _ : state)
     {
         SelectionParams params;
-        if (reuseMode == 2 && (++call & 1))
-            params.currentCutPolicy =
-                CurrentCutPolicy::PreferReadyAncestors;
+        if (reuseMode == 2)
+        {
+            constexpr float missThresholds[] = {3.75f, 4.0f, 4.25f};
+            params.threshold = missThresholds[++call % std::size(missThresholds)];
+        }
         result = query.selectFrontier(world, stable, params);
         consume(result);
     }
