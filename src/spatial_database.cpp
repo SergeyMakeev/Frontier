@@ -1346,10 +1346,13 @@ void SpatialDatabase::moveInstance(InstanceHandle ref,
 {
     const InstanceId dense = denseInstanceId(ref);
     if (dense == kInvalidInstanceId) return;
-    moveInstanceDense(dense, transform.pos, transform.scale);
+    uint32_t mutationGeneration = 0;
+    moveInstanceDense(dense, transform.pos, transform.scale,
+                      mutationGeneration);
 }
 
-void SpatialDatabase::moveInstanceDense(InstanceId dense, float4 pos, float scale)
+void SpatialDatabase::moveInstanceDense(InstanceId dense, float4 pos, float scale,
+                                        uint32_t& mutationGeneration)
 {
     Instance& inst = instances_[dense];
     FRONTIER_CHECK(representableScale(scale) &&
@@ -1388,17 +1391,18 @@ void SpatialDatabase::moveInstanceDense(InstanceId dense, float4 pos, float scal
     FRONTIER_CHECK(finiteNonEmptyBounds(worldBox) &&
                        std::isfinite(maxErrWorld),
                    "SpatialDatabase::moveInstance: transformed root overflows");
+    if (mutationGeneration == 0)
+        mutationGeneration = ++generationCounter_;
     if (scale != inst.scale || !std::isfinite(nextTravel))
     {
         // Scale changes alter the error field itself. Extremely long-running
         // translation odometers also restart safely by invalidating once.
         instanceMotionTravel_[dense] = 0.0f;
-        instanceFrontierVersions_[dense] = ++generationCounter_;
+        instanceFrontierVersions_[dense] = mutationGeneration;
     }
     else
     {
         instanceMotionTravel_[dense] = nextTravel;
-        ++generationCounter_;
     }
     inst.pos = pos;
     inst.scale = scale;
@@ -1449,8 +1453,14 @@ void SpatialDatabase::moveInstances(MotionGroup& group,
         group.mappingVersion_ != instanceMappingVersion_)
         refreshMotionGroup(group);
 
+    // All members belong to one writer mutation batch. They may share a
+    // frontier version: cache validity only compares each instance's current
+    // stamp with its own recorded stamp. Advancing the database generation
+    // once also removes a serialized increment from every translated root.
+    uint32_t mutationGeneration = 0;
     for (const MotionGroup::Slot slot : group.physicalOrder_)
-        moveInstanceDense(slot.dense, positions[slot.source], scale);
+        moveInstanceDense(slot.dense, positions[slot.source], scale,
+                          mutationGeneration);
 }
 
 // ============================================================================

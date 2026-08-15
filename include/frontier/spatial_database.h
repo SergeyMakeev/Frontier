@@ -1538,7 +1538,8 @@ private:
     Instance* resolveInstance(InstanceHandle instance);
     InstanceId denseInstanceId(InstanceHandle instance) const;
     InstanceId publicInstanceId(InstanceId dense) const;
-    void moveInstanceDense(InstanceId dense, float4 pos, float scale);
+    void moveInstanceDense(InstanceId dense, float4 pos, float scale,
+                           uint32_t& mutationGeneration);
     void refreshMotionGroup(MotionGroup& group) const;
     void reorderInstancesByTlas();
 

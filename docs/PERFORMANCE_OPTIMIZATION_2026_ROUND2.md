@@ -294,3 +294,36 @@ Pinned 0.40-second samples, nine repetitions:
 
 The full Debug BVH4/BVH8 matrix passes 184/184 tests. Raw result:
 `experiment7-a.json`.
+
+## Experiment 8: stamp a motion batch once
+
+**Status: retained.**
+
+### Theory
+
+Pure translation preserves the per-instance frontier-content version, but it
+must still advance the database generation so the whole-result shortcut knows
+to examine exact TLAS visibility and per-root motion margins. The first version
+of the translation cache advanced that shared counter for every moved root.
+Besides doing unnecessary work, 400 dependent read-modify-write operations on
+one address serialize the otherwise streaming motion loop.
+
+Advance the generation lazily on the first effective move in a `MotionGroup`
+and reuse that stamp for any scale-change invalidations in the same batch.
+Per-instance cache correctness only requires the new value to differ from that
+instance's recorded value; versions do not need to be unique within a writer
+batch. An entirely unchanged batch still leaves the generation untouched.
+
+### Result
+
+Pinned 0.40-second samples, nine repetitions:
+
+| Workload | Per-root stamps | One batch stamp | Speedup |
+|---|---:|---:|---:|
+| `MotionGroup`, 400 changed roots | 2.94 us | 2.83 us | 1.04x |
+| Move/publish/select 100% of 10k | 228 us | 224 us | 1.02x |
+
+The unchanged motion path does not reach the new stamping branch and matched
+the prior long audit at 0.958 versus 0.957 us. The 10%-moving frame remained
+inside its observed 64-69 us run-to-run band. Debug BVH4/BVH8 passes 184/184
+tests. Raw result: `experiment8-a.json`.
