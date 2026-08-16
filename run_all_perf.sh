@@ -594,6 +594,7 @@ required_families=(
     BM_MotionGroupSteady
     BM_MovingObjectsSelectionScale
     BM_MovingCameraSelectionScale
+    BM_LiveCityDrivingFrame
     BM_FlatTlasSelectionScale
     BM_InstanceForestSelectionScale
     BM_FlatInstanceLifecycle

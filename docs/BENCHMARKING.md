@@ -63,6 +63,14 @@ library's macro-based public payload customization.
   16-unit, and 256-unit separations and measures the two-entry whole-cut memo
   after admission. It is not a continuously unique camera stream; counters
   report average reused/walked roots and the reuse rate.
+- `BM_LiveCityDrivingFrame` measures one complete dynamic city frame with a
+  continuously changing 40 mph camera, 100 independently moving 50-leaf cars,
+  1,000 independently moving 10-leaf pedestrians, and an 85,000-leaf static
+  world organized primarily into independent depth-five blocks. The scene has
+  exactly 100,000 logical leaves and 1,191 TLAS roots. Actor position staging,
+  batched motion, publication, and selection are timed. Each repetition runs
+  8,192 fixed frames, or 136.5 seconds of simulated 60 Hz time, so every host
+  samples two complete deterministic trajectories.
 - `BM_InstanceForestRootSelectionScale` uses the same mounted forest but a
   distant camera that stops at renderable TLAS roots, separating top-level
   query/dispatch cost from refined BLAS traversal.
@@ -213,7 +221,7 @@ records the chosen CPU, capacity, maximum frequency, governor, warmup, and
 before/after frequency, load, and thermal snapshots in `manifest.txt`,
 `REPORT.md`, and `performance_state.txt`.
 
-The current registry contains 83 cases per payload build. With five
+The current registry contains 84 cases per payload build. With five
 0.5-second-minimum repetitions plus correctness and machine characterization,
 a complete report normally takes roughly 10-20 minutes depending on build and
 host speed.

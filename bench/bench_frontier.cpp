@@ -1,5 +1,6 @@
 #include <benchmark/benchmark.h>
 
+#include <algorithm>
 #include <cmath>
 #include <memory>
 #include <string>
@@ -13,6 +14,26 @@ using namespace frontiertest;
 namespace {
 
 constexpr uint32_t kDetailCount = 8;
+
+constexpr uint32_t kLiveCityStaticBlocks = 83;
+constexpr uint32_t kLiveCityStaticLeavesPerBlock = 1024;
+constexpr uint32_t kLiveCityStaticSingles = 8;
+constexpr uint32_t kLiveCityCars = 100;
+constexpr uint32_t kLiveCityCarLeaves = 50;
+constexpr uint32_t kLiveCityPedestrians = 1000;
+constexpr uint32_t kLiveCityPedestrianLeaves = 10;
+constexpr uint32_t kLiveCityStaticDepth = 5;
+constexpr uint32_t kLiveCityFrames = 4096;
+constexpr uint32_t kLiveCityFrameMask = kLiveCityFrames - 1;
+constexpr float kLiveCityFrameRate = 60.0f;
+constexpr float kMetersPerSecondPerMph = 0.44704f;
+constexpr float kPi = 3.14159265358979323846f;
+constexpr uint32_t kLiveCityTotalLeaves =
+    kLiveCityStaticBlocks * kLiveCityStaticLeavesPerBlock +
+    kLiveCityStaticSingles + kLiveCityCars * kLiveCityCarLeaves +
+    kLiveCityPedestrians * kLiveCityPedestrianLeaves;
+static_assert(kLiveCityTotalLeaves == 100000);
+static_assert((kLiveCityFrames & kLiveCityFrameMask) == 0);
 
 float4 housePosition(uint32_t index, uint32_t side)
 {
@@ -188,6 +209,246 @@ std::unique_ptr<AssemblyScene> buildFlatReadinessFanoutScene(uint32_t count)
             node(i + 1, 16.0f, box(1.0f), true), desc);
         scene->world.mountSubtree(root.rootNode(), detail);
     }
+    return scene;
+}
+
+AABB liveCityBounds(float x, float z, float half, float halfHeight)
+{
+    return AABB::fromCenterExtent(float4::point(x, 0.0f, z),
+                                  float4::vec(half, halfHeight, half));
+}
+
+SubtreeBytes makeLiveCityStaticBlock(uint32_t firstPayload)
+{
+    struct LevelNode
+    {
+        SubtreeBuilder::NodeId id;
+        float x;
+        float z;
+        float half;
+    };
+
+    SubtreeBuilder builder;
+    builder.reserve(1365); // 1 + 4 + 16 + 64 + 256 + 1024.
+    uint32_t payload = firstPayload;
+    constexpr float rootHalf = 48.0f;
+    constexpr float refineError = 10000.0f;
+    std::vector<LevelNode> level;
+    level.push_back({builder.createNode(node(
+                         payload++, refineError,
+                         liveCityBounds(0.0f, 0.0f, rootHalf, 20.0f))),
+                     0.0f, 0.0f, rootHalf});
+
+    for (uint32_t depth = 1; depth <= kLiveCityStaticDepth; ++depth)
+    {
+        std::vector<LevelNode> next;
+        next.reserve(level.size() * 4);
+        const bool leaf = depth == kLiveCityStaticDepth;
+        for (const LevelNode& parent : level)
+        {
+            const float childHalf = parent.half * 0.5f;
+            for (int dz : {-1, 1})
+                for (int dx : {-1, 1})
+                {
+                    const float x = parent.x + float(dx) * childHalf;
+                    const float z = parent.z + float(dz) * childHalf;
+                    next.push_back({builder.createNode(
+                                        parent.id,
+                                        node(payload++, leaf ? 0.0f
+                                                             : refineError,
+                                             liveCityBounds(x, z, childHalf,
+                                                            20.0f))),
+                                    x, z, childHalf});
+                }
+        }
+        level = std::move(next);
+    }
+    return builder.build();
+}
+
+SubtreeBytes makeLiveCityActor(uint32_t firstPayload, uint32_t leafCount,
+                               float xPitch, float zPitch,
+                               uint32_t columns, float halfExtent)
+{
+    SubtreeBuilder builder;
+    builder.reserve(leafCount);
+    const uint32_t rows = (leafCount + columns - 1) / columns;
+    for (uint32_t i = 0; i < leafCount; ++i)
+    {
+        const float x = (float(i % columns) -
+                         0.5f * float(columns - 1)) * xPitch;
+        const float z = (float(i / columns) -
+                         0.5f * float(rows - 1)) * zPitch;
+        builder.createNode(node(firstPayload + i, 0.0f,
+                                box(halfExtent, float4::point(x, 0.0f, z))));
+    }
+    return builder.build();
+}
+
+struct LiveCityScene
+{
+    SpatialDatabase world;
+    SpatialDatabase::MotionGroup carMotion;
+    SpatialDatabase::MotionGroup pedestrianMotion;
+    std::vector<float4> unitCircle;
+    std::vector<float4> carCenters;
+    std::vector<float4> pedestrianCenters;
+    std::vector<float4> carPositions;
+    std::vector<float4> pedestrianPositions;
+    std::vector<Camera> cameras;
+    size_t immutableBytes = 0;
+};
+
+float liveCityTrackRadius(float mph, uint32_t loops)
+{
+    const float metersPerFrame = mph * kMetersPerSecondPerMph /
+                                 kLiveCityFrameRate;
+    const float radiansPerFrame =
+        2.0f * kPi * float(loops) / float(kLiveCityFrames);
+    return metersPerFrame / radiansPerFrame;
+}
+
+uint32_t liveCityTrackSample(uint32_t frame, uint32_t loops,
+                             uint32_t phase, bool reverse)
+{
+    const uint32_t progress = (frame * loops) & kLiveCityFrameMask;
+    return (phase + (reverse ? (kLiveCityFrames - progress) : progress)) &
+           kLiveCityFrameMask;
+}
+
+void updateLiveCityActorPositions(LiveCityScene& scene, uint32_t frame)
+{
+    constexpr uint32_t carLoops = 4;
+    constexpr uint32_t pedestrianLoops = 1;
+    const float carRadius = liveCityTrackRadius(40.0f, carLoops);
+    const float pedestrianRadius = liveCityTrackRadius(1.5f, pedestrianLoops);
+
+    for (uint32_t i = 0; i < kLiveCityCars; ++i)
+    {
+        const uint32_t phase = i * kLiveCityFrames / kLiveCityCars;
+        const uint32_t sample = liveCityTrackSample(
+            frame, carLoops, phase, (i & 1u) != 0);
+        const float4 u = scene.unitCircle[sample];
+        const float4 c = scene.carCenters[i];
+        scene.carPositions[i] = float4::point(
+            c.x + carRadius * u.x, 0.0f, c.z + carRadius * u.z);
+    }
+
+    for (uint32_t i = 0; i < kLiveCityPedestrians; ++i)
+    {
+        const uint32_t phase =
+            uint32_t((uint64_t(i) * kLiveCityFrames) /
+                     kLiveCityPedestrians);
+        const uint32_t sample = liveCityTrackSample(
+            frame, pedestrianLoops, phase, (i & 1u) != 0);
+        const float4 u = scene.unitCircle[sample];
+        const float4 c = scene.pedestrianCenters[i];
+        scene.pedestrianPositions[i] = float4::point(
+            c.x + pedestrianRadius * u.x, 0.0f,
+            c.z + pedestrianRadius * u.z);
+    }
+}
+
+std::unique_ptr<LiveCityScene> buildLiveCityScene()
+{
+    auto scene = std::make_unique<LiveCityScene>();
+    scene->unitCircle.reserve(kLiveCityFrames);
+    scene->cameras.reserve(kLiveCityFrames);
+    for (uint32_t frame = 0; frame < kLiveCityFrames; ++frame)
+    {
+        const float angle = 2.0f * kPi * float(frame) /
+                            float(kLiveCityFrames);
+        scene->unitCircle.push_back(
+            float4::vec(std::cos(angle), 0.0f, std::sin(angle)));
+    }
+
+    constexpr uint32_t cameraLoops = 2;
+    const float cameraRadius = liveCityTrackRadius(40.0f, cameraLoops);
+    for (uint32_t frame = 0; frame < kLiveCityFrames; ++frame)
+    {
+        const uint32_t sample = (frame * cameraLoops) & kLiveCityFrameMask;
+        const float4 u = scene->unitCircle[sample];
+        const float4 eye = float4::point(cameraRadius * u.x, 2.0f,
+                                         cameraRadius * u.z);
+        const float4 target = float4::point(
+            eye.x - 15.0f * u.z, eye.y, eye.z + 15.0f * u.x);
+        scene->cameras.push_back(makeLookAtCamera(
+            eye, target, 1.0f, 16.0f / 9.0f, 1080.0f, 0.1f, 1500.0f));
+    }
+
+    for (uint32_t i = 0; i < kLiveCityStaticBlocks; ++i)
+    {
+        SubtreeBytes staticBytes = makeLiveCityStaticBlock(1000000 + i * 2000);
+        scene->immutableBytes += staticBytes.size();
+        const SubtreeHandle staticBlock =
+            scene->world.registerSubtree(std::move(staticBytes));
+        InstanceDesc desc;
+        desc.pos = float4::point((float(i % 10) - 4.5f) * 100.0f, 0.0f,
+                                 (float(i / 10) - 4.0f) * 100.0f);
+        const InstanceHandle block = scene->world.instantiate(
+            node(10000 + i, 10000.0f,
+                 liveCityBounds(0.0f, 0.0f, 50.0f, 25.0f), true), desc);
+        scene->world.mountSubtree(block.rootNode(), staticBlock);
+    }
+    for (uint32_t i = 0; i < kLiveCityStaticSingles; ++i)
+    {
+        InstanceDesc desc;
+        desc.pos = float4::point((float(i) - 3.5f) * 35.0f, 0.0f, -440.0f);
+        scene->world.instantiate(node(11000 + i, 0.0f, box(2.0f)), desc);
+    }
+
+    SubtreeBytes carBytes = makeLiveCityActor(
+        2000000, kLiveCityCarLeaves, 0.8f, 0.8f, 5, 0.3f);
+    scene->immutableBytes += carBytes.size();
+    const SubtreeHandle car = scene->world.registerSubtree(std::move(carBytes));
+    SubtreeBytes pedestrianBytes = makeLiveCityActor(
+        3000000, kLiveCityPedestrianLeaves, 0.4f, 0.4f, 5, 0.15f);
+    scene->immutableBytes += pedestrianBytes.size();
+    const SubtreeHandle pedestrian =
+        scene->world.registerSubtree(std::move(pedestrianBytes));
+
+    scene->carCenters.reserve(kLiveCityCars);
+    scene->carPositions.resize(kLiveCityCars);
+    for (uint32_t i = 0; i < kLiveCityCars; ++i)
+        scene->carCenters.push_back(float4::point(
+            (float(i % 10) - 4.5f) * 82.0f, 0.0f,
+            (float(i / 10) - 4.5f) * 82.0f));
+    scene->pedestrianCenters.reserve(kLiveCityPedestrians);
+    scene->pedestrianPositions.resize(kLiveCityPedestrians);
+    for (uint32_t i = 0; i < kLiveCityPedestrians; ++i)
+        scene->pedestrianCenters.push_back(float4::point(
+            (float(i % 32) - 15.5f) * 27.0f, 0.0f,
+            (float(i / 32) - 15.5f) * 27.0f));
+    updateLiveCityActorPositions(*scene, 0);
+
+    std::vector<InstanceHandle> carHandles;
+    carHandles.reserve(kLiveCityCars);
+    for (uint32_t i = 0; i < kLiveCityCars; ++i)
+    {
+        InstanceDesc desc;
+        desc.pos = scene->carPositions[i];
+        const InstanceHandle instance = scene->world.instantiate(
+            node(20000 + i, 10000.0f, box(5.0f), true), desc);
+        scene->world.mountSubtree(instance.rootNode(), car);
+        carHandles.push_back(instance);
+    }
+
+    std::vector<InstanceHandle> pedestrianHandles;
+    pedestrianHandles.reserve(kLiveCityPedestrians);
+    for (uint32_t i = 0; i < kLiveCityPedestrians; ++i)
+    {
+        InstanceDesc desc;
+        desc.pos = scene->pedestrianPositions[i];
+        const InstanceHandle instance = scene->world.instantiate(
+            node(30000 + i, 10000.0f, box(1.5f), true), desc);
+        scene->world.mountSubtree(instance.rootNode(), pedestrian);
+        pedestrianHandles.push_back(instance);
+    }
+
+    TestAccess::markAllNodesReady(scene->world);
+    scene->world.optimize();
+    scene->carMotion.reset(carHandles);
+    scene->pedestrianMotion.reset(pedestrianHandles);
     return scene;
 }
 
@@ -865,6 +1126,77 @@ BENCHMARK(BM_MovingCameraSelectionScale)
     ->Args({10000, 0})->Args({10000, 10})
     ->Args({10000, 1600})->Args({10000, 25600})
     ->ArgNames({"instances", "step_x100"})
+    ->Unit(benchmark::kMicrosecond);
+
+// One complete 60 Hz city-simulation frame. The camera follows a contiguous
+// 40 mph circular road trajectory with no adjacent repeated pose. One hundred
+// car placements, each owning 50 detail leaves, travel at 40 mph; 1,000
+// pedestrian placements, each owning 10 part leaves, travel at 1.5 mph. The
+// remaining 85,000 leaves are static, primarily in 83 independent depth-five
+// blocks. Actor transforms, publication, and frontier selection are timed;
+// immutable scene construction and camera construction are not.
+static void BM_LiveCityDrivingFrame(benchmark::State& state)
+{
+    auto scene = buildLiveCityScene();
+    SpatialQuery query;
+    query.setReuseEnabled(true);
+    consume(query.selectFrontier(scene->world, scene->cameras[0], {}));
+
+    uint32_t frame = 0;
+    uint64_t calls = 0;
+    uint64_t totalEntries = 0;
+    uint64_t totalReused = 0;
+    uint64_t totalWalked = 0;
+    uint64_t minEntries = uint64_t(-1);
+    uint64_t maxEntries = 0;
+    FrontierResultView result;
+    for (auto _ : state)
+    {
+        frame = (frame + 1) & kLiveCityFrameMask;
+        updateLiveCityActorPositions(*scene, frame);
+        scene->world.moveInstances(scene->carMotion, scene->carPositions);
+        scene->world.moveInstances(scene->pedestrianMotion,
+                                   scene->pedestrianPositions);
+        scene->world.applyUpdates();
+        result = query.selectFrontier(scene->world, scene->cameras[frame], {});
+        consume(result);
+        ++calls;
+        totalEntries += result.size();
+        minEntries = std::min<uint64_t>(minEntries, result.size());
+        maxEntries = std::max<uint64_t>(maxEntries, result.size());
+        totalReused += query.reused();
+        totalWalked += query.walked();
+    }
+
+    const double callCount = double(calls);
+    const double visited = double(totalReused + totalWalked);
+    state.counters["camera_mph"] = 40.0;
+    state.counters["car_mph"] = 40.0;
+    state.counters["entries_per_call"] = double(totalEntries) / callCount;
+    state.counters["immutable_KB"] = double(scene->immutableBytes) / 1024.0;
+    state.counters["max_entries"] = double(maxEntries);
+    state.counters["min_entries"] = double(minEntries);
+    state.counters["mount_state_KB"] =
+        double(scene->world.subtreeInstanceStateBytes()) / 1024.0;
+    state.counters["moving_roots"] =
+        double(kLiveCityCars + kLiveCityPedestrians);
+    state.counters["pedestrian_mph"] = 1.5;
+    state.counters["potential_leaves"] = double(kLiveCityTotalLeaves);
+    state.counters["query_KB"] = double(query.bytes()) / 1024.0;
+    state.counters["reused_per_call"] = double(totalReused) / callCount;
+    state.counters["reuse_percent"] =
+        visited == 0.0 ? 0.0 : 100.0 * double(totalReused) / visited;
+    state.counters["simulated_seconds"] = callCount / kLiveCityFrameRate;
+    state.counters["static_depth"] = double(kLiveCityStaticDepth);
+    state.counters["tlas_roots"] =
+        double(kLiveCityStaticBlocks + kLiveCityStaticSingles +
+               kLiveCityCars + kLiveCityPedestrians);
+    state.counters["walked_per_call"] = double(totalWalked) / callCount;
+    state.SetItemsProcessed(int64_t(calls));
+}
+
+BENCHMARK(BM_LiveCityDrivingFrame)
+    ->Iterations(kLiveCityFrames * 2)
     ->Unit(benchmark::kMicrosecond);
 
 // Same mounted population as the refined forest, viewed far enough away that
