@@ -293,8 +293,8 @@ struct LiveCityScene
     std::vector<float4> unitCircle;
     std::vector<float4> carCenters;
     std::vector<float4> pedestrianCenters;
-    std::vector<float4> carPositions;
-    std::vector<float4> pedestrianPositions;
+    std::vector<InstanceTransform> carTransforms;
+    std::vector<InstanceTransform> pedestrianTransforms;
     std::vector<Camera> cameras;
     size_t immutableBytes = 0;
 };
@@ -330,8 +330,12 @@ void updateLiveCityActorPositions(LiveCityScene& scene, uint32_t frame)
             frame, carLoops, phase, (i & 1u) != 0);
         const float4 u = scene.unitCircle[sample];
         const float4 c = scene.carCenters[i];
-        scene.carPositions[i] = float4::point(
+        InstanceTransform& transform = scene.carTransforms[i];
+        transform.pos = float4::point(
             c.x + carRadius * u.x, 0.0f, c.z + carRadius * u.z);
+        const float direction = (i & 1u) != 0 ? -1.0f : 1.0f;
+        // Actor +Z follows the exact tangent of the circular road.
+        transform.yaw = {direction * u.x, direction * u.z};
     }
 
     for (uint32_t i = 0; i < kLiveCityPedestrians; ++i)
@@ -343,9 +347,12 @@ void updateLiveCityActorPositions(LiveCityScene& scene, uint32_t frame)
             frame, pedestrianLoops, phase, (i & 1u) != 0);
         const float4 u = scene.unitCircle[sample];
         const float4 c = scene.pedestrianCenters[i];
-        scene.pedestrianPositions[i] = float4::point(
+        InstanceTransform& transform = scene.pedestrianTransforms[i];
+        transform.pos = float4::point(
             c.x + pedestrianRadius * u.x, 0.0f,
             c.z + pedestrianRadius * u.z);
+        const float direction = (i & 1u) != 0 ? -1.0f : 1.0f;
+        transform.yaw = {direction * u.x, direction * u.z};
     }
 }
 
@@ -408,13 +415,13 @@ std::unique_ptr<LiveCityScene> buildLiveCityScene()
         scene->world.registerSubtree(std::move(pedestrianBytes));
 
     scene->carCenters.reserve(kLiveCityCars);
-    scene->carPositions.resize(kLiveCityCars);
+    scene->carTransforms.resize(kLiveCityCars);
     for (uint32_t i = 0; i < kLiveCityCars; ++i)
         scene->carCenters.push_back(float4::point(
             (float(i % 10) - 4.5f) * 82.0f, 0.0f,
             (float(i / 10) - 4.5f) * 82.0f));
     scene->pedestrianCenters.reserve(kLiveCityPedestrians);
-    scene->pedestrianPositions.resize(kLiveCityPedestrians);
+    scene->pedestrianTransforms.resize(kLiveCityPedestrians);
     for (uint32_t i = 0; i < kLiveCityPedestrians; ++i)
         scene->pedestrianCenters.push_back(float4::point(
             (float(i % 32) - 15.5f) * 27.0f, 0.0f,
@@ -426,9 +433,13 @@ std::unique_ptr<LiveCityScene> buildLiveCityScene()
     for (uint32_t i = 0; i < kLiveCityCars; ++i)
     {
         InstanceDesc desc;
-        desc.pos = scene->carPositions[i];
+        desc.pos = scene->carTransforms[i].pos;
+        desc.yaw = scene->carTransforms[i].yaw;
+        NodeDesc carRoot =
+            node(20000 + i, 10000.0f, box(5.0f), true);
+        carRoot.flags |= NodeDesc::FlagYawInvariantBounds;
         const InstanceHandle instance = scene->world.instantiate(
-            node(20000 + i, 10000.0f, box(5.0f), true), desc);
+            carRoot, desc);
         scene->world.mountSubtree(instance.rootNode(), car);
         carHandles.push_back(instance);
     }
@@ -438,9 +449,13 @@ std::unique_ptr<LiveCityScene> buildLiveCityScene()
     for (uint32_t i = 0; i < kLiveCityPedestrians; ++i)
     {
         InstanceDesc desc;
-        desc.pos = scene->pedestrianPositions[i];
+        desc.pos = scene->pedestrianTransforms[i].pos;
+        desc.yaw = scene->pedestrianTransforms[i].yaw;
+        NodeDesc pedestrianRoot =
+            node(30000 + i, 10000.0f, box(1.5f), true);
+        pedestrianRoot.flags |= NodeDesc::FlagYawInvariantBounds;
         const InstanceHandle instance = scene->world.instantiate(
-            node(30000 + i, 10000.0f, box(1.5f), true), desc);
+            pedestrianRoot, desc);
         scene->world.mountSubtree(instance.rootNode(), pedestrian);
         pedestrianHandles.push_back(instance);
     }
@@ -1154,9 +1169,9 @@ static void BM_LiveCityDrivingFrame(benchmark::State& state)
     {
         frame = (frame + 1) & kLiveCityFrameMask;
         updateLiveCityActorPositions(*scene, frame);
-        scene->world.moveInstances(scene->carMotion, scene->carPositions);
+        scene->world.moveInstances(scene->carMotion, scene->carTransforms);
         scene->world.moveInstances(scene->pedestrianMotion,
-                                   scene->pedestrianPositions);
+                                   scene->pedestrianTransforms);
         scene->world.applyUpdates();
         result = query.selectFrontier(scene->world, scene->cameras[frame], {});
         consume(result);
@@ -1174,6 +1189,8 @@ static void BM_LiveCityDrivingFrame(benchmark::State& state)
     state.counters["car_mph"] = 40.0;
     state.counters["entries_per_call"] = double(totalEntries) / callCount;
     state.counters["immutable_KB"] = double(scene->immutableBytes) / 1024.0;
+    state.counters["orientation_KB"] =
+        double(scene->world.instanceOrientationStateBytes()) / 1024.0;
     state.counters["max_entries"] = double(maxEntries);
     state.counters["min_entries"] = double(minEntries);
     state.counters["mount_state_KB"] =

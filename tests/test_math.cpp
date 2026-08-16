@@ -318,6 +318,42 @@ TEST(Camera, LocalTransformIsScaleInvariant)
     EXPECT_NEAR(errWorld, errLocal, 1e-3f * errWorld);
 }
 
+TEST(Camera, PlanarYawTransformsBoundsPositionPlanesAndEnvelope)
+{
+    const AABB localBox = AABB::fromMinMax(
+        float4::point(-1.0f, -0.5f, -3.0f),
+        float4::point(2.0f, 0.5f, 4.0f));
+    const float4 position = float4::point(10.0f, 1.0f, 20.0f);
+    const YawRotation quarterTurn{0.0f, 1.0f};
+    const AABB worldBox = toWorld(localBox, position, 2.0f, quarterTurn);
+    EXPECT_FLOAT_EQ(worldBox.mn.x, 2.0f);
+    EXPECT_FLOAT_EQ(worldBox.mx.x, 16.0f);
+    EXPECT_FLOAT_EQ(worldBox.mn.y, 0.0f);
+    EXPECT_FLOAT_EQ(worldBox.mx.y, 2.0f);
+    EXPECT_FLOAT_EQ(worldBox.mn.z, 18.0f);
+    EXPECT_FLOAT_EQ(worldBox.mx.z, 24.0f);
+
+    Camera world{};
+    world.pos = float4::point(14.0f, 5.0f, 26.0f);
+    world.k = 600.0f;
+    world.envLo = float4::vec(1.0f, 2.0f, 3.0f);
+    world.envHi = float4::vec(5.0f, 4.0f, 7.0f);
+    world.frustum.plane[0] = {1.0f, 0.0f, 0.0f, -5.0f};
+    const Camera local = toLocal(world, position, 2.0f, quarterTurn, 1u);
+    EXPECT_FLOAT_EQ(local.pos.x, 3.0f);
+    EXPECT_FLOAT_EQ(local.pos.y, 2.0f);
+    EXPECT_FLOAT_EQ(local.pos.z, -2.0f);
+    EXPECT_FLOAT_EQ(local.frustum.plane[0].x, 0.0f);
+    EXPECT_FLOAT_EQ(local.frustum.plane[0].z, -1.0f);
+    EXPECT_FLOAT_EQ(local.frustum.plane[0].w, 2.5f);
+    EXPECT_FLOAT_EQ(local.envLo.x, 1.5f);
+    EXPECT_FLOAT_EQ(local.envHi.x, 3.5f);
+    EXPECT_FLOAT_EQ(local.envLo.y, 1.0f);
+    EXPECT_FLOAT_EQ(local.envHi.y, 2.0f);
+    EXPECT_FLOAT_EQ(local.envLo.z, 2.5f);
+    EXPECT_FLOAT_EQ(local.envHi.z, 0.5f);
+}
+
 TEST(Camera, DamperConstructorNormalizesInvalidHalfLife)
 {
     CameraDamper negative(-4.0f);

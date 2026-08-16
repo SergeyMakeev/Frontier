@@ -43,7 +43,8 @@ Frontier requires C++20.
 - Spans never own their elements. Their lifetime is stated with the producing
   function.
 - Translation components use `float4`; only `x`, `y`, and `z` are spatial.
-  Transforms support translation and positive uniform scale, not rotation.
+  Top-level instances support planar yaw plus positive uniform scale. Mounted
+  subtree transforms support translation and positive uniform scale.
 
 The main headers are:
 
@@ -301,7 +302,10 @@ AABB toWorld(const AABB& box, float4 position, float scale);
 
 The distance overloads return zero for touching or overlapping geometry.
 `toWorld()` applies translation and uniform scale and preserves empty boxes;
-`scale` is expected to be positive.
+the `YawRotation` overload additionally returns the exact axis-aligned world
+enclosure after planar yaw. `scale` is expected to be positive. Matching
+`toLocal()` overloads inverse-transform cameras and conservatively enclose a
+rotated damping envelope.
 
 ### Frustum culling
 
@@ -535,6 +539,29 @@ struct Transform {
 
 Represents translation plus positive uniform scale. It occupies 32 bytes.
 
+### `YawRotation` and `InstanceTransform`
+
+```cpp
+struct YawRotation {
+    float cosine = 1.0f;
+    float sine = 0.0f;
+};
+
+YawRotation yawRotation(float radians);
+
+struct InstanceTransform {
+    float4 pos = float4::point(0, 0, 0);
+    float scale = 1.0f;
+    YawRotation yaw{};
+};
+```
+
+`YawRotation` is a finite unit cosine/sine pair for rotation around +Y.
+Keeping the pair instead of an angle lets animation systems submit an existing
+forward vector without database-side trigonometry. `InstanceTransform`
+occupies 32 bytes and applies only to top-level placements; mounted subtrees
+continue to use `Transform`.
+
 ### `ScalarAABB`
 
 ```cpp
@@ -559,7 +586,10 @@ quantize spatial components. It occupies 24 bytes.
 
 ```cpp
 struct NodeDesc {
-    enum Flag : uint32_t { FlagMountable = 1u << 0 };
+    enum Flag : uint32_t {
+        FlagMountable = 1u << 0,
+        FlagYawInvariantBounds = 1u << 1,
+    };
 
     UserPayload payload{};
     float geometricError = 0.0f;
@@ -567,6 +597,7 @@ struct NodeDesc {
     ScalarAABB bounds = AABB::empty();
 
     bool isMountable() const noexcept;
+    bool hasYawInvariantBounds() const noexcept;
 };
 ```
 
@@ -574,9 +605,14 @@ struct NodeDesc {
   returned through live node handles. Equal values are allowed and have no
   implicit effect on readiness. It must not equal `kInvalidPayload`.
 - `geometricError` must be finite and non-negative.
-- `flags` currently accepts `FlagMountable`; keep all reserved bits zero.
+- `FlagMountable` marks an expandable assembly boundary.
+- On a TLAS root only, `FlagYawInvariantBounds` promises that `bounds`
+  contains the root's content at every planar yaw around the local origin.
+  Frontier can then keep one translation-only broadphase envelope while
+  rotating mounted detail traversal. `SubtreeBuilder` rejects this flag.
+- Keep every other reserved flag bit zero.
 - `bounds` is the node's conservative hierarchy-local bound.
-- `isMountable()` tests `FlagMountable`.
+- `isMountable()` and `hasYawInvariantBounds()` test their corresponding bits.
 
 A mountable builder node must remain a local leaf. A mountable TLAS root or
 mounted node may receive one runtime child placement. `NodeDesc` occupies 36
@@ -989,13 +1025,15 @@ struct SelectionParams {
 struct InstanceDesc {
     float4 pos{};
     float scale = 1.0f;
+    YawRotation yaw{};
     uint32_t mask = ~0u;
 };
 ```
 
-Describes one TLAS placement. Position components must be finite and `scale`
-must be finite, positive, and large enough that `1.0f / scale` remains finite.
-`mask & Camera::viewMask == 0` culls the instance at the top level.
+Describes one TLAS placement. Position components must be finite, `scale` must
+be finite, positive, and large enough that `1.0f / scale` remains finite, and
+`yaw` must be a finite unit cosine/sine pair. `mask & Camera::viewMask == 0`
+culls the instance at the top level.
 
 ```cpp
 struct SelectionStats {
@@ -1280,7 +1318,7 @@ InstanceHandle instantiate(const NodeDesc& root,
 ```
 
 - **Parameters:** `root` describes the permanent renderable fallback;
-  `desc` supplies world translation, uniform scale, and view mask.
+  `desc` supplies world translation, uniform scale, planar yaw, and view mask.
 - **Returns:** a generation-stamped instance handle whose `rootNode()` is live
   immediately.
 - **Effects:** inserts one TLAS leaf. A non-mountable one-node instance needs no
@@ -1289,6 +1327,8 @@ InstanceHandle instantiate(const NodeDesc& root,
   zero, root bounds are finite and non-empty on all axes, and instance position
   and scale are finite with positive scale and finite reciprocal. The
   transformed root bound and error must remain representable as finite floats.
+  If `FlagYawInvariantBounds` is set, the application guarantees that the
+  authored root bound contains all content at every possible submitted yaw.
 - **Readiness:** the live TLAS root is always ready. Its payload value does not
   affect the readiness of mounted definition nodes with the same value.
 
@@ -1302,13 +1342,18 @@ void removeInstance(InstanceHandle instance);
 - **Stale behavior:** no-op.
 
 ```cpp
+void moveInstance(InstanceHandle instance,
+                  const InstanceTransform& transform);
 void moveInstance(InstanceHandle instance, const Transform& transform);
 ```
 
-- **Parameters:** new world translation and scale for the whole instance.
+- **Parameters:** new world translation, scale, and optional planar yaw for the
+  whole instance. The `Transform` overload is the identity-yaw convenience
+  path.
 - **Effects:** moves the TLAS root and every mounted descendant as one object;
-  pure translation consumes affected query records' exact distance margins,
-  while scale changes invalidate those records. Public handles remain valid.
+  translation and angular displacement consume affected query records' exact
+  distance margins, while scale changes invalidate those records. Public
+  handles remain valid.
 - **Stale behavior:** no-op.
 - **Contract:** position and scale are finite, with positive scale and finite
   reciprocal. The transformed root bound and error must remain representable
@@ -1349,6 +1394,9 @@ that work.
 void moveInstances(MotionGroup& group,
                    std::span<const float4> positions,
                    float scale = 1.0f);
+
+void moveInstances(MotionGroup& group,
+                   std::span<const InstanceTransform> transforms);
 ```
 
 - **Parameters:** `positions[i]` belongs to the handle copied at group index
@@ -1364,6 +1412,11 @@ void moveInstances(MotionGroup& group,
   with finite reciprocal, and every position belonging to a live instance is
   finite. Each transformed root bound and error must remain representable as
   finite floats.
+
+The `InstanceTransform` overload supplies an independent position, scale, and
+yaw for each group member. Angular motion is charged conservatively by the
+maximum possible displacement of any point in the authored root bound; this
+keeps cached LOD decisions exact without invalidating every rotating actor.
 
 ```cpp
 void translateInstances(MotionGroup& group, float4 delta);
@@ -1601,6 +1654,7 @@ uint32_t frame() const;
 size_t overlayCount() const;
 size_t overlayBytes() const;
 size_t subtreeInstanceStateBytes() const;
+size_t instanceOrientationStateBytes() const;
 ```
 
 - `mountedSubtreeCount()` returns the number of live mounted placements.
@@ -1611,6 +1665,8 @@ size_t subtreeInstanceStateBytes() const;
   transforms, shared coverage/readiness words, private coverage copies, stamps,
   slab capacity, definition-to-mount references, and mount-link capacity;
   immutable registered `SubtreeBytes` are excluded.
+- `instanceOrientationStateBytes()` returns the optional cold top-level yaw
+  and authored-local-bounds stream. It is zero until non-identity yaw is used.
 
 ## 11. Threading contract
 
@@ -1642,7 +1698,8 @@ reuse-record updates are query-local and ordered.
 - TLAS root generations use 20 bits.
 - Public instance ids use 24 bits, with the all-ones value reserved.
 - `FrontierEntry` instance ids and error codes are packed into one 32-bit word.
-- Runtime transforms are translation plus positive uniform scale.
+- Top-level runtime transforms support translation, positive uniform scale,
+  and planar yaw. Mounted-subtree transforms support translation and scale.
 
 These are representational limits, not suggested operating budgets. Use the
 database memory and count introspection methods to set application-specific

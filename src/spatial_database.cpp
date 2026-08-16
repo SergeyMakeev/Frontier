@@ -71,6 +71,31 @@ inline bool representableScale(float scale)
            std::isfinite(1.0f / scale);
 }
 
+inline bool identityYaw(YawRotation yaw)
+{
+    return yaw.cosine == 1.0f && yaw.sine == 0.0f;
+}
+
+inline bool validYaw(YawRotation yaw)
+{
+    const float norm2 = yaw.cosine * yaw.cosine + yaw.sine * yaw.sine;
+    return std::isfinite(norm2) && std::fabs(norm2 - 1.0f) <= 1.0e-3f;
+}
+
+inline float boundsRadiusXZ(const AABB& bounds)
+{
+    const float x = std::max(std::fabs(bounds.mn.x),
+                             std::fabs(bounds.mx.x));
+    const float z = std::max(std::fabs(bounds.mn.z),
+                             std::fabs(bounds.mx.z));
+    return std::hypot(x, z);
+}
+
+inline bool yawInvariantBounds(float signedRadius)
+{
+    return std::signbit(signedRadius);
+}
+
 inline bool finiteNonEmptyBounds(const AABB& b)
 {
     // Positive ordering rejects empty axes and NaNs. Bounding each extent
@@ -806,9 +831,7 @@ SubtreeInstanceHandle SpatialDatabase::mountTlasRoot(
     FRONTIER_CHECK(child != nullptr,
                    "SpatialDatabase::mount: invalid or released subtree");
     const float invInstanceScale = 1.0f / inst.scale;
-    const AABB rootLocal = AABB::fromMinMax(
-        (inst.worldBox.mn - inst.pos) * invInstanceScale,
-        (inst.worldBox.mx - inst.pos) * invInstanceScale);
+    const AABB rootLocal = instanceLocalBounds(dense);
     const AABB childBounds = toWorld(child->view.bounds(),
                                      transform.pos, transform.scale);
     FRONTIER_CHECK(rootLocal.contains(childBounds),
@@ -1185,7 +1208,7 @@ InstanceHandle SpatialDatabase::addTlasRootInstance(
     const NodeDesc& root, const InstanceDesc& desc)
 {
     FRONTIER_CHECK(representableScale(desc.scale) &&
-                       finitePosition(desc.pos),
+                       finitePosition(desc.pos) && validYaw(desc.yaw),
                    "SpatialDatabase::instantiate: invalid transform");
     FRONTIER_CHECK(root.geometricError >= 0.0f &&
                        std::isfinite(root.geometricError),
@@ -1193,12 +1216,18 @@ InstanceHandle SpatialDatabase::addTlasRootInstance(
     const detail::PayloadWord rootPayload = detail::encodePayload(root.payload);
     FRONTIER_CHECK(rootPayload != detail::invalidPayloadWord(),
                    "SpatialDatabase::instantiate: reserved invalid payload");
-    FRONTIER_CHECK((root.flags & ~uint32_t(NodeDesc::FlagMountable)) == 0,
+    constexpr uint32_t kTlasRootFlags =
+        NodeDesc::FlagMountable | NodeDesc::FlagYawInvariantBounds;
+    FRONTIER_CHECK((root.flags & ~kTlasRootFlags) == 0,
                    "SpatialDatabase::instantiate: unknown node flags");
     const AABB rootBounds = root.bounds;
     FRONTIER_CHECK(finiteNonEmptyBounds(rootBounds),
                    "SpatialDatabase::instantiate: empty or non-finite root bounds");
-    const AABB worldBounds = toWorld(rootBounds, desc.pos, desc.scale);
+    const AABB worldBounds =
+        root.hasYawInvariantBounds() || identityYaw(desc.yaw)
+                                 ? toWorld(rootBounds, desc.pos, desc.scale)
+                                 : toWorld(rootBounds, desc.pos, desc.scale,
+                                           desc.yaw);
     const float worldError = root.geometricError * desc.scale;
     FRONTIER_CHECK(finiteNonEmptyBounds(worldBounds) &&
                        std::isfinite(worldError),
@@ -1219,6 +1248,8 @@ InstanceHandle SpatialDatabase::addTlasRootInstance(
         FRONTIER_CHECK(instances_.size() < kInvalidInstanceId,
                        "SpatialDatabase: exhausted the 24-bit InstanceId space");
         instances_.emplace_back();
+        if (!instanceOrientations_.empty())
+            instanceOrientations_.emplace_back();
         if (!tlasRootPayloads_.empty()) tlasRootPayloads_.emplace_back();
         instanceFrontierVersions_.emplace_back();
         instanceMotionTravel_.emplace_back();
@@ -1242,6 +1273,9 @@ InstanceHandle SpatialDatabase::addTlasRootInstance(
     }
     instanceHandleToDense_[handle] = id;
     instanceDenseToHandle_[id] = handle;
+    if ((!identityYaw(desc.yaw) || root.hasYawInvariantBounds()) &&
+        instanceOrientations_.empty())
+        ensureInstanceOrientations();
     if (tlasRootPayloads_.size() < instances_.size())
         tlasRootPayloads_.resize(instances_.size());
     Instance& inst = instances_[id];
@@ -1260,6 +1294,16 @@ InstanceHandle SpatialDatabase::addTlasRootInstance(
     inst.mask = desc.mask;
     inst.worldBox = worldBounds;
     inst.maxErrWorld = worldError;
+    if (!instanceOrientations_.empty())
+    {
+        InstanceOrientation& orientation = instanceOrientations_[id];
+        orientation.localBounds = rootBounds;
+        orientation.yaw = desc.yaw;
+        const float radius = boundsRadiusXZ(rootBounds);
+        orientation.radiusXZ = root.hasYawInvariantBounds()
+                                   ? -radius
+                                   : radius;
+    }
     invalidateInstanceFrontier(id);
     instanceMotionTravel_[id] = 0.0f;
     instanceTlasLoose_[id] = 0;
@@ -1403,6 +1447,8 @@ void SpatialDatabase::removeInstance(InstanceHandle ref)
     if (liveInstances_.empty()) instanceLayoutSpatialized_ = false;
     instances_[id].liveIndex = kInvalidIndex;
     instances_[id].setAlive(false);
+    if (!instanceOrientations_.empty())
+        instanceOrientations_[id] = InstanceOrientation{};
     instanceHandleToDense_[ref.id] = kInvalidInstanceId;
     instanceDenseToHandle_[id] = kInvalidInstanceId;
     freeInstanceHandles_.push_back(ref.id);
@@ -1413,38 +1459,88 @@ void SpatialDatabase::removeInstance(InstanceHandle ref)
 }
 
 void SpatialDatabase::moveInstance(InstanceHandle ref,
-                                   const Transform& transform)
+                                   const InstanceTransform& transform)
 {
     const InstanceId dense = denseInstanceId(ref);
     if (dense == kInvalidInstanceId) return;
     materializeTlasGlobalOffset();
     uint32_t mutationGeneration = 0;
     float batchMaxTravel = 0.0f;
-    moveInstanceDense(dense, transform.pos, transform.scale,
+    moveInstanceDense(dense, transform.pos, transform.scale, transform.yaw,
                       mutationGeneration, batchMaxTravel);
     instanceMotionTravelGlobal_ += batchMaxTravel;
     ++instanceSpatialVersion_;
 }
 
+void SpatialDatabase::ensureInstanceOrientations()
+{
+    if (!instanceOrientations_.empty()) return;
+    instanceOrientations_.resize(instances_.size());
+    for (const InstanceId dense : liveInstances_)
+    {
+        const Instance& inst = instances_[dense];
+        const float invScale = 1.0f / inst.scale;
+        const AABB localBounds = AABB::fromMinMax(
+            (inst.worldBox.mn - inst.pos) * invScale,
+            (inst.worldBox.mx - inst.pos) * invScale);
+        InstanceOrientation& orientation = instanceOrientations_[dense];
+        orientation.localBounds = localBounds;
+        orientation.yaw = YawRotation{};
+        orientation.radiusXZ = boundsRadiusXZ(localBounds);
+    }
+}
+
+AABB SpatialDatabase::instanceLocalBounds(InstanceId dense) const
+{
+    if (!instanceOrientations_.empty())
+        return instanceOrientations_[dense].localBounds.toAABB();
+    const Instance& inst = instances_[dense];
+    const float invScale = 1.0f / inst.scale;
+    return AABB::fromMinMax((inst.worldBox.mn - inst.pos) * invScale,
+                            (inst.worldBox.mx - inst.pos) * invScale);
+}
+
+void SpatialDatabase::setInstanceLocalBounds(InstanceId dense,
+                                             const AABB& bounds)
+{
+    if (instanceOrientations_.empty()) return;
+    InstanceOrientation& orientation = instanceOrientations_[dense];
+    const bool invariant = yawInvariantBounds(orientation.radiusXZ);
+    orientation.localBounds = bounds;
+    const float radius = boundsRadiusXZ(bounds);
+    orientation.radiusXZ = invariant ? -radius : radius;
+}
+
 void SpatialDatabase::moveInstanceDense(InstanceId dense, float4 pos, float scale,
+                                        YawRotation yaw,
                                         uint32_t& mutationGeneration,
                                         float& batchMaxTravel)
 {
     Instance& inst = instances_[dense];
     FRONTIER_CHECK(representableScale(scale) &&
-                       finitePosition(pos),
+                       finitePosition(pos) && validYaw(yaw),
                    "SpatialDatabase::moveInstance: invalid transform");
+    const YawRotation oldYaw = instanceOrientations_.empty()
+                                   ? YawRotation{}
+                                   : instanceOrientations_[dense].yaw;
+    const bool yawChanged = yaw.cosine != oldYaw.cosine ||
+                            yaw.sine != oldYaw.sine;
     // Animation systems commonly submit a stable cohort every frame even
     // when many members did not move. Preserve their frontier records and
     // avoid touching the exact TLAS leaf or ancestor chain at all.
-    if (scale == inst.scale && pos.x == inst.pos.x &&
+    if (!yawChanged && scale == inst.scale && pos.x == inst.pos.x &&
         pos.y == inst.pos.y && pos.z == inst.pos.z)
         return;
+    if (!identityYaw(yaw) && instanceOrientations_.empty())
+        ensureInstanceOrientations();
     AABB worldBox;
     float maxErrWorld = inst.maxErrWorld;
     float nextTravel = instanceMotionTravel_[dense];
     float translationTravel = 0.0f;
-    if (scale == inst.scale)
+    float rotationTravel = 0.0f;
+    const bool invariant = !instanceOrientations_.empty() &&
+        yawInvariantBounds(instanceOrientations_[dense].radiusXZ);
+    if (scale == inst.scale && (!yawChanged || invariant))
     {
         const float4 delta = pos - inst.pos;
         worldBox = AABB::fromMinMax(inst.worldBox.mn + delta,
@@ -1454,17 +1550,39 @@ void SpatialDatabase::moveInstanceDense(InstanceId dense, float4 pos, float scal
         // single-axis animation/streaming shifts.
         translationTravel = std::fabs(delta.x) + std::fabs(delta.y) +
                             std::fabs(delta.z);
-        nextTravel += translationTravel;
+        if (yawChanged)
+        {
+            const float yawChordBound =
+                std::fabs(yaw.cosine - oldYaw.cosine) +
+                std::fabs(yaw.sine - oldYaw.sine);
+            rotationTravel = inst.scale *
+                             std::fabs(instanceOrientations_[dense].radiusXZ) *
+                             yawChordBound;
+        }
+        nextTravel += translationTravel + rotationTravel;
     }
     else
     {
+        const AABB localBounds = instanceLocalBounds(dense);
         const float invOldScale = 1.0f / inst.scale;
-        const AABB localBounds = AABB::fromMinMax(
-            (inst.worldBox.mn - inst.pos) * invOldScale,
-            (inst.worldBox.mx - inst.pos) * invOldScale);
         const float localError = inst.maxErrWorld * invOldScale;
-        worldBox = toWorld(localBounds, pos, scale);
+        worldBox = invariant || identityYaw(yaw)
+                       ? toWorld(localBounds, pos, scale)
+                       : toWorld(localBounds, pos, scale, yaw);
         maxErrWorld = localError * scale;
+        if (scale == inst.scale)
+        {
+            const float4 delta = pos - inst.pos;
+            translationTravel = std::fabs(delta.x) + std::fabs(delta.y) +
+                                std::fabs(delta.z);
+            const float yawChordBound =
+                std::fabs(yaw.cosine - oldYaw.cosine) +
+                std::fabs(yaw.sine - oldYaw.sine);
+            rotationTravel = inst.scale *
+                             std::fabs(instanceOrientations_[dense].radiusXZ) *
+                             yawChordBound;
+            nextTravel += translationTravel + rotationTravel;
+        }
     }
     FRONTIER_CHECK(finiteNonEmptyBounds(worldBox) &&
                        std::isfinite(maxErrWorld),
@@ -1481,12 +1599,15 @@ void SpatialDatabase::moveInstanceDense(InstanceId dense, float4 pos, float scal
     else
     {
         instanceMotionTravel_[dense] = nextTravel;
-        batchMaxTravel = std::max(batchMaxTravel, translationTravel);
+        batchMaxTravel = std::max(batchMaxTravel,
+                                  translationTravel + rotationTravel);
     }
     inst.pos = pos;
     inst.scale = scale;
     inst.worldBox = worldBox;
     inst.maxErrWorld = maxErrWorld;
+    if (!instanceOrientations_.empty())
+        instanceOrientations_[dense].yaw = yaw;
     tlasOnInstanceMoved(dense);
 }
 
@@ -1606,8 +1727,36 @@ void SpatialDatabase::moveInstances(MotionGroup& group,
     uint32_t mutationGeneration = 0;
     float batchMaxTravel = 0.0f;
     for (const MotionGroup::Slot slot : group.physicalOrder_)
-        moveInstanceDense(slot.dense, positions[slot.source], scale,
+    {
+        const YawRotation yaw = instanceOrientations_.empty()
+                                    ? YawRotation{}
+                                    : instanceOrientations_[slot.dense].yaw;
+        moveInstanceDense(slot.dense, positions[slot.source], scale, yaw,
                           mutationGeneration, batchMaxTravel);
+    }
+    instanceMotionTravelGlobal_ += batchMaxTravel;
+    if (!group.physicalOrder_.empty()) ++instanceSpatialVersion_;
+}
+
+void SpatialDatabase::moveInstances(
+    MotionGroup& group, std::span<const InstanceTransform> transforms)
+{
+    FRONTIER_CHECK(
+        group.instances_.size() == transforms.size(),
+        "SpatialDatabase::moveInstances: motion-group/transform count mismatch");
+    if (!group.physicalOrderValid_ ||
+        group.mappingVersion_ != instanceMappingVersion_)
+        refreshMotionGroup(group);
+
+    materializeTlasGlobalOffset();
+    uint32_t mutationGeneration = 0;
+    float batchMaxTravel = 0.0f;
+    for (const MotionGroup::Slot slot : group.physicalOrder_)
+    {
+        const InstanceTransform& transform = transforms[slot.source];
+        moveInstanceDense(slot.dense, transform.pos, transform.scale,
+                          transform.yaw, mutationGeneration, batchMaxTravel);
+    }
     instanceMotionTravelGlobal_ += batchMaxTravel;
     if (!group.physicalOrder_.empty()) ++instanceSpatialVersion_;
 }
@@ -2001,6 +2150,11 @@ size_t SpatialDatabase::subtreeInstanceStateBytes() const
     return bytes;
 }
 
+size_t SpatialDatabase::instanceOrientationStateBytes() const
+{
+    return instanceOrientations_.capacity() * sizeof(InstanceOrientation);
+}
+
 // ============================================================================
 // motion: lazy, coalesced, deduplicated conservative grow-only refit
 // ============================================================================
@@ -2076,12 +2230,22 @@ void SpatialDatabase::flushBounds()
         if (!inst.alive() || inst.generation != m.instGeneration) continue;
         if (resolveTlasRoot(m.node) == dense)
         {
-            const AABB worldBox = toWorld(m.box, inst.pos, inst.scale);
+            const YawRotation yaw = instanceOrientations_.empty()
+                                        ? YawRotation{}
+                                        : instanceOrientations_[dense].yaw;
+            const bool invariant = !instanceOrientations_.empty() &&
+                yawInvariantBounds(
+                    instanceOrientations_[dense].radiusXZ);
+            const AABB worldBox = invariant || identityYaw(yaw)
+                                      ? toWorld(m.box, inst.pos, inst.scale)
+                                      : toWorld(m.box, inst.pos, inst.scale,
+                                                yaw);
             FRONTIER_CHECK(
                 finiteNonEmptyBounds(worldBox),
                 "SpatialDatabase::flushBounds: transformed root bounds "
                 "overflow");
             instances_[dense].worldBox = worldBox;
+            setInstanceLocalBounds(dense, m.box);
             invalidateInstanceFrontier(dense);
             tlasOnInstanceMoved(dense);
             continue;
@@ -2157,10 +2321,7 @@ void SpatialDatabase::applyBoundsChange(InstanceId id, uint32_t slot, uint32_t i
             FRONTIER_ASSERT(owner.isTlasRoot() && owner.index == id,
                             "root mount lost its TLAS owner");
             Instance& root = instances_[id];
-            const float invScale = 1.0f / root.scale;
-            AABB rootLocal = AABB::fromMinMax(
-                (root.worldBox.mn - root.pos) * invScale,
-                (root.worldBox.mx - root.pos) * invScale);
+            AABB rootLocal = instanceLocalBounds(id);
             const MountTransformRt& transform = mountTransforms_[curSlot];
             const AABB mountedRoot = toWorld(
                 overlay.rootBounds.toAABB(), transform.pos, transform.scale);
@@ -2169,13 +2330,22 @@ void SpatialDatabase::applyBoundsChange(InstanceId id, uint32_t slot, uint32_t i
                 "SpatialDatabase::flushBounds: bounds overflow at root "
                 "mount boundary");
             rootLocal.expand(mountedRoot);
-            const AABB worldBox =
-                toWorld(rootLocal, root.pos, root.scale);
+            const YawRotation yaw = instanceOrientations_.empty()
+                                        ? YawRotation{}
+                                        : instanceOrientations_[id].yaw;
+            const bool invariant = !instanceOrientations_.empty() &&
+                yawInvariantBounds(instanceOrientations_[id].radiusXZ);
+            const AABB worldBox = invariant || identityYaw(yaw)
+                                      ? toWorld(rootLocal, root.pos,
+                                                root.scale)
+                                      : toWorld(rootLocal, root.pos,
+                                                root.scale, yaw);
             FRONTIER_CHECK(
                 finiteNonEmptyBounds(worldBox),
                 "SpatialDatabase::flushBounds: transformed instance bounds "
                 "overflow");
             root.worldBox = worldBox;
+            setInstanceLocalBounds(id, rootLocal);
             tlasOnInstanceMoved(id);
             return;
         }
@@ -2202,11 +2372,7 @@ AABB SpatialDatabase::nodeBounds(InstanceHandle ref, NodeHandle h)
     Instance* inst = resolveInstance(ref);
     const InstanceId root = resolveTlasRoot(h);
     if (inst && root == InstanceId(inst - instances_.data()))
-    {
-        const float invScale = 1.0f / inst->scale;
-        return AABB::fromMinMax((inst->worldBox.mn - inst->pos) * invScale,
-                                (inst->worldBox.mx - inst->pos) * invScale);
-    }
+        return instanceLocalBounds(root);
     const SubtreeInstanceRt* rt = resolve(h);
     if (!inst || !rt) return AABB::empty();
     FRONTIER_CHECK(mountBelongsTo(*inst, h.slot()),
@@ -2856,6 +3022,9 @@ void SpatialDatabase::reorderInstancesByTlas()
     // memory and subsequent permutations scale with the live population,
     // rather than with the database's historical peak.
     std::vector<Instance> newInstances(liveCount);
+    std::vector<InstanceOrientation> newOrientations;
+    const bool hadOrientations = !instanceOrientations_.empty();
+    if (hadOrientations) newOrientations.resize(liveCount);
     std::vector<detail::PayloadWord> newTlasRootPayloads;
     const bool hadTlasRootPayloads = !tlasRootPayloads_.empty();
     if (hadTlasRootPayloads) newTlasRootPayloads.resize(liveCount);
@@ -2871,6 +3040,8 @@ void SpatialDatabase::reorderInstancesByTlas()
     {
         const InstanceId old = order[next];
         newInstances[next] = std::move(instances_[old]);
+        if (hadOrientations)
+            newOrientations[next] = instanceOrientations_[old];
         if (hadTlasRootPayloads)
             newTlasRootPayloads[next] = tlasRootPayloads_[old];
         newFrontierVersions[next] = instanceFrontierVersions_[old];
@@ -2882,6 +3053,8 @@ void SpatialDatabase::reorderInstancesByTlas()
             slots_[newInstances[next].rootSlot].owner.index = next;
     }
     instances_.swap(newInstances);
+    if (hadOrientations)
+        instanceOrientations_.swap(newOrientations);
     if (hadTlasRootPayloads)
         tlasRootPayloads_.swap(newTlasRootPayloads);
     instanceFrontierVersions_.swap(newFrontierVersions);
@@ -4023,7 +4196,13 @@ void SpatialDatabase::runTlasRootInstance(
         return;
     }
 
-    const Camera local = toLocal(view, inst.pos, inst.scale, mask);
+    Camera local;
+    if (instanceOrientations_.empty() ||
+        identityYaw(instanceOrientations_[instIdx].yaw))
+        local = toLocal(view, inst.pos, inst.scale, mask);
+    else
+        local = toLocal(view, inst.pos, inst.scale,
+                        instanceOrientations_[instIdx].yaw, mask);
     const bool fullyReady = mountedTreeFullyReady(childSlot);
     if (fullyReady)
     {

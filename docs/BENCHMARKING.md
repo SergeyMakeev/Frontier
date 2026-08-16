@@ -67,10 +67,15 @@ library's macro-based public payload customization.
   continuously changing 40 mph camera, 100 independently moving 50-leaf cars,
   1,000 independently moving 10-leaf pedestrians, and an 85,000-leaf static
   world organized primarily into independent depth-five blocks. The scene has
-  exactly 100,000 logical leaves and 1,191 TLAS roots. Actor position staging,
-  batched motion, publication, and selection are timed. Each repetition runs
+  exactly 100,000 logical leaves and 1,191 TLAS roots. Every moving actor's
+  local forward axis follows the tangent of its curved track, including the
+  opposite heading for reverse traffic. Actor roots are authored as
+  conservative yaw-swept envelopes, as production vehicle/crowd broadphases
+  commonly are. Full actor-transform staging, batched rigid motion,
+  publication, and selection are timed. Each repetition runs
   8,192 fixed frames, or 136.5 seconds of simulated 60 Hz time, so every host
-  samples two complete deterministic trajectories.
+  samples two complete deterministic trajectories. `orientation_KB` reports
+  the optional cold yaw/local-bounds stream.
 - `BM_InstanceForestRootSelectionScale` uses the same mounted forest but a
   distant camera that stops at renderable TLAS roots, separating top-level
   query/dispatch cost from refined BLAS traversal.

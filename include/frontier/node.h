@@ -101,14 +101,26 @@ inline PayloadWord invalidPayloadWord() noexcept
 
 inline constexpr uint32_t kInvalidIndex = 0xFFFFFFFFu;
 
-// Translation plus positive uniform scale, the transform contract shared by
-// top-level instances and mounted subtrees.
+// Translation plus positive uniform scale for mounted subtrees.
 struct Transform
 {
     float4 pos = float4::point(0.0f, 0.0f, 0.0f);
     float scale = 1.0f;
 };
 static_assert(sizeof(Transform) == 32, "transform layout changed");
+
+// Top-level placement transform. Yaw is stored as a unit cosine/sine pair so
+// animation systems can submit their already-computed forward vector without
+// paying for atan2 followed by sin/cos in the database. Planar yaw covers the
+// dominant vehicle/crowd case while keeping this descriptor at 32 bytes.
+struct InstanceTransform
+{
+    float4 pos = float4::point(0.0f, 0.0f, 0.0f);
+    float scale = 1.0f;
+    YawRotation yaw{};
+};
+static_assert(sizeof(InstanceTransform) == 32,
+              "instance transform layout changed");
 
 // Exact six-float bounds storage for cold authoring data. Runtime traversal
 // keeps using the SIMD-friendly AABB and WideBounds representations.
@@ -158,8 +170,13 @@ struct NodeDesc
     enum Flag : uint32_t
     {
         FlagMountable = 1u << 0,
+        // Top-level-only promise: bounds already contain the node's content
+        // at every planar yaw around the local origin. This lets a rotating
+        // actor keep one translation-only TLAS envelope. SubtreeBuilder
+        // rejects this flag because mounted placements do not carry yaw.
+        FlagYawInvariantBounds = 1u << 1,
     };
-    // The remaining 31 bits are reserved for future node properties.
+    // The remaining 30 bits are reserved for future node properties.
 
     UserPayload payload{};
     float geometricError = 0.0f;
@@ -169,6 +186,10 @@ struct NodeDesc
     bool isMountable() const noexcept
     {
         return (flags & FlagMountable) != 0;
+    }
+    bool hasYawInvariantBounds() const noexcept
+    {
+        return (flags & FlagYawInvariantBounds) != 0;
     }
 };
 static_assert(sizeof(NodeDesc) == sizeof(UserPayload) + 32,

@@ -39,9 +39,10 @@ The data model is deliberately small:
   returns its opaque definition handle.
 - A definition can only be mounted beneath a renderable TLAS root or a
   `mountable` leaf in another mounted definition.
-- Transforms belong to instances and mounts. Immutable payload, error, and
-  authored bounds remain in registered bytes; runtime bound changes use
-  copy-on-write overlays.
+- Top-level instances support translation, positive uniform scale, and planar
+  yaw; mounted-subtree placements support translation and uniform scale.
+  Immutable payload, error, and authored bounds remain in registered bytes;
+  runtime bound changes use copy-on-write overlays.
 
 This makes a one-node object exceptionally cheap: it has no definition bytes or
 mount state. Deep assemblies remain composable—a city definition can contain a

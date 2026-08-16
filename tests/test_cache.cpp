@@ -27,6 +27,46 @@ TEST(QueryCache, ReusesStableFrontiers)
     EXPECT_GT(query.reused(), 0u);
 }
 
+TEST(QueryCache, AngularMotionMatchesUncachedSelection)
+{
+    SpatialDatabase database;
+    SubtreeBuilder builder;
+    const auto coarse = builder.createNode(node(
+        10, 12.0f, box(3.0f, float4::point(0.0f, 0.0f, 5.0f))));
+    builder.createNode(coarse, node(
+        11, 0.0f, box(1.0f, float4::point(-1.5f, 0.0f, 5.0f))));
+    builder.createNode(coarse, node(
+        12, 0.0f, box(1.0f, float4::point(1.5f, 0.0f, 5.0f))));
+    const SubtreeHandle subtree =
+        database.registerSubtree(builder.build());
+    const InstanceHandle instance = instantiateFor(
+        database, subtree, box(12.0f), 64.0f);
+    TestAccess::markAllNodesReady(database);
+    database.applyUpdates();
+
+    SpatialQuery cached;
+    SpatialQuery reference;
+    reference.setReuseEnabled(false);
+    const Camera camera = cameraAt(-100.0f);
+    uint64_t totalReused = 0;
+    for (uint32_t frame = 0; frame < 256; ++frame)
+    {
+        const float angle = 0.0001f * float(frame);
+        database.moveInstance(
+            instance,
+            InstanceTransform{float4::point(0.0f, 0.0f, 0.0f), 1.0f,
+                              yawRotation(angle)});
+        database.applyUpdates();
+        const std::vector<UserPayload> actual = payloads(
+            database, cached.selectFrontier(database, camera, {}), false);
+        const std::vector<UserPayload> expected = payloads(
+            database, reference.selectFrontier(database, camera, {}), false);
+        EXPECT_EQ(actual, expected);
+        totalReused += cached.reused();
+    }
+    EXPECT_GT(totalReused, 0u);
+}
+
 TEST(QueryCache, RetainsWholeInternalResultButStillFillsExternalSinks)
 {
     SpatialDatabase database;

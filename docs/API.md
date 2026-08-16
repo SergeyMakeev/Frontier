@@ -140,7 +140,7 @@ Frontier separates immutable authored data from mutable placement data:
 | Concept | What it represents | Ownership and mutability |
 |---|---|---|
 | node | one renderable representation of a hierarchy region | payload, error, flags, and authored bounds |
-| top-level instance | one permanent renderable root in the TLAS | mutable translation, uniform scale, mask, and world bound |
+| top-level instance | one permanent renderable root in the TLAS | mutable translation, uniform scale, planar yaw, mask, and world bound |
 | subtree definition | one reusable BLAS-like descendant hierarchy | immutable registered serialized bytes |
 | mounted placement | one definition attached below one renderable node | accumulated transform and state for mounted descendants |
 | spatial query | one camera/view selection | owns per-view selection state, scratch, and output |
@@ -217,12 +217,14 @@ NodeDesc proxy{
   the node hierarchy's local units. Frontier scales and projects it for the
   current camera; zero means this node has no error-driven reason to refine.
 - `FlagMountable` makes the node an expandable assembly boundary.
+- On a TLAS root, `FlagYawInvariantBounds` promises that the authored bound
+  already contains the object's content at every planar yaw. It avoids
+  rebuilding a rotating broadphase AABB; do not set it on builder nodes.
 - `bounds` is exact six-float authoring storage and accepts an `AABB` directly.
 
 The descriptor occupies 36 bytes with a four-byte payload and 40 bytes with an
-eight-byte payload. The 32-bit flag word currently defines only
-`FlagMountable`; the remaining bits are reserved for future node properties and
-must remain zero. Builder and TLAS-root creation reject unknown bits.
+eight-byte payload. The remaining flag bits are reserved and must remain zero.
+Builders accept only `FlagMountable`; TLAS roots accept both defined flags.
 
 `UserPayload` defaults to `uint64_t`, with `UINT64_MAX` as the invalid value.
 Applications can replace both build-wide using preprocessor definitions; the
@@ -744,13 +746,14 @@ Frontier distinguishes three kinds of movement.
 
 ### Move an entire top-level object
 
-`moveInstance()` changes the translation and uniform scale of the permanent
-root and everything mounted below it:
+`moveInstance()` changes the translation, uniform scale, and planar yaw of the
+permanent root and everything mounted below it:
 
 ```cpp
-database.moveInstance(carInstance, Transform{
+database.moveInstance(carInstance, InstanceTransform{
     .pos = newCarPosition,
     .scale = 1.0f,
+    .yaw = carYaw,
 });
 ```
 
@@ -766,6 +769,10 @@ SpatialDatabase::MotionGroup trafficGroup(trafficInstances);
 
 // positions[i] corresponds to trafficInstances[i].
 database.moveInstances(trafficGroup, positions, 1.0f);
+
+// Or submit independent rigid placements, including yaw, in the same stable
+// caller order.
+database.moveInstances(trafficGroup, vehicleTransforms);
 ```
 
 When the complete cohort shares one translation, submit that fact directly:
@@ -801,9 +808,10 @@ avoids resolving or validating every public handle on every frame. One database
 mapping epoch proves the complete cached order valid; add, remove, slot reuse,
 and physical reorder advance that epoch and force a safe group refresh.
 
-Pure translation does not automatically discard a reusable frontier. Frontier
-charges the translation's conservative L1 distance against the same exact
-decision margin used for camera travel. TLAS leaf envelopes remain
+Pure translation or yaw does not automatically discard a reusable frontier.
+Frontier charges translation plus a conservative bound on angular point
+displacement against the same exact decision margin used for camera travel.
+TLAS leaf envelopes remain
 conservative; queries that reach a loose leaf retest its current instance bound
 exactly. A scale change still
 invalidates the affected record because it changes geometric error as well as
@@ -820,10 +828,10 @@ The database automatically rebuilds that cache after `optimize()` or another
 physical layout change; ordinary frames only perform the ordered O(n) update.
 Keep a `MotionGroup` alive across frames to amortize the sort—recreating it each
 frame throws away the benefit. Use individual `moveInstance()` calls for
-occasional movement, changing cohorts, or objects that require different
-scales, since one `moveInstances()` call applies one scale to the whole group.
-Use `translateInstances()` whenever a cohort shares one delta; use
-`moveInstances()` for absolute positions or a shared scale change.
+occasional movement or changing cohorts. Use `translateInstances()` whenever a
+cohort shares one delta; use the position overload of `moveInstances()` for
+absolute positions or a shared scale, and the `InstanceTransform` overload for
+independent scale and yaw.
 
 ### Place a mounted definition
 
@@ -1243,7 +1251,8 @@ if (database.isSubtree(definition))
 
 Current limits:
 
-- transforms are translation plus positive uniform scale;
+- top-level transforms support translation, positive uniform scale, and
+  planar yaw; mount transforms support translation and uniform scale;
 - one authored node has at most 511 local children;
 - mounted placement slots and definition-local node indices use 20 bits;
 - mounted-node generations use 24 bits;

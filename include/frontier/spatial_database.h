@@ -403,12 +403,15 @@ struct InstanceDesc
 {
     float4   pos{};
     float    scale = 1.0f;
+    YawRotation yaw{};
 
     // ANDed against Camera::viewMask; a zero result culls the instance at
     // the top level. Cheap layer visibility: shadow-only props, editor-only
     // gizmos, per-view opt-outs.
     uint32_t mask = ~0u;
 };
+static_assert(sizeof(InstanceDesc) == 32,
+              "instance descriptor must stay two SIMD words");
 
 // ---------------------------------------------------------------------------
 // Output sinks
@@ -977,13 +980,25 @@ public:
                                const InstanceDesc& desc = {});
 
     void removeInstance(InstanceHandle instance); // no-op if stale
-    void moveInstance(InstanceHandle instance, const Transform& transform);
+    void moveInstance(InstanceHandle instance,
+                      const InstanceTransform& transform);
+    void moveInstance(InstanceHandle instance, const Transform& transform)
+    {
+        moveInstance(instance,
+                     InstanceTransform{transform.pos, transform.scale});
+    }
 
     // positions[i] belongs to the InstanceHandle at i in the MotionGroup.
     // Stale refs are ignored and duplicate refs use the final position.
     void moveInstances(MotionGroup& group,
                        std::span<const float4> positions,
                        float scale = 1.0f);
+
+    // transforms[i] belongs to the InstanceHandle at i in the MotionGroup.
+    // This is the rigid placement path for independently translating,
+    // scaling, and yawing actors such as vehicles and pedestrians.
+    void moveInstances(MotionGroup& group,
+                       std::span<const InstanceTransform> transforms);
 
     // Translate every live member of a persistent cohort by the same world-
     // space delta. Unlike submitting N absolute positions, this API carries
@@ -1101,6 +1116,9 @@ public:
     // Retained capacity for mount records, transforms, shared/COW node state,
     // stamps, and mount links. Immutable subtree bytes are excluded.
     size_t subtreeInstanceStateBytes() const;
+    // Capacity owned by the optional top-level yaw stream. Zero until a
+    // non-identity instance orientation is first submitted.
+    size_t instanceOrientationStateBytes() const;
 
     struct TestAccess;   // defined by tests; full access to internals
 
@@ -1546,11 +1564,29 @@ private:
     static_assert(sizeof(Instance) == 80,
                   "coupled instance state must stay 80 bytes");
 
+    // Cold parallel stream allocated only once a scene uses non-identity yaw.
+    // Authored local bounds are retained because a rotated world AABB cannot
+    // be inverted exactly. The hot Instance record remains 80 bytes.
+    struct InstanceOrientation
+    {
+        ScalarAABB localBounds = AABB::empty();
+        YawRotation yaw{};
+        // Magnitude bounds angular point travel. A negative sign marks an
+        // authored yaw-invariant root envelope without spending another word.
+        float radiusXZ = 0.0f;
+    };
+    static_assert(sizeof(InstanceOrientation) == 36,
+                  "cold instance orientation layout changed");
+
     // nullptr when the ref is stale (slot recycled) or invalid.
     Instance* resolveInstance(InstanceHandle instance);
     InstanceId denseInstanceId(InstanceHandle instance) const;
     InstanceId publicInstanceId(InstanceId dense) const;
+    void ensureInstanceOrientations();
+    AABB instanceLocalBounds(InstanceId dense) const;
+    void setInstanceLocalBounds(InstanceId dense, const AABB& bounds);
     void moveInstanceDense(InstanceId dense, float4 pos, float scale,
+                           YawRotation yaw,
                            uint32_t& mutationGeneration,
                            float& batchMaxTravel);
     void invalidateInstanceFrontier(InstanceId dense,
@@ -2042,6 +2078,7 @@ private:
     uint32_t              generationCounter_ = 0;
 
     std::vector<Instance> instances_;
+    std::vector<InstanceOrientation> instanceOrientations_;
     // Cold root identity stream. Payload exists after the first TLAS root.
     std::vector<detail::PayloadWord> tlasRootPayloads_;
     // Packed TLAS-root marker for exact one-node instances; a cold

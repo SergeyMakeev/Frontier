@@ -163,6 +163,9 @@ TEST(SubtreeBuilder, RejectsReservedFlagsAndMalformedBounds)
     NodeDesc unknownFlags = node(1, 0.0f, box());
     unknownFlags.flags = 1u << 31;
     EXPECT_THROW(flagsBuilder.createNode(unknownFlags), std::logic_error);
+    NodeDesc topLevelOnly = node(1, 0.0f, box());
+    topLevelOnly.flags = NodeDesc::FlagYawInvariantBounds;
+    EXPECT_THROW(flagsBuilder.createNode(topLevelOnly), std::logic_error);
 
     SubtreeBuilder boundsBuilder;
     NodeDesc malformed = node(2, 0.0f, box());

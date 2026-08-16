@@ -22,6 +22,122 @@ TEST(Motion, MovesTlasOwnedNodeWithoutSubtreeState)
     EXPECT_EQ(database.mountedSubtreeCount(), 0u);
 }
 
+TEST(Motion, YawPreservesExactLocalBoundsAcrossRotationAndDeformation)
+{
+    SpatialDatabase database;
+    const AABB authored = AABB::fromMinMax(
+        float4::point(-1.0f, -0.5f, -3.0f),
+        float4::point(2.0f, 0.5f, 4.0f));
+    InstanceDesc desc;
+    desc.pos = float4::point(10.0f, 1.0f, 20.0f);
+    desc.scale = 2.0f;
+    desc.yaw = {0.0f, 1.0f};
+    const InstanceHandle instance =
+        database.instantiate(node(7, 0.0f, authored), desc);
+
+    const AABB rotated = TestAccess::instanceBounds(database, instance);
+    EXPECT_FLOAT_EQ(rotated.mn.x, 2.0f);
+    EXPECT_FLOAT_EQ(rotated.mx.x, 16.0f);
+    EXPECT_FLOAT_EQ(rotated.mn.z, 18.0f);
+    EXPECT_FLOAT_EQ(rotated.mx.z, 24.0f);
+    const AABB recovered = database.nodeBounds(instance, instance.rootNode());
+    EXPECT_FLOAT_EQ(recovered.mn.x, authored.mn.x);
+    EXPECT_FLOAT_EQ(recovered.mx.z, authored.mx.z);
+
+    const AABB deformed = AABB::fromMinMax(
+        float4::point(-2.0f, -1.0f, -5.0f),
+        float4::point(3.0f, 1.0f, 6.0f));
+    database.setNodeBounds(instance, instance.rootNode(), deformed);
+    database.flushBounds();
+    database.moveInstance(
+        instance,
+        InstanceTransform{float4::point(30.0f, 2.0f, 40.0f), 1.5f,
+                          YawRotation{}});
+
+    const AABB unrotated = TestAccess::instanceBounds(database, instance);
+    EXPECT_FLOAT_EQ(unrotated.mn.x, 27.0f);
+    EXPECT_FLOAT_EQ(unrotated.mx.x, 34.5f);
+    EXPECT_FLOAT_EQ(unrotated.mn.z, 32.5f);
+    EXPECT_FLOAT_EQ(unrotated.mx.z, 49.0f);
+    const AABB finalLocal = database.nodeBounds(instance, instance.rootNode());
+    EXPECT_FLOAT_EQ(finalLocal.mn.x, deformed.mn.x);
+    EXPECT_FLOAT_EQ(finalLocal.mx.z, deformed.mx.z);
+}
+
+TEST(Motion, MotionGroupSubmitsIndependentYawTransforms)
+{
+    SpatialDatabase database;
+    const AABB authored = AABB::fromMinMax(
+        float4::point(-1.0f, -1.0f, -3.0f),
+        float4::point(1.0f, 1.0f, 3.0f));
+    const InstanceHandle first = database.instantiate(node(1, 0.0f, authored));
+    const InstanceHandle second = database.instantiate(node(2, 0.0f, authored));
+    const std::array<InstanceHandle, 2> handles{first, second};
+    SpatialDatabase::MotionGroup group(handles);
+    const std::array<InstanceTransform, 2> transforms{
+        InstanceTransform{float4::point(10.0f, 0.0f, 0.0f), 1.0f,
+                          YawRotation{0.0f, 1.0f}},
+        InstanceTransform{float4::point(20.0f, 0.0f, 0.0f), 2.0f,
+                          YawRotation{1.0f, 0.0f}}};
+    database.moveInstances(group, transforms);
+
+    const AABB firstBounds = TestAccess::instanceBounds(database, first);
+    EXPECT_FLOAT_EQ(firstBounds.mn.x, 7.0f);
+    EXPECT_FLOAT_EQ(firstBounds.mx.x, 13.0f);
+    EXPECT_FLOAT_EQ(firstBounds.mn.z, -1.0f);
+    EXPECT_FLOAT_EQ(firstBounds.mx.z, 1.0f);
+    const AABB secondBounds = TestAccess::instanceBounds(database, second);
+    EXPECT_FLOAT_EQ(secondBounds.mn.x, 18.0f);
+    EXPECT_FLOAT_EQ(secondBounds.mx.x, 22.0f);
+    EXPECT_FLOAT_EQ(secondBounds.mn.z, -6.0f);
+    EXPECT_FLOAT_EQ(secondBounds.mx.z, 6.0f);
+}
+
+TEST(Motion, IdentityOnlySceneKeepsOrientationStreamUnallocated)
+{
+    SpatialDatabase database;
+    const InstanceHandle instance =
+        database.instantiate(node(1, 0.0f, box()));
+    EXPECT_EQ(database.instanceOrientationStateBytes(), 0u);
+    database.moveInstance(
+        instance, Transform{float4::point(5.0f, 0.0f, 0.0f), 1.0f});
+    EXPECT_EQ(database.instanceOrientationStateBytes(), 0u);
+
+    database.moveInstance(
+        instance,
+        InstanceTransform{float4::point(5.0f, 0.0f, 0.0f), 1.0f,
+                          YawRotation{0.0f, 1.0f}});
+    EXPECT_GT(database.instanceOrientationStateBytes(), 0u);
+    EXPECT_EQ(TestAccess::instanceBytes(), 80u);
+}
+
+TEST(Motion, AuthoredYawInvariantRootKeepsOneBroadphaseEnvelope)
+{
+    SpatialDatabase database;
+    NodeDesc root = node(1, 0.0f, box(5.0f));
+    root.flags |= NodeDesc::FlagYawInvariantBounds;
+    InstanceDesc desc;
+    desc.pos = float4::point(10.0f, 0.0f, 20.0f);
+    desc.yaw = {0.0f, 1.0f};
+    const InstanceHandle instance = database.instantiate(root, desc);
+
+    AABB bounds = TestAccess::instanceBounds(database, instance);
+    EXPECT_FLOAT_EQ(bounds.mn.x, 5.0f);
+    EXPECT_FLOAT_EQ(bounds.mx.x, 15.0f);
+    EXPECT_FLOAT_EQ(bounds.mn.z, 15.0f);
+    EXPECT_FLOAT_EQ(bounds.mx.z, 25.0f);
+
+    database.moveInstance(
+        instance,
+        InstanceTransform{float4::point(30.0f, 0.0f, 40.0f), 1.0f,
+                          yawRotation(0.75f)});
+    bounds = TestAccess::instanceBounds(database, instance);
+    EXPECT_FLOAT_EQ(bounds.mn.x, 25.0f);
+    EXPECT_FLOAT_EQ(bounds.mx.x, 35.0f);
+    EXPECT_FLOAT_EQ(bounds.mn.z, 35.0f);
+    EXPECT_FLOAT_EQ(bounds.mx.z, 45.0f);
+}
+
 TEST(Motion, NodeBoundsUseCopyOnWritePerTopLevelInstance)
 {
     SpatialDatabase database;
@@ -298,12 +414,21 @@ TEST(Motion, RejectsInvalidTransformsWithoutCorruptingTlas)
     EXPECT_THROW(database.instantiate(node(2, 0.0f, box()), invalidPosition),
                  std::logic_error);
 
+    InstanceDesc invalidYaw;
+    invalidYaw.yaw = {1.0f, 1.0f};
+    EXPECT_THROW(database.instantiate(node(2, 0.0f, box()), invalidYaw),
+                 std::logic_error);
+
     InstanceHandle instance =
         database.instantiate(node(3, 0.0f, box()));
     const AABB before = TestAccess::instanceBounds(database, instance);
     Transform invalidMove;
     invalidMove.pos.x = std::numeric_limits<float>::infinity();
     EXPECT_THROW(database.moveInstance(instance, invalidMove),
+                 std::logic_error);
+    InstanceTransform invalidYawMove;
+    invalidYawMove.yaw = {0.0f, 0.0f};
+    EXPECT_THROW(database.moveInstance(instance, invalidYawMove),
                  std::logic_error);
     const AABB after = TestAccess::instanceBounds(database, instance);
     EXPECT_FLOAT_EQ(after.mn.x, before.mn.x);

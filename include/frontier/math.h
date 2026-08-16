@@ -263,6 +263,22 @@ inline float distanceToBox(const AABB& b, float4 qmn, float4 qmx)
     return std::sqrt(fmadd(cx, cx, fmadd(cy, cy, cz * cz)));
 }
 
+// Compact planar orientation used by top-level instance placements. Keeping
+// cosine/sine instead of an angle removes trigonometry from per-frame motion
+// submission and gives traversal the inverse rotation directly. The pair is
+// required to be finite and unit length.
+struct YawRotation
+{
+    float cosine = 1.0f;
+    float sine = 0.0f;
+};
+static_assert(sizeof(YawRotation) == 8, "yaw rotation must stay two floats");
+
+inline YawRotation yawRotation(float radians)
+{
+    return {std::cos(radians), std::sin(radians)};
+}
+
 // Point-to-box distance; 0 when the point is inside.
 inline float distanceToBox(const AABB& b, float4 p) { return distanceToBox(b, p, p); }
 
@@ -869,7 +885,7 @@ inline Camera makeLookAtCamera(float4 pos, float4 target,
 }
 
 // Transform a world-space view into an instance's local space.
-// Instances are positioned by translation + uniform scale (no rotation).
+// This translation + uniform-scale overload is also the identity-yaw fast path.
 // The error ratio geomError / distance is scale-invariant, so k is unchanged.
 inline Camera toLocal(const Camera& v, float4 instPos, float instScale,
                       uint8_t activePlanes)
@@ -899,11 +915,85 @@ inline Camera toLocal(const Camera& v, float4 instPos, float instScale)
     return toLocal(v, instPos, instScale, kAllPlanes);
 }
 
+// Inverse-transform a world-space view through a planar instance placement.
+// World = position + scale * yaw * local. The axis-aligned damping envelope
+// becomes an oriented box under the inverse yaw, so retain its exact AABB
+// enclosure in local space.
+inline Camera toLocal(const Camera& v, float4 instPos, float instScale,
+                      YawRotation yaw, uint8_t activePlanes)
+{
+    assert(instScale > 0.0f);
+    const float invScale = 1.0f / instScale;
+    const float c = yaw.cosine;
+    const float s = yaw.sine;
+    const float4 delta = (v.pos - instPos) * invScale;
+
+    Camera local;
+    local.pos = {c * delta.x + s * delta.z, delta.y,
+                 -s * delta.x + c * delta.z, delta.w};
+    local.k = v.k;
+    local.viewMask = v.viewMask;
+
+    const float4 envelopeCenter = (v.envHi - v.envLo) * (0.5f * invScale);
+    const float4 envelopeExtent = (v.envHi + v.envLo) * (0.5f * invScale);
+    const float ac = std::fabs(c);
+    const float as = std::fabs(s);
+    const float4 localCenter = {
+        c * envelopeCenter.x + s * envelopeCenter.z,
+        envelopeCenter.y,
+        -s * envelopeCenter.x + c * envelopeCenter.z, 0.0f};
+    const float4 localExtent = {
+        ac * envelopeExtent.x + as * envelopeExtent.z,
+        envelopeExtent.y,
+        as * envelopeExtent.x + ac * envelopeExtent.z, 0.0f};
+    local.envLo = localExtent - localCenter;
+    local.envHi = localExtent + localCenter;
+
+    for (uint32_t p = 0; p < 6; ++p)
+    {
+        if (!(activePlanes & (1u << p))) continue;
+        const float4 pl = v.frustum.plane[p];
+        local.frustum.plane[p] = {
+            c * pl.x + s * pl.z, pl.y, -s * pl.x + c * pl.z,
+            (dot3(pl, instPos) + pl.w) * invScale};
+    }
+    return local;
+}
+
+inline Camera toLocal(const Camera& v, float4 instPos, float instScale,
+                      YawRotation yaw)
+{
+    return toLocal(v, instPos, instScale, yaw, kAllPlanes);
+}
+
 // Transform a local AABB to world space (translation + uniform scale).
 inline AABB toWorld(const AABB& b, float4 instPos, float instScale)
 {
     if (b.isEmpty()) return AABB::empty();
     return AABB::fromMinMax(b.mn * instScale + instPos, b.mx * instScale + instPos);
+}
+
+// Exact world AABB of a local AABB after planar yaw, uniform scale, and
+// translation. Center/extent form avoids transforming eight corners.
+inline AABB toWorld(const AABB& b, float4 instPos, float instScale,
+                    YawRotation yaw)
+{
+    if (b.isEmpty()) return AABB::empty();
+    const float4 center = b.center();
+    const float4 extent = (b.mx - b.mn) * 0.5f;
+    const float c = yaw.cosine;
+    const float s = yaw.sine;
+    const float ac = std::fabs(c);
+    const float as = std::fabs(s);
+    const float4 worldCenter = float4::point(
+        instPos.x + instScale * (c * center.x - s * center.z),
+        instPos.y + instScale * center.y,
+        instPos.z + instScale * (s * center.x + c * center.z));
+    const float4 worldExtent = float4::vec(
+        instScale * (ac * extent.x + as * extent.z),
+        instScale * extent.y,
+        instScale * (as * extent.x + ac * extent.z));
+    return AABB::fromCenterExtent(worldCenter, worldExtent);
 }
 
 // screenErrorPx = geometricError * k / distance, saturating when inside.
