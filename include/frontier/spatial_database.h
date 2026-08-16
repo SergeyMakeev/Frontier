@@ -2013,6 +2013,9 @@ private:
     void runTlasRootInstance(uint32_t instIdx, const Camera& view,
                              const SelectionParams& params, uint8_t mask,
                              Worker& w) const;
+    void runOrientedTlasRootInstance(uint32_t instIdx, const Camera& view,
+                                     const SelectionParams& params,
+                                     uint8_t mask, Worker& w) const;
     template<bool FullyReady>
     void runSubtree(const WorkItem& item, const Instance& inst,
                     const Camera& local, const SelectionParams& params,
