@@ -275,14 +275,17 @@ jobs:
       - name: Coverage report
         shell: bash
         run: |
-          llvm-profdata merge -sparse \
+          LLVM_VERSION="$(clang -dumpversion | cut -d. -f1)"
+          LLVM_PROFDATA="$(command -v "llvm-profdata-$LLVM_VERSION" || command -v llvm-profdata)"
+          LLVM_COV="$(command -v "llvm-cov-$LLVM_VERSION" || command -v llvm-cov)"
+          "$LLVM_PROFDATA" merge -sparse \
             build-coverage/coverage-*.profraw \
             -o build-coverage/coverage.profdata
-          llvm-cov report build-coverage/tests/frontier_tests \
+          "$LLVM_COV" report build-coverage/tests/frontier_tests \
             -instr-profile=build-coverage/coverage.profdata \
             -ignore-filename-regex='(_deps|/tests/|/usr/|/opt/)' \
             | tee build-coverage/coverage.txt
-          llvm-cov export build-coverage/tests/frontier_tests \
+          "$LLVM_COV" export build-coverage/tests/frontier_tests \
             -instr-profile=build-coverage/coverage.profdata \
             -ignore-filename-regex='(_deps|/tests/|/usr/|/opt/)' \
             -format=lcov > build-coverage/coverage.lcov
