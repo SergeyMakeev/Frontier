@@ -58,10 +58,11 @@ library's macro-based public payload customization.
   forests of mounted instance hierarchies. Reuse mode 2 cycles three thresholds
   to force deterministic record-cache misses without admitting any of those
   keys to the two-entry exact-view memo.
-- `BM_MovingCameraSelectionScale` alternates between two translated cameras
-  over a fully hierarchical forest. It covers stationary, 0.1-unit, 16-unit,
-  and 256-unit steps and reports average reused/walked roots and the reuse
-  rate.
+- `BM_MovingCameraSelectionScale` alternates between two exact recurring camera
+  poses over a fully hierarchical forest. It covers stationary, 0.1-unit,
+  16-unit, and 256-unit separations and measures the two-entry whole-cut memo
+  after admission. It is not a continuously unique camera stream; counters
+  report average reused/walked roots and the reuse rate.
 - `BM_InstanceForestRootSelectionScale` uses the same mounted forest but a
   distant camera that stops at renderable TLAS roots, separating top-level
   query/dispatch cost from refined BLAS traversal.

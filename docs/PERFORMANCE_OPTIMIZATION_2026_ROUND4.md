@@ -143,3 +143,78 @@ the Windows development host has neither Linux cpufreq sysfs nor `taskset`.
 - Google Benchmark accepted `--benchmark_min_warmup_time` in the repository's
   pinned dependency build.
 - `git diff --check` passed before commit.
+
+## Controlled SBC validation
+
+The follow-up AArch64 bundle
+`frontier-perf-Linux-aarch64-20260815T231001Z.zip` has SHA-256
+`BA1C5F99CF3AE3A3A7DB4EDED45AE3917E64F35E32CA372A206EBC705A343E62`.
+It is a complete, clean build of `8320f75`: both payload inventories contain
+all 83 medians and all 380 Debug matrix tests pass.
+
+The collector selected logical CPU 4, a Cortex-A72-class core with capacity
+1024 and a 2,208,000 kHz maximum. Although the governor remained `ondemand`,
+every boundary snapshot from collector start through the architecture suite
+reported 2,208,000 kHz. Big-core temperature rose from 40.7 C to 46.2 C and
+the hottest reported zone ended at 47.2 C, with no evidence of throttling.
+
+### Defect closure
+
+All four repaired mode-2 cases report zero reused roots and the complete root
+population walked. The 10,000-root medians are:
+
+| Payload | Hierarchical roots | Median | CV | Reused / walked |
+|---|---:|---:|---:|---:|
+| 64-bit | 50% | 2,966.919 us | 0.58% | 0 / 10,000 |
+| 64-bit | 100% | 4,769.455 us | 0.41% | 0 / 10,000 |
+| 32-bit | 50% | 3,033.783 us | 0.56% | 0 / 10,000 |
+| 32-bit | 100% | 4,966.904 us | 0.59% | 0 / 10,000 |
+
+The benchmark defect is therefore closed on the target architecture. For the
+fully hierarchical case, cache validation and allocation make a genuine miss
+54.9% slower than raw traversal with the 64-bit payload and 61.7% slower with
+the 32-bit payload.
+
+### Raw mounted-selection closure
+
+| Eight-byte-payload run | Raw mounted 10k | Change vs controlled rerun |
+|---|---:|---:|
+| Older published SBC reference | 3,106.796 us | +0.92% |
+| `d2f308a`, scheduler default | 3,266.012 us | +6.09% |
+| `8320f75`, CPU 4 + warmup | 3,078.618 us | baseline |
+
+The controlled rerun is 5.74% faster than the immediately preceding
+scheduler-default bundle and 0.91% faster than the older published reference.
+Payload32 independently improves from 3,136.215 us to 3,070.947 us (2.08%).
+Root-only selection remains effectively unchanged at 662.071 us versus
+663.938 us. These paired results close the suspected portable raw-traversal
+regression; the earlier 5.1% delta was a measurement-state artifact.
+
+### Performance-goal confirmation on the SBC
+
+The controlled medians preserve the major architectural improvements against
+the earlier published RK3399 results:
+
+| Workload, 64-bit payload | Published | Controlled final | Speedup |
+|---|---:|---:|---:|
+| Motion group, 400 changed roots | 5.947 us | 0.0207 us | 287x |
+| Move/publish/select, 10% of 10k | 1,084.059 us | 38.417 us | 28.2x |
+| Move/publish/select, 100% of 10k | 9,243.448 us | 17.213 us | 537x |
+| Stable mounted exact view, 10k | 524.382 us | 0.0651 us | 8,058x |
+| Recurring camera, 256-unit separation | 937.813 us | 0.0699 us | 13,412x |
+
+The camera row is specifically the two-pose recurring-view workload described
+in the benchmark. It demonstrates exact whole-cut memo lookup, not the cost of
+an arbitrary stream of unique camera poses.
+
+### Stability and comparison policy
+
+Seventy-eight of 83 payload64 cases and 80 of 83 payload32 cases have CV at or
+below 2%. The apparent 32.1% payload64 flat-construction regression has 24.3%
+CV and is rejected as noise. Across the 79 unchanged cases per payload, the
+median change from the prior bundle is only -0.10% for payload64 and -0.09% for
+payload32. Production runtime sources did not change between those bundles;
+small opposite-direction deltas in focused cache kernels therefore reflect the
+changed execution conditions, not code. `8320f75` is the new controlled SBC
+baseline, and subsequent performance claims should compare only against runs
+using the same affinity, warmup, and telemetry protocol.

@@ -795,11 +795,12 @@ BENCHMARK(BM_InstanceForestSelectionScale)
     ->ArgNames({"instances", "hierarchical_percent", "reuse_mode"})
     ->Unit(benchmark::kMicrosecond);
 
-// Measures actual camera motion rather than forcing cache invalidation through
-// a parameter change. Two prebuilt, identically oriented cameras alternate by
-// the requested translation, so the timed region contains selection only.
-// Accumulated travel periodically exhausts exact-cut validity margins; the
-// counters expose the resulting steady mixture of reused and walked roots.
+// Measures an exact recurring-camera workload rather than invalidating the
+// cache through a parameter change. Two prebuilt, identically oriented cameras
+// alternate by the requested translation, so the timed region contains only
+// selection. Once both recurring views have been admitted, the two-entry
+// whole-cut memo returns exact snapshots. This intentionally does not represent
+// a stream of continuously unique camera poses.
 static void BM_MovingCameraSelectionScale(benchmark::State& state)
 {
     const uint32_t count = uint32_t(state.range(0));
