@@ -202,7 +202,8 @@ write_report()
 - \`commands.txt\`: benchmark filters and sampling parameters
 - \`performance_state.txt\`: selected-core frequency, load, and thermal snapshots
 - \`oriented_text_layout.txt\`: linked text bounds, addresses, and sizes for
-  the cached selector and rotated-root walker when the platform exposes them
+  both mounted-root walkers and the cached selector when the platform exposes
+  them
 
 Performance processes used ${affinity_description}. Each benchmark receives a
 ${benchmark_warmup_seconds}-second untimed warmup so demand-based governors can
@@ -522,7 +523,7 @@ failure_stage=benchmark-inventory
     fi
     if command -v nm >/dev/null 2>&1; then
         nm -n -S -C "${bench_exe}" 2>&1 |
-            grep -E 'SpatialDatabase::(selectFrontierCached|runOrientedTlasRootInstance)' || true
+            grep -E 'SpatialDatabase::(selectFrontierCached|run(Oriented)?TlasRootInstance)' || true
     else
         echo "nm unavailable"
     fi
@@ -534,7 +535,7 @@ failure_stage=benchmark-inventory
     fi
     if command -v nm >/dev/null 2>&1; then
         nm -n -S -C "${bench32_exe}" 2>&1 |
-            grep -E 'SpatialDatabase::(selectFrontierCached|runOrientedTlasRootInstance)' || true
+            grep -E 'SpatialDatabase::(selectFrontierCached|run(Oriented)?TlasRootInstance)' || true
     else
         echo "nm unavailable"
     fi

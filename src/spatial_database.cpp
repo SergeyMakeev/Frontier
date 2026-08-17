@@ -4264,6 +4264,115 @@ void SpatialDatabase::runTlasRootInstance(
     }
 }
 
+// Keep the two mounted-root walkers adjacent to each other and to the subtree
+// traversal machinery they call. The identity-only body stays first and
+// unchanged; databases with an orientation stream use this second variant.
+void SpatialDatabase::runOrientedTlasRootInstance(
+    uint32_t instIdx, const Camera& view, const SelectionParams& params,
+    uint8_t mask, Worker& w) const
+{
+    const Instance& inst = instances_[instIdx];
+    FRONTIER_STAT(w, instancesVisited, 1);
+
+    const float worldDistance =
+        inst.maxErrWorld > 0.0f
+            ? distanceToBox(inst.worldBox, view.queryMin(), view.queryMax())
+            : 0.0f;
+    const float error = inst.maxErrWorld > 0.0f
+                            ? screenError(inst.maxErrWorld, view.k,
+                                          worldDistance)
+                            : 0.0f;
+    if (w.trackMargin && inst.maxErrWorld > 0.0f)
+    {
+        const float worldFlip = inst.maxErrWorld * view.k / w.bar;
+        const float worldSlack = worldDistance > worldFlip
+                                     ? worldDistance - worldFlip
+                                     : worldFlip - worldDistance;
+        w.margin = std::min(w.margin, worldSlack / inst.scale);
+        w.maxError = std::max(w.maxError,
+                              inst.maxErrWorld / inst.scale);
+    }
+
+    const InstanceId outputInstance = publicInstanceId(instIdx);
+    const NodeHandle root = NodeHandle::tlasRoot(outputInstance,
+                                                 inst.generation);
+    const uint32_t childSlot = inst.rootSlot;
+    if (!(error > params.threshold) || childSlot == kInvalidIndex)
+    {
+        w.result.shared.push(makeFrontierEntry(
+            root, error, w.bar, w.barInv, outputInstance));
+        return;
+    }
+
+    const YawRotation yaw = instanceOrientations_[instIdx].yaw;
+    const Camera local = identityYaw(yaw)
+                             ? toLocal(view, inst.pos, inst.scale, mask)
+                             : toLocal(view, inst.pos, inst.scale, yaw, mask);
+    const bool fullyReady = mountedTreeFullyReady(childSlot);
+    if (fullyReady)
+    {
+        runSubtree<true>(makeWorkItem(childSlot, inst, 1, 1, mask), inst,
+                         local, params, w);
+        while (!w.work.empty())
+        {
+            const WorkItem item = w.work.back();
+            w.work.pop_back();
+            runSubtree<true>(item, inst, local, params, w);
+        }
+        return;
+    }
+
+    if (params.currentCutPolicy == CurrentCutPolicy::PreferReadyAncestors)
+    {
+        w.work.clear();
+        w.workCandidates.clear();
+        w.ancestorCandidates.clear();
+        w.ancestorIdeal.clear();
+
+        const uint32_t rootCandidate = w.addAncestorCandidate(
+            kInvalidIndex,
+            makeFrontierEntry(root, error, w.bar, w.barInv, outputInstance));
+        runSubtreeAncestor(makeWorkItem(childSlot, inst, 0, 1, mask), inst,
+                           local, params, rootCandidate, w);
+        while (!w.work.empty())
+        {
+            const WorkItem item = w.work.back();
+            w.work.pop_back();
+            FRONTIER_ASSERT(!w.workCandidates.empty(),
+                            "ancestor work stack underflow");
+            const uint32_t candidate = w.workCandidates.back();
+            w.workCandidates.pop_back();
+            runSubtreeAncestor(item, inst, local, params, candidate, w);
+        }
+        FRONTIER_ASSERT(w.workCandidates.empty(),
+                        "ancestor work stack mismatch");
+        w.finishAncestorCut();
+        return;
+    }
+
+    const bool currentCanDescend = visibleDescendantsCovered(
+        childSlot, 0, mask, inst, local,
+        w.trackTouches ? &w : nullptr);
+    if (!currentCanDescend)
+        w.result.currentOnly.push(makeFrontierEntry(
+            root, error, w.bar, w.barInv, outputInstance));
+
+    runSubtree<false>(makeWorkItem(childSlot, inst,
+                                  uint8_t(currentCanDescend), 1, mask),
+                      inst, local, params, w);
+    while (!w.work.empty())
+    {
+        const WorkItem item = w.work.back();
+        w.work.pop_back();
+        const bool branchFullyReady = item.current() && item.ideal() &&
+                                      mountedTreeFullyReady(item.slot());
+        if (branchFullyReady)
+            runSubtree<true>(item, inst, local, params, w);
+        else
+            runSubtree<false>(item, inst, local, params, w);
+    }
+}
+
 void SpatialDatabase::runTlasFlatInstance(uint32_t instIdx,
                                           const Camera& view, Worker& w) const
 {
@@ -5131,115 +5240,6 @@ void SpatialDatabase::selectFrontierCached(const Camera& camera, const Selection
 #ifdef FRONTIER_STATS
     query.stats_ = w.stats;
 #endif
-}
-
-// Kept out of the identity-placement walker above so the much larger rotated
-// camera transform cannot change register allocation or instruction layout in
-// databases that never allocate the optional orientation stream.
-void SpatialDatabase::runOrientedTlasRootInstance(
-    uint32_t instIdx, const Camera& view, const SelectionParams& params,
-    uint8_t mask, Worker& w) const
-{
-    const Instance& inst = instances_[instIdx];
-    FRONTIER_STAT(w, instancesVisited, 1);
-
-    const float worldDistance =
-        inst.maxErrWorld > 0.0f
-            ? distanceToBox(inst.worldBox, view.queryMin(), view.queryMax())
-            : 0.0f;
-    const float error = inst.maxErrWorld > 0.0f
-                            ? screenError(inst.maxErrWorld, view.k,
-                                          worldDistance)
-                            : 0.0f;
-    if (w.trackMargin && inst.maxErrWorld > 0.0f)
-    {
-        const float worldFlip = inst.maxErrWorld * view.k / w.bar;
-        const float worldSlack = worldDistance > worldFlip
-                                     ? worldDistance - worldFlip
-                                     : worldFlip - worldDistance;
-        w.margin = std::min(w.margin, worldSlack / inst.scale);
-        w.maxError = std::max(w.maxError,
-                              inst.maxErrWorld / inst.scale);
-    }
-
-    const InstanceId outputInstance = publicInstanceId(instIdx);
-    const NodeHandle root = NodeHandle::tlasRoot(outputInstance,
-                                                 inst.generation);
-    const uint32_t childSlot = inst.rootSlot;
-    if (!(error > params.threshold) || childSlot == kInvalidIndex)
-    {
-        w.result.shared.push(makeFrontierEntry(
-            root, error, w.bar, w.barInv, outputInstance));
-        return;
-    }
-
-    const YawRotation yaw = instanceOrientations_[instIdx].yaw;
-    const Camera local = identityYaw(yaw)
-                             ? toLocal(view, inst.pos, inst.scale, mask)
-                             : toLocal(view, inst.pos, inst.scale, yaw, mask);
-    const bool fullyReady = mountedTreeFullyReady(childSlot);
-    if (fullyReady)
-    {
-        runSubtree<true>(makeWorkItem(childSlot, inst, 1, 1, mask), inst,
-                         local, params, w);
-        while (!w.work.empty())
-        {
-            const WorkItem item = w.work.back();
-            w.work.pop_back();
-            runSubtree<true>(item, inst, local, params, w);
-        }
-        return;
-    }
-
-    if (params.currentCutPolicy == CurrentCutPolicy::PreferReadyAncestors)
-    {
-        w.work.clear();
-        w.workCandidates.clear();
-        w.ancestorCandidates.clear();
-        w.ancestorIdeal.clear();
-
-        const uint32_t rootCandidate = w.addAncestorCandidate(
-            kInvalidIndex,
-            makeFrontierEntry(root, error, w.bar, w.barInv, outputInstance));
-        runSubtreeAncestor(makeWorkItem(childSlot, inst, 0, 1, mask), inst,
-                           local, params, rootCandidate, w);
-        while (!w.work.empty())
-        {
-            const WorkItem item = w.work.back();
-            w.work.pop_back();
-            FRONTIER_ASSERT(!w.workCandidates.empty(),
-                            "ancestor work stack underflow");
-            const uint32_t candidate = w.workCandidates.back();
-            w.workCandidates.pop_back();
-            runSubtreeAncestor(item, inst, local, params, candidate, w);
-        }
-        FRONTIER_ASSERT(w.workCandidates.empty(),
-                        "ancestor work stack mismatch");
-        w.finishAncestorCut();
-        return;
-    }
-
-    const bool currentCanDescend = visibleDescendantsCovered(
-        childSlot, 0, mask, inst, local,
-        w.trackTouches ? &w : nullptr);
-    if (!currentCanDescend)
-        w.result.currentOnly.push(makeFrontierEntry(
-            root, error, w.bar, w.barInv, outputInstance));
-
-    runSubtree<false>(makeWorkItem(childSlot, inst,
-                                  uint8_t(currentCanDescend), 1, mask),
-                      inst, local, params, w);
-    while (!w.work.empty())
-    {
-        const WorkItem item = w.work.back();
-        w.work.pop_back();
-        const bool branchFullyReady = item.current() && item.ideal() &&
-                                      mountedTreeFullyReady(item.slot());
-        if (branchFullyReady)
-            runSubtree<true>(item, inst, local, params, w);
-        else
-            runSubtree<false>(item, inst, local, params, w);
-    }
 }
 
 void SpatialQuery::selectFrontier(const SpatialDatabase& database, const Camera& camera,

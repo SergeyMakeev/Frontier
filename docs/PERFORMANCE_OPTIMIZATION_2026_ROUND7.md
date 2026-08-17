@@ -135,38 +135,64 @@ The `.text.hot.*` prefix grouped the pair successfully but also pulled the
 large selector into the early hot region and perturbed unrelated traversal
 placement. Proximity alone was the wrong constraint.
 
-## Retained target experiment: normal-text island
+## Experiment 7: ordinary AArch64 text island
 
-The revised GCC AArch64 attribute uses `.text.frontier_oriented`, preserving
-the same `noinline` and `noclone` guarantees but removing the privileged
-`.text.hot.*` classification. The GNU linker can keep the pair adjacent in the
-ordinary text bucket without moving the large cached selector ahead of normal
-traversal code. This is a one-field revision of the failed experiment: the
-function bodies, calls, API, data layout, and benchmark workload are unchanged.
+The next GCC AArch64 variant changed the section to
+`.text.frontier_oriented`, preserving `noinline`, `noclone`, and selector–walker
+adjacency while removing the privileged `.text.hot.*` classification. The link
+again honored the constraint. The rotated walker and cached selector began at
+`0x19900` and `0x1a3b4` for payload64 and `0x19990` and `0x1a444` for
+payload32. Their sizes were identical across payloads: `0xab4` and `0x2fe4`.
 
-The attribute remains limited to GCC on AArch64. MSVC, Clang, x86, and other
-targets expand it to nothing. The Linux collector records the final linked
-addresses in `oriented_text_layout.txt`, so the next bundle will show whether
-the pair stayed together and whether it returned to the normal text range.
+**Result: rejected.** The run was broadly 0.57% slower in the machine-probe
+geomean and 0.94% slower in the architecture-kernel geomean, but it still
+failed the target after accounting for that drift:
+
+| Guard | `fb8d395` | ordinary island | Change |
+|---|---:|---:|---:|
+| payload32 live city | 654.405 us | 661.000 us | +1.01% |
+| payload64 live city | 653.470 us | 657.388 us | +0.60% |
+| payload32, 10k roots, 50% hierarchy | 1,623.364 us | 1,648.503 us | +1.55% |
+| payload32, 10k roots, 100% hierarchy | 3,002.483 us | 3,044.704 us | +1.41% |
+| payload64, 10k roots, 50% hierarchy | 1,666.783 us | 1,711.647 us | +2.69% |
+| payload64, 10k roots, 100% hierarchy | 2,993.951 us | 3,054.538 us | +2.02% |
+
+Motion publication remained payload-neutral at 142.540 us for payload32 and
+142.521 us for payload64. Moving the pair within text therefore cannot explain
+or recover the payload-specific selection delta. Both ELF section constraints
+were removed.
+
+## Retained target experiment: traversal-local walkers
+
+The rotated walker now appears immediately after the identity walker in source,
+before flat-root dispatch and both selectors. No compiler or linker attributes
+remain. The new locality relationship is between the two root walkers and the
+subtree traversal machinery they repeatedly call, rather than between the
+rotated walker and a selector that calls it only about 20 times per live-city
+frame. Function bodies, dispatch, APIs, and data layouts are unchanged.
+
+An alternating, CPU-4-pinned Windows A/B treated payload32 live city as flat:
+median geomean +0.36%, mean geomean -0.15%. Payload64 improved 1.41% by median
+geomean and 1.53% by mean. The four 10k identity guards ranged from -2.35% to
++0.26% by median; three improved and the fourth was within noise. This is only
+a safety screen because MSVC does not predict GCC AArch64 placement. Direct
+paired SBC measurement is the acceptance gate.
 
 ## Tradeoffs
 
-- The optimization is intentionally compiler/architecture-specific because
-  that is where the regression exists. A future AArch64 Clang result needs its
-  own evidence before opting into the section attribute.
-- A named ordinary ELF text section constrains linker freedom for these two
-  functions without assigning the whole pair privileged hot placement. It has
-  no data-memory cost.
-- Preventing inlining and cloning preserves identity isolation and call
-  locality but gives up future GCC LTO freedom for these two functions. The
-  target result determines whether that trade is favorable.
+- Source adjacency is a soft layout hint, not a linker contract. That avoids
+  the global placement damage measured with named ELF sections but means a
+  future compiler may choose a different order under LTO.
+- Keeping two specialized walkers duplicates their common traversal-control
+  body. This preserves the recovered identity fast path at a modest text-size
+  cost; the experiment changes no retained data.
 - The full benchmark suite gains one realistic motion-only case, increasing
   collection time slightly in exchange for removing ambiguity in future
   dynamic-scene regressions.
 
 ## Required target acceptance
 
-Retain the normal-text island only if the next clean SBC run satisfies both:
+Retain traversal-local walker placement only if paired SBC runs satisfy both:
 
 1. payload32 `BM_LiveCityDrivingFrame` recovers materially toward or below
    643.147 us without a corresponding machine/architecture-probe shift;
@@ -187,6 +213,5 @@ does not affect actor motion or TLAS publication.
 - Both benchmark inventories contain the driving-frame and motion-only cases.
 - Linux collector shell syntax: validated with `bash -n`.
 
-The architecture-specific attributes intentionally do not activate in these
-local MSVC builds. GCC 13 AArch64 compilation, linked symbol proximity, and the
-performance accept/reject conditions above remain target-board gates.
+GCC 13 AArch64 linked order and the performance accept/reject conditions above
+remain target-board gates.
