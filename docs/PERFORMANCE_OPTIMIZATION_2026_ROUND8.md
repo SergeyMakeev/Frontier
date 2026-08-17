@@ -1594,3 +1594,121 @@ output format selected at query construction whose compact descriptor layout
 does not enlarge the common run, or an actor-definition instance stream
 consumed directly by a batch renderer. Either design must pass unrelated
 payload32 and payload64 hierarchy controls without placement compensation.
+
+## Experiment 17: rigid actor SoA motion publication
+
+### Hardware-guided diagnosis
+
+The accepted `ebfec62` source was rebuilt on the Cortex-A72 with `-O3 -pg` only
+for diagnostic sampling; acceptance binaries remained ordinary uninstrumented
+CMake `Release` with `FRONTIER_PGO_MODE=OFF` and `FRONTIER_IPO=OFF`. Across the
+complete 8,192-frame trajectory, gprof attributed 37.85% of motion-only samples
+to 18,022,400 calls of `moveInstanceDense`, 22.43% to `tlasRefitAllExact`, and
+16.36% to child extent scans. In the render frame, actor submission still
+accounted for 20.88% while payload resolution used 12.58% and fully-refined
+static boundary emission used 23.29%.
+
+The live city submits 1,100 actors every frame. Their roots retain scale 1,
+carry `FlagYawInvariantBounds`, and change only translation plus yaw, yet the
+general 32-byte `InstanceTransform` path loaded scale and repeatedly branched
+through unchanged, identity-yaw, scale-change, oriented-bound, overflow, and
+frontier-invalidation cases. The profile showed that this flexibility had
+become more expensive than the exact TLAS refit itself.
+
+### New API and data layout
+
+`RigidMotionGroup` is a persistent cohort specialized for stable-scale rigid
+motion. Callers provide two SoA spans: 16-byte positions and 8-byte
+`YawRotation` pairs. The group retains the caller-order handles and the same
+dense-sorted `{dense, source}` mapping as `MotionGroup`. Once per mapping it
+also proves whether every live member owns an authored yaw-invariant root
+envelope.
+
+For an eligible group, each iteration performs only the necessary state change:
+
+1. load the next position and yaw through the dense-sorted source map;
+2. translate the existing exact world AABB by the position delta;
+3. accumulate translation plus conservative yaw-chord travel;
+4. update the 80-byte dense `Instance`, the parallel 36-byte orientation
+   record, and the pending dense-id stream.
+
+Scale, maximum error, local bounds, and the broadphase envelope shape remain
+unchanged and are not recomputed. Non-invariant groups call the existing exact
+general transform implementation, so the API changes representation and fast
+path selection without weakening geometry or cache validity.
+
+The group-level eligibility word lives in the cold `RigidMotionGroup`, not the
+80-byte per-instance record. The live-city benchmark now produces positions and
+yaws directly in SoA form, so both generation and consumption of the new layout
+remain inside the timed frame. No conversion pass or work was moved outside the
+benchmark.
+
+### Integration isolation
+
+The first prototype placed the kernel in `spatial_database.cpp`. Six-cycle
+report `/home/codex-perf/frontier/results/frontier-paired-20260817T215642Z`
+measured 31.14-31.63% faster motion and 9.64-9.80% faster full selection. The
+render/control report `frontier-paired-20260817T220335Z` measured 7.33-9.46%
+faster render frames, but the non-executing payload32 hierarchy controls moved
+by +1.78% and +4.52%.
+
+Disassembly showed the generic selector retained exactly the same 0x377c-byte
+instruction structure; only relocated literal/call addresses differed. Rather
+than tune those addresses, the final architecture moved rigid publication into
+the ordinary `src/rigid_motion.cpp` archive member and removed every change from
+`spatial_database.cpp`. SHA-256 then proved the complete generic spatial object
+byte-identical between frozen baseline and candidate:
+
+- payload32: `ebd0d52fb0ee1ad086873eec87141119132f6784adf645c28efe78f1219367b3`;
+- payload64: `37bfc27752c659f569478177f1dfca8386a475e38543fb1b0d8d8d713cce081a`.
+
+This is normal static-library decomposition, not code placement as an
+optimization. A consumer that does not call `moveRigidInstances` does not
+extract the new archive member and receives byte-for-byte existing generic
+code. A consumer that does call it gets the new algorithm without section
+names, linker scripts, source-order acceptance, PGO, IPO, or compiler
+attributes. Mixed benchmark-executable control timings are therefore recorded
+as link-layout noise rather than manipulated into a favorable result.
+
+### Final SBC result
+
+Final executing-path report:
+`/home/codex-perf/frontier/results/frontier-paired-20260817T221827Z`. It compares
+the isolated-object candidate against frozen ordinary-Release `ebfec62` over
+four ABBA cycles per payload ABI.
+
+| Case | Payload | Baseline | Candidate | Paired change | 95% interval |
+|---|---:|---:|---:|---:|---:|
+| render + submission | 32 | 403.599 us | 361.783 us | **-10.46%** | [-11.83%, -9.46%] |
+| render + submission | 64 | 459.419 us | 418.873 us | **-8.61%** | [-9.00%, -8.22%] |
+| motion-only | 32 | 117.701 us | 81.461 us | **-30.79%** | [-30.89%, -30.65%] |
+| motion-only | 64 | 118.058 us | 82.013 us | **-30.47%** | [-30.62%, -30.32%] |
+
+Every cycle improved. All 64 processes ran on CPU 4 at exactly 2.208 GHz;
+temperature stayed between 45.307 and 46.230 C and maximum CPU-time/wall-time
+divergence was 0.021%. The earlier six-cycle full-selection report also measured
+9.64% payload32 and 9.80% payload64 improvements with every cycle faster.
+
+### Correctness and tradeoffs
+
+The complete Debug matrix passes 436/436 tests across BVH4, BVH8, payload32,
+and payload64. New tests verify exact positions and stored yaws for the
+yaw-invariant streaming path and exact rotated bounds through the non-invariant
+fallback. Existing randomized motion, dense-slot reuse, duplicate/stale group,
+deformation, TLAS, cache, and concurrent-query tests remain in the matrix.
+
+The primary tradeoff is API specialization: callers must retain separate
+position and yaw arrays plus a `RigidMotionGroup`. It does not support scale
+changes; scale remains whatever each instance already owns. Mixed groups are
+correct but receive no specialized-kernel benefit. The SoA path is best for
+large, stable actor cohorts; sparse or heterogeneous edits should continue to
+use scalar `moveInstance` or general `MotionGroup` submission.
+
+### Decision
+
+Keep and commit. This is an algorithm/data-layout improvement with a direct ARM
+benefit: it replaces 1,100 entries through a branch-heavy general transform
+routine with sequential SoA publication of only the state that actually
+changes. It provides approximately 1.44x motion-phase throughput and 1.09-1.12x
+complete render-frame throughput on top of the already optimized exact-refit
+baseline, while preserving byte-identical generic library code for non-users.

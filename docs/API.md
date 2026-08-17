@@ -776,6 +776,23 @@ database.moveInstances(trafficGroup, positions, 1.0f);
 database.moveInstances(trafficGroup, vehicleTransforms);
 ```
 
+For a large rigid cohort with fixed per-instance scale, retain positions and
+yaws as separate streams and use `RigidMotionGroup`:
+
+```cpp
+SpatialDatabase::RigidMotionGroup rigidTraffic(vehicleInstances);
+
+// Both spans remain in the same stable caller order as vehicleInstances.
+database.moveRigidInstances(rigidTraffic, vehiclePositions, vehicleYaws);
+```
+
+If every root carries `FlagYawInvariantBounds`, eligibility is cached until the
+physical instance mapping changes. Each frame then streams the dense instance
+and orientation arrays, translates the existing exact broadphase box, and
+updates yaw without loading an unused scale from an AoS transform or entering
+the general oriented-bound reconstruction path. Mixed/non-invariant cohorts
+remain exact by falling back to the ordinary transform kernel.
+
 When the complete cohort shares one translation, submit that fact directly:
 
 ```cpp
@@ -834,6 +851,10 @@ occasional movement or changing cohorts. Use `translateInstances()` whenever a
 cohort shares one delta; use the position overload of `moveInstances()` for
 absolute positions or a shared scale, and the `InstanceTransform` overload for
 independent scale and yaw.
+
+For stable-scale actors with independently changing yaw, prefer
+`RigidMotionGroup` and `moveRigidInstances()` over the AoS transform overload;
+keep the general overload for scale animation or an authoritative AoS source.
 
 ### Place a mounted definition
 

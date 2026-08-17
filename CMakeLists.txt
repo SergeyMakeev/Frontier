@@ -116,6 +116,7 @@ set(FRONTIER_SOURCES
     src/config.cpp
     src/subtree.cpp
     src/spatial_database.cpp
+    src/rigid_motion.cpp
 )
 
 function(frontier_configure_library target width)

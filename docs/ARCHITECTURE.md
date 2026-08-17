@@ -151,6 +151,16 @@ dense-list index together. Public ids map through stable handle-to-dense tables.
 `optimize()` compacts dead dense slots and rewrites physical back-pointers while
 preserving those ids.
 
+Rigid actor animation has a separate archive-level publication module.
+`RigidMotionGroup` caches the same caller-to-dense mapping plus a proof that all
+members use authored yaw-invariant broadphase bounds. Positions and yaws arrive
+as independent contiguous streams; stable-scale actors translate their exact
+world boxes in place while orientation and travel update in parallel dense
+arrays. The general AoS transform path remains the fallback for scale changes
+or ordinary oriented bounds. Keeping this kernel in its own static-library
+object means applications that never call it do not link it; the generic
+spatial-database object and its query code remain byte-identical.
+
 ## Copy-on-write bounds
 
 Authored bounds are immutable and usually read directly from the definition.

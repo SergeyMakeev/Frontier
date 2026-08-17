@@ -1421,6 +1421,44 @@ yaw for each group member. Angular motion is charged conservatively by the
 maximum possible displacement of any point in the authored root bound; this
 keeps cached LOD decisions exact without invalidating every rotating actor.
 
+### `RigidMotionGroup`
+
+```cpp
+class SpatialDatabase::RigidMotionGroup {
+public:
+    RigidMotionGroup();
+    explicit RigidMotionGroup(
+        std::span<const InstanceHandle> instances);
+    void reset(std::span<const InstanceHandle> instances);
+    size_t size() const;
+};
+
+void moveRigidInstances(RigidMotionGroup& group,
+                        std::span<const float4> positions,
+                        std::span<const YawRotation> yaws);
+```
+
+`RigidMotionGroup` is the structure-of-arrays path for a persistent cohort that
+changes translation and planar yaw while retaining each instance's existing
+scale. `positions[i]` and `yaws[i]` correspond to the handle copied at group
+index `i`; both spans must exactly match the group size. Positions and unit
+cosine/sine pairs must be finite, and translated root bounds must remain
+representable.
+
+When every live member was authored with `FlagYawInvariantBounds`, Frontier
+proves that property once per physical instance mapping and uses a streaming
+rigid kernel. It translates the already exact world AABB, updates the cold yaw
+stream and motion odometer, and queues the dense id without re-entering the
+general scale/oriented-bounds path. A group containing any ordinary oriented
+bound falls back to the general exact transform implementation. Stale handles
+are ignored and duplicates retain the last caller entry, matching
+`MotionGroup`.
+
+Keep the group and its SoA arrays alive across frames. Use this path for
+traffic, pedestrians, rigid particles, and similar stable actor populations.
+Use `moveInstances(MotionGroup&, span<InstanceTransform>)` when scale changes
+or when AoS is the application's authoritative layout.
+
 ```cpp
 void translateInstances(MotionGroup& group, float4 delta);
 ```

@@ -88,6 +88,16 @@ struct SpatialDatabase::TestAccess
         return instance ? instance->worldBox : AABB::empty();
     }
 
+    static YawRotation instanceYaw(const SpatialDatabase& database,
+                                   InstanceHandle handle)
+    {
+        const InstanceId dense = database.denseInstanceId(handle);
+        return dense != kInvalidInstanceId &&
+                       !database.instanceOrientations_.empty()
+                   ? database.instanceOrientations_[dense].yaw
+                   : YawRotation{};
+    }
+
     static AABB tlasLeafBounds(SpatialDatabase& database,
                                InstanceHandle handle)
     {

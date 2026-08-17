@@ -177,6 +177,65 @@ TEST(Motion, AuthoredYawInvariantRootKeepsOneBroadphaseEnvelope)
     EXPECT_FLOAT_EQ(bounds.mx.z, 45.0f);
 }
 
+TEST(Motion, RigidMotionGroupStreamsYawInvariantActors)
+{
+    SpatialDatabase database;
+    NodeDesc root = node(1, 8.0f, box(5.0f));
+    root.flags |= NodeDesc::FlagYawInvariantBounds;
+    InstanceDesc firstDesc;
+    firstDesc.pos = float4::point(1.0f, 0.0f, 2.0f);
+    InstanceDesc secondDesc;
+    secondDesc.pos = float4::point(4.0f, 0.0f, 8.0f);
+    const InstanceHandle first = database.instantiate(root, firstDesc);
+    const InstanceHandle second = database.instantiate(root, secondDesc);
+    const std::array<InstanceHandle, 2> handles{first, second};
+    SpatialDatabase::RigidMotionGroup group(handles);
+    const std::array<float4, 2> positions{
+        float4::point(11.0f, 0.0f, 12.0f),
+        float4::point(24.0f, 0.0f, 28.0f)};
+    const std::array<YawRotation, 2> yaws{
+        YawRotation{0.0f, 1.0f}, YawRotation{-1.0f, 0.0f}};
+
+    database.moveRigidInstances(group, positions, yaws);
+    database.applyUpdates();
+
+    const AABB firstBounds = TestAccess::instanceBounds(database, first);
+    const AABB secondBounds = TestAccess::instanceBounds(database, second);
+    EXPECT_FLOAT_EQ(firstBounds.center().x, 11.0f);
+    EXPECT_FLOAT_EQ(firstBounds.center().z, 12.0f);
+    EXPECT_FLOAT_EQ(secondBounds.center().x, 24.0f);
+    EXPECT_FLOAT_EQ(secondBounds.center().z, 28.0f);
+    EXPECT_FLOAT_EQ(TestAccess::instanceYaw(database, first).cosine, 0.0f);
+    EXPECT_FLOAT_EQ(TestAccess::instanceYaw(database, first).sine, 1.0f);
+    EXPECT_FLOAT_EQ(TestAccess::instanceYaw(database, second).cosine, -1.0f);
+    EXPECT_FLOAT_EQ(TestAccess::instanceYaw(database, second).sine, 0.0f);
+    EXPECT_EQ(TestAccess::instanceBytes(), 80u);
+}
+
+TEST(Motion, RigidMotionGroupFallsBackForOrientedBounds)
+{
+    SpatialDatabase database;
+    const AABB authored = AABB::fromMinMax(
+        float4::point(-1.0f, -1.0f, -3.0f),
+        float4::point(1.0f, 1.0f, 3.0f));
+    const InstanceHandle instance =
+        database.instantiate(node(1, 0.0f, authored));
+    const std::array<InstanceHandle, 1> handles{instance};
+    SpatialDatabase::RigidMotionGroup group(handles);
+    const std::array<float4, 1> positions{
+        float4::point(10.0f, 0.0f, 20.0f)};
+    const std::array<YawRotation, 1> yaws{YawRotation{0.0f, 1.0f}};
+
+    database.moveRigidInstances(group, positions, yaws);
+    database.applyUpdates();
+
+    const AABB bounds = TestAccess::instanceBounds(database, instance);
+    EXPECT_FLOAT_EQ(bounds.mn.x, 7.0f);
+    EXPECT_FLOAT_EQ(bounds.mx.x, 13.0f);
+    EXPECT_FLOAT_EQ(bounds.mn.z, 19.0f);
+    EXPECT_FLOAT_EQ(bounds.mx.z, 21.0f);
+}
+
 TEST(Motion, NodeBoundsUseCopyOnWritePerTopLevelInstance)
 {
     SpatialDatabase database;

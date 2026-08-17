@@ -288,13 +288,15 @@ SubtreeBytes makeLiveCityActor(uint32_t firstPayload, uint32_t leafCount,
 struct LiveCityScene
 {
     SpatialDatabase world;
-    SpatialDatabase::MotionGroup carMotion;
-    SpatialDatabase::MotionGroup pedestrianMotion;
+    SpatialDatabase::RigidMotionGroup carMotion;
+    SpatialDatabase::RigidMotionGroup pedestrianMotion;
     std::vector<float4> unitCircle;
     std::vector<float4> carCenters;
     std::vector<float4> pedestrianCenters;
-    std::vector<InstanceTransform> carTransforms;
-    std::vector<InstanceTransform> pedestrianTransforms;
+    std::vector<float4> carPositions;
+    std::vector<float4> pedestrianPositions;
+    std::vector<YawRotation> carYaws;
+    std::vector<YawRotation> pedestrianYaws;
     std::vector<Camera> cameras;
     size_t immutableBytes = 0;
 };
@@ -330,12 +332,11 @@ void updateLiveCityActorPositions(LiveCityScene& scene, uint32_t frame)
             frame, carLoops, phase, (i & 1u) != 0);
         const float4 u = scene.unitCircle[sample];
         const float4 c = scene.carCenters[i];
-        InstanceTransform& transform = scene.carTransforms[i];
-        transform.pos = float4::point(
+        scene.carPositions[i] = float4::point(
             c.x + carRadius * u.x, 0.0f, c.z + carRadius * u.z);
         const float direction = (i & 1u) != 0 ? -1.0f : 1.0f;
         // Actor +Z follows the exact tangent of the circular road.
-        transform.yaw = {direction * u.x, direction * u.z};
+        scene.carYaws[i] = {direction * u.x, direction * u.z};
     }
 
     for (uint32_t i = 0; i < kLiveCityPedestrians; ++i)
@@ -347,12 +348,11 @@ void updateLiveCityActorPositions(LiveCityScene& scene, uint32_t frame)
             frame, pedestrianLoops, phase, (i & 1u) != 0);
         const float4 u = scene.unitCircle[sample];
         const float4 c = scene.pedestrianCenters[i];
-        InstanceTransform& transform = scene.pedestrianTransforms[i];
-        transform.pos = float4::point(
+        scene.pedestrianPositions[i] = float4::point(
             c.x + pedestrianRadius * u.x, 0.0f,
             c.z + pedestrianRadius * u.z);
         const float direction = (i & 1u) != 0 ? -1.0f : 1.0f;
-        transform.yaw = {direction * u.x, direction * u.z};
+        scene.pedestrianYaws[i] = {direction * u.x, direction * u.z};
     }
 }
 
@@ -415,13 +415,15 @@ std::unique_ptr<LiveCityScene> buildLiveCityScene()
         scene->world.registerSubtree(std::move(pedestrianBytes));
 
     scene->carCenters.reserve(kLiveCityCars);
-    scene->carTransforms.resize(kLiveCityCars);
+    scene->carPositions.resize(kLiveCityCars);
+    scene->carYaws.resize(kLiveCityCars);
     for (uint32_t i = 0; i < kLiveCityCars; ++i)
         scene->carCenters.push_back(float4::point(
             (float(i % 10) - 4.5f) * 82.0f, 0.0f,
             (float(i / 10) - 4.5f) * 82.0f));
     scene->pedestrianCenters.reserve(kLiveCityPedestrians);
-    scene->pedestrianTransforms.resize(kLiveCityPedestrians);
+    scene->pedestrianPositions.resize(kLiveCityPedestrians);
+    scene->pedestrianYaws.resize(kLiveCityPedestrians);
     for (uint32_t i = 0; i < kLiveCityPedestrians; ++i)
         scene->pedestrianCenters.push_back(float4::point(
             (float(i % 32) - 15.5f) * 27.0f, 0.0f,
@@ -433,8 +435,8 @@ std::unique_ptr<LiveCityScene> buildLiveCityScene()
     for (uint32_t i = 0; i < kLiveCityCars; ++i)
     {
         InstanceDesc desc;
-        desc.pos = scene->carTransforms[i].pos;
-        desc.yaw = scene->carTransforms[i].yaw;
+        desc.pos = scene->carPositions[i];
+        desc.yaw = scene->carYaws[i];
         NodeDesc carRoot =
             node(20000 + i, 10000.0f, box(5.0f), true);
         carRoot.flags |= NodeDesc::FlagYawInvariantBounds;
@@ -450,8 +452,8 @@ std::unique_ptr<LiveCityScene> buildLiveCityScene()
     for (uint32_t i = 0; i < kLiveCityPedestrians; ++i)
     {
         InstanceDesc desc;
-        desc.pos = scene->pedestrianTransforms[i].pos;
-        desc.yaw = scene->pedestrianTransforms[i].yaw;
+        desc.pos = scene->pedestrianPositions[i];
+        desc.yaw = scene->pedestrianYaws[i];
         NodeDesc pedestrianRoot =
             node(30000 + i, 10000.0f, box(1.5f), true);
         pedestrianRoot.flags |= NodeDesc::FlagYawInvariantBounds;
@@ -1187,9 +1189,12 @@ static void BM_LiveCityDrivingFrame(benchmark::State& state)
     {
         frame = (frame + 1) & kLiveCityFrameMask;
         updateLiveCityActorPositions(*scene, frame);
-        scene->world.moveInstances(scene->carMotion, scene->carTransforms);
-        scene->world.moveInstances(scene->pedestrianMotion,
-                                   scene->pedestrianTransforms);
+        scene->world.moveRigidInstances(scene->carMotion,
+                                        scene->carPositions,
+                                        scene->carYaws);
+        scene->world.moveRigidInstances(scene->pedestrianMotion,
+                                        scene->pedestrianPositions,
+                                        scene->pedestrianYaws);
         scene->world.applyUpdates();
         result = query.selectFrontier(scene->world, scene->cameras[frame], {});
         consume(result);
@@ -1249,9 +1254,12 @@ static void BM_LiveCityMotionFrame(benchmark::State& state)
     {
         frame = (frame + 1) & kLiveCityFrameMask;
         updateLiveCityActorPositions(*scene, frame);
-        scene->world.moveInstances(scene->carMotion, scene->carTransforms);
-        scene->world.moveInstances(scene->pedestrianMotion,
-                                   scene->pedestrianTransforms);
+        scene->world.moveRigidInstances(scene->carMotion,
+                                        scene->carPositions,
+                                        scene->carYaws);
+        scene->world.moveRigidInstances(scene->pedestrianMotion,
+                                        scene->pedestrianPositions,
+                                        scene->pedestrianYaws);
         scene->world.applyUpdates();
         benchmark::DoNotOptimize(scene->world.mountedSubtreeCount());
         ++calls;
@@ -1298,9 +1306,12 @@ static void BM_LiveCityRenderSubmissionFrame(benchmark::State& state)
     {
         frame = (frame + 1) & kLiveCityFrameMask;
         updateLiveCityActorPositions(*scene, frame);
-        scene->world.moveInstances(scene->carMotion, scene->carTransforms);
-        scene->world.moveInstances(scene->pedestrianMotion,
-                                   scene->pedestrianTransforms);
+        scene->world.moveRigidInstances(scene->carMotion,
+                                        scene->carPositions,
+                                        scene->carYaws);
+        scene->world.moveRigidInstances(scene->pedestrianMotion,
+                                        scene->pedestrianPositions,
+                                        scene->pedestrianYaws);
         scene->world.applyUpdates();
         result = query.selectRenderFrontier(
             scene->world, scene->cameras[frame], {});

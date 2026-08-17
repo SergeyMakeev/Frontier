@@ -1099,6 +1099,31 @@ public:
         bool physicalOrderValid_ = false;
     };
 
+    // Persistent cohort for the rigid SoA update path. Eligibility for the
+    // yaw-invariant kernel is proved once per physical instance mapping rather
+    // than retested every frame.
+    class RigidMotionGroup
+    {
+    public:
+        RigidMotionGroup() = default;
+        explicit RigidMotionGroup(std::span<const InstanceHandle> instances)
+            : motion_(instances)
+        {}
+        void reset(std::span<const InstanceHandle> instances)
+        {
+            motion_.reset(instances);
+            checkedMappingVersion_ = 0;
+            allYawInvariant_ = false;
+        }
+        size_t size() const { return motion_.size(); }
+
+    private:
+        friend class SpatialDatabase;
+        MotionGroup motion_;
+        uint32_t checkedMappingVersion_ = 0;
+        bool allYawInvariant_ = false;
+    };
+
     // During initial assembly, additions are accumulated for the first build.
     // Once a TLAS exists, insertion is O(depth) and may allocate a TLAS node
     // when a full leaf splits; it never scans the whole instance population.
@@ -1133,6 +1158,13 @@ public:
     // scaling, and yawing actors such as vehicles and pedestrians.
     void moveInstances(MotionGroup& group,
                        std::span<const InstanceTransform> transforms);
+    // Rigid actor stream with structure-of-arrays input. Scale is retained
+    // from each instance. Groups whose authored root bounds are yaw-invariant
+    // use a branch-light batch kernel that translates exact bounds in place;
+    // other groups fall back to the general transform path.
+    void moveRigidInstances(RigidMotionGroup& group,
+                            std::span<const float4> positions,
+                            std::span<const YawRotation> yaws);
 
     // Translate every live member of a persistent cohort by the same world-
     // space delta. Unlike submitting N absolute positions, this API carries
