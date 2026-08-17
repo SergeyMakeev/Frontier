@@ -327,6 +327,18 @@ TEST(Contracts, FixedOutputReportsOverflow)
     EXPECT_EQ(sink.shared.dropped(), 5u);
 }
 
+TEST(Contracts, FixedOutputGeneratedRangeReportsOverflow)
+{
+    std::array<uint32_t, 3> output{};
+    Sink<uint32_t> sink{output};
+    sink.push(7);
+    sink.pushGenerated(4, [](uint32_t i) { return 100 + i; });
+
+    EXPECT_EQ(output, (std::array<uint32_t, 3>{7, 100, 101}));
+    EXPECT_EQ(sink.count(), output.size());
+    EXPECT_EQ(sink.dropped(), 2u);
+}
+
 TEST(Contracts, EncodedFrontierErrorPreservesTheExactThresholdSide)
 {
     constexpr float threshold = 4.0f;

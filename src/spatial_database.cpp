@@ -522,6 +522,9 @@ void SpatialDatabase::destroySubtree(uint32_t definition)
                    "SpatialDatabase::releaseSubtree: live instances remain");
     subtree = SubtreeDefinitionRt{};
     nodeStatePools_[definition] = NodeStatePoolRt{};
+    if (fullyRefinedLeafPlans_ &&
+        definition < fullyRefinedLeafPlans_->size())
+        (*fullyRefinedLeafPlans_)[definition] = FullyRefinedLeafPlan{};
     freeSubtrees_.push_back(definition);
     FRONTIER_ASSERT(liveSubtrees_ != 0,
                     "registered-subtree count underflow");
@@ -561,6 +564,7 @@ SubtreeHandle SpatialDatabase::registerSubtree(SubtreeBytes&& bytes)
         }
     }
     float minInnerError = FLT_MAX;
+    uint32_t terminalLeafCount = 0;
     for (uint32_t node = 1; node < runtime.view.packedNodeCount(); ++node)
     {
         if (runtime.view.isMountable(node))
@@ -571,11 +575,77 @@ SubtreeHandle SpatialDatabase::registerSubtree(SubtreeBytes&& bytes)
         if (runtime.view.childCount(node) != 0)
             minInnerError = std::min(
                 minInnerError, runtime.view.geometricError_[node]);
+        else
+            ++terminalLeafCount;
     }
     if (minInnerError == FLT_MAX || !terminalLeavesZeroError)
         minInnerError = 0.0f;
     runtime.minInnerErrorAndRootFlag =
         std::copysign(minInnerError, rootLeavesOnly ? -1.0f : 1.0f);
+
+    if (fullyRefinedLeafPlans_ &&
+        definition < fullyRefinedLeafPlans_->size())
+        (*fullyRefinedLeafPlans_)[definition] = FullyRefinedLeafPlan{};
+    if (runtime.view.nodeCount() >= 16 && minInnerError > 0.0f)
+    {
+        if (!fullyRefinedLeafPlans_)
+            fullyRefinedLeafPlans_ =
+                std::make_unique<std::vector<FullyRefinedLeafPlan>>();
+        fullyRefinedLeafPlans_->resize(subtrees_.size());
+        FullyRefinedLeafPlan& plan =
+            (*fullyRefinedLeafPlans_)[definition];
+        struct BuildItem
+        {
+            uint32_t node;
+            bool exit;
+        };
+
+        plan.ranges.resize(runtime.view.packedNodeCount());
+        plan.terminalNodes.reserve(terminalLeafCount);
+        std::vector<BuildItem> stack;
+        stack.reserve(runtime.view.nodeCount());
+        stack.push_back({0, false});
+        while (!stack.empty())
+        {
+            const BuildItem item = stack.back();
+            stack.pop_back();
+            FullyRefinedLeafRange& range = plan.ranges[item.node];
+            if (item.exit)
+            {
+                range.count =
+                    uint32_t(plan.terminalNodes.size()) - range.begin;
+                continue;
+            }
+
+            range.begin = uint32_t(plan.terminalNodes.size());
+            stack.push_back({item.node, true});
+            const uint32_t first = runtime.view.wideOffset(item.node);
+            const uint32_t blocks = runtime.view.wideBlockCount(item.node);
+            for (uint32_t b = 0; b < blocks; ++b)
+            {
+                const uint32_t block = first + b;
+                const WideBlock& children = runtime.view.wide_[block];
+                const uint32_t lanes = runtime.view.blockMask_[block];
+                uint32_t leaves = blockLeafLanes(lanes);
+                while (leaves)
+                {
+                    const uint32_t lane =
+                        uint32_t(std::countr_zero(leaves));
+                    leaves &= leaves - 1;
+                    plan.terminalNodes.push_back(children.child[lane]);
+                }
+                uint32_t inner = blockValidLanes(lanes) &
+                                 ~blockLeafLanes(lanes);
+                while (inner)
+                {
+                    const uint32_t lane =
+                        uint32_t(std::countr_zero(inner));
+                    inner &= inner - 1;
+                    stack.push_back({children.child[lane], false});
+                }
+            }
+        }
+    }
     ++liveSubtrees_;
     return SubtreeHandle{definition, runtime.generation};
 }
@@ -4015,6 +4085,143 @@ void SpatialDatabase::runSubtree(const WorkItem& item, const Instance& inst,
         runSubtreeImpl<FullyReady, true>(item, inst, local, params, w);
 }
 
+void SpatialDatabase::runFullyReadyRootLeaves(
+    const WorkItem& item, const Instance& inst, const Camera& rootLocal,
+    Worker& w) const
+{
+    const SubtreeInstanceRt& rt = slots_[item.slot()];
+    const MountTransformRt& transform = mountTransforms_[item.slot()];
+    const bool identityTransform =
+        transform.scale == 1.0f && transform.pos.x == 0.0f &&
+        transform.pos.y == 0.0f && transform.pos.z == 0.0f;
+    std::optional<Camera> transformed;
+    const Camera& local = identityTransform
+                              ? rootLocal
+                              : transformed.emplace(mountLocalCamera(
+                                    rootLocal, item.slot(), item.mask()));
+    recordTraversalDependency(w, item.slot());
+    FRONTIER_STAT(w, subtreesVisited, 1);
+    const SubtreeView& pg = subtrees_[rt.definition].view;
+    const uint32_t gen = rt.generation();
+    const InstanceId instance =
+        publicInstanceId(InstanceId(&inst - instances_.data()));
+    w.nodeStack.clear();
+    wideVisit<true, false>(item, pg, rt.errClamp, gen, instance, 0,
+                           item.mask(), 1, 1, local, w);
+    FRONTIER_ASSERT(w.nodeStack.empty(),
+                    "root-leaf definition produced interior work");
+}
+
+bool SpatialDatabase::tryRunFullyRefinedBoundary(
+    const WorkItem& item, const Instance& inst, const Camera& rootLocal,
+    Worker& w) const
+{
+    const SubtreeInstanceRt& rt = slots_[item.slot()];
+    const MountTransformRt& transform = mountTransforms_[item.slot()];
+    const bool identityTransform =
+        transform.scale == 1.0f && transform.pos.x == 0.0f &&
+        transform.pos.y == 0.0f && transform.pos.z == 0.0f;
+    std::optional<Camera> transformed;
+    const Camera& local = identityTransform
+                              ? rootLocal
+                              : transformed.emplace(mountLocalCamera(
+                                    rootLocal, item.slot(), item.mask()));
+    const SubtreeDefinitionRt& definition = subtrees_[rt.definition];
+    const SubtreeView& pg = definition.view;
+    FRONTIER_ASSERT(fullyRefinedLeafPlans_ &&
+                        rt.definition < fullyRefinedLeafPlans_->size(),
+                    "fully-refined definition has no leaf plan");
+    const FullyRefinedLeafPlan& plan =
+        (*fullyRefinedLeafPlans_)[rt.definition];
+    const float innerError =
+        std::min(definition.minInnerError(), rt.errClamp);
+    if (inst.hasOverlayList() || !(innerError > 0.0f)) return false;
+
+    const AABB bounds = pg.bounds();
+    const float4 qmn = local.queryMin();
+    const float4 qmx = local.queryMax();
+    const float dx = std::max(std::fabs(qmn.x - bounds.mx.x),
+                              std::fabs(qmx.x - bounds.mn.x));
+    const float dy = std::max(std::fabs(qmn.y - bounds.mx.y),
+                              std::fabs(qmx.y - bounds.mn.y));
+    const float dz = std::max(std::fabs(qmn.z - bounds.mx.z),
+                              std::fabs(qmx.z - bounds.mn.z));
+    const float farthestSq = dx * dx + dy * dy + dz * dz;
+    const float refineDistance = innerError * local.k * w.barInv;
+    if (!(refineDistance * refineDistance > farthestSq)) return false;
+
+    recordTraversalDependency(w, item.slot());
+    FRONTIER_STAT(w, subtreesVisited, 1);
+    FRONTIER_STAT(w, fullyRefinedSubtrees, 1);
+    const uint32_t gen = rt.generation();
+    const InstanceId instance =
+        publicInstanceId(InstanceId(&inst - instances_.data()));
+    w.nodeStack.clear();
+    const auto visit = [&](uint32_t node, uint8_t mask)
+    {
+        if (mask == 0)
+        {
+            const FullyRefinedLeafRange range = plan.ranges[node];
+            const uint32_t* terminal =
+                plan.terminalNodes.data() + range.begin;
+            w.result.shared.pushGenerated(
+                range.count, [&](uint32_t i)
+                {
+                    return FrontierEntry{
+                        NodeHandle{item.slot(), terminal[i], gen}, uint8_t(0),
+                        instance};
+                });
+            return;
+        }
+
+        const uint32_t count = pg.childCount(node);
+        uint32_t block = pg.wideOffset(node);
+        for (uint32_t base = 0; base < count; base += kWide, ++block)
+        {
+            const WideBlock& children = pg.wide_[block];
+            const uint32_t lanes = pg.blockMask_[block];
+            FRONTIER_STAT(w, wideBlocksTested, 1);
+            uint8_t outMasks[kWide];
+            const uint32_t survivors =
+                testWideAabb(item.bounds(block), local.frustum, mask,
+                             outMasks) & lanes;
+            if (!survivors) continue;
+            FRONTIER_STAT(w, lanesSurvived,
+                          uint64_t(std::popcount(survivors)));
+
+            const uint32_t leafLanes = blockLeafLanes(lanes);
+            uint32_t leaves = survivors & leafLanes;
+            while (leaves)
+            {
+                const uint32_t lane = uint32_t(std::countr_zero(leaves));
+                leaves &= leaves - 1;
+                w.result.shared.push(FrontierEntry{
+                    NodeHandle{item.slot(), children.child[lane], gen},
+                    uint8_t(0), instance});
+            }
+
+            uint32_t inner = survivors & ~leafLanes;
+            while (inner)
+            {
+                const uint32_t lane = uint32_t(std::countr_zero(inner));
+                inner &= inner - 1;
+                w.nodeStack.push_back(
+                    {children.child[lane], 0.0f, outMasks[lane], 1, 1});
+            }
+        }
+    };
+
+    visit(0, item.mask());
+    while (!w.nodeStack.empty())
+    {
+        const NodeItem entry = w.nodeStack.back();
+        w.nodeStack.pop_back();
+        FRONTIER_STAT(w, nodesVisited, 1);
+        visit(entry.node(), entry.planes());
+    }
+    return true;
+}
+
 void SpatialDatabase::runSubtreeAncestor(
     const WorkItem& item, const Instance& inst, const Camera& local,
     const SelectionParams& params, uint32_t ancestorCandidate, Worker& w) const
@@ -4108,102 +4315,6 @@ void SpatialDatabase::runSubtreeAncestorImpl(
 
     FRONTIER_ASSERT(w.nodeCandidates.empty(),
                     "ancestor candidate stack mismatch");
-}
-
-#if defined(_MSC_VER)
-__declspec(noinline)
-#elif defined(__GNUC__) || defined(__clang__)
-__attribute__((noinline, section(".text.frontier_refined")))
-#endif
-bool SpatialDatabase::tryRunFullyRefinedBoundary(
-    const WorkItem& item, const Instance& inst, const Camera& rootLocal,
-    Worker& w) const
-{
-    const SubtreeInstanceRt& rt = slots_[item.slot()];
-    const MountTransformRt& transform = mountTransforms_[item.slot()];
-    const bool identityTransform =
-        transform.scale == 1.0f && transform.pos.x == 0.0f &&
-        transform.pos.y == 0.0f && transform.pos.z == 0.0f;
-    std::optional<Camera> transformed;
-    const Camera& local = identityTransform
-                              ? rootLocal
-                              : transformed.emplace(mountLocalCamera(
-                                    rootLocal, item.slot(), item.mask()));
-    const SubtreeDefinitionRt& definition = subtrees_[rt.definition];
-    const SubtreeView& pg = definition.view;
-    const float innerError =
-        std::min(definition.minInnerError(), rt.errClamp);
-    if (inst.hasOverlayList() || !(innerError > 0.0f)) return false;
-
-    const AABB bounds = pg.bounds();
-    const float4 qmn = local.queryMin();
-    const float4 qmx = local.queryMax();
-    const float dx = std::max(std::fabs(qmn.x - bounds.mx.x),
-                              std::fabs(qmx.x - bounds.mn.x));
-    const float dy = std::max(std::fabs(qmn.y - bounds.mx.y),
-                              std::fabs(qmx.y - bounds.mn.y));
-    const float dz = std::max(std::fabs(qmn.z - bounds.mx.z),
-                              std::fabs(qmx.z - bounds.mn.z));
-    const float farthestSq = dx * dx + dy * dy + dz * dz;
-    const float refineDistance = innerError * local.k * w.barInv;
-    if (!(refineDistance * refineDistance > farthestSq)) return false;
-
-    recordTraversalDependency(w, item.slot());
-    FRONTIER_STAT(w, subtreesVisited, 1);
-    FRONTIER_STAT(w, fullyRefinedSubtrees, 1);
-    const uint32_t gen = rt.generation();
-    const InstanceId instance =
-        publicInstanceId(InstanceId(&inst - instances_.data()));
-    w.nodeStack.clear();
-    const auto visit = [&](uint32_t node, uint8_t mask)
-    {
-        const uint32_t count = pg.childCount(node);
-        uint32_t block = pg.wideOffset(node);
-        for (uint32_t base = 0; base < count;
-             base += kWide, ++block)
-        {
-            const WideBlock& children = pg.wide_[block];
-            const uint32_t lanes = pg.blockMask_[block];
-            FRONTIER_STAT(w, wideBlocksTested, 1);
-            uint8_t outMasks[kWide];
-            const uint32_t survivors =
-                testWideAabb(item.bounds(block), local.frustum, mask,
-                             outMasks) & lanes;
-            if (!survivors) continue;
-            FRONTIER_STAT(w, lanesSurvived,
-                          uint64_t(std::popcount(survivors)));
-
-            const uint32_t leafLanes = blockLeafLanes(lanes);
-            uint32_t leaves = survivors & leafLanes;
-            while (leaves)
-            {
-                const uint32_t lane = uint32_t(std::countr_zero(leaves));
-                leaves &= leaves - 1;
-                w.result.shared.push(FrontierEntry{
-                    NodeHandle{item.slot(), children.child[lane], gen},
-                    uint8_t(0), instance});
-            }
-
-            uint32_t inner = survivors & ~leafLanes;
-            while (inner)
-            {
-                const uint32_t lane = uint32_t(std::countr_zero(inner));
-                inner &= inner - 1;
-                w.nodeStack.push_back(
-                    {children.child[lane], 0.0f, outMasks[lane], 1, 1});
-            }
-        }
-    };
-
-    visit(0, item.mask());
-    while (!w.nodeStack.empty())
-    {
-        const NodeItem entry = w.nodeStack.back();
-        w.nodeStack.pop_back();
-        FRONTIER_STAT(w, nodesVisited, 1);
-        visit(entry.node(), entry.planes());
-    }
-    return true;
 }
 
 template<bool FullyReady, bool SparseOverlay>
@@ -4464,6 +4575,12 @@ void SpatialDatabase::runTlasRootInstance(
     {
         const WorkItem rootItem =
             makeWorkItem(childSlot, inst, 1, 1, mask);
+        if (mountTransforms_[childSlot].rootLeavesOnly() &&
+            !inst.hasOverlayList())
+        {
+            runFullyReadyRootLeaves(rootItem, inst, local, w);
+            return;
+        }
         // The one-time proof costs more than the ordinary walk for toy
         // hierarchies. Registration sets this flag only for eligible trees
         // with at least sixteen authored nodes.
@@ -4583,6 +4700,12 @@ void SpatialDatabase::runOrientedTlasRootInstance(
     {
         const WorkItem rootItem =
             makeWorkItem(childSlot, inst, 1, 1, mask);
+        if (mountTransforms_[childSlot].rootLeavesOnly() &&
+            !inst.hasOverlayList())
+        {
+            runFullyReadyRootLeaves(rootItem, inst, local, w);
+            return;
+        }
         if (mask != 0 &&
             mountTransforms_[childSlot].fullyRefinedCandidate() &&
             tryRunFullyRefinedBoundary(rootItem, inst, local, w)) [[unlikely]]

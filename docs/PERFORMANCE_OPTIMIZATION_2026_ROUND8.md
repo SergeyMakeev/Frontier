@@ -1087,3 +1087,190 @@ of those mechanisms. Further work will use ordinary release builds and pursue
 only algorithmic reductions, data layout, memory traffic, and stable explicit
 specialization. PGO remains useful as a diagnostic tool, but it is not part of
 the performance architecture or acceptance claim.
+
+## Experiment 13: collapse fully-inside refined branches to leaf ranges
+
+### Acceptance contract
+
+This experiment starts from the current repository state after Experiment 12,
+not from any PGO build. The frozen SBC baseline is an ordinary CMake `Release`
+build at `/home/codex-perf/frontier/worktrees/restored/build-release-alg-base`
+with both `FRONTIER_PGO_MODE=OFF` and `FRONTIER_IPO=OFF`. The candidate uses the
+same options, compiler, source tree, CPU affinity, and benchmark executables.
+
+The final implementation contains no profile data, LTO dependency,
+compiler-specific optimization attribute, custom section, linker script,
+function-order file, or separate-object placement optimization. An intermediate
+screen did place the specialized helper in a normal second translation unit to
+diagnose an unrelated-walker code-generation change. That separation was
+removed before final acceptance; the final control and live-city reports below
+come from the single ordinary `spatial_database.cpp` implementation.
+
+### Theory
+
+Experiment 11 proved once per eligible placement that every ordinary interior
+node must refine. It consequently removed all descendant LOD-distance math, but
+the boundary walker still visited every visible interior node, loaded every
+wide AABB block, tested it against the frustum, and pushed/popped an explicit
+DFS item. In the live city, most visible static blocks cross one or two frustum
+planes only near their top. Once a descendant's propagated plane mask becomes
+zero, every lower descendant is known visible. Continuing to test that branch
+is redundant.
+
+Move this repeated work to definition registration. For every eligible static
+definition, precompute the terminal leaves under each interior node in exactly
+the order the existing LIFO walker emits them. During selection, continue the
+ordinary SIMD boundary walk only while a nonzero plane mask remains. At the
+first fully-inside node, append its precomputed leaf range and stop touching
+the descendant BVH.
+
+### New definition-side data layout
+
+`FullyRefinedLeafPlan` owns two contiguous arrays:
+
+1. `terminalNodes`: 32-bit authored node indices in exact traversal/output
+   order. Its capacity is reserved from the exact terminal count collected by
+   the existing registration classification pass.
+2. `ranges`: one 8-byte `{begin, count}` pair indexed directly by packed node
+   index. Looking up a collapsed branch is therefore one indexed load followed
+   by a sequential read from `terminalNodes`.
+
+Registration constructs the arrays with an iterative enter/exit DFS. Leaves of
+each wide block are appended in ascending lane order; interior lanes are pushed
+in ascending order and therefore consumed in descending LIFO order, matching
+the general walker byte-for-byte. The exit record closes the node's range after
+all descendants have appended.
+
+The plan store itself is lazy. `SpatialDatabase` contains only one nullable
+pointer; the outer vector and all per-definition arrays are allocated only when
+a definition has at least 16 authored nodes, no mountable nodes, zero-error
+terminal leaves, and positive error on every ordinary interior node. Shallow
+trees and ineligible application data allocate nothing. Released definition
+slots clear their plan before reuse.
+
+For one 1,365-node live-city static block, the logical arrays contain 1,024
+terminal indices and 1,366 ranges: 4,096 + 10,928 = 15,024 bytes. Across the 83
+static definitions in the benchmark this is about 1.19 MiB, plus roughly 6 KiB
+of outer-vector capacity. This is definition-shared memory: it is not multiplied
+by placements, cameras, queries, or frames. The previous immutable bytes remain
+unchanged.
+
+### Query-side architecture
+
+The specialized query now has three phases:
+
+1. Reuse the Experiment 11 farthest-corner proof to establish that LOD cannot
+   stop at an interior node.
+2. Traverse only the frustum boundary. A nonzero propagated plane mask uses the
+   same SIMD wide AABB test and exact survivor order as before.
+3. When the mask reaches zero, read `{begin, count}` and generate the complete
+   `FrontierEntry` span directly from contiguous terminal indices.
+
+`Sink::pushGenerated` supports the third phase. A growable result checks/grows
+once and fills its final destination sequentially; a fixed caller span computes
+the fitting prefix once and reports the exact dropped count. This removes one
+capacity branch and one size update per emitted static leaf without changing
+the public fixed-buffer overflow contract.
+
+A second small specialization handles fully-ready definitions whose root
+contains only leaves. It invokes the root wide visit directly and skips the
+generic subtree DFS driver and empty-stack loop. It preserves mount transforms,
+orientation, frustum masks, dependency recording, statistics, error encoding,
+and exact output. This recovered 0.8-3.1% in the ordinary hierarchy controls
+instead of treating their earlier movement as acceptable noise.
+
+### Experiments and refinements
+
+The first range-collapse screen used per-entry `Sink::push` and an always-live
+parallel plan vector. Report `frontier-paired-20260817T172302Z` improved
+live-city selection by 11.64% payload32 and 12.76% payload64, and render plus
+submission by 13.08% and 9.11%, but moved payload32 hierarchy controls by as
+much as +6.12%. Moving the cold member to the end of `SpatialDatabase` alone
+did not repair that result (`frontier-paired-20260817T174027Z`). Reject those
+layouts.
+
+Generating a complete range after one destination resize was the important
+second algorithmic reduction. Focused report
+`frontier-paired-20260817T175049Z` improved live-city selection by 19.56% and
+18.46%, and render plus submission by 17.22% and 14.04%. A six-cycle full screen
+(`frontier-paired-20260817T180213Z`) retained 18.03%/17.95% selection and
+17.44%/14.05% render gains, but one noisy payload64 hierarchy point estimate
+remained positive.
+
+Direct root-leaf dispatch made the hierarchy work smaller, but a ten-cycle
+screen still found one +1.03% payload64 50%-hierarchy result
+(`frontier-paired-20260817T183112Z`). Heap-layout inspection identified the
+always-live parallel plan vector as the remaining avoidable footprint. Making
+the store lazy produced improvements in all four controls in report
+`frontier-paired-20260817T184143Z`. Finally, put the specialized helper back in
+the ordinary source file and reserve exact terminal capacity, eliminating the
+last code-placement dependency.
+
+Final control report: `frontier-paired-20260817T185117Z`.
+
+| Case | Payload | Baseline | Candidate | Paired change | 95% interval |
+|---|---:|---:|---:|---:|---:|
+| uncached hierarchy, 50% | 32 | 1648.524 us | 1631.677 us | **-0.82%** | [-1.30%, -0.27%] |
+| uncached hierarchy, 50% | 64 | 1593.855 us | 1537.719 us | **-4.94%** | [-7.64%, -2.40%] |
+| uncached hierarchy, 100% | 32 | 3013.130 us | 2945.160 us | **-2.45%** | [-2.99%, -1.75%] |
+| uncached hierarchy, 100% | 64 | 2967.553 us | 2850.256 us | **-3.13%** | [-4.14%, -2.33%] |
+
+All 96 samples ran on CPU 4 at 2.208 GHz and 45.307-46.230 C. Maximum
+CPU-time/wall-time divergence was 0.027%. Payload64 50% retained a noisy
+baseline CV, but all six paired cycles improved; the other three cases also
+improved with tight intervals.
+
+### Final live-city result
+
+Final report: `frontier-paired-20260817T185416Z`.
+
+| Case | Payload | Baseline | Candidate | Paired change | 95% interval |
+|---|---:|---:|---:|---:|---:|
+| live-city selection | 32 | 580.557 us | 473.262 us | **-18.13%** | [-19.45%, -16.35%] |
+| live-city selection | 64 | 582.317 us | 475.773 us | **-18.11%** | [-19.19%, -17.23%] |
+| render + submission | 32 | 584.259 us | 476.170 us | **-18.47%** | [-19.11%, -17.69%] |
+| render + submission | 64 | 627.203 us | 535.546 us | **-14.50%** | [-14.68%, -14.33%] |
+| motion-only | 32 | 169.397 us | 165.069 us | **-2.54%** | [-2.63%, -2.43%] |
+| motion-only | 64 | 165.474 us | 165.881 us | +0.12% | [-0.11%, +0.43%] |
+
+All 96 samples ran on CPU 4 at 2.208 GHz and 45.307-46.230 C. Maximum
+CPU-time/wall-time divergence was 0.020%. Every live-city cycle improved by at
+least 14.33%. Payload64 motion is statistically and practically unchanged; the
+optimization does not execute in that motion-only timed region. The selection
+speedup is approximately 1.22x on top of the current source baseline and comes
+entirely from the algorithm and data layout described above.
+
+### Correctness boundaries and tradeoffs
+
+The fast path remains intentionally narrow. It does not run for small trees,
+mountable definitions, nonzero-error terminal leaves, nonpositive-error
+interiors, overlays, incomplete readiness, or a camera position that fails the
+fully-refined proof. Every such case uses the existing general walker.
+
+The trade is cold registration work and definition-shared memory for lower
+per-frame traversal and result-construction work. Eligible definition
+registration performs an additional iterative topology walk and allocates two
+arrays. Dynamic placement/motion costs do not grow, and no per-query plan is
+built. Because ranges store node indices rather than complete
+`FrontierEntry` objects, instance slot, generation, and public instance id stay
+runtime-correct while the immutable portion remains compact.
+
+Exact output ordering matters to cache records and downstream consumers. The
+dedicated boundary test compares the specialized path with an independently
+forced general walk over a moving partial-frustum intersection; the complete
+four-configuration matrix covers both BVH widths and 32-/64-bit payload ABIs.
+
+The final Debug matrix passed 424/424 tests on the SBC: 106 tests each for
+BVH4/payload64, BVH8/payload64, BVH4/payload32, and BVH8/payload32. This includes
+the moving boundary equivalence test, randomized serial/parallel and readiness
+torture tests, hot-layout contracts, and the new fixed-sink generated-range
+overflow contract.
+
+### Decision
+
+Keep and commit. The final candidate meets the integration constraint: it is a
+normal portable C++20 implementation with no build-system optimization mode or
+link-layout assumption. The observed gain survives both payload ABIs, full
+render submission, moving actors, and unrelated hierarchy controls. The cost is
+the explicitly bounded, lazy, definition-shared acceleration memory and a cold
+registration pass for eligible static definitions.

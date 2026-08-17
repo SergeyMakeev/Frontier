@@ -552,6 +552,29 @@ public:
         dropped_ += n - take;
     }
 
+    // Grow/check once, then construct a contiguous generated range directly in
+    // the destination. This is useful when source values depend on a small
+    // runtime prefix and therefore cannot be memcpy'd from immutable storage.
+    template <class Generator>
+    void pushGenerated(uint32_t n, Generator&& generate)
+    {
+        if (n == 0) return;
+        if (vec_)
+        {
+            const uint32_t begin = uint32_t(vec_->size());
+            vec_->resize_uninitialized(size_t(begin) + n);
+            T* out = vec_->data() + begin;
+            for (uint32_t i = 0; i < n; ++i) out[i] = generate(i);
+            return;
+        }
+        const uint32_t fits = count_ < capacity_ ? capacity_ - count_ : 0;
+        const uint32_t take = n < fits ? n : fits;
+        for (uint32_t i = 0; i < take; ++i)
+            data_[count_ + i] = generate(i);
+        count_ += take;
+        dropped_ += n - take;
+    }
+
     uint32_t count() const { return vec_ ? uint32_t(vec_->size()) : count_; }
     uint32_t dropped() const { return dropped_; }
     bool     overflowed() const { return dropped_ != 0; }
@@ -1303,6 +1326,24 @@ private:
     };
     static_assert(sizeof(SubtreeDefinitionRt) <= 160,
                   "subtree definition runtime state grew");
+
+    struct FullyRefinedLeafRange
+    {
+        uint32_t begin = 0;
+        uint32_t count = 0;
+    };
+    static_assert(sizeof(FullyRefinedLeafRange) == 8);
+
+    // Cold, definition-indexed acceleration data for the specialized
+    // fully-refined traversal. Terminal nodes are stored in the exact order
+    // produced by the ordinary LIFO walk. Every interior node owns one
+    // contiguous range, allowing a subtree that becomes wholly inside the
+    // frustum to emit all terminal leaves without visiting lower BVH blocks.
+    struct FullyRefinedLeafPlan
+    {
+        std::vector<uint32_t> terminalNodes;
+        std::vector<FullyRefinedLeafRange> ranges;
+    };
 
     // Definition-local coverage state. Placements without mounted descendants
     // point at one shared block; attaching a child takes a private copy on
@@ -2169,6 +2210,8 @@ private:
     void runSubtree(const WorkItem& item, const Instance& inst,
                     const Camera& local, const SelectionParams& params,
                     Worker& w) const;
+    void runFullyReadyRootLeaves(const WorkItem& item, const Instance& inst,
+                                 const Camera& rootLocal, Worker& w) const;
     template<bool FullyReady, bool SparseOverlay>
     void runSubtreeImpl(const WorkItem& item, const Instance& inst,
                         const Camera& local,
@@ -2367,6 +2410,12 @@ private:
     std::vector<MortonItem> tlasKeysTmp_;
     std::vector<int32_t>                       tlasLevelTmp_;
     std::vector<uint32_t>                      tlasItemsTmp_;
+    // Cold and last: adding the optional refined plan must not move any of the
+    // long-established hot scene streams above it.
+    // Allocate the cold store only if a registered definition can use it.
+    // Shallow scenes therefore pay one nullable pointer in SpatialDatabase,
+    // not an always-live three-word vector or a parallel per-definition array.
+    std::unique_ptr<std::vector<FullyRefinedLeafPlan>> fullyRefinedLeafPlans_;
 };
 
 } // namespace frontier
