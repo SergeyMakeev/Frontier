@@ -888,3 +888,202 @@ the unchanged generic walker. Registration performs one additional topology
 scan and one mount-flag bit is consumed. In exchange, the common live-city
 frame is about 1.19x faster end to end with exact output and no additional
 frame-state memory.
+
+## Experiment 12: retrain PGO after path specialization
+
+### Theory
+
+The accepted frustum-only traversal changes which functions execute in the
+live-city training workload. Retraining GCC PGO on that workload could compound
+the source-level win through better layout, inlining, and branch probabilities.
+The first retraining corpus intentionally matched the previous procedure: the
+live-city render-submission frame alone, for the public payload64 library and
+both benchmark payload libraries.
+
+### First corpus result
+
+Paired report:
+`/home/codex-perf/frontier/results/frontier-paired-20260817T145702Z`
+
+| Case | Payload | Baseline | Candidate | Paired change | 95% interval |
+|---|---:|---:|---:|---:|---:|
+| live-city selection | 32 | 653.958 us | 519.929 us | **-20.30%** | [-20.67%, -19.95%] |
+| live-city selection | 64 | 655.307 us | 517.513 us | **-20.63%** | [-21.07%, -20.14%] |
+| live-city render + scan | 32 | 616.646 us | 520.731 us | **-15.48%** | [-16.01%, -14.99%] |
+| live-city render + scan | 64 | 673.695 us | 572.834 us | **-14.83%** | [-15.49%, -14.11%] |
+| motion-only | 32 | 143.559 us | 126.249 us | **-12.05%** | [-12.13%, -11.98%] |
+| motion-only | 64 | 143.852 us | 126.889 us | **-11.91%** | [-12.03%, -11.78%] |
+| uncached hierarchy, 50% | 32 | 1671.656 us | 1928.216 us | **+15.61%** | [+14.19%, +17.02%] |
+| uncached hierarchy, 50% | 64 | 1609.772 us | 1937.327 us | **+21.61%** | [+19.95%, +23.39%] |
+| uncached hierarchy, 100% | 32 | 3138.793 us | 3634.633 us | **+15.31%** | [+14.14%, +16.47%] |
+| uncached hierarchy, 100% | 64 | 2975.739 us | 3489.249 us | **+17.36%** | [+16.67%, +17.95%] |
+
+All 240 samples ran at 2.208 GHz between 45.307 and 46.230 C, with load
+0.920-1.283 and maximum CPU/wall divergence 0.036%. The regressions are real,
+not environmental noise.
+
+### Diagnosis and next corpus
+
+Before specialization, the live-city workload exercised the general fully-ready
+walker, so the single-case corpus incidentally trained both the common scenario
+and generic mounted-hierarchy traversal. After specialization, those deep static
+boundary roots enter the new helper instead. The old generic walker therefore
+receives almost no useful counts even though unrelated workloads still depend
+on it. GCC's PGO use pass consequently treats important generic blocks as cold;
+the 15-22% control loss is the result.
+
+Reject the first corpus. Extend training with the 10,000-instance 50% and 100%
+uncached hierarchy cases for all three payload-library variants. This deliberately
+teaches GCC both sides of the new architectural split while keeping live-city
+render submission as the primary realistic workload. Rebuild and accept only if
+the large live-city/motion gains survive without the generic-walker regressions.
+
+### Balanced-corpus screening result
+
+Paired report:
+`/home/codex-perf/frontier/results/frontier-paired-20260817T152539Z`
+
+Adding the two generic cases at Google Benchmark's default roughly 0.5-second
+minimum materially reduced, but did not eliminate, the overfit:
+
+| Case | Payload | Paired change | 95% interval |
+|---|---:|---:|---:|
+| live-city selection | 32 | **-20.62%** | [-21.09%, -20.07%] |
+| live-city selection | 64 | **-20.73%** | [-21.05%, -20.43%] |
+| live-city render + scan | 32 | **-16.75%** | [-17.33%, -16.10%] |
+| live-city render + scan | 64 | **-13.51%** | [-13.95%, -13.06%] |
+| motion-only | 32 | **-12.83%** | [-12.94%, -12.68%] |
+| motion-only | 64 | **-12.63%** | [-12.95%, -12.42%] |
+| uncached hierarchy, 50% | 32 | **+5.27%** | [+3.98%, +6.44%] |
+| uncached hierarchy, 50% | 64 | **+9.31%** | [+6.72%, +11.30%] |
+| uncached hierarchy, 100% | 32 | **+8.64%** | [+7.22%, +10.15%] |
+| uncached hierarchy, 100% | 64 | **+8.00%** | [+6.53%, +9.39%] |
+
+The same 240-sample environment was stable at 2.208 GHz and 45.307-46.230 C.
+This second result confirms that missing generic profile weight, rather than the
+specialized source itself, drives the regression: modest generic coverage cut
+the loss roughly in half without sacrificing trained-path gains.
+
+The original live-city trace performs about 18.7 million deep static-node visits
+across its fixed 8,192 frames. The short generic cases traverse many instances
+but very shallow trees and still contribute fewer relevant inner-loop edge
+counts. Reject the default-weight corpus and raise each generic case's minimum
+training time from 0.5 to 2 seconds. This approximately quadruples those counts;
+the next acceptance run must again preserve the live-city/motion improvements
+and remove the remaining control losses.
+
+### Four-times-weighted screen and generated-code diagnosis
+
+The two-second generic corpus collected 848-910 iterations of the 50% case and
+508-511 of the 100% case for each payload64 library; payload32 collected 1,007
+and 566 respectively. Four-cycle screen:
+`/home/codex-perf/frontier/results/frontier-paired-20260817T155401Z`.
+
+| Case | Payload | Paired change | 95% interval |
+|---|---:|---:|---:|
+| uncached hierarchy, 50% | 32 | **+7.39%** | [+6.64%, +8.50%] |
+| uncached hierarchy, 50% | 64 | **+9.85%** | [+7.29%, +11.83%] |
+| uncached hierarchy, 100% | 32 | **+10.15%** | [+7.39%, +14.05%] |
+| uncached hierarchy, 100% | 64 | **+3.80%** | [+2.50%, +5.12%] |
+
+More counts did not consistently improve the generic path. Symbol inspection
+then exposed the compiler decision directly. In the frozen accepted PGO
+baseline, `runSubtreeImpl<true, false>` is `0x7f8` bytes. The live-city-only,
+default-balanced, and four-times-weighted retrains shrink it to `0x578`,
+`0x5c8`, and `0x5c4` bytes respectively. Their complete executable text also
+falls from 631,509 bytes to roughly 460-473 KiB. PGO continues to optimize the
+fallback for size despite direct training, so corpus weight alone is not a
+reliable contract.
+
+Reject the weighted corpus as a complete solution. Mark the general walker
+template `hot` for GCC/Clang so it remains speed-optimized regardless of whether
+the currently selected realistic training scene reaches it. This is an
+architectural statement, not benchmark-specific inlining: non-specializable
+deep hierarchies genuinely depend on that fallback. Rebuild with the measured
+corpus, verify restored generated-code size, and re-run paired controls before
+acceptance.
+
+The compiler-hint screen rejected that theory: GCC ignored the manual `hot`
+attribute in the presence of profile feedback and emitted the identical `0x5c4`
+symbol and 472,750-byte text segment. Remove the hint. The missing information
+is not merely function-level hotness; it is the deep walk's branch and loop-edge
+shape. The next corpus must exercise the generic walker with the same city depth,
+boundary masks, and camera trajectory as the specialized realistic case.
+
+The exact-byte dual-path corpus used a registration option to leave the static
+hierarchy's zero-error bytes unchanged while declining only the specialized
+mount flag. Its general trace was much faster than the nonzero-leaf approximation
+(about 1,027 versus 1,185 us payload64 in generation mode), proving the intended
+zero-error branches were restored. Nevertheless, screen report
+`frontier-paired-20260817T162821Z` still regressed the four uncached controls by
+9.27-18.57%. The generic symbol remained `0x57c`.
+
+This rules out missing cases, insufficient counts, and mismatched leaf behavior.
+The general walker is deliberately polymorphic: sparse/ready state, overlay
+shape, hierarchy depth, zero-error masks, and LOD transitions produce mutually
+different branch distributions. A single corpus is not a stable optimization
+contract for that fallback. The next experiment excludes `runSubtreeImpl` from
+profile instrumentation/feedback with GCC/Clang's
+`no_profile_instrument_function` attribute. Specialized callers and the rest of
+the realistic frame remain PGO-optimized; the fallback should retain ordinary
+stable `-O3` code regardless of corpus composition.
+
+The first isolation screen (`frontier-paired-20260817T163348Z`) expanded the
+walker from `0x57c` to `0x720`, reduced the 50% losses to 1.92-2.00%, and turned
+the 100% controls into 1.00-2.32% improvements. This proves feedback isolation
+is the correct lever, but whole-program IPA still transforms the nominally
+unprofiled function. Add `noipa` alongside `no_profile_instrument_function` to
+make the fallback a self-contained ordinary-`O3` kernel; screen again before a
+fresh strict PGO rebuild.
+
+The `noipa` screen (`frontier-paired-20260817T163726Z`) did not improve the
+remaining shape: 50% controls were still 1.29-2.71% slower, 100% payload32 was
+0.94% slower/inconclusive, and only 100% payload64 remained faster. Reject
+`noipa` and retain feedback isolation as the better intermediate. A true
+translation-unit boundary is required if the fallback is to receive exactly
+ordinary `-O3` code while the surrounding database remains LTO+PGO optimized.
+
+Before extracting a translation unit, test the narrower remaining mechanism:
+PGO use globally enables hot/cold block partitioning even for a function whose
+own feedback is disabled. Apply a function-local
+`no-reorder-blocks-and-partition` optimization attribute together with feedback
+isolation. This should preserve the fallback as one speed-oriented body without
+also disabling all IPA.
+
+That flag emitted the byte-identical `0x720` walker, so reject and remove it
+without another timing run. Inspection then found the missed boundary: the
+outer driver delegates every SIMD block to the separately instantiated
+`wideVisit` template, which still consumed PGO. Apply feedback isolation to both
+the outer DFS driver and its wide inner kernel before considering a
+translation-unit split.
+
+The two-function isolation screen
+(`frontier-paired-20260817T164600Z`) was worse: the 50% controls regressed
+6.99-8.05% and the 100% controls regressed 2.21-3.96%. Explicitly adding
+`unroll-loops` produced essentially identical code, so it was removed without a
+redundant timing run. A fresh strict build then weighted the exact generic trace
+four times more heavily than the specialized trace (32,768 versus 8,192 fixed
+frames). The generic walker remained byte-identical at `0x57c`; absolute sample
+count was not controlling GCC's decision.
+
+Combining feedback isolation with an explicit `hot` classification did change
+code generation, expanding `wideVisit<true, false, false>` from `0xc64` to
+`0xcdc`. Timing still rejected it. Report
+`frontier-paired-20260817T170541Z` measured 6.95-11.59% regressions in the 50%
+controls and 1.67-5.70% in the 100% controls.
+
+### Decision: reject PGO as a shipped optimization
+
+No PGO candidate is accepted or committed. All experimental API switches,
+training-only benchmarks, attributes, section/layout hints, and corpus changes
+were removed. The evidence is stronger than a single failed corpus: several
+semantically valid training mixes moved unrelated mounted-hierarchy throughput
+by 5-22%, while attempts to stabilize generated code with compiler-specific
+attributes also regressed it. Such a result would be sensitive to an embedding
+application's link graph, workload mix, compiler version, and LTO decisions.
+
+The accepted fully-refined traversal from Experiment 11 does not depend on any
+of those mechanisms. Further work will use ordinary release builds and pursue
+only algorithmic reductions, data layout, memory traffic, and stable explicit
+specialization. PGO remains useful as a diagnostic tool, but it is not part of
+the performance architecture or acceptance claim.
