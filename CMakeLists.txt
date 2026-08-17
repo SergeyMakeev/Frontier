@@ -15,6 +15,11 @@ set(FRONTIER_BVH_WIDTH "AUTO" CACHE STRING
 set_property(CACHE FRONTIER_BVH_WIDTH PROPERTY STRINGS AUTO 4 8)
 option(FRONTIER_PROFILE_SYMBOLS "Keep optimized source line tables for CPU profiling" OFF)
 option(FRONTIER_IPO "Enable interprocedural optimization for Frontier targets" OFF)
+set(FRONTIER_PGO_MODE "OFF" CACHE STRING
+    "GCC profile-guided optimization phase (OFF, GENERATE, or USE)")
+set_property(CACHE FRONTIER_PGO_MODE PROPERTY STRINGS OFF GENERATE USE)
+set(FRONTIER_PGO_DIR "" CACHE PATH
+    "Directory containing GCC profile data for FRONTIER_PGO_MODE")
 option(FRONTIER_STATS "Enable per-query traversal statistics" OFF)
 option(FRONTIER_CONTRACT_CHECKS "Enable public caller-contract checks" ON)
 option(FRONTIER_VALIDATE_SUBTREES
@@ -66,6 +71,43 @@ if(FRONTIER_IPO)
         message(FATAL_ERROR
             "FRONTIER_IPO requested but unsupported: ${FRONTIER_IPO_ERROR}")
     endif()
+endif()
+
+# PGO is intentionally a build-wide setting. With IPO enabled, GCC consumes
+# profiles during both compilation and the final LTO link; the benchmark
+# executable must also link the profiling runtime during the generate phase.
+# Applying the flags globally keeps all three stages consistent and profiles
+# call edges that cross the library/executable boundary.
+string(TOUPPER "${FRONTIER_PGO_MODE}" FRONTIER_PGO_MODE)
+if(NOT FRONTIER_PGO_MODE STREQUAL "OFF")
+    if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+        message(FATAL_ERROR
+            "FRONTIER_PGO_MODE currently supports GCC only")
+    endif()
+    if(NOT FRONTIER_PGO_MODE STREQUAL "GENERATE" AND
+       NOT FRONTIER_PGO_MODE STREQUAL "USE")
+        message(FATAL_ERROR
+            "FRONTIER_PGO_MODE must be OFF, GENERATE, or USE")
+    endif()
+    if(FRONTIER_PGO_DIR STREQUAL "")
+        message(FATAL_ERROR
+            "FRONTIER_PGO_DIR is required when FRONTIER_PGO_MODE is enabled")
+    endif()
+    get_filename_component(FRONTIER_PGO_DIR_ABSOLUTE
+        "${FRONTIER_PGO_DIR}" ABSOLUTE BASE_DIR "${CMAKE_BINARY_DIR}")
+    if(FRONTIER_PGO_MODE STREQUAL "GENERATE")
+        set(FRONTIER_PGO_FLAGS
+            "-fprofile-generate=${FRONTIER_PGO_DIR_ABSOLUTE}")
+    else()
+        set(FRONTIER_PGO_FLAGS
+            "-fprofile-use=${FRONTIER_PGO_DIR_ABSOLUTE}"
+            -fprofile-correction
+            -Wno-missing-profile)
+    endif()
+    add_compile_options(${FRONTIER_PGO_FLAGS})
+    add_link_options(${FRONTIER_PGO_FLAGS})
+    message(STATUS
+        "Frontier GCC PGO: ${FRONTIER_PGO_MODE} (${FRONTIER_PGO_DIR_ABSOLUTE})")
 endif()
 
 # ---- core library -----------------------------------------------------------

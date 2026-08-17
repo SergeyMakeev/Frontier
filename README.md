@@ -220,6 +220,19 @@ bash ./run_unit_tests.sh  # Debug, checks enabled, BVH4 + BVH8
 bash ./run_perf_bench.sh  # Release, native BVH width, 4/8-byte payload comparison
 ```
 
+For a maximum-throughput native ARM64 deployment, GCC profile-guided
+optimization can train on the realistic moving-camera/moving-actor city
+trajectory and rebuild the public archive under LTO:
+
+```sh
+FRONTIER_PGO_CPU=4 FRONTIER_PGO_JOBS=4 bash ./run_arm_pgo.sh build-arm-pgo
+```
+
+The script creates a fresh profile corpus on every invocation and trains the
+public library plus both benchmark payload layouts. The equivalent manual
+CMake phases are `FRONTIER_PGO_MODE=GENERATE` followed by `USE`, with both
+pointing at the same `FRONTIER_PGO_DIR`. PGO currently requires GCC.
+
 On Windows, use `run_unit_tests.bat` and `run_perf_bench.bat`.
 
 The full correctness matrix, deterministic torture tests, sanitizer jobs, and
@@ -227,7 +240,8 @@ release verification commands are described in [docs/TESTING.md](docs/TESTING.md
 
 Important options are `FRONTIER_BUILD_TESTS`, `FRONTIER_BUILD_BENCH`,
 `FRONTIER_BVH_WIDTH`, `FRONTIER_AVX2`, `FRONTIER_FORCE_SCALAR`,
-`FRONTIER_IPO`, `FRONTIER_STATS`, `FRONTIER_CONTRACT_CHECKS`, and
+`FRONTIER_IPO`, `FRONTIER_PGO_MODE`, `FRONTIER_PGO_DIR`, `FRONTIER_STATS`,
+`FRONTIER_CONTRACT_CHECKS`, and
 `FRONTIER_VALIDATE_SUBTREES`.
 
 The CMake setting `FRONTIER_BVH_WIDTH` accepts `AUTO`, `4`, or `8` and defaults

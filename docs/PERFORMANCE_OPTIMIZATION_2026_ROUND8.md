@@ -568,3 +568,95 @@ off-route cuts because the cyclic city trajectory revisits them and converts
 that retained state directly into fewer walks. No production source from this
 experiment is committed; the negative results are retained here to prevent a
 future repetition.
+
+## Experiment 8: live-city profile-guided ARM build
+
+### Motivation and decomposition
+
+Direct component measurements on the accepted SBC build put the payload32
+live-city driving frame at 656 us and the motion/publication-only companion at
+144 us. Roughly 512 us therefore remains in camera query, frontier production,
+and output handling. This is large enough that instruction placement, inlining,
+and branch layout can matter even after the data-path changes above.
+
+Hardware sampling was not yet available (`perf` was absent and the benchmark
+account had no passwordless sudo), so GCC edge/call profiling was used instead.
+An instrumented build executed the complete 8,192-frame render-submission
+trajectory on pinned CPU 4. It recorded the real contiguous 40 mph camera path,
+all 1,100 moving actor roots, recurrent actor revisits, cache hits/misses, and
+every downstream leaf read.
+
+### Prototype and a necessary negative control
+
+The first profile corpus contained only the payload32 executable. That build
+improved payload32 by 3.95%, but payload64—whose target-specific object paths
+had no matching profile—regressed 1.44%. This is a useful negative control:
+turning on `-fprofile-use` without training every deployed ABI is not safe.
+
+Prototype report:
+`/home/codex-perf/frontier/results/frontier-paired-20260817T122614Z`
+
+| Payload | Normal LTO | Partially trained PGO | Paired change | 95% interval |
+|---:|---:|---:|---:|---:|
+| 32 | 643.905 us | 620.545 us | **-3.95%** | [-4.55%, -3.37%] |
+| 64 | 708.280 us | 717.704 us | **+1.44%** | [+0.76%, +2.20%] |
+
+Training both private payload layouts reversed the payload64 result: a manual
+balanced prototype improved payload32 by 3.93% and payload64 by 5.22% in report
+`frontier-paired-20260817T123449Z`.
+
+### Productionized build architecture
+
+CMake now exposes two explicit GCC phases:
+
+- `FRONTIER_PGO_MODE=GENERATE` instruments compilation and the LTO link;
+- `FRONTIER_PGO_MODE=USE` consumes corrected counts and tolerates genuinely
+  unexercised translation units;
+- `FRONTIER_PGO_DIR` identifies the corpus shared by both phases.
+
+The flags are intentionally build-wide. GCC consumes profile information at
+compile and LTO link time, and the generating executable must link the profile
+runtime. A dedicated `frontier_pgo_training` target links the public
+`frontier` archive rather than the ABI-explicit benchmark archive. This detail
+is required because GCC keys `.gcda` files by object output path; exercising a
+byte-identical private library does not train the production archive.
+
+`run_arm_pgo.sh` automates the native ARM pipeline. It creates a unique corpus,
+builds instrumented public/payload64/payload32 targets, runs the realistic
+trajectory for all three on a caller-selected CPU, reconfigures the same build
+for profile use, and emits the optimized production archive and benchmark
+binaries. Typical invocation on the SBC is:
+
+```bash
+FRONTIER_PGO_CPU=4 FRONTIER_PGO_JOBS=4 ./run_arm_pgo.sh build-arm-pgo
+```
+
+### Scripted SBC acceptance result
+
+The final comparison uses binaries produced solely by that script, against the
+accepted non-PGO actor-unit build:
+`/home/codex-perf/frontier/results/frontier-paired-20260817T124638Z`
+
+| Payload | Normal LTO | Scripted PGO | Paired change | 95% interval | CV baseline / candidate |
+|---:|---:|---:|---:|---:|---:|
+| 32 | 648.631 us | 619.007 us | **-4.57%** | [-5.14%, -3.77%] | 0.59% / 0.76% |
+| 64 | 708.092 us | 675.981 us | **-4.53%** | [-4.92%, -4.32%] | 0.36% / 0.32% |
+
+Every one of the six independent cycle effects improved. All 24 processes ran
+on CPU 4 at exactly 2.208 GHz; temperature was 46.230-47.153 C and maximum
+CPU/wall divergence was 0.021%. The result is a reproducible build-level gain
+on top of all architectural improvements, not a one-off manual flag test.
+
+### Tradeoffs and decision
+
+Keep and commit. PGO adds two full compilations and three 8,192-frame training
+runs. Its output is tied to compiler version, source control flow, compile-time
+payload layout, and training distribution; an application whose production
+camera/actor distribution differs substantially should train with its own
+representative driver. The checked-in script deliberately generates profiles
+on the target rather than committing fragile path- and CFG-keyed `.gcda`
+artifacts.
+
+The default build remains unchanged. Deployments seeking maximum SBC
+throughput opt into the scripted mode and receive about 4.5% additional
+end-to-end live-city performance in both supported payload layouts.

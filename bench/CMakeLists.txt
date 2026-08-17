@@ -35,6 +35,23 @@ if(FRONTIER_IPO)
     set_property(TARGET frontier_submission_bench_payload32 PROPERTY INTERPROCEDURAL_OPTIMIZATION ON)
 endif()
 
+# The normal payload64 benchmark uses a private ABI-explicit library so that
+# its 32/64 comparison is hermetic. PGO also needs to execute the public
+# `frontier` target itself: GCC keys profiles by object output path, so counts
+# collected from the private payload64 target cannot optimize the production
+# archive. This training executable supplies that otherwise-identical path.
+if(NOT FRONTIER_PGO_MODE STREQUAL "OFF")
+    add_executable(frontier_pgo_training bench_frontier.cpp)
+    target_link_libraries(frontier_pgo_training PRIVATE
+        frontier benchmark::benchmark Threads::Threads)
+    target_include_directories(frontier_pgo_training PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../tests)
+    if(FRONTIER_IPO)
+        set_property(TARGET frontier_pgo_training PROPERTY
+            INTERPROCEDURAL_OPTIMIZATION ON)
+    endif()
+endif()
+
 # Kept separate from frontier_bench deliberately: these machine-characterization
 # probes must not change the code layout of the end-to-end library benchmarks.
 add_executable(frontier_machine_bench bench_machine.cpp)
