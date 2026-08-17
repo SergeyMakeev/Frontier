@@ -539,17 +539,43 @@ SubtreeHandle SpatialDatabase::registerSubtree(SubtreeBytes&& bytes)
     runtime.bytes = std::move(bytes);
     runtime.view = view;
     runtime.generation = ++generationCounter_;
-    runtime.rootLeavesOnly = true;
+    bool rootLeavesOnly = true;
+    bool terminalLeavesZeroError = true;
     const uint32_t firstBlock = runtime.view.wideOffset(0);
     for (uint32_t b = 0; b < runtime.view.wideBlockCount(0); ++b)
     {
         const uint32_t lanes = runtime.view.blockMask_[firstBlock + b];
         if (detail::blockValidLanes(lanes) != detail::blockLeafLanes(lanes))
         {
-            runtime.rootLeavesOnly = false;
+            rootLeavesOnly = false;
             break;
         }
     }
+    for (uint32_t block = 0; block < runtime.view.wideCount(); ++block)
+    {
+        const uint32_t lanes = runtime.view.blockMask_[block];
+        if ((blockLeafLanes(lanes) & ~blockZeroErrorLanes(lanes)) != 0)
+        {
+            terminalLeavesZeroError = false;
+            break;
+        }
+    }
+    float minInnerError = FLT_MAX;
+    for (uint32_t node = 1; node < runtime.view.packedNodeCount(); ++node)
+    {
+        if (runtime.view.isMountable(node))
+        {
+            minInnerError = 0.0f;
+            break;
+        }
+        if (runtime.view.childCount(node) != 0)
+            minInnerError = std::min(
+                minInnerError, runtime.view.geometricError_[node]);
+    }
+    if (minInnerError == FLT_MAX || !terminalLeavesZeroError)
+        minInnerError = 0.0f;
+    runtime.minInnerErrorAndRootFlag =
+        std::copysign(minInnerError, rootLeavesOnly ? -1.0f : 1.0f);
     ++liveSubtrees_;
     return SubtreeHandle{definition, runtime.generation};
 }
@@ -707,8 +733,10 @@ uint32_t SpatialDatabase::registerMount(uint32_t definition, NodeRef owner)
     MountTransformRt& hot = mountTransforms_[slot];
     hot.generation = generation;
     hot.definitionAndFlags = definition;
-    if (defined.rootLeavesOnly)
+    if (defined.rootLeavesOnly())
         hot.definitionAndFlags |= MountTransformRt::kRootLeavesOnly;
+    if (defined.view.nodeCount() >= 16 && defined.minInnerError() > 0.0f)
+        hot.definitionAndFlags |= MountTransformRt::kFullyRefinedCandidate;
 
     initializeMountCoverage(slot);
     instance.definitionPrev = kInvalidIndex;
@@ -4082,6 +4110,102 @@ void SpatialDatabase::runSubtreeAncestorImpl(
                     "ancestor candidate stack mismatch");
 }
 
+#if defined(_MSC_VER)
+__declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+__attribute__((noinline, section(".text.frontier_refined")))
+#endif
+bool SpatialDatabase::tryRunFullyRefinedBoundary(
+    const WorkItem& item, const Instance& inst, const Camera& rootLocal,
+    Worker& w) const
+{
+    const SubtreeInstanceRt& rt = slots_[item.slot()];
+    const MountTransformRt& transform = mountTransforms_[item.slot()];
+    const bool identityTransform =
+        transform.scale == 1.0f && transform.pos.x == 0.0f &&
+        transform.pos.y == 0.0f && transform.pos.z == 0.0f;
+    std::optional<Camera> transformed;
+    const Camera& local = identityTransform
+                              ? rootLocal
+                              : transformed.emplace(mountLocalCamera(
+                                    rootLocal, item.slot(), item.mask()));
+    const SubtreeDefinitionRt& definition = subtrees_[rt.definition];
+    const SubtreeView& pg = definition.view;
+    const float innerError =
+        std::min(definition.minInnerError(), rt.errClamp);
+    if (inst.hasOverlayList() || !(innerError > 0.0f)) return false;
+
+    const AABB bounds = pg.bounds();
+    const float4 qmn = local.queryMin();
+    const float4 qmx = local.queryMax();
+    const float dx = std::max(std::fabs(qmn.x - bounds.mx.x),
+                              std::fabs(qmx.x - bounds.mn.x));
+    const float dy = std::max(std::fabs(qmn.y - bounds.mx.y),
+                              std::fabs(qmx.y - bounds.mn.y));
+    const float dz = std::max(std::fabs(qmn.z - bounds.mx.z),
+                              std::fabs(qmx.z - bounds.mn.z));
+    const float farthestSq = dx * dx + dy * dy + dz * dz;
+    const float refineDistance = innerError * local.k * w.barInv;
+    if (!(refineDistance * refineDistance > farthestSq)) return false;
+
+    recordTraversalDependency(w, item.slot());
+    FRONTIER_STAT(w, subtreesVisited, 1);
+    FRONTIER_STAT(w, fullyRefinedSubtrees, 1);
+    const uint32_t gen = rt.generation();
+    const InstanceId instance =
+        publicInstanceId(InstanceId(&inst - instances_.data()));
+    w.nodeStack.clear();
+    const auto visit = [&](uint32_t node, uint8_t mask)
+    {
+        const uint32_t count = pg.childCount(node);
+        uint32_t block = pg.wideOffset(node);
+        for (uint32_t base = 0; base < count;
+             base += kWide, ++block)
+        {
+            const WideBlock& children = pg.wide_[block];
+            const uint32_t lanes = pg.blockMask_[block];
+            FRONTIER_STAT(w, wideBlocksTested, 1);
+            uint8_t outMasks[kWide];
+            const uint32_t survivors =
+                testWideAabb(item.bounds(block), local.frustum, mask,
+                             outMasks) & lanes;
+            if (!survivors) continue;
+            FRONTIER_STAT(w, lanesSurvived,
+                          uint64_t(std::popcount(survivors)));
+
+            const uint32_t leafLanes = blockLeafLanes(lanes);
+            uint32_t leaves = survivors & leafLanes;
+            while (leaves)
+            {
+                const uint32_t lane = uint32_t(std::countr_zero(leaves));
+                leaves &= leaves - 1;
+                w.result.shared.push(FrontierEntry{
+                    NodeHandle{item.slot(), children.child[lane], gen},
+                    uint8_t(0), instance});
+            }
+
+            uint32_t inner = survivors & ~leafLanes;
+            while (inner)
+            {
+                const uint32_t lane = uint32_t(std::countr_zero(inner));
+                inner &= inner - 1;
+                w.nodeStack.push_back(
+                    {children.child[lane], 0.0f, outMasks[lane], 1, 1});
+            }
+        }
+    };
+
+    visit(0, item.mask());
+    while (!w.nodeStack.empty())
+    {
+        const NodeItem entry = w.nodeStack.back();
+        w.nodeStack.pop_back();
+        FRONTIER_STAT(w, nodesVisited, 1);
+        visit(entry.node(), entry.planes());
+    }
+    return true;
+}
+
 template<bool FullyReady, bool SparseOverlay>
 void SpatialDatabase::runSubtreeImpl(const WorkItem& item,
                         const Instance& inst,
@@ -4106,6 +4230,7 @@ void SpatialDatabase::runSubtreeImpl(const WorkItem& item,
     const uint32_t gen = rt.generation();
     const InstanceId instance =
         publicInstanceId(InstanceId(&inst - instances_.data()));
+
     // One bar, no history: damping is already folded into the view's camera
     // envelope, which widened the measured error rather than moving the
     // threshold. That is what makes selection a pure read of the SpatialDatabase.
@@ -4337,10 +4462,18 @@ void SpatialDatabase::runTlasRootInstance(
     const bool fullyReady = mountedTreeFullyReady(childSlot);
     if (fullyReady)
     {
+        const WorkItem rootItem =
+            makeWorkItem(childSlot, inst, 1, 1, mask);
+        // The one-time proof costs more than the ordinary walk for toy
+        // hierarchies. Registration sets this flag only for eligible trees
+        // with at least sixteen authored nodes.
+        if (mask != 0 &&
+            mountTransforms_[childSlot].fullyRefinedCandidate() &&
+            tryRunFullyRefinedBoundary(rootItem, inst, local, w)) [[unlikely]]
+            return;
         // The first placement is already in hand. Enter it directly; the work
         // stack is only needed for mounted descendants discovered by the walk.
-        runSubtree<true>(makeWorkItem(childSlot, inst, 1, 1, mask), inst,
-                         local, params, w);
+        runSubtree<true>(rootItem, inst, local, params, w);
         while (!w.work.empty())
         {
             const WorkItem item = w.work.back();
@@ -4448,8 +4581,13 @@ void SpatialDatabase::runOrientedTlasRootInstance(
     const bool fullyReady = mountedTreeFullyReady(childSlot);
     if (fullyReady)
     {
-        runSubtree<true>(makeWorkItem(childSlot, inst, 1, 1, mask), inst,
-                         local, params, w);
+        const WorkItem rootItem =
+            makeWorkItem(childSlot, inst, 1, 1, mask);
+        if (mask != 0 &&
+            mountTransforms_[childSlot].fullyRefinedCandidate() &&
+            tryRunFullyRefinedBoundary(rootItem, inst, local, w)) [[unlikely]]
+            return;
+        runSubtree<true>(rootItem, inst, local, params, w);
         while (!w.work.empty())
         {
             const WorkItem item = w.work.back();

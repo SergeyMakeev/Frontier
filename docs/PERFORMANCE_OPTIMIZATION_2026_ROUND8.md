@@ -660,3 +660,231 @@ artifacts.
 The default build remains unchanged. Deployments seeking maximum SBC
 throughput opt into the scripted mode and receive about 4.5% additional
 end-to-end live-city performance in both supported payload layouts.
+
+## Experiment 9: coalesced motion-group TLAS publication (rejected)
+
+### Theory
+
+Cars and pedestrians are submitted through two `MotionGroup` batches. The
+existing move path immediately grows each edited TLAS leaf and propagates its
+new envelope toward the root. Consecutive actors sometimes share a leaf host,
+so a batch-level dirty-host list appeared able to replace repeated ancestor
+growth with one propagation per unique host. A second variant deferred the
+coalescing boundary across both actor batches until `applyUpdates()`.
+
+### Result
+
+The first controlled report is
+`/home/codex-perf/frontier/results/frontier-paired-20260817T125930Z`:
+
+| Payload | Baseline | Candidate | Paired change | 95% interval | Baseline / candidate CV |
+|---:|---:|---:|---:|---:|---:|
+| 32 | 143.625 us | 143.016 us | -1.95% | [-4.73%, -0.46%] | 3.77% / 0.11% |
+| 64 | 143.765 us | 143.888 us | +0.06% | [+0.01%, +0.09%] | 0.14% / 0.15% |
+
+The payload32 paired estimate was created almost entirely by one noisy
+baseline cycle: its raw median improvement was only 0.42%, while the three
+cycle effects were -4.73%, -0.59%, and -0.46%. Payload64 was a stable slight
+loss. Deferring across both groups also worsened a direct motion smoke from
+about 144 to 148 us. The moving actors are spatially dispersed enough that
+host/ancestor duplication is too small to repay dirty-list maintenance.
+
+### Decision
+
+Reject and fully revert both variants. Motion publication was not the dominant
+remaining cost, and the data showed no payload-independent win.
+
+## Experiment 10: direct zero-error actor-root emission (rejected)
+
+### Theory
+
+The car and pedestrian definitions are flat forests of fully-ready,
+zero-geometric-error leaves. When their root is already wholly inside the
+frustum, no child can make either a culling or LOD decision. Classify this
+topology at registration, place a flag in the hot mount record, and emit child
+handles directly without entering the generic subtree walker.
+
+### Instrumented result
+
+The branch activated only 0.102 times per live-city frame while the query
+re-walked 12.966 roots per frame. Instrumented payload32 selection remained
+about 392 us and the measured walk remained about 282 us. The reason is not a
+slow implementation: actor-unit caching already retains these flat actor cuts.
+Almost every remaining miss belongs to a deep static block intersecting a
+frustum plane. The proposed actor shortcut attacked a path that the retained
+architecture had already removed.
+
+### Decision
+
+Reject and remove the classification flag and direct-emission loop. Retain the
+diagnosis: per-instance reuse percentages hid the fact that essentially all
+remaining hierarchy work was concentrated in roughly thirteen large static
+boundary roots.
+
+## Experiment 11: provably fully-refined frustum-only traversal
+
+### Phase profile
+
+Temporary `FRONTIER_STATS` timers divided one payload32 frame into independent
+phases. The exact values moved slightly with instrumentation, but the stable
+shape was:
+
+| Phase | Approximate cost per frame |
+|---|---:|
+| Actor-position generation | 24-27 us |
+| Car motion submission | 45-52 us |
+| Pedestrian motion submission | 149-156 us |
+| TLAS publication | 1.6-1.7 us |
+| Selection | 390-410 us |
+| Downstream submission scan | 49-53 us |
+
+Inside selection, about 13 misses consumed 343-362 us. Their hierarchy walk
+alone cost 279-293 us and handle-to-payload resolution another 52-56 us. Each
+frame visited approximately 2,283 interior nodes, tested 2,296 BVH4 blocks,
+and retained 8,759 lanes. This established the actual optimization target:
+exact traversal of deep static blocks cut by a moving frustum.
+
+### Key observation
+
+The static-city authoring data uses geometric error 10,000 for every interior
+node and zero for every terminal leaf. At the benchmark's camera scale and
+1,500 m far plane, every visible interior node must refine. The generic walker
+nevertheless performs, for every surviving interior lane:
+
+1. an AABB-to-camera-envelope squared distance;
+2. a vector square root and divide on NEON;
+3. screen-error comparison and quantization;
+4. the LOD stop/descend branch;
+5. validity-margin arithmetic for a cut that cannot be cached because the root
+   still has a nonzero frustum mask.
+
+All of that work is redundant if the library can prove up front that even the
+smallest interior error remains over threshold at the farthest possible point
+in the root bounds.
+
+### Conservative proof
+
+Registration computes the minimum geometric error across ordinary interior
+nodes. Eligibility is disabled when any node is mountable, any interior error
+is zero, or any terminal leaf has nonzero error. For an eligible boundary
+placement, selection computes an upper bound `Dmax` on the distance from the
+camera damping envelope to any point in the definition root box and tests:
+
+```text
+(min(minInteriorError, mountErrorClamp) * cameraK / threshold)^2 > Dmax^2
+```
+
+Every descendant box lies inside the validated root bounds, so its actual
+minimum camera distance cannot exceed `Dmax`. The left side is the squared
+distance at which the least-detailed interior node would cross the threshold.
+If the inequality holds, every interior node is strictly over threshold. The
+specialized loop may therefore perform only masked frustum tests, push
+surviving interior child ids, and emit surviving zero-error leaves. The result
+is bit-exact: no overdraw, no omitted leaf, and the same zero error codes.
+
+The optimization is limited to fully-ready, overlay-free, top-level mounted
+trees whose TLAS root remains partially intersecting. Roots wholly inside use
+the existing retained-cut cache; roots outside were already rejected by the
+TLAS. Small definitions below sixteen authored nodes retain the general walk
+because the one-time proof costs more than the distance arithmetic it removes.
+
+### Runtime metadata and data layout
+
+No hot structure grows:
+
+- `SubtreeDefinitionRt` remains at its established 160-byte ceiling. The
+  magnitude of `minInnerErrorAndRootFlag` stores the conservative minimum
+  interior error; its otherwise-unused sign bit preserves the independent
+  root-leaves-only classification (negative zero represents a flat root-leaf
+  forest).
+- `MountTransformRt` remains exactly 32 bytes. Bit 31 of
+  `definitionAndFlags` still identifies root-leaf forests; bit 30 now marks a
+  sufficiently large fully-refined candidate; the low 30 bits hold the
+  definition index.
+- The immutable BVH remains the existing BVH4 SoA layout: six bound vectors,
+  error vector, and child-id vector per wide block, with packed valid/leaf/
+  zero-error masks. The specialized loop reads bounds, masks, and child ids but
+  never consumes the error vector.
+- Classification is an O(nodes + wide blocks) scan during subtree
+  registration, outside frame selection. Query and database frame-state byte
+  counts are unchanged.
+
+The extra flag reduces the theoretical definition-index field from 31 to 30
+bits (roughly 1.07 billion simultaneous definitions). This is far above the
+practical memory limit and buys a single hot test without another pointer or
+record load.
+
+### Code-placement experiments
+
+The arithmetic optimization was immediately large, but several layout
+variants were measured before acceptance:
+
+1. **Inline specialized template.** Instrumented walk time fell from about
+   293 to 217 us. A production paired run
+   (`frontier-paired-20260817T134516Z`) improved live-city selection by
+   13.45-13.82% and full render by 11.45-12.28%, but enlarged the generic
+   fully-ready walker and produced small, ABI-dependent uncached-control
+   regressions.
+2. **Out-of-line `cold` helper.** This restored generic placement but GCC
+   optimized the entire NEON culling loop for size. Report
+   `frontier-paired-20260817T141812Z` retained only a 5.11-5.87% selection win
+   and 5.15-5.45% full-render win.
+3. **Small-tree break-even gate.** The uncached control definition contains
+   only three authored nodes; calling the proof there was counterproductive.
+   A sixteen-node eligibility threshold removed that executed overhead.
+4. **Final isolated section.** Dispatch moved out of `runSubtreeImpl` to the
+   fully-ready TLAS-root boundary and uses the spare mount flag. The generic
+   fully-ready walker returned to exactly its baseline `0x7f8` bytes in both
+   payload ABIs. The specialized helper is no-inline and lives in
+   `.text.frontier_refined`, isolating layout without the size-biased `cold`
+   optimization. This recovered the full compute win.
+
+### Correctness
+
+A dedicated test builds two matching 21-node boundary hierarchies. The fast
+definition has zero-error leaves; the independent reference uses tiny nonzero
+leaf errors to disable specialization while preserving terminal selection.
+Across camera-boundary placement, their visible payload sets must match. In a
+statistics build the test additionally proves that the fast definition enters
+the new path and the reference does not.
+
+The complete Debug matrix passed all 420 tests across BVH4, BVH8, payload32,
+and payload64. The final generic fully-ready walker has the same symbol size as
+the frozen baseline in all production binaries.
+
+### Final SBC acceptance
+
+Final combined report:
+`/home/codex-perf/frontier/results/frontier-paired-20260817T143013Z`
+
+| Case | Payload | Baseline | Candidate | Paired change | 95% interval | Baseline / candidate CV |
+|---|---:|---:|---:|---:|---:|---:|
+| live-city selection | 32 | 651.698 us | 549.488 us | **-15.70%** | [-16.40%, -14.83%] | 0.88% / 1.17% |
+| live-city selection | 64 | 653.808 us | 546.012 us | **-16.36%** | [-16.53%, -16.24%] | 0.77% / 0.57% |
+| live-city render + scan | 32 | 648.106 us | 547.757 us | **-15.62%** | [-15.82%, -15.51%] | 0.85% / 0.61% |
+| live-city render + scan | 64 | 710.811 us | 603.237 us | **-14.86%** | [-15.11%, -14.58%] | 0.47% / 0.65% |
+| motion-only | 32 | 143.249 us | 143.194 us | +0.16% | [-0.37%, +0.69%] | 0.25% / 0.59% |
+| motion-only | 64 | 143.748 us | 143.331 us | -0.19% | [-0.40%, +0.09%] | 0.13% / 0.30% |
+| uncached hierarchy, 50% | 32 | 1635.956 us | 1634.032 us | +0.77% | [-0.41%, +2.36%] | 0.58% / 1.54% |
+| uncached hierarchy, 50% | 64 | 1614.468 us | 1577.796 us | -5.78% | [-8.41%, -0.39%] | 7.93% / 1.48% |
+| uncached hierarchy, 100% | 32 | 3152.754 us | 3116.519 us | -0.16% | [-0.90%, +0.84%] | 1.28% / 1.59% |
+| uncached hierarchy, 100% | 64 | 2962.906 us | 2953.928 us | -0.22% | [-0.76%, +0.51%] | 0.67% / 0.74% |
+
+Every live-city cycle improved by at least 14.58%. Motion and all unrelated
+controls are statistically non-regressing or improved; the noisy payload64
+50% baseline accounts for its unusually large point estimate. All 120 fresh
+processes ran on CPU 4 at exactly 2.208 GHz. Temperature stayed between 45.307
+and 46.230 C, one-minute load between 1.002 and 2.041, and maximum CPU/wall
+divergence was 0.025%.
+
+### Tradeoffs and decision
+
+Keep and commit. The optimization deliberately helps a specific but common
+rendering shape: large, fully-ready static detail trees that are close enough
+to require their finest authored level and straddle the moving view boundary.
+It provides no benefit to shallow trees, mounted compositions, overlays,
+nonzero-error terminal leaves, or trees near an LOD transition; those remain on
+the unchanged generic walker. Registration performs one additional topology
+scan and one mount-flag bit is consumed. In exchange, the common live-city
+frame is about 1.19x faster end to end with exact output and no additional
+frame-state memory.

@@ -21,6 +21,33 @@ struct Scene
     }
 };
 
+SubtreeBytes makeFullyRefinedReferenceSubtree(float leafError)
+{
+    SubtreeBuilder builder;
+    const auto root = builder.createNode(node(10, 16.0f, box(4.0f)));
+    UserPayload payload = 11;
+    for (int z : {-1, 1})
+        for (int x : {-1, 1})
+        {
+            const float4 center = float4::point(float(x) * 2.0f, 0.0f,
+                                                float(z) * 2.0f);
+            const auto interior = builder.createNode(
+                root, node(payload++, 16.0f, box(2.0f, center)));
+            for (int leafZ : {-1, 1})
+                for (int leafX : {-1, 1})
+                {
+                    const float4 leafCenter =
+                        center + float4::vec(float(leafX) * 0.75f, 0.0f,
+                                             float(leafZ) * 0.75f);
+                    builder.createNode(
+                        interior,
+                        node(payload++, leafError,
+                             box(0.5f, leafCenter)));
+                }
+        }
+    return builder.build();
+}
+
 } // namespace
 
 TEST(Frontier, PermanentRootCoversMissingMountedPayloads)
@@ -599,4 +626,60 @@ TEST(Frontier, RenderAsUnitCoarsensOnlyDescendantFrustumCulling)
     // Policy changes invalidate the cached render record immediately.
     scene.database.setInstanceRenderAsUnit(scene.instance, false);
     EXPECT_EQ(renderPayloads(renderQuery), exactPayloads);
+}
+
+TEST(Frontier, FullyRefinedBoundaryTraversalMatchesTheGeneralWalker)
+{
+    SpatialDatabase fastDatabase;
+    SpatialDatabase referenceDatabase;
+    const SubtreeHandle fastSubtree = fastDatabase.registerSubtree(
+        makeFullyRefinedReferenceSubtree(0.0f));
+    // A nonzero terminal error deliberately disables the specialized path;
+    // terminal leaves are still selected unconditionally, so payload
+    // visibility remains an independent reference for the same hierarchy.
+    const SubtreeHandle referenceSubtree = referenceDatabase.registerSubtree(
+        makeFullyRefinedReferenceSubtree(1.0e-20f));
+    const InstanceHandle fastInstance = instantiateFor(
+        fastDatabase, fastSubtree, box(5.0f), 64.0f);
+    const InstanceHandle referenceInstance = instantiateFor(
+        referenceDatabase, referenceSubtree, box(5.0f), 64.0f);
+    TestAccess::markAllNodesReady(fastDatabase);
+    TestAccess::markAllNodesReady(referenceDatabase);
+
+    SpatialQuery fastQuery;
+    SpatialQuery referenceQuery;
+    fastQuery.setReuseEnabled(false);
+    referenceQuery.setReuseEnabled(false);
+    const Camera camera = cameraAt(-8.0f);
+
+    bool reachedBoundary = false;
+    for (uint32_t step = 1; step <= 160; ++step)
+    {
+        InstanceTransform transform;
+        transform.pos = float4::point(float(step) * 0.125f, 0.0f, 0.0f);
+        fastDatabase.moveInstance(fastInstance, transform);
+        referenceDatabase.moveInstance(referenceInstance, transform);
+        fastDatabase.applyUpdates();
+        referenceDatabase.applyUpdates();
+
+        const std::vector<UserPayload> fast = payloads(
+            fastDatabase,
+            fastQuery.selectFrontier(fastDatabase, camera, {}), false);
+        const std::vector<UserPayload> reference = payloads(
+            referenceDatabase,
+            referenceQuery.selectFrontier(referenceDatabase, camera, {}),
+            false);
+        EXPECT_EQ(fast, reference);
+        if (fast.empty() || fast.size() == 16) continue;
+
+        reachedBoundary = true;
+#ifdef FRONTIER_STATS
+        EXPECT_GT(fastQuery.lastSelectionStats().fullyRefinedSubtrees, 0u);
+        EXPECT_EQ(referenceQuery.lastSelectionStats().fullyRefinedSubtrees,
+                  0u);
+#endif
+        break;
+    }
+    EXPECT_TRUE(reachedBoundary)
+        << "test scene never reached a partial-leaf frustum intersection";
 }

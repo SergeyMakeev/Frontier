@@ -603,6 +603,9 @@ struct SelectionStats
     uint64_t nodesVisited = 0;
     uint64_t wideBlocksTested = 0;
     uint64_t lanesSurvived = 0;
+#ifdef FRONTIER_STATS
+    uint64_t fullyRefinedSubtrees = 0;
+#endif
 };
 
 // Result of one mounted-topology collection pass. Definition-node readiness is
@@ -1266,7 +1269,11 @@ private:
         uint32_t generation = 0;
         uint32_t readyNodes = 0;
         uint32_t firstMount = kInvalidIndex;
-        bool rootLeavesOnly = false;
+        // Magnitude: minimum geometric error among ordinary interior nodes;
+        // zero disables the fully-refined traversal. The otherwise unused
+        // sign bit records the independent root-leaves-only classification,
+        // keeping this hot definition record at its established size.
+        float minInnerErrorAndRootFlag = 0.0f;
 
         bool inUse() const { return !bytes.empty(); }
         bool isNodeReady(uint32_t node) const
@@ -1284,6 +1291,14 @@ private:
         bool allNodesReady() const
         {
             return readyNodes + 1 == view.packedNodeCount();
+        }
+        bool rootLeavesOnly() const
+        {
+            return std::signbit(minInnerErrorAndRootFlag);
+        }
+        float minInnerError() const
+        {
+            return std::fabs(minInnerErrorAndRootFlag);
         }
     };
     static_assert(sizeof(SubtreeDefinitionRt) <= 160,
@@ -1319,7 +1334,9 @@ private:
     struct MountTransformRt
     {
         static constexpr uint32_t kRootLeavesOnly = 1u << 31;
-        static constexpr uint32_t kDefinitionMask = ~kRootLeavesOnly;
+        static constexpr uint32_t kFullyRefinedCandidate = 1u << 30;
+        static constexpr uint32_t kDefinitionMask =
+            ~(kRootLeavesOnly | kFullyRefinedCandidate);
 
         float4 pos = float4::point(0.0f, 0.0f, 0.0f);
         float scale = 1.0f;
@@ -1334,6 +1351,10 @@ private:
         bool rootLeavesOnly() const
         {
             return (definitionAndFlags & kRootLeavesOnly) != 0;
+        }
+        bool fullyRefinedCandidate() const
+        {
+            return (definitionAndFlags & kFullyRefinedCandidate) != 0;
         }
     };
     static_assert(sizeof(MountTransformRt) == 32,
@@ -2152,6 +2173,10 @@ private:
     void runSubtreeImpl(const WorkItem& item, const Instance& inst,
                         const Camera& local,
                         const SelectionParams& params, Worker& w) const;
+    bool tryRunFullyRefinedBoundary(const WorkItem& item,
+                                    const Instance& inst,
+                                    const Camera& rootLocal,
+                                    Worker& worker) const;
     template<bool SparseOverlay>
     void runSubtreeAncestorImpl(const WorkItem& item, const Instance& inst,
                                 const Camera& local,
