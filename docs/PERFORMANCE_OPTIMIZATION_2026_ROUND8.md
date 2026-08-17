@@ -428,3 +428,84 @@ the direct paired effects to the full-leaf results yields approximately 28.3%
 payload32 and 25.8% payload64 improvement over the accepted grouped-resolver
 baseline, while using substantially less retained renderer state than the AoS
 prototype.
+
+## Experiment 6: opt-in instance-granular frustum culling
+
+### Observation and theory
+
+The compact renderer still re-walked 20.43 of 293 visible roots per frame.
+Records are cacheable only when their top-level root was wholly inside the
+frustum; a nonzero plane mask forces exact descendant tests on every call.
+Cars and pedestrians are already submitted, transformed, and clipped as actor
+runs. For such small articulated actors, culling every child part on the CPU
+can cost more than submitting the handful of offscreen boundary parts.
+
+After the TLAS proves an actor root is not outside, erase its descendant plane
+mask for the render-native query only. LOD decisions remain exact and continue
+to use camera/motion margins; only frustum precision changes from leaf to
+actor-root granularity. The normal handle query remains leaf-exact.
+
+### Rejected broad version
+
+The first prototype applied this rule to every hierarchical instance. Locally
+it reached 99.96% record reuse and only 0.11 walks per frame, but submissions
+rose from about 24,073 to 30,806 leaves (+28.0%) because deep static-world
+blocks at the frustum boundary were emitted whole. Despite its dramatic CPU
+speed, that is an unreasonable general renderer tradeoff and was rejected
+without an SBC acceptance run.
+
+### Revised architecture
+
+Add `SpatialDatabase::setInstanceRenderAsUnit()`. The policy is an explicit
+bit in the existing cold instance flag word, so the 80-byte instance record
+and 32-byte public descriptor do not grow. Changing the policy invalidates
+that instance's cached frontier immediately.
+
+During a render-native cached query, the selector checks the policy only for
+the uncommon shell of roots with a nonzero TLAS plane mask. Opted-in roots use
+mask zero for their subtree walk/cache record; ordinary roots retain exact
+descendant masks. The live-city benchmark opts in the 100 cars and 1,000
+pedestrians but leaves all static blocks exact.
+
+This version raises average submissions only from 24,072.7 to 24,139.3
+(+0.28%), while reducing walks from 20.43 to 12.97 (-36.5%) and increasing
+reuse from 93.03% to 95.58%.
+
+### Correctness
+
+A dedicated test moves a two-part actor to a frustum boundary where the exact
+handle query returns one child. Opting into render-as-unit returns both children
+as a conservative superset; the handle API still returns exactly one. Disabling
+the policy invalidates the retained record and restores the exact render set on
+the next call. The complete BVH4/BVH8/payload32/payload64 Debug matrix passed
+all 416 tests.
+
+### SBC result
+
+Direct compact-exact versus compact-actor-unit report:
+`/home/codex-perf/frontier/results/frontier-paired-20260817T115024Z`
+
+| Payload | Exact descendant cull | Actor-unit candidate | Paired change | 95% interval | CV baseline / candidate |
+|---:|---:|---:|---:|---:|---:|
+| 32 | 652.736 us | 647.556 us | **-0.89%** | [-1.00%, -0.81%] | 0.46% / 0.58% |
+| 64 | 718.757 us | 709.689 us | **-1.31%** | [-1.51%, -0.94%] | 0.43% / 0.39% |
+
+Every cycle improved: payload32 -0.87%, -1.00%, -0.81%; payload64 -1.49%,
+-0.94%, -1.51%. All 24 processes held CPU 4 at 2.208 GHz, temperature stayed
+44.384-45.307 C, one-minute load 1.024-1.896, and maximum CPU/wall divergence
+was 0.021%.
+
+### Tradeoffs and decision
+
+Keep and commit. The caller must opt in only actor-sized roots for which GPU
+clipping or meshlet culling is cheaper than CPU child traversal. The render cut
+is then a conservative superset of the exact handle cut at the frustum edge;
+it never omits visible leaves. LOD selection, readiness, payloads, errors, and
+instance identity remain unchanged.
+
+The longer-lived full actor records cross a cache-slab capacity boundary in
+this trajectory: reported query capacity grows from 1,169 to 2,257 KiB for
+payload32 and 1,424 to 2,768 KiB for payload64. Absolute state remains small,
+but the roughly 1.1-1.3 MiB increase is a real cost for a 1% frame gain. A
+future bounded-cache/eviction experiment should reclaim invisible actor
+records without giving back the boundary reuse.

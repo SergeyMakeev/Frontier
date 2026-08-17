@@ -1599,6 +1599,16 @@ void SpatialDatabase::moveInstance(InstanceHandle ref,
     ++instanceSpatialVersion_;
 }
 
+void SpatialDatabase::setInstanceRenderAsUnit(InstanceHandle ref, bool enabled)
+{
+    const InstanceId dense = denseInstanceId(ref);
+    if (dense == kInvalidInstanceId) return;
+    Instance& inst = instances_[dense];
+    if (inst.renderAsUnit() == enabled) return;
+    inst.setRenderAsUnit(enabled);
+    invalidateInstanceFrontier(dense);
+}
+
 void SpatialDatabase::ensureInstanceOrientations()
 {
     if (!instanceOrientations_.empty()) return;
@@ -5137,7 +5147,18 @@ void SpatialDatabase::selectFrontierCached(const Camera& camera, const Selection
     for (uint32_t i = 0; i < nVis; ++i)
     {
         const uint32_t instIdx = scratch.visible[i].instance();
-        const uint8_t  mask = scratch.visible[i].mask();
+        const uint8_t visibleMask = scratch.visible[i].mask();
+        // Opted-in render-native actors are already batched at instance
+        // granularity. Once the TLAS proves that their root intersects the
+        // frustum, retain the whole LOD cut and let the renderer clip the
+        // small boundary actor. Ordinary/static instances and the handle API
+        // keep exact descendant culling. The Instance record is fetched only
+        // for the uncommon nonzero-mask shell.
+        const uint8_t mask =
+            visibleMask != 0 && segmentedRender &&
+                    instances_[instIdx].renderAsUnit()
+                ? 0
+                : visibleMask;
         SpatialQuery::Rec& r = query.rec_[instIdx];
         const bool overflow = frontierCountsOverflow(r.counts);
         const SpatialQuery::OverflowCounts* fullCounts =

@@ -542,3 +542,61 @@ TEST(Frontier, RenderQueryTracksCachedRebuildsAndApiSwitches)
     query.reset();
     expectExact(camera);
 }
+
+TEST(Frontier, RenderAsUnitCoarsensOnlyDescendantFrustumCulling)
+{
+    Scene scene;
+    TestAccess::markAllNodesReady(scene.database);
+    scene.database.applyUpdates();
+    const Camera camera = cameraAt(-8.0f);
+    SpatialQuery exactQuery;
+    exactQuery.setReuseEnabled(false);
+
+    std::vector<UserPayload> exactPayloads;
+    float boundaryX = 0.0f;
+    for (uint32_t step = 1; step <= 160; ++step)
+    {
+        boundaryX = float(step) * 0.125f;
+        InstanceTransform transform;
+        transform.pos = float4::point(boundaryX, 0.0f, 0.0f);
+        scene.database.moveInstance(scene.instance, transform);
+        scene.database.applyUpdates();
+        exactPayloads = payloads(
+            scene.database,
+            exactQuery.selectFrontier(scene.database, camera, {}), false);
+        if (exactPayloads.size() == 1) break;
+    }
+    ASSERT_EQ(exactPayloads.size(), 1u)
+        << "test scene never reached a one-child frustum intersection";
+
+    const auto renderPayloads = [&](SpatialQuery& query)
+    {
+        const RenderFrontierView render =
+            query.selectRenderFrontier(scene.database, camera, {});
+        std::vector<UserPayload> result;
+        result.reserve(render.size());
+        for (const RenderFrontierRun run : render.runs())
+        {
+            const RenderFrontierSpan leaves = render[run];
+            result.insert(result.end(), leaves.payloads.begin(),
+                          leaves.payloads.end());
+        }
+        std::sort(result.begin(), result.end());
+        return result;
+    };
+
+    SpatialQuery renderQuery;
+    scene.database.setInstanceRenderAsUnit(scene.instance);
+    EXPECT_EQ(renderPayloads(renderQuery),
+              (std::vector<UserPayload>{11, 12}));
+
+    // The normal handle API remains descendant-exact despite the render hint.
+    EXPECT_EQ(payloads(scene.database,
+                       exactQuery.selectFrontier(scene.database, camera, {}),
+                       false),
+              exactPayloads);
+
+    // Policy changes invalidate the cached render record immediately.
+    scene.database.setInstanceRenderAsUnit(scene.instance, false);
+    EXPECT_EQ(renderPayloads(renderQuery), exactPayloads);
+}

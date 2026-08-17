@@ -1082,6 +1082,11 @@ public:
     void removeInstance(InstanceHandle instance); // no-op if stale
     void moveInstance(InstanceHandle instance,
                       const InstanceTransform& transform);
+    // Opt into instance-granular culling for render-native queries. The TLAS
+    // still rejects a fully invisible root, but an intersecting root keeps its
+    // complete cached LOD cut so small articulated actors do not re-walk all
+    // child bounds at the frustum edge.
+    void setInstanceRenderAsUnit(InstanceHandle instance, bool enabled = true);
     void moveInstance(InstanceHandle instance, const Transform& transform)
     {
         moveInstance(instance,
@@ -1595,7 +1600,10 @@ private:
         static constexpr uint32_t kAlive = 1u << 31;
         static constexpr uint32_t kMountableRoot = 1u << 30;
         static constexpr uint32_t kZeroErrorRoot = 1u << 29;
+        static constexpr uint32_t kRenderAsUnit = 1u << 28;
         static constexpr uint32_t kOverlayListMask = kInvalidInstanceId;
+        static constexpr uint32_t kInstanceFlags =
+            kAlive | kMountableRoot | kZeroErrorRoot | kRenderAsUnit;
 
         float4   pos{};
         AABB     worldBox;
@@ -1624,6 +1632,15 @@ private:
         {
             return (overlayListAndAlive & kZeroErrorRoot) != 0;
         }
+        bool renderAsUnit() const
+        {
+            return (overlayListAndAlive & kRenderAsUnit) != 0;
+        }
+        void setRenderAsUnit(bool value)
+        {
+            if (value) overlayListAndAlive |= kRenderAsUnit;
+            else overlayListAndAlive &= ~kRenderAsUnit;
+        }
         void setZeroErrorRoot(bool value)
         {
             if (value) overlayListAndAlive |= kZeroErrorRoot;
@@ -1647,15 +1664,13 @@ private:
             FRONTIER_ASSERT(index < kOverlayListMask,
                         "SpatialDatabase: exhausted overlay-list index space");
             overlayListAndAlive =
-                (overlayListAndAlive &
-                 (kAlive | kMountableRoot | kZeroErrorRoot)) |
+                (overlayListAndAlive & kInstanceFlags) |
                 index;
         }
         void clearOverlayList()
         {
             overlayListAndAlive =
-                (overlayListAndAlive &
-                 (kAlive | kMountableRoot | kZeroErrorRoot)) |
+                (overlayListAndAlive & kInstanceFlags) |
                 kOverlayListMask;
         }
 

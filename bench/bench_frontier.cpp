@@ -440,6 +440,7 @@ std::unique_ptr<LiveCityScene> buildLiveCityScene()
         carRoot.flags |= NodeDesc::FlagYawInvariantBounds;
         const InstanceHandle instance = scene->world.instantiate(
             carRoot, desc);
+        scene->world.setInstanceRenderAsUnit(instance);
         scene->world.mountSubtree(instance.rootNode(), car);
         carHandles.push_back(instance);
     }
@@ -456,6 +457,7 @@ std::unique_ptr<LiveCityScene> buildLiveCityScene()
         pedestrianRoot.flags |= NodeDesc::FlagYawInvariantBounds;
         const InstanceHandle instance = scene->world.instantiate(
             pedestrianRoot, desc);
+        scene->world.setInstanceRenderAsUnit(instance);
         scene->world.mountSubtree(instance.rootNode(), pedestrian);
         pedestrianHandles.push_back(instance);
     }
