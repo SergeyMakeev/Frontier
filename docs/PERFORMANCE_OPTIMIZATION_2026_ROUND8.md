@@ -509,3 +509,62 @@ payload32 and 1,424 to 2,768 KiB for payload64. Absolute state remains small,
 but the roughly 1.1-1.3 MiB increase is a real cost for a 1% frame gain. A
 future bounded-cache/eviction experiment should reclaim invisible actor
 records without giving back the boundary reuse.
+
+## Experiment 7: sampled visibility aging and right-sized compaction (rejected)
+
+### Theory
+
+The actor-unit policy retains full cached cuts for roots encountered anywhere
+along the driving route. Add one visibility epoch byte per instance, sweep the
+record table once every 256 frames, evict cuts absent for three sampled epochs,
+and compact into `used - garbage` entries instead of preserving the old slab
+capacity. This should shrink the query's long-route working set and might
+improve cache/TLB behavior enough to recover part of the memory cost from
+Experiment 6.
+
+### Variant A: sampled visibility only
+
+The first implementation marked only the roots visible on each sweep. It cut
+payload32 query capacity from 2,257.0 to 776.8 KiB, but short visibility
+intervals between two samples were invisible to the aging policy. Average
+walks rose from 12.966 to 13.392 roots per frame and reuse fell from 95.576% to
+95.431%.
+
+SBC report:
+`/home/codex-perf/frontier/results/frontier-paired-20260817T120448Z`
+
+| Payload | Actor-unit baseline | Aging candidate | Paired change | 95% interval | CV baseline / candidate |
+|---:|---:|---:|---:|---:|---:|
+| 32 | 644.980 us | 676.566 us | **+5.07%** | [+4.78%, +5.53%] | 0.81% / 0.58% |
+| 64 | 710.206 us | 746.895 us | **+5.12%** | [+4.72%, +5.45%] | 0.41% / 0.30% |
+
+### Variant B: exact per-frame visibility stamps
+
+The second implementation wrote the current epoch byte for every visible root
+on every frame, eliminating sampling blind spots. The capacity result remained
+excellent (778.5 KiB for payload32), but revisiting legitimately aged-out
+actors still requires new subtree walks. The walked/reuse counters were
+effectively unchanged from Variant A, demonstrating that revisit misses rather
+than sampling error were the fundamental cost.
+
+SBC report:
+`/home/codex-perf/frontier/results/frontier-paired-20260817T121207Z`
+
+| Payload | Actor-unit baseline | Aging candidate | Paired change | 95% interval | CV baseline / candidate |
+|---:|---:|---:|---:|---:|---:|
+| 32 | 643.219 us | 676.866 us | **+5.70%** | [+5.53%, +5.85%] | 0.44% / 0.87% |
+| 64 | 714.039 us | 749.544 us | **+4.88%** | [+4.57%, +5.12%] | 0.48% / 0.45% |
+
+Both reports held CPU 4 at exactly 2.208 GHz with maximum CPU/wall divergence
+of 0.023% and temperatures between 44.384 and 45.307 C. The regressions are
+therefore decisive, not environmental noise.
+
+### Decision
+
+Reject and fully revert both variants. The experiment offers a valid optional
+memory policy (about 1.48 MiB saved in payload32), but it is a CPU-for-memory
+trade rather than a performance optimization. This project deliberately keeps
+off-route cuts because the cyclic city trajectory revisits them and converts
+that retained state directly into fewer walks. No production source from this
+experiment is committed; the negative results are retained here to prevent a
+future repetition.
