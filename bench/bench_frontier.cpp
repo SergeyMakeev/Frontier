@@ -476,16 +476,13 @@ void consume(const FrontierResultView& cut)
 }
 
 #ifndef FRONTIER_OMIT_SUBMISSION_BENCH
-std::span<ResolvedFrontierEntry> buildLiveCitySubmissions(
-    const SpatialDatabase& world, const FrontierResultView& cut,
-    std::vector<ResolvedFrontierEntry>& submissions)
+void consumeLiveCitySubmissions(const RenderFrontierView& result)
 {
-    const std::span<ResolvedFrontierEntry> resolved =
-        world.resolveFrontier(cut.current(), submissions);
-    benchmark::DoNotOptimize(resolved.data());
-    benchmark::DoNotOptimize(resolved.size());
+    benchmark::DoNotOptimize(result.storage().data());
+    benchmark::DoNotOptimize(result.runs().data());
+    benchmark::DoNotOptimize(result.size());
+    benchmark::DoNotOptimize(result.segmentCount());
     benchmark::ClobberMemory();
-    return resolved;
 }
 #endif
 
@@ -1278,16 +1275,15 @@ static void BM_LiveCityRenderSubmissionFrame(benchmark::State& state)
     auto scene = buildLiveCityScene();
     SpatialQuery query;
     query.setReuseEnabled(true);
-    FrontierResultView result =
-        query.selectFrontier(scene->world, scene->cameras[0], {});
-    std::vector<ResolvedFrontierEntry> submissions(kLiveCityTotalLeaves);
-    std::span<ResolvedFrontierEntry> resolved =
-        buildLiveCitySubmissions(scene->world, result, submissions);
+    RenderFrontierView result =
+        query.selectRenderFrontier(scene->world, scene->cameras[0], {});
+    consumeLiveCitySubmissions(result);
 
     uint32_t frame = 0;
     uint64_t calls = 0;
     uint64_t totalEntries = 0;
     uint64_t totalSubmissions = 0;
+    uint64_t totalSegments = 0;
     uint64_t totalReused = 0;
     uint64_t totalWalked = 0;
     uint64_t minEntries = uint64_t(-1);
@@ -1300,11 +1296,13 @@ static void BM_LiveCityRenderSubmissionFrame(benchmark::State& state)
         scene->world.moveInstances(scene->pedestrianMotion,
                                    scene->pedestrianTransforms);
         scene->world.applyUpdates();
-        result = query.selectFrontier(scene->world, scene->cameras[frame], {});
-        resolved = buildLiveCitySubmissions(scene->world, result, submissions);
+        result = query.selectRenderFrontier(
+            scene->world, scene->cameras[frame], {});
+        consumeLiveCitySubmissions(result);
         ++calls;
         totalEntries += result.size();
-        totalSubmissions += resolved.size();
+        totalSubmissions += result.size();
+        totalSegments += result.segmentCount();
         minEntries = std::min<uint64_t>(minEntries, result.size());
         maxEntries = std::max<uint64_t>(maxEntries, result.size());
         totalReused += query.reused();
@@ -1326,6 +1324,8 @@ static void BM_LiveCityRenderSubmissionFrame(benchmark::State& state)
     state.counters["reuse_percent"] =
         visited == 0.0 ? 0.0 : 100.0 * double(totalReused) / visited;
     state.counters["simulated_seconds"] = callCount / kLiveCityFrameRate;
+    state.counters["segments_per_call"] =
+        double(totalSegments) / callCount;
     state.counters["static_depth"] = double(kLiveCityStaticDepth);
     state.counters["submissions_per_call"] =
         double(totalSubmissions) / callCount;

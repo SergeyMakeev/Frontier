@@ -125,3 +125,163 @@ patched alongside the query's retained frontier, so unchanged entries require
 neither handle decoding nor rewriting. A split payload/instance-error layout is
 also worth measuring for payload64 because it uses 12 bytes instead of the 16
 bytes required by naturally aligned AoS entries.
+
+## Experiment 2: one globally retained resolved stream
+
+### Theory
+
+Keep a contiguous resolved current cut inside `SpatialQuery`. When cached
+selection patches a stable-size per-instance range, resolve only that range in
+place; when the whole result remains valid, retain every byte. With about 93%
+of visible roots reused, this appeared capable of removing nearly the entire
+remaining full-cut resolution pass.
+
+### Correctness result
+
+The prototype passed 412 tests across both BVH and payload widths. Added cases
+compared every resolved payload/instance/error tuple against the handle cut
+after cache hits, readiness changes, handle-only API calls, uncached selection,
+and reset.
+
+### SBC result
+
+Focused report:
+`/home/codex-perf/frontier/results/frontier-paired-20260817T103946Z`
+
+Compared with the accepted grouped resolver:
+
+| Case | Payload | Baseline | Candidate | Paired change | 95% interval |
+|---|---:|---:|---:|---:|---:|
+| live-city selection | 32 | 655.371 us | 649.659 us | -0.57% | [-0.89%, -0.27%] |
+| live-city selection | 64 | 662.243 us | 657.423 us | -0.82% | [-1.52%, -0.46%] |
+| live-city render | 32 | 871.483 us | 861.513 us | -1.14% | [-1.46%, -0.83%] |
+| live-city render | 64 | 983.369 us | 984.647 us | +0.22% | [-5.19%, +5.97%] |
+
+All 48 processes stayed at 2.208 GHz and 45.307-46.230 C; maximum CPU/wall
+divergence was 0.022%. The payload64 render samples inherited substantial host
+load noise, but even the stable payload32 result is far below the expected
+gain. The small selection-only improvement is likely favorable code placement
+or secondary control flow and is not enough to justify the extra architecture
+by itself.
+
+### Diagnosis and decision
+
+Reject the global layout. The cache's 93% reuse statistic is per visible
+instance, but the retained output can be patched only when the complete visible
+instance sequence and every preceding bucket count remain unchanged. A car
+camera moving through a city crosses visibility boundaries continually. One
+entering/leaving instance invalidates the global contiguous layout and forces a
+full resolve even though nearly every surviving instance's cached cut is still
+valid.
+
+The next prototype moves resolved retention into each instance record. It will
+return a compact ordered list of zero-copy per-instance segments. Visibility
+churn then adds/removes only segment descriptors; cached leaf payloads never
+move, and a re-walk resolves only that instance's new current cut. This trades
+one contiguous array for scatter/gather submission, which is a natural fit for
+per-instance transforms and render batching.
+
+## Experiment 3: per-instance resolved slabs and zero-copy render runs
+
+### Theory
+
+Make the unit of renderer-facing retention match the existing unit of query
+reuse. Each cached instance record already owns a stable block in the handle
+slab. Add a parallel resolved slab at the same offset and a one-byte validity
+flag per instance. A hit returns the existing resolved prefix without touching
+its leaf entries. A miss rewrites and resolves only that instance. Each frame
+then emits an ordered list of `{begin, count}` descriptors for the visible
+instances instead of rebuilding a globally contiguous leaf array.
+
+In the live-city workload the current cut averages 24,073 leaf entries but is
+described by only 291 runs. Visibility churn therefore rewrites about 2.3 KiB
+of descriptors, not a 188 KiB payload32 or 376 KiB payload64 submission array.
+The roughly 7% of instance records that fail reuse are the only records whose
+handle and resolved leaf bytes are rewritten.
+
+### Architecture and data layout
+
+- `SpatialQuery::store_` remains the authoritative 12-byte handle-entry slab.
+  A record's three buckets are laid out as `shared`, `currentOnly`, then
+  `idealOnly`.
+- `SpatialQuery::resolvedStore_` mirrors the same allocation and offsets. Only
+  the `shared + currentOnly` prefix is initialized because that is the
+  renderable current cut. It uses the existing 8-byte payload32 or 16-byte
+  payload64 `ResolvedFrontierEntry`.
+- `resolvedRecords_[instance]` is a lazy one-byte validity stream. The normal
+  handle API invalidates the byte only when it rewrites that record; switching
+  between handle and render queries cannot expose stale payloads.
+- `RenderFrontierRun` is exactly eight bytes: a 32-bit slab offset and 32-bit
+  count. Runs follow visible-instance order and index the retained resolved
+  slab. Offsets remain valid when a later miss reallocates the slab; storing
+  raw pointers here would not.
+- `RenderFrontierView` returns the immutable slab, the ordered run span, and
+  the exact total entry count. Cached hierarchical queries never assemble the
+  old global output buckets on this path. Reuse-disabled and all-flat queries
+  fall back to one materialized contiguous run, keeping one consumer API.
+- Slab compaction copies valid handle and resolved records together, preserving
+  matching offsets. Expired records drop both mirrors.
+
+### Correctness
+
+The renderer view is a set-equivalent current cut. Its order is deliberately
+instance-major (`shared + currentOnly` per visible instance), rather than the
+handle API's global bucket-major order. The test suite resolves an independent
+handle query and compares every payload, packed instance id, and error code
+after cache hits, readiness changes, an intervening handle-only query,
+reuse-disabled queries, camera motion, and reset. It also checks every run
+against the slab bounds and verifies that run counts sum to the advertised
+entry count.
+
+The prototype compiled in both benchmark payload widths. The local Debug
+BVH4/BVH8/payload32/payload64 matrix passed all 412 tests. No existing selection result, handle
+layout, or mounted hierarchy was changed.
+
+### SBC results
+
+Focused paired report:
+`/home/codex-perf/frontier/results/frontier-paired-20260817T110135Z`
+
+Compared with accepted commit `6d0bac1`:
+
+| Case | Payload | Baseline | Candidate | Paired change | 95% interval | CV baseline / candidate |
+|---|---:|---:|---:|---:|---:|---:|
+| live-city selection control | 32 | 658.670 us | 654.302 us | -0.34% | [-0.59%, -0.04%] | 0.63% / 0.46% |
+| live-city selection control | 64 | 657.719 us | 659.571 us | +0.04% | [-0.81%, +0.53%] | 0.28% / 0.55% |
+| live-city render production | 32 | 871.047 us | 576.893 us | **-33.90%** | [-34.62%, -33.14%] | 0.37% / 1.13% |
+| live-city render production | 64 | 879.894 us | 634.755 us | **-30.53%** | [-32.18%, -27.81%] | 6.36% / 0.34% |
+
+All six payload32 render samples were large wins; its three cycle effects were
+-33.14%, -34.62%, and -33.91%. All payload64 cycles also won despite noisy
+baseline processes. The selection control is practically unchanged, showing
+that the benefit comes from removing global result assembly and resolution,
+not from unrelated traversal code layout.
+
+All 48 processes ran CPU 4 at exactly 2.208 GHz. Temperature stayed between
+43.461 and 46.230 C, one-minute load between 1.000 and 1.542, and maximum
+CPU/wall divergence was 0.022%.
+
+### Tradeoffs and decision
+
+Keep and commit. Relative to the already grouped-resolver baseline this removes
+294.2 us/frame in payload32 and 245.1 us/frame in payload64, producing 1.51x
+and 1.44x complete CPU-frame throughput respectively.
+
+The cost is persistent renderer-cache memory: one resolved entry slot beside
+each retained handle slot, plus one byte per instance and eight bytes per
+visible run. Payload64 retains twice the resolved-slab bytes of payload32 and
+still has four bytes of natural AoS padding per entry. Results are no longer a
+single contiguous leaf span, so consumers must submit or iterate scatter/gather
+runs. This is a favorable fit for instance transforms and batching but may be
+less convenient for an API that insists on one flat GPU upload. Such callers
+can flatten explicitly, while performance-sensitive renderers avoid paying
+that bandwidth every frame.
+
+### Remaining measurement question
+
+This result measures production of the complete renderer-facing structure,
+including all motion, TLAS publication, selection, miss resolution, and run
+generation. It does not yet time a consumer reading every retained leaf after
+selection. The next controlled experiment will add the same payload/metadata
+scan to baseline and candidate binaries so the scatter/gather iteration cost
+is included without conflating it with this production win.

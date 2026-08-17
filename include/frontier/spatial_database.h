@@ -333,6 +333,50 @@ struct FrontierResultView
     bool empty() const { return size() == 0; }
 };
 
+// One per-instance run in the renderer-facing cache slab. Offsets instead of
+// pointers keep this descriptor at eight bytes and remain valid if filling a
+// later cache miss grows and relocates the slab.
+struct RenderFrontierRun
+{
+    uint32_t begin = 0;
+    uint32_t count = 0;
+};
+static_assert(sizeof(RenderFrontierRun) == 8,
+              "render frontier run must stay eight bytes");
+
+// Scatter/gather current cut produced by
+// SpatialQuery::selectRenderFrontier(). Runs follow visible-instance order and
+// each indexes immutable resolved entries retained with that instance's query
+// record. An entering or leaving instance changes only this compact run list;
+// cached leaf payloads do not move. The view remains valid until the next
+// selection or reset on that SpatialQuery.
+class RenderFrontierView
+{
+public:
+    RenderFrontierView() = default;
+    RenderFrontierView(std::span<const ResolvedFrontierEntry> storage,
+                       std::span<const RenderFrontierRun> runs,
+                       size_t entryCount)
+        : storage_(storage), runs_(runs), entryCount_(entryCount)
+    {}
+
+    std::span<const RenderFrontierRun> runs() const { return runs_; }
+    std::span<const ResolvedFrontierEntry> storage() const { return storage_; }
+    std::span<const ResolvedFrontierEntry> operator[](
+        const RenderFrontierRun& run) const
+    {
+        return storage_.subspan(run.begin, run.count);
+    }
+    size_t size() const { return entryCount_; }
+    size_t segmentCount() const { return runs_.size(); }
+    bool empty() const { return entryCount_ == 0; }
+
+private:
+    std::span<const ResolvedFrontierEntry> storage_;
+    std::span<const RenderFrontierRun> runs_;
+    size_t entryCount_ = 0;
+};
+
 namespace detail {
 
 struct FrontierBuffers
@@ -693,6 +737,15 @@ public:
     FrontierResultView selectFrontier(const SpatialDatabase& database, const Camera& camera,
                             const SelectionParams& params);
 
+    // Render-native cached query. Resolved current cuts are retained per
+    // instance and returned as compact zero-copy runs. Cache hits preserve
+    // their existing bytes; only re-walked instances are re-resolved. The
+    // handle-returning selectFrontier() remains available for streaming and
+    // readiness work, which can run at an independent cadence.
+    RenderFrontierView selectRenderFrontier(const SpatialDatabase& database,
+                                            const Camera& camera,
+                                            const SelectionParams& params);
+
     // Advanced zero-copy path: write directly to fixed caller storage.
     void selectFrontier(const SpatialDatabase& database, const Camera& camera,
                    const SelectionParams& params, FrontierResultSink& outResult);
@@ -823,6 +876,11 @@ private:
     detail::AppendBuffer<OverflowCounts> overflowCounts_;
     detail::AppendBuffer<uint32_t> freeOverflowCounts_;
     detail::AppendBuffer<FrontierEntry> store_;   // slab of recorded runs
+    // Lazily allocated renderer mirror of the shared + currentOnly prefix in
+    // each cached run. Ideal-only slots remain unused. One byte per instance
+    // records whether its mirror matches the handle slab.
+    detail::AppendBuffer<ResolvedFrontierEntry> resolvedStore_;
+    std::vector<uint8_t> resolvedRecords_;
     // Distance the damped query envelope has travelled since this SpatialQuery was
     // created, accumulated per call. kTravel_ similarly accumulates absolute
     // projection-scale motion. A record taken with margin m remains valid

@@ -461,3 +461,78 @@ TEST(Frontier, BulkResolutionPreservesOrderMetadataAndStaleSafety)
     EXPECT_EQ(stale[1].payload, kInvalidPayload);
     EXPECT_EQ(stale[2].payload, kInvalidPayload);
 }
+
+TEST(Frontier, RenderQueryTracksCachedRebuildsAndApiSwitches)
+{
+    Scene scene;
+    TestAccess::markAllNodesReady(scene.database);
+    scene.database.applyUpdates();
+    SpatialQuery query;
+    SpatialQuery referenceQuery;
+    const Camera camera = cameraAt(-8.0f);
+
+    const auto expectExact = [&](const Camera& view)
+    {
+        const FrontierResultView handles =
+            referenceQuery.selectFrontier(scene.database, view, {});
+        std::vector<ResolvedFrontierEntry> expected(handles.currentSize());
+        const std::span<ResolvedFrontierEntry> resolved =
+            scene.database.resolveFrontier(handles.current(), expected);
+        ASSERT_EQ(resolved.size(), expected.size());
+
+        const RenderFrontierView render =
+            query.selectRenderFrontier(scene.database, view, {});
+        std::vector<ResolvedFrontierEntry> actual;
+        actual.reserve(render.size());
+        size_t runEntries = 0;
+        for (const RenderFrontierRun run : render.runs())
+        {
+            ASSERT_LE(size_t(run.begin) + run.count,
+                      render.storage().size());
+            const std::span<const ResolvedFrontierEntry> entries =
+                render[run];
+            actual.insert(actual.end(), entries.begin(), entries.end());
+            runEntries += entries.size();
+        }
+        EXPECT_EQ(runEntries, render.size());
+        ASSERT_EQ(actual.size(), expected.size());
+
+        const auto less = [](const ResolvedFrontierEntry& a,
+                             const ResolvedFrontierEntry& b)
+        {
+            if (a.payload != b.payload) return a.payload < b.payload;
+            return a.instanceAndError < b.instanceAndError;
+        };
+        std::sort(actual.begin(), actual.end(), less);
+        std::sort(expected.begin(), expected.end(), less);
+        for (size_t i = 0; i < expected.size(); ++i)
+        {
+            EXPECT_EQ(actual[i].payload, expected[i].payload);
+            EXPECT_EQ(actual[i].instanceAndError,
+                      expected[i].instanceAndError);
+        }
+    };
+
+    expectExact(camera);
+    expectExact(camera);
+
+    const NodeHandle detail = handleOf(scene.database, 12);
+    scene.database.markNodeUnavailable(detail);
+    expectExact(camera);
+
+    // A handle-only call deliberately invalidates the retained renderer view.
+    // The next render query must rebuild it rather than expose stale payloads.
+    scene.database.markNodeReady(detail);
+    const FrontierResultView handlesOnly =
+        query.selectFrontier(scene.database, cameraAt(-7.5f), {});
+    EXPECT_FALSE(handlesOnly.empty());
+    expectExact(camera);
+
+    // Uncached/all-direct selection rebuilds the complete output every call.
+    query.setReuseEnabled(false);
+    expectExact(camera);
+    expectExact(cameraAt(-7.0f));
+
+    query.reset();
+    expectExact(camera);
+}

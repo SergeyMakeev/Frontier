@@ -212,6 +212,8 @@ struct QueryScratch
     std::vector<SpatialDatabase::VisibleItem> previousVisible;
     std::vector<SpatialDatabase::TlasItem>    tlasStack;
     detail::FrontierBuffers              output;
+    detail::AppendBuffer<ResolvedFrontierEntry> resolvedCurrent;
+    detail::AppendBuffer<RenderFrontierRun> renderRuns;
     ViewMemo viewMemo[2];
     uint64_t memoClock = 0;
     uint32_t lastSceneMappingVersion = 0;
@@ -220,6 +222,9 @@ struct QueryScratch
     bool haveLastScene = false;
     bool retainedVisible = false;
     bool retainedAllVisible = false;
+    bool segmentedRenderRequested = false;
+    bool renderRunsValid = false;
+    size_t renderEntryCount = 0;
 
     size_t bytes() const
     {
@@ -229,7 +234,9 @@ struct QueryScratch
                    workers.capacity() * sizeof(SpatialDatabase::Worker) +
                    output.shared.capacity() * sizeof(FrontierEntry) +
                    output.currentOnly.capacity() * sizeof(FrontierEntry) +
-                   output.idealOnly.capacity() * sizeof(FrontierEntry);
+                   output.idealOnly.capacity() * sizeof(FrontierEntry) +
+                   resolvedCurrent.capacity() * sizeof(ResolvedFrontierEntry) +
+                   renderRuns.capacity() * sizeof(RenderFrontierRun);
         for (const ViewMemo& memo : viewMemo)
         {
             n += memo.output.shared.capacity() * sizeof(FrontierEntry);
@@ -4738,6 +4745,8 @@ void SpatialQuery::reset()
     overflowCounts_.clear();
     freeOverflowCounts_.clear();
     store_.clear();
+    resolvedStore_.clear();
+    resolvedRecords_.clear();
     used_ = garbage_ = reused_ = walked_ = 0;
     travel_ = kTravel_ = 0.0f;
     wholeMargin_ = wholeTravel_ = wholeKTravel_ = wholeMaxSlope_ = 0.0f;
@@ -4757,6 +4766,11 @@ void SpatialQuery::reset()
     if (scratch_)
     {
         scratch_->output.clear();
+        scratch_->resolvedCurrent.clear();
+        scratch_->renderRuns.clear();
+        scratch_->segmentedRenderRequested = false;
+        scratch_->renderRunsValid = false;
+        scratch_->renderEntryCount = 0;
         scratch_->visible.clear();
         scratch_->previousVisible.clear();
         scratch_->retainedVisible = false;
@@ -4793,6 +4807,8 @@ size_t SpatialQuery::bytes() const
            overflowCounts_.capacity() * sizeof(OverflowCounts) +
            freeOverflowCounts_.capacity() * sizeof(uint32_t) +
            store_.capacity() * sizeof(FrontierEntry) +
+           resolvedStore_.capacity() * sizeof(ResolvedFrontierEntry) +
+           resolvedRecords_.capacity() * sizeof(uint8_t) +
            mountUse_.capacity() * sizeof(MountUseRec) +
            dirtyMounts_.capacity() * sizeof(uint32_t) +
            (scratch_ ? scratch_->bytes() : 0);
@@ -4810,6 +4826,9 @@ void SpatialQuery::compact()
     // keep the existing allocation headroom while making the copy order moot.
     detail::AppendBuffer<FrontierEntry> packed;
     packed.resize_uninitialized(store_.size());
+    detail::AppendBuffer<ResolvedFrontierEntry> resolvedPacked;
+    const bool haveResolved = !resolvedStore_.empty();
+    if (haveResolved) resolvedPacked.resize_uninitialized(store_.size());
     uint32_t w = 0;
     for (size_t i = 0; i < rec_.size(); ++i)
     {
@@ -4823,22 +4842,35 @@ void SpatialQuery::compact()
             if (frontierCountsOverflow(r.counts))
                 freeOverflowCounts_.push_back(frontierOverflowIndex(r.counts));
             r.counts = 0;
+            if (!resolvedRecords_.empty()) resolvedRecords_[i] = 0;
             continue;
         }
-        uint32_t count = frontierTotal(r.counts);
+        uint32_t shared = frontierCount(r.counts, 0);
+        uint32_t current = frontierCount(r.counts, 1);
+        uint32_t ideal = frontierCount(r.counts, 2);
         if (frontierCountsOverflow(r.counts))
         {
             const OverflowCounts& counts = overflowCounts_[frontierOverflowIndex(r.counts)];
-            count = counts.shared + counts.current + counts.ideal;
+            shared = counts.shared;
+            current = counts.current;
+            ideal = counts.ideal;
         }
+        const uint32_t count = shared + current + ideal;
         if (count)
             std::memcpy(packed.data() + w, store_.data() + r.begin,
                         size_t(count) * sizeof(FrontierEntry));
+        if (haveResolved && !resolvedRecords_.empty() && resolvedRecords_[i] &&
+            shared + current != 0)
+            std::memcpy(resolvedPacked.data() + w,
+                        resolvedStore_.data() + r.begin,
+                        size_t(shared + current) *
+                            sizeof(ResolvedFrontierEntry));
         r.begin = w;
         cold.capacity = count;
         w += count;
     }
     store_.swap(packed);
+    if (haveResolved) resolvedStore_.swap(resolvedPacked);
     used_ = w;
     garbage_ = 0;
 }
@@ -4848,6 +4880,8 @@ void SpatialDatabase::selectFrontierCached(const Camera& camera, const Selection
                             FrontierResultSink& outResult) const
 {
     QueryScratch& scratch = *query.scratch_;
+    const bool segmentedRender = scratch.segmentedRenderRequested;
+    if (!segmentedRender) scratch.renderRunsValid = false;
 #ifdef FRONTIER_STATS
     query.stats_ = SelectionStats{};
 #endif
@@ -4894,6 +4928,9 @@ void SpatialDatabase::selectFrontierCached(const Camera& camera, const Selection
         query.overflowCounts_.clear();
         query.freeOverflowCounts_.clear();
         query.store_.clear();
+        query.resolvedStore_.clear();
+        query.resolvedRecords_.clear();
+        scratch.renderRunsValid = false;
         query.used_ = query.garbage_ = 0;
         query.instanceLayoutVersion_ = instanceLayoutVersion_;
     }
@@ -4901,6 +4938,8 @@ void SpatialDatabase::selectFrontierCached(const Camera& camera, const Selection
     {
         query.rec_.resize(instances_.size());
         query.recCold_.resize(instances_.size());
+        if (!query.resolvedRecords_.empty())
+            query.resolvedRecords_.resize(instances_.size(), 0);
         if (!query.secondDep_.empty())
             query.secondDep_.resize_uninitialized(instances_.size());
     }
@@ -4950,7 +4989,9 @@ void SpatialDatabase::selectFrontierCached(const Camera& camera, const Selection
         (scratch.visible.empty() ||
          std::memcmp(scratch.visible.data(), scratch.previousVisible.data(),
                      scratch.visible.size() * sizeof(VisibleItem)) == 0));
-    if (outResult.retainsExisting_ && usage == nullptr &&
+    const bool retainedAnswer = outResult.retainsExisting_ ||
+                                (segmentedRender && scratch.renderRunsValid);
+    if (retainedAnswer && usage == nullptr &&
         query.wholeReusable_ && sameVisible &&
         query.visibleMappingVersion_ == instanceMappingVersion_ &&
         query.wholeContentGeneration_ == frontierContentGeneration_ &&
@@ -4964,7 +5005,18 @@ void SpatialDatabase::selectFrontierCached(const Camera& camera, const Selection
         return;
     }
 
-    bool patchOutput = outResult.retainsExisting_ && usage == nullptr &&
+    if (segmentedRender)
+    {
+        scratch.renderRuns.clear();
+        scratch.renderEntryCount = 0;
+        if (query.resolvedRecords_.empty())
+            query.resolvedRecords_.resize(instances_.size(), 0);
+        if (query.resolvedStore_.size() < query.store_.size())
+            query.resolvedStore_.resize_uninitialized(query.store_.size());
+    }
+
+    bool patchOutput = !segmentedRender && outResult.retainsExisting_ &&
+                       usage == nullptr &&
                        query.wholeReusable_ && sameVisible &&
                        query.wholeEpoch_ == query.epoch_;
     bool rebuildOutput = false;
@@ -4973,7 +5025,7 @@ void SpatialDatabase::selectFrontierCached(const Camera& camera, const Selection
         outResult.shared.clear();
         outResult.currentOnly.clear();
         outResult.idealOnly.clear();
-        scratch.retainedVisible = false;
+        if (!segmentedRender) scratch.retainedVisible = false;
     }
 
     // The one safe moment to squeeze the slab: before any offset recorded this
@@ -5053,7 +5105,25 @@ void SpatialDatabase::selectFrontierCached(const Camera& camera, const Selection
                                               : frontierCount(r.counts, 1);
             const uint32_t ideal = overflow ? fullCounts->ideal
                                             : frontierCount(r.counts, 2);
-            if (!patchOutput && !rebuildOutput)
+            if (segmentedRender)
+            {
+                const uint32_t renderCount = shared + current;
+                if (renderCount != 0)
+                {
+                    if (!query.resolvedRecords_[instIdx])
+                    {
+                        const std::span<const FrontierEntry> source(
+                            query.store_.data() + r.begin, renderCount);
+                        const std::span<ResolvedFrontierEntry> target(
+                            query.resolvedStore_.data() + r.begin, renderCount);
+                        resolveFrontier(FrontierCutView{source, {}}, target);
+                        query.resolvedRecords_[instIdx] = 1;
+                    }
+                    scratch.renderRuns.push_back({r.begin, renderCount});
+                    scratch.renderEntryCount += renderCount;
+                }
+            }
+            else if (!patchOutput && !rebuildOutput)
             {
                 SpatialQuery::RecCold& cold = query.recCold_[instIdx];
                 cold.output[0] = outResult.shared.count();
@@ -5120,8 +5190,13 @@ void SpatialDatabase::selectFrontierCached(const Camera& camera, const Selection
         {
             query.garbage_ += cold.capacity;
             if (size_t(query.used_) + n > query.store_.size())
+            {
                 query.store_.resize_uninitialized(
                     std::max<size_t>(size_t(query.used_) + n, query.store_.size() * 2 + 256));
+                if (segmentedRender || !query.resolvedStore_.empty())
+                    query.resolvedStore_.resize_uninitialized(
+                        query.store_.size());
+            }
             r.begin = query.used_;
             cold.capacity = n;
             query.used_ += n;
@@ -5170,6 +5245,21 @@ void SpatialDatabase::selectFrontierCached(const Camera& camera, const Selection
         if (nIdeal)
             std::memcpy(dst + nShared + nCurrent, w.frontierBuffer.idealOnly.data(),
                         size_t(nIdeal) * sizeof(FrontierEntry));
+
+        if (!query.resolvedRecords_.empty())
+        {
+            query.resolvedRecords_[instIdx] = 0;
+            if (segmentedRender && nShared + nCurrent != 0)
+            {
+                const std::span<const FrontierEntry> source(
+                    dst, nShared + nCurrent);
+                const std::span<ResolvedFrontierEntry> target(
+                    query.resolvedStore_.data() + r.begin,
+                    nShared + nCurrent);
+                resolveFrontier(FrontierCutView{source, {}}, target);
+                query.resolvedRecords_[instIdx] = 1;
+            }
+        }
 
         if (eligible)
         {
@@ -5241,7 +5331,7 @@ void SpatialDatabase::selectFrontierCached(const Camera& camera, const Selection
                 rebuildOutput = true;
             }
         }
-        else if (!rebuildOutput)
+        else if (!segmentedRender && !rebuildOutput)
         {
             // From the walk buffer, not from the slab: same bytes, still hot.
             cold.output[0] = outResult.shared.count();
@@ -5250,6 +5340,11 @@ void SpatialDatabase::selectFrontierCached(const Camera& camera, const Selection
             outResult.shared.pushRange(w.frontierBuffer.shared.data(), nShared);
             outResult.currentOnly.pushRange(w.frontierBuffer.currentOnly.data(), nCurrent);
             outResult.idealOnly.pushRange(w.frontierBuffer.idealOnly.data(), nIdeal);
+        }
+        if (segmentedRender && nShared + nCurrent != 0)
+        {
+            scratch.renderRuns.push_back({r.begin, nShared + nCurrent});
+            scratch.renderEntryCount += nShared + nCurrent;
         }
         ++query.walked_;
     }
@@ -5294,8 +5389,10 @@ void SpatialDatabase::selectFrontierCached(const Camera& camera, const Selection
     query.wholeInstanceTravel_ = instanceMotionTravelGlobal_;
     query.wholeEpoch_ = query.epoch_;
     query.wholeContentGeneration_ = frontierContentGeneration_;
-    scratch.retainedVisible = outResult.retainsExisting_;
-    scratch.retainedAllVisible = outResult.retainsExisting_ && allVisible;
+    scratch.retainedVisible = outResult.retainsExisting_ || segmentedRender;
+    scratch.retainedAllVisible =
+        (outResult.retainsExisting_ || segmentedRender) && allVisible;
+    if (segmentedRender) scratch.renderRunsValid = true;
     query.visibleMappingVersion_ = instanceMappingVersion_;
 #ifdef FRONTIER_STATS
     query.stats_ = w.stats;
@@ -5461,6 +5558,64 @@ FrontierResultView SpatialQuery::selectFrontier(const SpatialDatabase& database,
     scratch.lastSceneSpatialVersion = database.instanceSpatialVersion_;
     scratch.haveLastScene = memoEligible;
     return output.view();
+}
+
+RenderFrontierView SpatialQuery::selectRenderFrontier(
+    const SpatialDatabase& database, const Camera& camera,
+    const SelectionParams& params)
+{
+    QueryScratch& scratch = *scratch_;
+    const bool segmented =
+        reuseEnabled_ &&
+        database.flatInstanceCount_ != database.liveInstances_.size();
+    if (segmented)
+    {
+        scratch.segmentedRenderRequested = true;
+        struct SegmentedRequestGuard
+        {
+            QueryScratch& scratch;
+            ~SegmentedRequestGuard()
+            {
+                scratch.segmentedRenderRequested = false;
+            }
+        } guard{scratch};
+        FrontierResultSink discard;
+        selectFrontier(database, camera, params, discard);
+        return {
+            std::span<const ResolvedFrontierEntry>(resolvedStore_.data(),
+                                                   resolvedStore_.size()),
+            std::span<const RenderFrontierRun>(scratch.renderRuns.data(),
+                                               scratch.renderRuns.size()),
+            scratch.renderEntryCount};
+    }
+
+    // Reuse-disabled and all-flat databases do not retain per-instance
+    // hierarchical records. Materialize one contiguous fallback run so the
+    // renderer consumes the same scatter/gather interface in every mode.
+    const FrontierResultView frontier = selectFrontier(database, camera, params);
+    const size_t count = frontier.currentSize();
+    scratch.resolvedCurrent.resize_uninitialized(count);
+    const std::span<ResolvedFrontierEntry> storage(
+        scratch.resolvedCurrent.data(), count);
+    const std::span<ResolvedFrontierEntry> resolved =
+        database.resolveFrontier(frontier.current(), storage);
+    FRONTIER_ASSERT(resolved.size() == count,
+                    "render frontier resolution size mismatch");
+    scratch.renderRuns.clear();
+    if (count != 0)
+    {
+        FRONTIER_CHECK(count <= UINT32_MAX,
+                       "render frontier exceeds 32-bit run capacity");
+        scratch.renderRuns.push_back({0, uint32_t(count)});
+    }
+    scratch.renderEntryCount = count;
+    scratch.renderRunsValid = false;
+    return {
+        std::span<const ResolvedFrontierEntry>(scratch.resolvedCurrent.data(),
+                                               count),
+        std::span<const RenderFrontierRun>(scratch.renderRuns.data(),
+                                           scratch.renderRuns.size()),
+        count};
 }
 
 } // namespace frontier
