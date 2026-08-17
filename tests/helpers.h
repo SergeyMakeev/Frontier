@@ -88,6 +88,24 @@ struct SpatialDatabase::TestAccess
         return instance ? instance->worldBox : AABB::empty();
     }
 
+    static AABB tlasLeafBounds(SpatialDatabase& database,
+                               InstanceHandle handle)
+    {
+        const InstanceId dense = database.denseInstanceId(handle);
+        if (dense == kInvalidInstanceId) return AABB::empty();
+        const Instance& instance = database.instances_[dense];
+        return database.tlasNodes_[instance.tlasNode()].bounds.lane(
+            instance.tlasLane());
+    }
+
+    static bool tlasLeafIsLoose(SpatialDatabase& database,
+                                InstanceHandle handle)
+    {
+        const InstanceId dense = database.denseInstanceId(handle);
+        return dense != kInvalidInstanceId &&
+               database.instanceTlasLoose_[dense] != 0;
+    }
+
     static size_t definitionBytes() { return sizeof(SubtreeDefinitionRt); }
     static const void* definitionData(const SpatialDatabase& database,
                                       SubtreeHandle handle)

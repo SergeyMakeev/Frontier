@@ -1106,6 +1106,9 @@ public:
                                const InstanceDesc& desc = {});
 
     void removeInstance(InstanceHandle instance); // no-op if stale
+    // Update exact instance state now and coalesce TLAS maintenance until the
+    // next applyUpdates(). Small cohorts retain swept grow-only envelopes;
+    // large cohorts publish one exact bottom-up TLAS refit.
     void moveInstance(InstanceHandle instance,
                       const InstanceTransform& transform);
     // Opt into instance-granular culling for render-native queries. The TLAS
@@ -1219,9 +1222,10 @@ public:
     // one, the shared authored bounds otherwise. Flushes pending moves first.
     AABB nodeBounds(InstanceHandle instance, NodeHandle node);
 
-    // Publish queued changes and prepare a stable read-only selection
-    // snapshot. Call once before a group of selections, even when no database
-    // contents changed; it also advances the epoch used by collection aging.
+    // Publish queued node-bound and instance-motion changes, perform scheduled
+    // TLAS maintenance, and prepare a stable read-only selection snapshot.
+    // Call once before a group of selections, even when no database contents
+    // changed; it also advances the epoch used by collection aging.
     // No SpatialDatabase mutation (including collect) may overlap or occur before every
     // SpatialQuery selection using this snapshot has completed.
     void applyUpdates();
@@ -1232,7 +1236,8 @@ public:
     // intentionally heavier than applyUpdates(): call it at an occasional
     // synchronization point after disruptive database changes (level transition,
     // teleport, loading screen), not as routine per-frame maintenance. It
-    // flushes pending bounds edits but does not advance collection age.
+    // consumes pending bounds and instance-motion edits but does not advance
+    // collection age.
     void optimize();
 
     // ---- garbage collection ----------------------------------------------------
@@ -2174,6 +2179,8 @@ private:
                        std::vector<TlasItem>& stack) const;
     void tlasOnInstanceMoved(InstanceId id);
     void tlasNoteGrowth(float addedArea);
+    void flushInstanceMoves();
+    void tlasRefitAllExact();
 
     // Incremental structural edits, so that spawning or removing one instance
     // costs O(tree depth) instead of a full rebuild. Both no-op when a rebuild
@@ -2408,6 +2415,9 @@ private:
 
     std::vector<MortonItem> tlasKeys_;
     std::vector<MortonItem> tlasKeysTmp_;
+    // Build and publication are mutually exclusive. Between rebuilds these
+    // existing scratch buffers retain exact-refit postorder and pending moved
+    // dense ids, avoiding extra SpatialDatabase fields or allocations.
     std::vector<int32_t>                       tlasLevelTmp_;
     std::vector<uint32_t>                      tlasItemsTmp_;
     // Cold and last: adding the optional refined plan must not move any of the

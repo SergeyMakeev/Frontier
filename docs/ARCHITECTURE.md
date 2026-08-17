@@ -128,10 +128,22 @@ the existing query epoch.
 
 Initial and quality builds use the configured `BinnedSAH`, `Median`, or `Morton`
 tier. Incremental insertion descends by least bound growth and splits a full
-leaf. Removal invalidates a lane. Motion grows ancestor lanes until already
-contained. Population drift, edit fraction, and added surface area schedule
-rebuilds. Motion does not rebuild merely because many exact leaf lanes changed;
-only measured ancestor-bound growth consumes the motion rebuild budget.
+leaf. Removal invalidates a lane. Instance motion updates exact dense instance
+state immediately but defers TLAS writes to `applyUpdates()`. A cohort smaller
+than one quarter of the TLAS population uses conservative grow-only leaf and
+ancestor propagation. At or above that threshold, publication streams the
+complete TLAS once in retained bottom-up order, copies exact leaf state from
+the dense instance array, recomputes interior lanes, and clears loose-leaf
+flags. This trades scattered mover-to-root walks for sequential O(TLAS nodes)
+work and shrinks old swept envelopes at the same time. Population drift, edit
+fraction, and added surface area still schedule quality rebuilds.
+
+The large-batch path reuses mutually exclusive build scratch: one 32-bit array
+holds pending dense instance ids and the temporary DFS stack, while another
+retains the TLAS postorder until topology changes. It adds no field or
+allocation to `SpatialDatabase`; a structural edit invalidates the retained
+order. Pending node-bound edits are folded into exact instance boxes before the
+actor-motion publication pass.
 
 An 80-byte `Instance` keeps transform, exact world bound, maximum root error,
 mask, mounted-root slot, generation, overlay-list index, TLAS back-pointer, and

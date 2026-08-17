@@ -1353,7 +1353,8 @@ void moveInstance(InstanceHandle instance, const Transform& transform);
 - **Effects:** moves the TLAS root and every mounted descendant as one object;
   translation and angular displacement consume affected query records' exact
   distance margins, while scale changes invalidate those records. Public
-  handles remain valid.
+  handles remain valid. Exact instance state changes during submission; TLAS
+  maintenance is coalesced and becomes queryable after `applyUpdates()`.
 - **Stale behavior:** no-op.
 - **Contract:** position and scale are finite, with positive scale and finite
   reciprocal. The transformed root bound and error must remain representable
@@ -1403,7 +1404,9 @@ void moveInstances(MotionGroup& group,
   `i`; one uniform scale applies to all live members.
 - **Effects:** moves live instances in cached physical order. Stale handles are
   ignored. If the group contains the same live instance more than once, the
-  final caller-order position wins.
+  final caller-order position wins. TLAS writes are deferred to the publication
+  barrier: small cohorts grow conservative swept paths, while a cohort covering
+  at least one quarter of the TLAS leaves triggers one exact bottom-up refit.
 - **Reuse accounting:** the largest L1 translation in the effective batch is
   added once to the database-wide conservative motion path. This lets a query
   validate a retained complete cut in O(1); individual per-instance odometers
@@ -1601,21 +1604,22 @@ or render transform.
 void applyUpdates();
 ```
 
-Flushes bounds, performs any scheduled TLAS rebuild, publishes the state for a
-group of read-only selections, and increments `frame()`. Call once before each
-selection group, even when the writer made no scene edits, if collection age
-should advance. No mutation or collection may overlap selections using the
-published snapshot.
+Flushes node bounds, coalesces pending instance motion, performs any scheduled
+TLAS refit or rebuild, publishes the state for a group of read-only selections,
+and increments `frame()`. Call once before each selection group, even when the
+writer made no scene edits, if collection age should advance. No mutation or
+collection may overlap selections using the published snapshot.
 
 ```cpp
 void optimize();
 ```
 
-Flushes bounds, forces a quality-tier TLAS rebuild, compacts dead dense
-instance slots, and restores physical query-record order. Public
-`InstanceHandle` values, root `NodeHandle` values, and `FrontierEntry::instance()`
-ids remain stable. This is a heavy synchronization-point operation and does
-not advance `frame()` or collection age.
+Consumes pending bounds and instance motion, forces a quality-tier TLAS
+rebuild, compacts dead dense instance slots, and restores physical query-record
+order. Public `InstanceHandle` values, root `NodeHandle` values, and
+`FrontierEntry::instance()` ids remain stable. This is a heavy
+synchronization-point operation and does not advance `frame()` or collection
+age.
 
 ### Mounted-placement collection
 

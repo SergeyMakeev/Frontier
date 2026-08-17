@@ -1843,7 +1843,7 @@ void SpatialDatabase::moveInstanceDense(InstanceId dense, float4 pos, float scal
     inst.maxErrWorld = maxErrWorld;
     if (!instanceOrientations_.empty())
         instanceOrientations_[dense].yaw = yaw;
-    tlasOnInstanceMoved(dense);
+    tlasItemsTmp_.push_back(dense);
 }
 
 void SpatialDatabase::refreshMotionGroup(MotionGroup& group) const
@@ -2425,6 +2425,11 @@ void SpatialDatabase::applyUpdates()
 {
     ++frame_;
     flushBounds();
+    // Publish the final instance boxes after all local-bound edits in this
+    // mutation batch have been folded into them. A large actor-motion cohort
+    // can then rebuild exact TLAS lanes once instead of immediately growing
+    // stale pre-deformation bounds and touching the same ancestors again.
+    flushInstanceMoves();
     if (tlasDirty_)
     {
         const bool firstSpatialization =
@@ -2435,6 +2440,9 @@ void SpatialDatabase::applyUpdates()
 
 void SpatialDatabase::optimize()
 {
+    // The rebuild below consumes the exact Instance records directly, so no
+    // intermediate refit of the old topology is necessary.
+    tlasItemsTmp_.clear();
     flushBounds();
     tlasDirty_ = true;
     tlasQualityBuild_ = true;
@@ -2728,6 +2736,7 @@ int32_t SpatialDatabase::tlasAllocNode()
 // rebuild. This is what bounds how much of that accumulates.
 void SpatialDatabase::tlasNoteEdit()
 {
+    tlasLevelTmp_.clear();
     ++tlasEdits_;
     if (float(tlasEdits_) > float(tlasLeafCount_) * config_.tlasEditFraction)
         tlasDirty_ = true;
@@ -2918,6 +2927,112 @@ void SpatialDatabase::tlasOnInstanceMoved(InstanceId id)
         tlasGrowUp(nodeIdx, envelope, inst.maxErrWorld, inst.mask);
 
     tlasNoteGrowth(added);
+}
+
+void SpatialDatabase::flushInstanceMoves()
+{
+    if (tlasItemsTmp_.empty()) return;
+    if (tlasDirty_)
+    {
+        tlasItemsTmp_.clear();
+        return;
+    }
+
+    // Once a quarter of the population moves, independently probing the leaf
+    // envelope and shared ancestors costs more memory traffic than streaming
+    // the complete compact TLAS once. The exact refit also removes loose-lane
+    // retests from the following query.
+    if (tlasItemsTmp_.size() * 4 >= tlasLeafCount_)
+    {
+        tlasItemsTmp_.clear();
+        tlasRefitAllExact();
+    }
+    else
+    {
+        for (const InstanceId dense : tlasItemsTmp_)
+            if (dense < instances_.size() && instances_[dense].alive())
+                tlasOnInstanceMoved(dense);
+        tlasItemsTmp_.clear();
+    }
+}
+
+void SpatialDatabase::tlasRefitAllExact()
+{
+    if (tlasRoot_ < 0) return;
+    materializeTlasGlobalOffset();
+
+    if (tlasLevelTmp_.empty())
+    {
+        std::vector<uint32_t>& stack = tlasItemsTmp_;
+        stack.clear();
+        stack.push_back(uint32_t(tlasRoot_));
+        while (!stack.empty())
+        {
+            const uint32_t packed = stack.back();
+            stack.pop_back();
+            const uint32_t nodeIndex = packed & kInstanceIdMask;
+            if ((packed & ~kInstanceIdMask) != 0)
+            {
+                tlasLevelTmp_.push_back(int32_t(nodeIndex));
+                continue;
+            }
+
+            stack.push_back(nodeIndex | (1u << kInstanceIdBits));
+            const TlasNode& node = tlasNodes_[nodeIndex];
+            uint32_t lanes = node.validLanes();
+            while (lanes)
+            {
+                const uint32_t lane = uint32_t(std::countr_zero(lanes));
+                lanes &= lanes - 1;
+                if (node.child[lane] >= 0)
+                    stack.push_back(uint32_t(node.child[lane]));
+            }
+        }
+    }
+
+    float exactArea = 0.0f;
+    for (const int32_t signedNodeIndex : tlasLevelTmp_)
+    {
+        const uint32_t nodeIndex = uint32_t(signedNodeIndex);
+        TlasNode& node = tlasNodes_[nodeIndex];
+        TlasMeta& meta = tlasMeta_[nodeIndex];
+        uint32_t lanes = node.validLanes();
+        while (lanes)
+        {
+            const uint32_t lane = uint32_t(std::countr_zero(lanes));
+            lanes &= lanes - 1;
+            const int32_t child = node.child[lane];
+            AABB bounds;
+            float maxError;
+            uint32_t layerMask;
+            if (child < 0)
+            {
+                const InstanceId dense = InstanceId(~child);
+                const Instance& instance = instances_[dense];
+                bounds = instance.worldBox;
+                maxError = instance.maxErrWorld;
+                layerMask = instance.mask;
+                instanceTlasLoose_[dense] = 0;
+            }
+            else
+            {
+                bounds = tlasNodeExtent(uint32_t(child), maxError,
+                                        layerMask);
+            }
+            node.bounds.setLane(lane, bounds);
+            meta.maxErr.v[lane] = maxError;
+            meta.laneMask[lane] = layerMask;
+            exactArea += surfaceArea(bounds);
+        }
+    }
+
+    tlasGrownArea_ = std::max(0.0f, exactArea - tlasBaseArea_);
+    if (tlasBaseArea_ > 0.0f &&
+        tlasGrownArea_ > tlasBaseArea_ * config_.tlasAreaDrift)
+    {
+        tlasDirty_ = true;
+        tlasQualityBuild_ = true;
+    }
 }
 
 // 21 bits per axis -> 63-bit Morton key.
@@ -3199,7 +3314,8 @@ int32_t SpatialDatabase::tlasBuildRange(std::vector<uint32_t>& items, int lo, in
 void SpatialDatabase::reorderInstancesByTlas()
 {
     FRONTIER_ASSERT(pendingMoves_.empty(),
-                "SpatialDatabase: cannot reorder instances with queued deformation edits");
+                    "SpatialDatabase: cannot reorder instances with queued "
+                    "deformation edits");
 
     const size_t slotCount = instances_.size();
     const size_t liveCount = liveInstances_.size();
@@ -3329,6 +3445,7 @@ void SpatialDatabase::tlasRebuild(bool reorderInstances)
     materializeTlasGlobalOffset();
     tlasNodes_.clear();
     tlasMeta_.clear();
+    tlasLevelTmp_.clear();
     tlasFreeNodes_.clear();
     tlasRoot_ = -1;
     tlasEdits_ = 0;
@@ -3458,6 +3575,8 @@ void SpatialDatabase::tlasRebuild(bool reorderInstances)
     for (const TlasNode& n : tlasNodes_)
         for (uint32_t l = 0; l < kWide; ++l)
             if (n.validMask & (1u << l)) tlasBaseArea_ += surfaceArea(n.bounds.lane(l));
+    tlasItemsTmp_.clear();
+    tlasLevelTmp_.clear();
 }
 
 template<bool UseMask, bool UseMinPix>
@@ -3466,8 +3585,10 @@ void SpatialDatabase::tlasQueryImpl(const Camera& view, float minPix,
                           std::vector<TlasItem>& stack) const
 {
     outVisible.clear();
-    FRONTIER_CHECK(!tlasDirty_ && pendingMoves_.empty(),
-               "SpatialQuery::selectFrontier: call applyUpdates() after database changes");
+    FRONTIER_CHECK(!tlasDirty_ && pendingMoves_.empty() &&
+                       tlasItemsTmp_.empty(),
+                   "SpatialQuery::selectFrontier: call applyUpdates() after "
+                   "database changes");
     if (tlasRoot_ < 0) return;
 
     const float4 qmn = view.queryMin(), qmx = view.queryMax();
@@ -3600,8 +3721,10 @@ void SpatialDatabase::consumeMountUsage(SpatialQuery& query)
 
 bool SpatialDatabase::tlasRootContainsPopulation(const Camera& view) const
 {
-    FRONTIER_CHECK(!tlasDirty_ && pendingMoves_.empty(),
-               "SpatialQuery::selectFrontier: call applyUpdates() after database changes");
+    FRONTIER_CHECK(!tlasDirty_ && pendingMoves_.empty() &&
+                       tlasItemsTmp_.empty(),
+                   "SpatialQuery::selectFrontier: call applyUpdates() after "
+                   "database changes");
     if (tlasRoot_ < 0) return true;
 
     const TlasNode& root = tlasNodes_[uint32_t(tlasRoot_)];

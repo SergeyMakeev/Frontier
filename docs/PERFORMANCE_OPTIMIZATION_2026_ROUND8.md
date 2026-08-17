@@ -1274,3 +1274,179 @@ link-layout assumption. The observed gain survives both payload ABIs, full
 render submission, moving actors, and unrelated hierarchy controls. The cost is
 the explicitly bounded, lazy, definition-shared acceleration memory and a cold
 registration pass for eligible static definitions.
+
+## Experiment 14: batch large actor motion into one exact TLAS refit
+
+### Portability constraint
+
+This experiment follows the integration rule established after the rejected
+PGO work. Baseline and candidate are ordinary GCC 13.3 CMake `Release` builds
+with `FRONTIER_PGO_MODE=OFF` and `FRONTIER_IPO=OFF`. The implementation has no
+profile corpus, compiler optimization attribute, custom text section, linker
+ordering rule, function-order file, or target-specific intrinsic. The final
+helpers are grouped with the TLAS maintenance code by responsibility; source or
+symbol placement is not an acceptance mechanism.
+
+An intermediate version deliberately placed the new publication helpers after
+query traversal to see whether unrelated control movement was code-layout
+noise. Another tried a special zero-error root kernel. Both ideas are rejected:
+the former is not a portable architectural gain and the latter made controls
+2-3% slower. The final report below uses ordinary code organization and records
+the remaining unrelated control movement instead of tuning around it.
+
+### Measured cost split and theory
+
+The live-city frame has 1,191 top-level instances, of which 1,100 move every
+frame: 100 cars plus 1,000 pedestrians. Their detailed 50- and 10-leaf actor
+trees are mounted below those roots, so one actor transform changes the exact
+world bound of one TLAS leaf rather than independently refitting every authored
+part. Selection emits about 24,100 visible frontier entries in roughly 293
+render runs per frame.
+
+At the Experiment 13 baseline, payload64 spent approximately 165 us submitting
+and publishing actor motion, 304 us selecting the cut after motion was
+subtracted, and another 63 us resolving/scanning the render payload. Large-scale
+motion was therefore the first remaining phase with a simple opportunity to
+remove work.
+
+Previously, every `moveInstanceDense()` immediately called
+`tlasOnInstanceMoved()`. That operation loaded the instance's TLAS
+back-pointer, examined and usually grew its leaf envelope, then walked parents
+until an already-containing ancestor allowed an early exit. This is good for a
+few movers: it touches only affected paths and bounded repeated motion often
+fits an existing swept envelope. It is poor when 1,100 of 1,191 roots move:
+the same shared ancestors are revisited through many scattered leaf-to-root
+walks, and loose leaf envelopes add exact-bound retests to the following query.
+
+The replacement is a density-dependent publication algorithm:
+
+1. Motion submission validates and updates the exact dense `Instance` record,
+   then appends its dense id to a flat pending stream. It does not mutate TLAS
+   nodes immediately.
+2. `applyUpdates()` first folds queued local-node deformation into final exact
+   instance boxes. It then publishes actor motion, preserving correctness for a
+   mixed "move actor and deform part" batch.
+3. If fewer than one quarter as many submissions as TLAS leaves are pending,
+   the existing grow-only per-instance algorithm runs unchanged.
+4. At or above one quarter, publication traverses the complete compact TLAS
+   once in bottom-up order. Leaf lanes copy exact bounds, error, and mask from
+   dense `Instance` records and clear their loose flags. Interior lanes union
+   their already-refitted children. The following selection therefore sees a
+   tight tree with no mover-specific exact-bound retests.
+5. Exact lane area is accumulated during the same pass. If topology quality is
+   now outside the configured area-drift budget, the existing quality rebuild
+   is scheduled; a refit never substitutes for a required topology rebuild.
+
+The break-even rule intentionally counts submissions rather than unique ids.
+Duplicates remain correct because exact instance state is last-write-wins; at
+worst, duplicates choose the full streaming pass earlier. Building a hash set
+or stamp array solely to deduplicate would add the random memory traffic this
+algorithm is intended to remove.
+
+### Data layout
+
+No runtime record grows and no new allocation is introduced. The algorithm
+uses data already present for rebuilds:
+
+- `Instance` remains 80 bytes and is the authoritative exact stream for world
+  bound, root error, layer mask, transform, orientation-side index, and TLAS
+  back-pointer.
+- `TlasNode` remains the query-hot wide SoA record containing bound lanes,
+  child references, valid flags, and parent index. `TlasMeta` remains the cold
+  parallel stream for maximum error and layer masks.
+- `instanceTlasLoose_` remains one byte per dense instance. The exact pass
+  clears it as each leaf lane is rewritten.
+- `tlasItemsTmp_`, an existing 32-bit rebuild scratch array, holds pending
+  dense mover ids between submission and publication. During the exact refit
+  it is reused as the iterative DFS stack.
+- `tlasLevelTmp_`, another existing 32-bit rebuild scratch array, retains the
+  node postorder after its first construction. Subsequent large-motion frames
+  stream that order directly. Insert, remove, or rebuild invalidates it.
+
+Build, publication, and read-only selection are already mutually exclusive
+under the database writer/read barrier, so these scratch roles cannot overlap.
+Capacity was already retained by TLAS construction; keeping the postorder's
+logical size live does not increase allocated capacity. The tradeoff is a more
+explicit lifetime invariant for the two scratch arrays, covered by structural
+edit and exact-refit tests.
+
+### Experiment sequence
+
+The first implementation used two new always-live vectors. It already improved
+motion by about 29% (`frontier-paired-20260817T192146Z`) and live-city frames by
+18-20% (`frontier-paired-20260817T192411Z`), proving the algorithmic theory, but
+the extra object layout and allocations were unnecessary. Reusing rebuild
+scratch removed both.
+
+Several control screens then exposed the very integration concern that makes
+code-placement tuning unacceptable. Moving the helper within
+`spatial_database.cpp` changed non-executing hierarchy controls by around one
+percent, and a zero-error root dispatch intended to compensate made them worse.
+Neither is kept or credited. The final source keeps only the batching policy,
+exact streaming refit, scratch reuse, and correctness support.
+
+### Final SBC result
+
+Final report:
+`/home/codex-perf/frontier/results/frontier-paired-20260817T201417Z`.
+It compares the exact final source with the frozen ordinary-Release `5397f59`
+build over four ABBA cycles per case and payload ABI.
+
+| Case | Payload | Baseline | Candidate | Paired change | 95% interval |
+|---|---:|---:|---:|---:|---:|
+| live-city selection | 32 | 479.467 us | 393.991 us | **-17.22%** | [-18.25%, -16.28%] |
+| live-city selection | 64 | 476.822 us | 401.717 us | **-15.93%** | [-16.44%, -15.42%] |
+| render + submission | 32 | 478.983 us | 402.987 us | **-15.60%** | [-16.14%, -15.07%] |
+| render + submission | 64 | 539.661 us | 459.392 us | **-14.99%** | [-15.80%, -14.55%] |
+| motion-only | 32 | 165.261 us | 117.800 us | **-28.64%** | [-28.91%, -28.29%] |
+| motion-only | 64 | 165.754 us | 119.285 us | **-28.21%** | [-28.44%, -27.99%] |
+| uncached hierarchy, 50% | 32 | 1596.615 us | 1596.544 us | -1.55% | [-3.87%, +0.83%] |
+| uncached hierarchy, 50% | 64 | 1539.487 us | 1541.749 us | +0.50% | [-0.71%, +1.82%] |
+| uncached hierarchy, 100% | 32 | 2868.922 us | 2931.242 us | +2.15% | [+1.68%, +2.79%] |
+| uncached hierarchy, 100% | 64 | 2908.943 us | 2946.344 us | +1.08% | [+0.58%, +1.63%] |
+
+All 160 samples ran on CPU 4 at exactly 2.208 GHz. Temperature stayed between
+45.307 and 46.230 C, one-minute load between 1.000 and 1.297, and maximum
+CPU-time/wall-time divergence was 0.028%. Every motion and live-city cycle
+improved. Motion coefficients of variation were 0.13-0.52%.
+
+The 100%-hierarchy control does not submit motion and cannot execute the new
+publication path. Its 1.08-2.15% change is nevertheless reported as a real
+binary-code-generation sensitivity, not relabeled as an algorithmic result.
+Chasing it through section placement, source reordering, `hot`/`cold`
+attributes, or a profile-trained build would recreate the fragile optimization
+being excluded. It remains a cross-compiler/integration measurement concern;
+the accepted claim is limited to the executing moving-scene paths above.
+
+### Correctness and tradeoffs
+
+`Motion.LargeMotionBatchPublishesOneExactTlasRefit` creates 64 roots, optimizes
+their TLAS, moves the complete cohort, publishes once, and verifies every leaf
+lane equals its authoritative `Instance.worldBox` and every loose flag is
+clear. The complete Debug matrix passes 428/428 tests across BVH4, BVH8,
+payload32, and payload64, including randomized TLAS churn, duplicate/stale
+motion groups, global-offset materialization, deformation, and concurrent
+read-only queries.
+
+The API timing changes deliberately: actor transform submission no longer
+writes the TLAS immediately. Exact instance state is updated during submission,
+but callers must reach `applyUpdates()` before selection, which was already the
+documented publication contract. `optimize()` consumes pending actor state by
+rebuilding directly from exact instances.
+
+For sparse motion, the old grow-only path remains the right algorithm and is
+retained. For dense motion, publication becomes O(TLAS nodes) even if many
+movers happened to remain inside old envelopes; the one-quarter threshold is a
+measured fixed policy rather than a universally optimal constant. The gain is
+largest when a large fraction of roots move independently. A complete cohort
+sharing one translation should still use `translateInstances()`, whose global
+offset is O(1) and strictly cheaper.
+
+### Decision
+
+Keep and commit. The result is an algorithm/data-layout improvement: it changes
+the unit of work from scattered per-actor ancestor walks to one sequential
+topology pass and reuses existing dense streams and scratch memory. It provides
+about a 1.40x motion-phase speedup and a 1.18-1.21x full moving-city speedup on
+the SBC without PGO, LTO, custom sections, compiler hints, or link-layout
+assumptions.

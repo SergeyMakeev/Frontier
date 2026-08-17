@@ -93,6 +93,45 @@ TEST(Motion, MotionGroupSubmitsIndependentYawTransforms)
     EXPECT_FLOAT_EQ(secondBounds.mx.z, 6.0f);
 }
 
+TEST(Motion, LargeMotionBatchPublishesOneExactTlasRefit)
+{
+    constexpr uint32_t count = 64;
+    SpatialDatabase database;
+    std::vector<InstanceHandle> handles;
+    std::vector<InstanceTransform> transforms(count);
+    handles.reserve(count);
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        InstanceDesc desc;
+        desc.pos = float4::point(float(i % 8) * 4.0f, 0.0f,
+                                 float(i / 8) * 4.0f);
+        handles.push_back(database.instantiate(
+            node(1000 + i, 0.0f, box()), desc));
+        transforms[i].pos = float4::point(
+            200.0f - float(i % 8) * 5.0f, float(i & 1u),
+            -100.0f + float(i / 8) * 6.0f);
+    }
+    database.applyUpdates();
+    database.optimize();
+
+    SpatialDatabase::MotionGroup group(handles);
+    database.moveInstances(group, transforms);
+    database.applyUpdates();
+
+    for (const InstanceHandle handle : handles)
+    {
+        const AABB exact = TestAccess::instanceBounds(database, handle);
+        const AABB leaf = TestAccess::tlasLeafBounds(database, handle);
+        EXPECT_FLOAT_EQ(leaf.mn.x, exact.mn.x);
+        EXPECT_FLOAT_EQ(leaf.mn.y, exact.mn.y);
+        EXPECT_FLOAT_EQ(leaf.mn.z, exact.mn.z);
+        EXPECT_FLOAT_EQ(leaf.mx.x, exact.mx.x);
+        EXPECT_FLOAT_EQ(leaf.mx.y, exact.mx.y);
+        EXPECT_FLOAT_EQ(leaf.mx.z, exact.mx.z);
+        EXPECT_FALSE(TestAccess::tlasLeafIsLoose(database, handle));
+    }
+}
+
 TEST(Motion, IdentityOnlySceneKeepsOrientationStreamUnallocated)
 {
     SpatialDatabase database;

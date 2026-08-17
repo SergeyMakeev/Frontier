@@ -747,7 +747,8 @@ Frontier distinguishes three kinds of movement.
 ### Move an entire top-level object
 
 `moveInstance()` changes the translation, uniform scale, and planar yaw of the
-permanent root and everything mounted below it:
+permanent root and everything mounted below it. Exact instance state changes at
+submission time; the TLAS snapshot is published by the next `applyUpdates()`:
 
 ```cpp
 database.moveInstance(carInstance, InstanceTransform{
@@ -781,12 +782,13 @@ When the complete cohort shares one translation, submit that fact directly:
 database.translateInstances(trafficGroup, frameDelta);
 ```
 
-`translateInstances()` is the preferred rigid-motion path. A group covering
-the complete live population updates one deferred world offset in O(1), without
-rewriting instance records or TLAS nodes. A differential edit, addition, or
-rebuild materializes that offset transparently. Subsets update their exact
-instance transforms, but bounded repeated motion reuses grow-only swept TLAS
-leaf envelopes instead of rewriting the same leaves every frame.
+`translateInstances()` is the preferred shared-delta rigid-motion path. A group
+covering the complete live population updates one deferred world offset in
+O(1), without rewriting instance records or TLAS nodes. A differential edit,
+addition, or rebuild materializes that offset transparently. Subsets update
+their exact instance transforms. At publication, cohorts below one quarter of
+the TLAS population reuse grow-only swept leaf envelopes; larger cohorts
+replace scattered per-mover ancestor walks with one exact bottom-up TLAS refit.
 
 Here **dense order** means Frontier's compact internal instance-slot order. It
 may change during `optimize()`, unlike public `InstanceHandle` identity and the
@@ -811,9 +813,9 @@ and physical reorder advance that epoch and force a safe group refresh.
 Pure translation or yaw does not automatically discard a reusable frontier.
 Frontier charges translation plus a conservative bound on angular point
 displacement against the same exact decision margin used for camera travel.
-TLAS leaf envelopes remain
-conservative; queries that reach a loose leaf retest its current instance bound
-exactly. A scale change still
+Small-batch TLAS leaf envelopes remain conservative; queries that reach a loose
+leaf retest its current instance bound exactly. Large-batch publication shrinks
+those envelopes back to exact bounds. A scale change still
 invalidates the affected record because it changes geometric error as well as
 distance.
 
