@@ -478,10 +478,11 @@ void consume(const FrontierResultView& cut)
 #ifndef FRONTIER_OMIT_SUBMISSION_BENCH
 void consumeLiveCitySubmissions(const RenderFrontierView& result)
 {
-    benchmark::DoNotOptimize(result.storage().data());
-    benchmark::DoNotOptimize(result.runs().data());
-    benchmark::DoNotOptimize(result.size());
-    benchmark::DoNotOptimize(result.segmentCount());
+    uint64_t checksum = 0;
+    for (const RenderFrontierRun run : result.runs())
+        for (const ResolvedFrontierEntry& entry : result[run])
+            checksum += uint64_t(entry.payload) + entry.instanceAndError;
+    benchmark::DoNotOptimize(checksum);
     benchmark::ClobberMemory();
 }
 #endif
@@ -1264,11 +1265,10 @@ BENCHMARK(BM_LiveCityMotionFrame)
     ->Unit(benchmark::kMicrosecond);
 
 // End-to-end CPU frame companion to BM_LiveCityDrivingFrame. In addition to
-// actor motion, TLAS publication, and selection, this walks the two-span
-// current cut, resolves every immutable render payload, and writes a compact
-// preallocated submission stream. It represents the downstream iteration and
-// render-packet generation cost that a selection-only benchmark intentionally
-// excludes; no allocator or graphics-driver work is timed.
+// actor motion, TLAS publication, selection, and render-frontier production,
+// this scans the payload and metadata of every resolved leaf. It represents
+// the minimum downstream iteration cost that a selection-only benchmark
+// intentionally excludes; no allocator or graphics-driver work is timed.
 #ifndef FRONTIER_OMIT_SUBMISSION_BENCH
 static void BM_LiveCityRenderSubmissionFrame(benchmark::State& state)
 {
@@ -1321,6 +1321,7 @@ static void BM_LiveCityRenderSubmissionFrame(benchmark::State& state)
         double(kLiveCityCars + kLiveCityPedestrians);
     state.counters["pedestrian_mph"] = 1.5;
     state.counters["potential_leaves"] = double(kLiveCityTotalLeaves);
+    state.counters["query_KB"] = double(query.bytes()) / 1024.0;
     state.counters["reuse_percent"] =
         visited == 0.0 ? 0.0 : 100.0 * double(totalReused) / visited;
     state.counters["simulated_seconds"] = callCount / kLiveCityFrameRate;

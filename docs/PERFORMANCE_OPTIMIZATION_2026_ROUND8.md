@@ -285,3 +285,68 @@ generation. It does not yet time a consumer reading every retained leaf after
 selection. The next controlled experiment will add the same payload/metadata
 scan to baseline and candidate binaries so the scatter/gather iteration cost
 is included without conflating it with this production win.
+
+## Experiment 4: downstream full-leaf scan control
+
+### Measurement design
+
+Compile isolated baseline and candidate submission binaries with the same
+GCC 13.3 Release/LTO/BVH4 settings. After producing the render frontier, both
+consumers accumulate the payload and packed instance/error word from every
+resolved leaf into an observed checksum. The baseline scans one contiguous
+span; the candidate scans the same fields through its ordered per-instance
+runs. Allocation and graphics-driver calls remain outside scope, but no leaf
+can now avoid downstream CPU iteration.
+
+The baseline source is the accepted grouped resolver from `6d0bac1`, rebuilt
+in the isolated `scan-base` worktree with only the checksum benchmark change.
+The candidate uses the committed per-instance cache from `932d854` with the
+same checksum. This avoids comparing the new workload against an old binary
+that did not perform it.
+
+### SBC results
+
+Focused paired report:
+`/home/codex-perf/frontier/results/frontier-paired-20260817T112005Z`
+
+| Payload | Contiguous baseline | Scatter/gather candidate | Paired change | 95% interval | CV baseline / candidate |
+|---:|---:|---:|---:|---:|---:|
+| 32 | 922.454 us | 674.842 us | **-26.77%** | [-27.00%, -26.63%] | 0.36% / 0.62% |
+| 64 | 975.393 us | 772.535 us | **-20.88%** | [-25.59%, -16.04%] | 6.81% / 0.59% |
+
+Payload32 is decisive: all three independent cycle effects lie within a
+0.37-point band (-27.00%, -26.67%, -26.63%). Payload64 baseline samples were
+again noisy under varying host load, but every cycle won (-25.59%, -20.72%,
+-16.04%) and even the upper confidence bound remains a large improvement.
+
+All 24 processes held CPU 4 at exactly 2.208 GHz. Temperature was
+44.384-46.230 C, one-minute load 1.007-2.902, and maximum CPU/wall divergence
+0.018%.
+
+The scan costs about 98 us/frame on the payload32 candidate and 138 us/frame
+on payload64, versus about 51 and 95 us added to the contiguous baselines.
+Thus scatter/gather iteration gives back roughly 47 us (payload32) and 43 us
+(payload64), but avoids 294 and 245 us of production work. Complete throughput
+including every leaf read remains 1.37x and 1.26x faster.
+
+### Memory observation
+
+The candidate query reports 1,358.5 KiB for payload32 and 1,868.5 KiB for
+payload64 versus 1,228.2 KiB for the handle-only baseline query: net query
+increases of 130.3 and 640.3 KiB. The increase is smaller than a raw second
+slab because the specialized path no longer retains global handle-output
+buckets. The benchmark baseline also owns a separate worst-case 100,000-entry
+submission vector (781.3 KiB payload32, 1,562.5 KiB payload64), whereas the
+candidate view directly references query storage. End-to-end retained memory
+in this workload is therefore lower despite the per-instance mirror; callers
+that provision a tighter baseline submission vector will see a smaller memory
+advantage.
+
+### Decision
+
+Keep the full-leaf scan in the realistic submission benchmark. The earlier
+measurement caveat is closed: the performance win survives actual downstream
+iteration by a wide margin. The remaining payload64 gap points to the next
+experiment: split the naturally padded 16-byte AoS entry into dense payload
+and packed-metadata streams, reducing retained bytes and scan bandwidth while
+preserving the per-instance run architecture.
