@@ -350,3 +350,81 @@ iteration by a wide margin. The remaining payload64 gap points to the next
 experiment: split the naturally padded 16-byte AoS entry into dense payload
 and packed-metadata streams, reducing retained bytes and scan bandwidth while
 preserving the per-instance run architecture.
+
+## Experiment 5: run-level instance identity and compact leaf streams
+
+### Theory
+
+The proposed payload/metadata SoA still repeats a 24-bit instance id on every
+leaf. That value is invariant across an instance cache record and its render
+run; renderers also select the instance transform once for the run, not once
+per leaf. Move instance identity into the run descriptor, keep payloads in a
+dense `UserPayload` stream, and store only the eight-bit error code per leaf.
+
+This changes raw renderer-cache bytes per leaf from 8 to 5 for payload32 and
+from a padded 16 to 9 for payload64. `RenderFrontierRun` grows from 8 to 12
+bytes by adding the instance id, but only about 291 descriptors represent the
+24,073-leaf average cut, so this costs roughly 1.1 KiB per frame while removing
+tens or hundreds of KiB from retained leaf storage.
+
+### New API and layout
+
+`RenderFrontierView` now exposes three independent spans:
+
+- `payloadStorage()`: dense immutable application payloads;
+- `errorStorage()`: one quantized error byte at the matching offset;
+- `runs()`: `{begin, count, instance}` descriptors in visible-instance order.
+
+Indexing a run returns a `RenderFrontierSpan` containing matching payload and
+error subspans plus the invariant instance id. The consumer uses the instance
+once to select transform/material batching state and streams the two leaf
+arrays. The uncached/all-flat fallback groups consecutive entries by instance
+and returns the same API.
+
+The query owns parallel payload and error slabs at the same offsets as its
+handle cache. A compact bulk resolver validates each mounted-handle run once,
+writes payloads and error bytes directly, and omits the redundant instance
+word. Compaction moves the handle, payload, and error blocks together.
+
+### Correctness
+
+The renderer-query test reconstructs the legacy `instanceAndError` word from
+`run.instance` and each error byte, then compares every complete tuple against
+an independently resolved handle query. It exercises hits, readiness
+invalidation, an intervening handle-only query, camera changes, reuse-disabled
+fallback, and reset; every run is bounds-checked against both storage streams.
+All 412 Debug tests passed across BVH4, BVH8, payload32, and payload64.
+
+### SBC result
+
+Direct AoS-versus-compact report:
+`/home/codex-perf/frontier/results/frontier-paired-20260817T113718Z`
+
+| Payload | AoS per-instance cache | Compact streams | Paired change | 95% interval | CV baseline / candidate |
+|---:|---:|---:|---:|---:|---:|
+| 32 | 668.281 us | 652.287 us | **-2.13%** | [-2.63%, -1.87%] | 0.71% / 1.02% |
+| 64 | 772.011 us | 722.946 us | **-6.26%** | [-6.64%, -5.58%] | 0.23% / 0.47% |
+
+Every cycle improved: payload32 effects were -2.63%, -1.89%, and -1.87%;
+payload64 effects were -5.58%, -6.57%, and -6.64%. All 24 processes held CPU
+4 at exactly 2.208 GHz. Temperature stayed at 44.384-46.230 C, one-minute load
+at 1.019-2.818, and maximum CPU/wall divergence was 0.020%.
+
+Reported `SpatialQuery` capacity fell from 1,358.5 to 1,169.0 KiB in payload32
+(-14.0%) and from 1,868.5 to 1,424.0 KiB in payload64 (-23.8%). These whole-
+query reductions include unchanged record, handle, visibility, worker, and run
+capacity, so they are smaller than the 37.5%/43.75% raw leaf-layout reductions.
+
+### Tradeoffs and decision
+
+Keep and commit. The API is explicitly instance-major and SoA, which is less
+convenient for consumers expecting one AoS leaf object. In exchange, it matches
+the actual transform boundary, removes semantically redundant data, reduces
+cache/TLB pressure, avoids alignment padding, and gives renderers the option to
+stream payloads without touching errors when prioritization is not needed.
+
+The improvement compounds with Experiment 3 rather than replacing it. Applying
+the direct paired effects to the full-leaf results yields approximately 28.3%
+payload32 and 25.8% payload64 improvement over the accepted grouped-resolver
+baseline, while using substantially less retained renderer state than the AoS
+prototype.

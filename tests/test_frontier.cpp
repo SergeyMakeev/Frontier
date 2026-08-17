@@ -488,10 +488,16 @@ TEST(Frontier, RenderQueryTracksCachedRebuildsAndApiSwitches)
         for (const RenderFrontierRun run : render.runs())
         {
             ASSERT_LE(size_t(run.begin) + run.count,
-                      render.storage().size());
-            const std::span<const ResolvedFrontierEntry> entries =
-                render[run];
-            actual.insert(actual.end(), entries.begin(), entries.end());
+                      render.payloadStorage().size());
+            ASSERT_LE(size_t(run.begin) + run.count,
+                      render.errorStorage().size());
+            const RenderFrontierSpan entries = render[run];
+            ASSERT_EQ(entries.payloads.size(), entries.errors.size());
+            for (size_t i = 0; i < entries.size(); ++i)
+                actual.push_back(
+                    {entries.payloads[i],
+                     uint32_t(entries.instance) |
+                         (uint32_t(entries.errors[i]) << kInstanceIdBits)});
             runEntries += entries.size();
         }
         EXPECT_EQ(runEntries, render.size());

@@ -212,7 +212,8 @@ struct QueryScratch
     std::vector<SpatialDatabase::VisibleItem> previousVisible;
     std::vector<SpatialDatabase::TlasItem>    tlasStack;
     detail::FrontierBuffers              output;
-    detail::AppendBuffer<ResolvedFrontierEntry> resolvedCurrent;
+    detail::AppendBuffer<UserPayload> resolvedPayloadCurrent;
+    detail::AppendBuffer<uint8_t> resolvedErrorCurrent;
     detail::AppendBuffer<RenderFrontierRun> renderRuns;
     ViewMemo viewMemo[2];
     uint64_t memoClock = 0;
@@ -235,7 +236,8 @@ struct QueryScratch
                    output.shared.capacity() * sizeof(FrontierEntry) +
                    output.currentOnly.capacity() * sizeof(FrontierEntry) +
                    output.idealOnly.capacity() * sizeof(FrontierEntry) +
-                   resolvedCurrent.capacity() * sizeof(ResolvedFrontierEntry) +
+                   resolvedPayloadCurrent.capacity() * sizeof(UserPayload) +
+                   resolvedErrorCurrent.capacity() * sizeof(uint8_t) +
                    renderRuns.capacity() * sizeof(RenderFrontierRun);
         for (const ViewMemo& memo : viewMemo)
         {
@@ -1265,6 +1267,64 @@ std::span<ResolvedFrontierEntry> SpatialDatabase::resolveFrontier(
     }
 
     return storage.first(required);
+}
+
+bool SpatialDatabase::resolveRenderLeaves(
+    FrontierCutView cut, std::span<UserPayload> payloads,
+    std::span<uint8_t> errors) const
+{
+    const size_t required = cut.size();
+    if (payloads.size() < required || errors.size() < required) return false;
+
+    UserPayload* payloadDst = payloads.data();
+    uint8_t* errorDst = errors.data();
+    uint32_t cachedSlot = NodeHandle::kInvalidSlot;
+    uint32_t cachedGeneration = 0;
+    uint32_t cachedNodeCount = 0;
+    const detail::PayloadWord* cachedPayloads = nullptr;
+
+    for (const FrontierEntry& entry : cut)
+    {
+        const NodeHandle handle = entry.nodeHandle;
+        const uint32_t slot = handle.slot();
+        detail::PayloadWord payload = detail::invalidPayloadWord();
+
+        if (slot != NodeHandle::kInvalidSlot)
+        {
+            const uint32_t generation = handle.generation();
+            if (slot != cachedSlot || generation != cachedGeneration)
+            {
+                cachedSlot = slot;
+                cachedGeneration = generation;
+                cachedPayloads = nullptr;
+                cachedNodeCount = 0;
+                if (slot < slots_.size())
+                {
+                    const MountStamp& stamp = mountStamps_[slot];
+                    if (stamp.inUse() && stamp.generation() == generation)
+                    {
+                        const detail::SubtreeView& view =
+                            subtreeView(slots_[slot]);
+                        cachedPayloads = view.payload_;
+                        cachedNodeCount = view.packedNodeCount();
+                    }
+                }
+            }
+
+            const uint32_t index = handle.index();
+            if (cachedPayloads && index != 0 && index < cachedNodeCount)
+                payload = cachedPayloads[index];
+        }
+        else
+        {
+            const InstanceId root = resolveTlasRoot(handle);
+            if (root != kInvalidInstanceId) payload = tlasRootPayloads_[root];
+        }
+
+        *payloadDst++ = detail::decodePayload(payload);
+        *errorDst++ = entry.errorCode();
+    }
+    return true;
 }
 
 // ============================================================================
@@ -4745,7 +4805,8 @@ void SpatialQuery::reset()
     overflowCounts_.clear();
     freeOverflowCounts_.clear();
     store_.clear();
-    resolvedStore_.clear();
+    resolvedPayloadStore_.clear();
+    resolvedErrorStore_.clear();
     resolvedRecords_.clear();
     used_ = garbage_ = reused_ = walked_ = 0;
     travel_ = kTravel_ = 0.0f;
@@ -4766,7 +4827,8 @@ void SpatialQuery::reset()
     if (scratch_)
     {
         scratch_->output.clear();
-        scratch_->resolvedCurrent.clear();
+        scratch_->resolvedPayloadCurrent.clear();
+        scratch_->resolvedErrorCurrent.clear();
         scratch_->renderRuns.clear();
         scratch_->segmentedRenderRequested = false;
         scratch_->renderRunsValid = false;
@@ -4807,7 +4869,8 @@ size_t SpatialQuery::bytes() const
            overflowCounts_.capacity() * sizeof(OverflowCounts) +
            freeOverflowCounts_.capacity() * sizeof(uint32_t) +
            store_.capacity() * sizeof(FrontierEntry) +
-           resolvedStore_.capacity() * sizeof(ResolvedFrontierEntry) +
+           resolvedPayloadStore_.capacity() * sizeof(UserPayload) +
+           resolvedErrorStore_.capacity() * sizeof(uint8_t) +
            resolvedRecords_.capacity() * sizeof(uint8_t) +
            mountUse_.capacity() * sizeof(MountUseRec) +
            dirtyMounts_.capacity() * sizeof(uint32_t) +
@@ -4826,9 +4889,14 @@ void SpatialQuery::compact()
     // keep the existing allocation headroom while making the copy order moot.
     detail::AppendBuffer<FrontierEntry> packed;
     packed.resize_uninitialized(store_.size());
-    detail::AppendBuffer<ResolvedFrontierEntry> resolvedPacked;
-    const bool haveResolved = !resolvedStore_.empty();
-    if (haveResolved) resolvedPacked.resize_uninitialized(store_.size());
+    detail::AppendBuffer<UserPayload> resolvedPayloadsPacked;
+    detail::AppendBuffer<uint8_t> resolvedErrorsPacked;
+    const bool haveResolved = !resolvedPayloadStore_.empty();
+    if (haveResolved)
+    {
+        resolvedPayloadsPacked.resize_uninitialized(store_.size());
+        resolvedErrorsPacked.resize_uninitialized(store_.size());
+    }
     uint32_t w = 0;
     for (size_t i = 0; i < rec_.size(); ++i)
     {
@@ -4861,16 +4929,24 @@ void SpatialQuery::compact()
                         size_t(count) * sizeof(FrontierEntry));
         if (haveResolved && !resolvedRecords_.empty() && resolvedRecords_[i] &&
             shared + current != 0)
-            std::memcpy(resolvedPacked.data() + w,
-                        resolvedStore_.data() + r.begin,
-                        size_t(shared + current) *
-                            sizeof(ResolvedFrontierEntry));
+        {
+            std::memcpy(resolvedPayloadsPacked.data() + w,
+                        resolvedPayloadStore_.data() + r.begin,
+                        size_t(shared + current) * sizeof(UserPayload));
+            std::memcpy(resolvedErrorsPacked.data() + w,
+                        resolvedErrorStore_.data() + r.begin,
+                        size_t(shared + current) * sizeof(uint8_t));
+        }
         r.begin = w;
         cold.capacity = count;
         w += count;
     }
     store_.swap(packed);
-    if (haveResolved) resolvedStore_.swap(resolvedPacked);
+    if (haveResolved)
+    {
+        resolvedPayloadStore_.swap(resolvedPayloadsPacked);
+        resolvedErrorStore_.swap(resolvedErrorsPacked);
+    }
     used_ = w;
     garbage_ = 0;
 }
@@ -4928,7 +5004,8 @@ void SpatialDatabase::selectFrontierCached(const Camera& camera, const Selection
         query.overflowCounts_.clear();
         query.freeOverflowCounts_.clear();
         query.store_.clear();
-        query.resolvedStore_.clear();
+        query.resolvedPayloadStore_.clear();
+        query.resolvedErrorStore_.clear();
         query.resolvedRecords_.clear();
         scratch.renderRunsValid = false;
         query.used_ = query.garbage_ = 0;
@@ -5011,8 +5088,13 @@ void SpatialDatabase::selectFrontierCached(const Camera& camera, const Selection
         scratch.renderEntryCount = 0;
         if (query.resolvedRecords_.empty())
             query.resolvedRecords_.resize(instances_.size(), 0);
-        if (query.resolvedStore_.size() < query.store_.size())
-            query.resolvedStore_.resize_uninitialized(query.store_.size());
+        if (query.resolvedPayloadStore_.size() < query.store_.size())
+        {
+            query.resolvedPayloadStore_.resize_uninitialized(
+                query.store_.size());
+            query.resolvedErrorStore_.resize_uninitialized(
+                query.store_.size());
+        }
     }
 
     bool patchOutput = !segmentedRender && outResult.retainsExisting_ &&
@@ -5114,12 +5196,22 @@ void SpatialDatabase::selectFrontierCached(const Camera& camera, const Selection
                     {
                         const std::span<const FrontierEntry> source(
                             query.store_.data() + r.begin, renderCount);
-                        const std::span<ResolvedFrontierEntry> target(
-                            query.resolvedStore_.data() + r.begin, renderCount);
-                        resolveFrontier(FrontierCutView{source, {}}, target);
+                        const std::span<UserPayload> payloads(
+                            query.resolvedPayloadStore_.data() + r.begin,
+                            renderCount);
+                        const std::span<uint8_t> errors(
+                            query.resolvedErrorStore_.data() + r.begin,
+                            renderCount);
+                        const bool resolved = resolveRenderLeaves(
+                            FrontierCutView{source, {}}, payloads, errors);
+                        FRONTIER_ASSERT(resolved,
+                                        "render leaf resolution size mismatch");
+                        (void)resolved;
                         query.resolvedRecords_[instIdx] = 1;
                     }
-                    scratch.renderRuns.push_back({r.begin, renderCount});
+                    scratch.renderRuns.push_back(
+                        {r.begin, renderCount,
+                         publicInstanceId(InstanceId(instIdx))});
                     scratch.renderEntryCount += renderCount;
                 }
             }
@@ -5193,9 +5285,13 @@ void SpatialDatabase::selectFrontierCached(const Camera& camera, const Selection
             {
                 query.store_.resize_uninitialized(
                     std::max<size_t>(size_t(query.used_) + n, query.store_.size() * 2 + 256));
-                if (segmentedRender || !query.resolvedStore_.empty())
-                    query.resolvedStore_.resize_uninitialized(
+                if (segmentedRender || !query.resolvedPayloadStore_.empty())
+                {
+                    query.resolvedPayloadStore_.resize_uninitialized(
                         query.store_.size());
+                    query.resolvedErrorStore_.resize_uninitialized(
+                        query.store_.size());
+                }
             }
             r.begin = query.used_;
             cold.capacity = n;
@@ -5253,10 +5349,17 @@ void SpatialDatabase::selectFrontierCached(const Camera& camera, const Selection
             {
                 const std::span<const FrontierEntry> source(
                     dst, nShared + nCurrent);
-                const std::span<ResolvedFrontierEntry> target(
-                    query.resolvedStore_.data() + r.begin,
+                const std::span<UserPayload> payloads(
+                    query.resolvedPayloadStore_.data() + r.begin,
                     nShared + nCurrent);
-                resolveFrontier(FrontierCutView{source, {}}, target);
+                const std::span<uint8_t> errors(
+                    query.resolvedErrorStore_.data() + r.begin,
+                    nShared + nCurrent);
+                const bool resolved = resolveRenderLeaves(
+                    FrontierCutView{source, {}}, payloads, errors);
+                FRONTIER_ASSERT(resolved,
+                                "render leaf resolution size mismatch");
+                (void)resolved;
                 query.resolvedRecords_[instIdx] = 1;
             }
         }
@@ -5343,7 +5446,9 @@ void SpatialDatabase::selectFrontierCached(const Camera& camera, const Selection
         }
         if (segmentedRender && nShared + nCurrent != 0)
         {
-            scratch.renderRuns.push_back({r.begin, nShared + nCurrent});
+            scratch.renderRuns.push_back(
+                {r.begin, nShared + nCurrent,
+                 publicInstanceId(InstanceId(instIdx))});
             scratch.renderEntryCount += nShared + nCurrent;
         }
         ++query.walked_;
@@ -5582,8 +5687,10 @@ RenderFrontierView SpatialQuery::selectRenderFrontier(
         FrontierResultSink discard;
         selectFrontier(database, camera, params, discard);
         return {
-            std::span<const ResolvedFrontierEntry>(resolvedStore_.data(),
-                                                   resolvedStore_.size()),
+            std::span<const UserPayload>(resolvedPayloadStore_.data(),
+                                         resolvedPayloadStore_.size()),
+            std::span<const uint8_t>(resolvedErrorStore_.data(),
+                                     resolvedErrorStore_.size()),
             std::span<const RenderFrontierRun>(scratch.renderRuns.data(),
                                                scratch.renderRuns.size()),
             scratch.renderEntryCount};
@@ -5594,25 +5701,38 @@ RenderFrontierView SpatialQuery::selectRenderFrontier(
     // renderer consumes the same scatter/gather interface in every mode.
     const FrontierResultView frontier = selectFrontier(database, camera, params);
     const size_t count = frontier.currentSize();
-    scratch.resolvedCurrent.resize_uninitialized(count);
-    const std::span<ResolvedFrontierEntry> storage(
-        scratch.resolvedCurrent.data(), count);
-    const std::span<ResolvedFrontierEntry> resolved =
-        database.resolveFrontier(frontier.current(), storage);
-    FRONTIER_ASSERT(resolved.size() == count,
+    scratch.resolvedPayloadCurrent.resize_uninitialized(count);
+    scratch.resolvedErrorCurrent.resize_uninitialized(count);
+    const bool resolved = database.resolveRenderLeaves(
+        frontier.current(),
+        std::span<UserPayload>(scratch.resolvedPayloadCurrent.data(), count),
+        std::span<uint8_t>(scratch.resolvedErrorCurrent.data(), count));
+    FRONTIER_ASSERT(resolved,
                     "render frontier resolution size mismatch");
+    (void)resolved;
     scratch.renderRuns.clear();
     if (count != 0)
     {
         FRONTIER_CHECK(count <= UINT32_MAX,
                        "render frontier exceeds 32-bit run capacity");
-        scratch.renderRuns.push_back({0, uint32_t(count)});
+        uint32_t index = 0;
+        for (const FrontierEntry& entry : frontier.current())
+        {
+            const InstanceId instance = entry.instance();
+            if (scratch.renderRuns.empty() ||
+                scratch.renderRuns.back().instance != instance)
+                scratch.renderRuns.push_back({index, 1, instance});
+            else
+                ++scratch.renderRuns.back().count;
+            ++index;
+        }
     }
     scratch.renderEntryCount = count;
     scratch.renderRunsValid = false;
     return {
-        std::span<const ResolvedFrontierEntry>(scratch.resolvedCurrent.data(),
-                                               count),
+        std::span<const UserPayload>(scratch.resolvedPayloadCurrent.data(),
+                                     count),
+        std::span<const uint8_t>(scratch.resolvedErrorCurrent.data(), count),
         std::span<const RenderFrontierRun>(scratch.renderRuns.data(),
                                            scratch.renderRuns.size()),
         count};

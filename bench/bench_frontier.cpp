@@ -480,8 +480,12 @@ void consumeLiveCitySubmissions(const RenderFrontierView& result)
 {
     uint64_t checksum = 0;
     for (const RenderFrontierRun run : result.runs())
-        for (const ResolvedFrontierEntry& entry : result[run])
-            checksum += uint64_t(entry.payload) + entry.instanceAndError;
+    {
+        const RenderFrontierSpan leaves = result[run];
+        checksum += leaves.instance;
+        for (size_t i = 0; i < leaves.size(); ++i)
+            checksum += uint64_t(leaves.payloads[i]) + leaves.errors[i];
+    }
     benchmark::DoNotOptimize(checksum);
     benchmark::ClobberMemory();
 }

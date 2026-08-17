@@ -334,15 +334,26 @@ struct FrontierResultView
 };
 
 // One per-instance run in the renderer-facing cache slab. Offsets instead of
-// pointers keep this descriptor at eight bytes and remain valid if filling a
-// later cache miss grows and relocates the slab.
+// pointers remain valid if filling a later cache miss relocates the slab. The
+// instance id lives here once rather than beside every leaf.
 struct RenderFrontierRun
 {
     uint32_t begin = 0;
     uint32_t count = 0;
+    InstanceId instance = kInvalidInstanceId;
 };
-static_assert(sizeof(RenderFrontierRun) == 8,
-              "render frontier run must stay eight bytes");
+static_assert(sizeof(RenderFrontierRun) == 12,
+              "render frontier run must stay twelve bytes");
+
+struct RenderFrontierSpan
+{
+    std::span<const UserPayload> payloads;
+    std::span<const uint8_t> errors;
+    InstanceId instance = kInvalidInstanceId;
+
+    size_t size() const { return payloads.size(); }
+    bool empty() const { return payloads.empty(); }
+};
 
 // Scatter/gather current cut produced by
 // SpatialQuery::selectRenderFrontier(). Runs follow visible-instance order and
@@ -354,25 +365,30 @@ class RenderFrontierView
 {
 public:
     RenderFrontierView() = default;
-    RenderFrontierView(std::span<const ResolvedFrontierEntry> storage,
+    RenderFrontierView(std::span<const UserPayload> payloads,
+                       std::span<const uint8_t> errors,
                        std::span<const RenderFrontierRun> runs,
                        size_t entryCount)
-        : storage_(storage), runs_(runs), entryCount_(entryCount)
+        : payloads_(payloads), errors_(errors), runs_(runs),
+          entryCount_(entryCount)
     {}
 
     std::span<const RenderFrontierRun> runs() const { return runs_; }
-    std::span<const ResolvedFrontierEntry> storage() const { return storage_; }
-    std::span<const ResolvedFrontierEntry> operator[](
+    std::span<const UserPayload> payloadStorage() const { return payloads_; }
+    std::span<const uint8_t> errorStorage() const { return errors_; }
+    RenderFrontierSpan operator[](
         const RenderFrontierRun& run) const
     {
-        return storage_.subspan(run.begin, run.count);
+        return {payloads_.subspan(run.begin, run.count),
+                errors_.subspan(run.begin, run.count), run.instance};
     }
     size_t size() const { return entryCount_; }
     size_t segmentCount() const { return runs_.size(); }
     bool empty() const { return entryCount_ == 0; }
 
 private:
-    std::span<const ResolvedFrontierEntry> storage_;
+    std::span<const UserPayload> payloads_;
+    std::span<const uint8_t> errors_;
     std::span<const RenderFrontierRun> runs_;
     size_t entryCount_ = 0;
 };
@@ -877,9 +893,12 @@ private:
     detail::AppendBuffer<uint32_t> freeOverflowCounts_;
     detail::AppendBuffer<FrontierEntry> store_;   // slab of recorded runs
     // Lazily allocated renderer mirror of the shared + currentOnly prefix in
-    // each cached run. Ideal-only slots remain unused. One byte per instance
-    // records whether its mirror matches the handle slab.
-    detail::AppendBuffer<ResolvedFrontierEntry> resolvedStore_;
+    // each cached run. Payload and one-byte error streams omit the per-leaf
+    // instance id, which is invariant for the run. Ideal-only slots remain
+    // unused. One byte per instance records whether the mirror matches the
+    // handle slab.
+    detail::AppendBuffer<UserPayload> resolvedPayloadStore_;
+    detail::AppendBuffer<uint8_t> resolvedErrorStore_;
     std::vector<uint8_t> resolvedRecords_;
     // Distance the damped query envelope has travelled since this SpatialQuery was
     // created, accumulated per call. kTravel_ similarly accumulates absolute
@@ -1961,6 +1980,9 @@ private:
     }
     InstanceId resolveTlasRoot(NodeHandle h) const;
     detail::PayloadWord tryGetPayloadWord(NodeHandle h) const;
+    bool resolveRenderLeaves(FrontierCutView cut,
+                             std::span<UserPayload> payloads,
+                             std::span<uint8_t> errors) const;
 
     uint32_t allocSubtree();
     void destroySubtree(uint32_t definition);
