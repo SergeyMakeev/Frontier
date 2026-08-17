@@ -191,6 +191,29 @@ struct FrontierEntry
 };
 static_assert(sizeof(FrontierEntry) == 12, "FrontierEntry must stay 12 bytes");
 
+// Renderer-facing form of a frontier entry. Resolving an entire cut through
+// SpatialDatabase::resolveFrontier() amortizes mount validation across the
+// consecutive nodes emitted from each mounted subtree. The instance and error
+// retain the same packed representation as FrontierEntry, while the opaque
+// node handle is replaced by the immutable application payload needed for
+// render submission.
+struct ResolvedFrontierEntry
+{
+    UserPayload payload = kInvalidPayload;
+    uint32_t    instanceAndError = kInvalidInstanceId;
+
+    InstanceId instance() const { return instanceAndError & kInstanceIdMask; }
+    uint8_t errorCode() const
+    {
+        return uint8_t(instanceAndError >> kInstanceIdBits);
+    }
+    bool overThreshold() const { return errorCode() >= kFrontierErrorThreshold; }
+};
+static_assert(std::is_trivially_copyable_v<ResolvedFrontierEntry>);
+static_assert(sizeof(ResolvedFrontierEntry) ==
+                  (sizeof(UserPayload) == 4 ? 8u : 16u),
+              "resolved frontier entry has unexpected padding");
+
 // Zero-copy forward range over two result buckets. Iteration exhausts `first`
 // before continuing with `second`; neither bucket is copied or made contiguous.
 class FrontierCutView
@@ -1040,6 +1063,16 @@ public:
     {
         return detail::decodePayload(tryGetPayloadWord(h));
     }
+
+    // Resolve one complete current or ideal cut into caller-owned render
+    // storage. Unlike repeated tryGetPayload() calls, this recognizes runs from
+    // the same mounted subtree, validates the placement once, and streams its
+    // immutable payload array directly. Stale handles still produce
+    // kInvalidPayload. Returns an empty span without writing when storage is too
+    // small; otherwise the returned prefix has exactly cut.size() entries.
+    std::span<ResolvedFrontierEntry> resolveFrontier(
+        FrontierCutView cut,
+        std::span<ResolvedFrontierEntry> storage) const;
 
     // ---- motion --------------------------------------------------------------
     // Record new local-space bounds for one node OF ONE INSTANCE: a bounds

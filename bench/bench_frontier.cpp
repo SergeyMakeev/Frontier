@@ -476,26 +476,16 @@ void consume(const FrontierResultView& cut)
 }
 
 #ifndef FRONTIER_OMIT_SUBMISSION_BENCH
-struct LiveCitySubmission
+std::span<ResolvedFrontierEntry> buildLiveCitySubmissions(
+    const SpatialDatabase& world, const FrontierResultView& cut,
+    std::vector<ResolvedFrontierEntry>& submissions)
 {
-    UserPayload payload;
-    InstanceId instance;
-    uint8_t error;
-};
-
-void buildLiveCitySubmissions(const SpatialDatabase& world,
-                              const FrontierResultView& cut,
-                              std::vector<LiveCitySubmission>& submissions)
-{
-    submissions.clear();
-    for (const FrontierEntry& entry : cut.current())
-    {
-        submissions.push_back({world.tryGetPayload(entry.nodeHandle),
-                               entry.instance(), entry.errorCode()});
-    }
-    benchmark::DoNotOptimize(submissions.data());
-    benchmark::DoNotOptimize(submissions.size());
+    const std::span<ResolvedFrontierEntry> resolved =
+        world.resolveFrontier(cut.current(), submissions);
+    benchmark::DoNotOptimize(resolved.data());
+    benchmark::DoNotOptimize(resolved.size());
     benchmark::ClobberMemory();
+    return resolved;
 }
 #endif
 
@@ -1290,9 +1280,9 @@ static void BM_LiveCityRenderSubmissionFrame(benchmark::State& state)
     query.setReuseEnabled(true);
     FrontierResultView result =
         query.selectFrontier(scene->world, scene->cameras[0], {});
-    std::vector<LiveCitySubmission> submissions;
-    submissions.reserve(kLiveCityTotalLeaves);
-    buildLiveCitySubmissions(scene->world, result, submissions);
+    std::vector<ResolvedFrontierEntry> submissions(kLiveCityTotalLeaves);
+    std::span<ResolvedFrontierEntry> resolved =
+        buildLiveCitySubmissions(scene->world, result, submissions);
 
     uint32_t frame = 0;
     uint64_t calls = 0;
@@ -1311,10 +1301,10 @@ static void BM_LiveCityRenderSubmissionFrame(benchmark::State& state)
                                    scene->pedestrianTransforms);
         scene->world.applyUpdates();
         result = query.selectFrontier(scene->world, scene->cameras[frame], {});
-        buildLiveCitySubmissions(scene->world, result, submissions);
+        resolved = buildLiveCitySubmissions(scene->world, result, submissions);
         ++calls;
         totalEntries += result.size();
-        totalSubmissions += submissions.size();
+        totalSubmissions += resolved.size();
         minEntries = std::min<uint64_t>(minEntries, result.size());
         maxEntries = std::max<uint64_t>(maxEntries, result.size());
         totalReused += query.reused();

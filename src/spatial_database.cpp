@@ -1200,6 +1200,66 @@ detail::PayloadWord SpatialDatabase::tryGetPayloadWord(NodeHandle h) const
     return subtreeView(*rt).payload_[h.index()];
 }
 
+std::span<ResolvedFrontierEntry> SpatialDatabase::resolveFrontier(
+    FrontierCutView cut, std::span<ResolvedFrontierEntry> storage) const
+{
+    const size_t required = cut.size();
+    if (storage.size() < required) return {};
+
+    ResolvedFrontierEntry* dst = storage.data();
+    uint32_t cachedSlot = NodeHandle::kInvalidSlot;
+    uint32_t cachedGeneration = 0;
+    uint32_t cachedNodeCount = 0;
+    const detail::PayloadWord* cachedPayloads = nullptr;
+
+    for (const FrontierEntry& entry : cut)
+    {
+        const NodeHandle handle = entry.nodeHandle;
+        const uint32_t slot = handle.slot();
+        detail::PayloadWord payload = detail::invalidPayloadWord();
+
+        if (slot != NodeHandle::kInvalidSlot)
+        {
+            const uint32_t generation = handle.generation();
+            if (slot != cachedSlot || generation != cachedGeneration)
+            {
+                cachedSlot = slot;
+                cachedGeneration = generation;
+                cachedPayloads = nullptr;
+                cachedNodeCount = 0;
+                if (slot < slots_.size())
+                {
+                    const MountStamp& stamp = mountStamps_[slot];
+                    if (stamp.inUse() && stamp.generation() == generation)
+                    {
+                        const detail::SubtreeView& view =
+                            subtreeView(slots_[slot]);
+                        cachedPayloads = view.payload_;
+                        cachedNodeCount = view.packedNodeCount();
+                    }
+                }
+            }
+
+            const uint32_t index = handle.index();
+            if (cachedPayloads && index != 0 && index < cachedNodeCount)
+                payload = cachedPayloads[index];
+        }
+        else
+        {
+            // TLAS roots are not naturally grouped by mount slot. Preserve the
+            // scalar path's generation validation for these uncommon entries.
+            const InstanceId root = resolveTlasRoot(handle);
+            if (root != kInvalidInstanceId) payload = tlasRootPayloads_[root];
+        }
+
+        dst->payload = detail::decodePayload(payload);
+        dst->instanceAndError = entry.instanceAndError;
+        ++dst;
+    }
+
+    return storage.first(required);
+}
+
 // ============================================================================
 // instances
 // ============================================================================

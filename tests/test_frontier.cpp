@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
 
+#include <array>
+
 #include "helpers.h"
 
 using namespace frontier;
@@ -412,4 +414,50 @@ TEST(Frontier, StaleNodeHandlesRemainSafeForPayloadLookup)
     const NodeHandle stale = handleOf(scene.database, 11);
     scene.database.removeInstance(scene.instance);
     EXPECT_EQ(scene.database.tryGetPayload(stale), kInvalidPayload);
+}
+
+TEST(Frontier, BulkResolutionPreservesOrderMetadataAndStaleSafety)
+{
+    SpatialDatabase database;
+    const SubtreeHandle subtree =
+        database.registerSubtree(makeLeafSubtree(66));
+    const InstanceHandle mountedRoot =
+        instantiateFor(database, subtree, box(2.0f));
+    const NodeHandle mountedNode = handleOf(database, 66);
+    const InstanceHandle flatRoot =
+        database.instantiate(node(77, 0.0f, box(1.0f)));
+
+    const std::array<FrontierEntry, 2> first{
+        FrontierEntry{mountedNode, uint8_t(17), 3},
+        FrontierEntry{mountedNode, uint8_t(129), 4}};
+    const std::array<FrontierEntry, 1> second{
+        FrontierEntry{flatRoot.rootNode(), uint8_t(8), 5}};
+    const FrontierCutView cut{first, second};
+    std::array<ResolvedFrontierEntry, 3> output{};
+
+    const std::span<ResolvedFrontierEntry> resolved =
+        database.resolveFrontier(cut, output);
+    ASSERT_EQ(resolved.size(), 3u);
+    EXPECT_EQ(resolved[0].payload, UserPayload(66));
+    EXPECT_EQ(resolved[0].instance(), 3u);
+    EXPECT_EQ(resolved[0].errorCode(), 17u);
+    EXPECT_EQ(resolved[1].payload, UserPayload(66));
+    EXPECT_EQ(resolved[1].instance(), 4u);
+    EXPECT_EQ(resolved[1].errorCode(), 129u);
+    EXPECT_TRUE(resolved[1].overThreshold());
+    EXPECT_EQ(resolved[2].payload, UserPayload(77));
+    EXPECT_EQ(resolved[2].instance(), 5u);
+    EXPECT_EQ(resolved[2].errorCode(), 8u);
+
+    std::array<ResolvedFrontierEntry, 2> undersized{};
+    EXPECT_TRUE(database.resolveFrontier(cut, undersized).empty());
+
+    database.removeInstance(mountedRoot);
+    database.removeInstance(flatRoot);
+    const std::span<ResolvedFrontierEntry> stale =
+        database.resolveFrontier(cut, output);
+    ASSERT_EQ(stale.size(), 3u);
+    EXPECT_EQ(stale[0].payload, kInvalidPayload);
+    EXPECT_EQ(stale[1].payload, kInvalidPayload);
+    EXPECT_EQ(stale[2].payload, kInvalidPayload);
 }
