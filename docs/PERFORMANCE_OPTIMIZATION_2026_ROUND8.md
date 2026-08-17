@@ -1450,3 +1450,41 @@ topology pass and reuses existing dense streams and scratch memory. It provides
 about a 1.40x motion-phase speedup and a 1.18-1.21x full moving-city speedup on
 the SBC without PGO, LTO, custom sections, compiler hints, or link-layout
 assumptions.
+
+## Experiment 15: propagate exact-refit summaries into parents
+
+### Theory and implementation
+
+Experiment 14's exact bottom-up pass visits every node lane, and an interior
+child is scanned again by `tlasNodeExtent()` when its parent lane is rebuilt.
+The candidate accumulated each node's bound, maximum error, and layer mask
+while visiting its lanes, then wrote that summary directly into the matching
+parent lane. Child-before-parent postorder made the parent lane exact before
+the parent was processed. This removed the second child-lane scan without new
+state, API changes, build flags, or data-layout growth.
+
+The focused six-cycle motion report
+`frontier-paired-20260817T203534Z` confirmed a real executing-path gain:
+payload32 improved 2.28% with a 95% interval of [-2.48%, -2.04%], and payload64
+improved 1.63% with an interval of [-1.81%, -1.46%].
+
+### Full gate and decision
+
+The full report is
+`/home/codex-perf/frontier/results/frontier-paired-20260817T203800Z`.
+Motion improved 2.99% payload32 and 2.15% payload64. Full render frames improved
+2.28% and 3.38%; handle-returning selection improved 1.00% payload32, while
+payload64 was inconclusive at -1.25% with an interval reaching +0.01%.
+
+The unrelated payload32 100%-hierarchy control regressed 4.85%, interval
+[+3.98%, +6.05%]. That benchmark submits no actor motion and cannot execute the
+changed loop. The result is generated-code/layout coupling, but it is still a
+real regression in the produced library binary. Fixing it by relocating the
+helper, forcing inline/out-of-line decisions, or adding compiler/linker layout
+hints would violate the portability constraint and would not survive an
+embedding application's link graph.
+
+**Reject and revert.** The small algorithmic motion gain does not justify a
+larger measured selection regression, and no code-placement compensation will
+be pursued. Both binaries used ordinary Release with PGO and IPO disabled; all
+160 full-gate samples ran at 2.208 GHz between 44.384 and 47.153 C.
