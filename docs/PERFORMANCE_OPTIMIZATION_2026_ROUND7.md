@@ -102,48 +102,61 @@ removed. It nevertheless confirmed that function placement can move the frame
 by more than the target regression even when function bodies and dispatch are
 unchanged.
 
-## Retained target experiment: one AArch64 hot text island
+## Experiment 6: privileged AArch64 hot text island
 
-GCC 13 AArch64 now receives `noinline`, `noclone`, and a shared
+GCC 13 AArch64 received `noinline`, `noclone`, and a shared
 `.text.hot.frontier_oriented` section attribute on exactly two functions:
 
 - `SpatialDatabase::selectFrontierCached()`;
 - `SpatialDatabase::runOrientedTlasRootInstance()`.
 
-This constrains the large cached selector and its rotated-root miss callee to
-the same hot linker input section while retaining the architectural split from
-round 6. `noinline` prevents LTO from absorbing the rotated camera transform
-into cached selection; `noclone` prevents payload-specific IPA clones from
-escaping the island. The identity walker remains in normal text and therefore
-stays isolated from orientation code. No compiler `hot` attribute is used: the
-goal is placement, not more aggressive optimization or growth of the already
-large selector.
+The SBC link honored the constraint. In both payload executables the rotated
+walker began at `0x9d50` and cached selection at `0xa804`, only 2,740 bytes
+apart. The motion-only phase was also decisive: payload32 measured 142.254 us
+and payload64 142.288 us, within 0.03%. Actor transform generation and TLAS
+publication are not the source of the payload32 loss.
 
-The attribute is deliberately limited to GCC on AArch64. MSVC, Clang, x86,
-and other targets expand it to nothing, so their code generation and the
-locally recovered identity path remain unchanged. No API, record, allocation,
-or result layout changes.
+**Result: rejected.** Moving the pair into the linker's privileged hot-text
+region made the target worse:
 
-Local MSVC cannot measure the GCC section placement; with the rejected source
-swap removed, the final runtime source is the `fb8d395` implementation. The
-next controlled SBC bundle is therefore the required accept/reject gate. The
-new phase benchmark will reveal whether any remaining target delta belongs to
-motion publication or cached selection rather than forcing another inference
-from the combined frame.
+| Guard | `fb8d395` | hot island | Change |
+|---|---:|---:|---:|
+| payload32 live city | 654.405 us | 658.037 us | +0.55% |
+| payload64 live city | 653.470 us | 651.968 us | -0.23% |
+| payload32, 10k roots, 50% hierarchy | 1,623.364 us | 1,726.373 us | +6.35% |
+| payload32, 10k roots, 100% hierarchy | 3,002.483 us | 3,153.940 us | +5.04% |
+| payload64, 10k roots, 50% hierarchy | 1,666.783 us | 1,697.240 us | +1.83% |
+| payload64, 10k roots, 100% hierarchy | 2,993.951 us | 3,101.865 us | +3.60% |
 
-The Linux collector also records the final linked addresses for the two
-functions in `oriented_text_layout.txt`. This checks that LTO and the final
-linker honored the intended proximity instead of inferring placement from
-source order or attributes alone.
+The architecture-kernel geomean moved only +0.33%, the selected core remained
+at 2.208 GHz, and thermal state matched the control run closely. The hierarchy
+losses are therefore too large and too localized to dismiss as host drift.
+The `.text.hot.*` prefix grouped the pair successfully but also pulled the
+large selector into the early hot region and perturbed unrelated traversal
+placement. Proximity alone was the wrong constraint.
+
+## Retained target experiment: normal-text island
+
+The revised GCC AArch64 attribute uses `.text.frontier_oriented`, preserving
+the same `noinline` and `noclone` guarantees but removing the privileged
+`.text.hot.*` classification. The GNU linker can keep the pair adjacent in the
+ordinary text bucket without moving the large cached selector ahead of normal
+traversal code. This is a one-field revision of the failed experiment: the
+function bodies, calls, API, data layout, and benchmark workload are unchanged.
+
+The attribute remains limited to GCC on AArch64. MSVC, Clang, x86, and other
+targets expand it to nothing. The Linux collector records the final linked
+addresses in `oriented_text_layout.txt`, so the next bundle will show whether
+the pair stayed together and whether it returned to the normal text range.
 
 ## Tradeoffs
 
 - The optimization is intentionally compiler/architecture-specific because
   that is where the regression exists. A future AArch64 Clang result needs its
   own evidence before opting into the section attribute.
-- A named ELF text section mildly constrains linker freedom for these two
-  functions. That constraint is the mechanism being tested; it has no data
-  memory cost.
+- A named ordinary ELF text section constrains linker freedom for these two
+  functions without assigning the whole pair privileged hot placement. It has
+  no data-memory cost.
 - Preventing inlining and cloning preserves identity isolation and call
   locality but gives up future GCC LTO freedom for these two functions. The
   target result determines whether that trade is favorable.
@@ -153,7 +166,7 @@ source order or attributes alone.
 
 ## Required target acceptance
 
-Retain the hot text island only if the next clean SBC run satisfies both:
+Retain the normal-text island only if the next clean SBC run satisfies both:
 
 1. payload32 `BM_LiveCityDrivingFrame` recovers materially toward or below
    643.147 us without a corresponding machine/architecture-probe shift;

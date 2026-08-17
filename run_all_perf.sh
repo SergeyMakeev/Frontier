@@ -201,8 +201,8 @@ write_report()
 - \`source.txt\`: exact Git revision and working-tree state
 - \`commands.txt\`: benchmark filters and sampling parameters
 - \`performance_state.txt\`: selected-core frequency, load, and thermal snapshots
-- \`oriented_text_layout.txt\`: linked addresses of the cached selector and
-  rotated-root walker when the platform exposes them
+- \`oriented_text_layout.txt\`: linked text bounds, addresses, and sizes for
+  the cached selector and rotated-root walker when the platform exposes them
 
 Performance processes used ${affinity_description}. Each benchmark receives a
 ${benchmark_warmup_seconds}-second untimed warmup so demand-based governors can
@@ -516,16 +516,24 @@ failure_stage=benchmark-inventory
 
 {
     echo "payload64=${bench_exe}"
+    if command -v readelf >/dev/null 2>&1; then
+        readelf -W -S "${bench_exe}" 2>&1 |
+            grep -E '[[:space:]]\.text([.[:space:]]|$)' || true
+    fi
     if command -v nm >/dev/null 2>&1; then
-        nm -n -C "${bench_exe}" 2>&1 |
+        nm -n -S -C "${bench_exe}" 2>&1 |
             grep -E 'SpatialDatabase::(selectFrontierCached|runOrientedTlasRootInstance)' || true
     else
         echo "nm unavailable"
     fi
     echo
     echo "payload32=${bench32_exe}"
+    if command -v readelf >/dev/null 2>&1; then
+        readelf -W -S "${bench32_exe}" 2>&1 |
+            grep -E '[[:space:]]\.text([.[:space:]]|$)' || true
+    fi
     if command -v nm >/dev/null 2>&1; then
-        nm -n -C "${bench32_exe}" 2>&1 |
+        nm -n -S -C "${bench32_exe}" 2>&1 |
             grep -E 'SpatialDatabase::(selectFrontierCached|runOrientedTlasRootInstance)' || true
     else
         echo "nm unavailable"

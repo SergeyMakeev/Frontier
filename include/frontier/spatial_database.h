@@ -34,12 +34,12 @@
 #include "subtree.h"
 
 // GCC's AArch64 function reordering separated the rotated root walker from
-// the large cached selector that calls it. Keep this pair in one hot text
+// the large cached selector that calls it. Keep this pair in one ordinary text
 // island and out of line; other toolchains retain their normal placement.
 #if defined(__GNUC__) && !defined(__clang__) && defined(__aarch64__)
   #define FRONTIER_ORIENTED_TEXT                                      \
       __attribute__((noinline, noclone,                               \
-                     section(".text.hot.frontier_oriented")))
+                     section(".text.frontier_oriented")))
 #else
   #define FRONTIER_ORIENTED_TEXT
 #endif
