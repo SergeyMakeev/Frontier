@@ -598,6 +598,37 @@ Each `FrontierEntry` carries a generation-stamped `NodeHandle`, an
 threshold-relative error code. The instance id is appropriate for indexing the
 application's top-level transform or entity table while that instance is live.
 
+### Fully resident max-detail output
+
+If a view always renders fully ready, zero-error terminal leaves, avoid
+materializing and resolving a handle for every leaf. `TerminalRenderQuery`
+returns immutable payload ranges with the instance id hoisted into each run:
+
+```cpp
+TerminalRenderQuery query;
+TerminalRenderView view = query.select(database, camera);
+
+for (const TerminalRenderRun run : view.runs()) {
+    const InstanceId instance = run.instance();
+    for (UserPayload payload : run.payloadSpan())
+        renderer.submit(payload, instance, run.errorCode());
+}
+```
+
+`view.size()` is still the number of logical leaf submissions; range output
+does not remove downstream work from the measurement or API. It removes the
+intermediate per-leaf `NodeHandle`, instance id, error byte, payload-resolution
+lookup, and query-owned resolved copy. The view and payload pointers remain
+valid until this query's next selection/reset or a database mutation.
+
+This path is strict rather than a compatibility wrapper. Every selected
+mounted tree must be fully ready, overlay-free, free of nested mount points,
+and end in zero-error leaves. Use ordinary `SpatialQuery` for streamed LOD,
+partial readiness, deformation, or nested topology. By default instances
+marked with `setInstanceRenderAsUnit()` retain their whole terminal range when
+the root intersects the frustum; pass `false` as the fourth `select()` argument
+when exact descendant culling is required.
+
 ## 8. Stream topology and render readiness independently
 
 Mounting makes finer topology known. Marking a node ready says the renderer has

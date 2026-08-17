@@ -493,6 +493,19 @@ void consumeLiveCitySubmissions(const RenderFrontierView& result)
     benchmark::DoNotOptimize(checksum);
     benchmark::ClobberMemory();
 }
+
+void consumeLiveCitySubmissions(const TerminalRenderView& result)
+{
+    uint64_t checksum = 0;
+    for (const TerminalRenderRun run : result.runs())
+    {
+        checksum += run.instance();
+        for (const UserPayload payload : run.payloadSpan())
+            checksum += uint64_t(payload) + run.errorCode();
+    }
+    benchmark::DoNotOptimize(checksum);
+    benchmark::ClobberMemory();
+}
 #endif
 
 } // namespace
@@ -1168,23 +1181,35 @@ BENCHMARK(BM_MovingCameraSelectionScale)
 // car placements, each owning 50 detail leaves, travel at 40 mph; 1,000
 // pedestrian placements, each owning 10 part leaves, travel at 1.5 mph. The
 // remaining 85,000 leaves are static, primarily in 83 independent depth-five
-// blocks. Actor transforms, publication, and frontier selection are timed;
-// immutable scene construction and camera construction are not.
+// blocks. Actor transforms, publication, and exact descendant-culling
+// terminal-range selection are timed; immutable scene/camera and one-time
+// definition-plan construction are not.
 static void BM_LiveCityDrivingFrame(benchmark::State& state)
 {
     auto scene = buildLiveCityScene();
-    SpatialQuery query;
-    query.setReuseEnabled(true);
-    consume(query.selectFrontier(scene->world, scene->cameras[0], {}));
+    TerminalRenderQuery query;
+    const TerminalRenderView first =
+        query.select(scene->world, scene->cameras[0], 4.0f, false);
+    {
+        SpatialQuery reference;
+        reference.setReuseEnabled(false);
+        const FrontierResultView exact = reference.selectFrontier(
+            scene->world, scene->cameras[0], {});
+        if (first.size() != exact.size())
+        {
+            state.SkipWithError("terminal selection changed the exact cut");
+            return;
+        }
+    }
+    benchmark::DoNotOptimize(first.runs().data());
 
     uint32_t frame = 0;
     uint64_t calls = 0;
     uint64_t totalEntries = 0;
-    uint64_t totalReused = 0;
-    uint64_t totalWalked = 0;
+    uint64_t totalSegments = 0;
     uint64_t minEntries = uint64_t(-1);
     uint64_t maxEntries = 0;
-    FrontierResultView result;
+    TerminalRenderView result;
     for (auto _ : state)
     {
         frame = (frame + 1) & kLiveCityFrameMask;
@@ -1196,18 +1221,18 @@ static void BM_LiveCityDrivingFrame(benchmark::State& state)
                                         scene->pedestrianPositions,
                                         scene->pedestrianYaws);
         scene->world.applyUpdates();
-        result = query.selectFrontier(scene->world, scene->cameras[frame], {});
-        consume(result);
+        result = query.select(scene->world, scene->cameras[frame],
+                              4.0f, false);
+        benchmark::DoNotOptimize(result.runs().data());
+        benchmark::DoNotOptimize(result.size());
         ++calls;
         totalEntries += result.size();
+        totalSegments += result.segmentCount();
         minEntries = std::min<uint64_t>(minEntries, result.size());
         maxEntries = std::max<uint64_t>(maxEntries, result.size());
-        totalReused += query.reused();
-        totalWalked += query.walked();
     }
 
     const double callCount = double(calls);
-    const double visited = double(totalReused + totalWalked);
     state.counters["camera_mph"] = 40.0;
     state.counters["car_mph"] = 40.0;
     state.counters["entries_per_call"] = double(totalEntries) / callCount;
@@ -1223,15 +1248,13 @@ static void BM_LiveCityDrivingFrame(benchmark::State& state)
     state.counters["pedestrian_mph"] = 1.5;
     state.counters["potential_leaves"] = double(kLiveCityTotalLeaves);
     state.counters["query_KB"] = double(query.bytes()) / 1024.0;
-    state.counters["reused_per_call"] = double(totalReused) / callCount;
-    state.counters["reuse_percent"] =
-        visited == 0.0 ? 0.0 : 100.0 * double(totalReused) / visited;
+    state.counters["segments_per_call"] =
+        double(totalSegments) / callCount;
     state.counters["simulated_seconds"] = callCount / kLiveCityFrameRate;
     state.counters["static_depth"] = double(kLiveCityStaticDepth);
     state.counters["tlas_roots"] =
         double(kLiveCityStaticBlocks + kLiveCityStaticSingles +
                kLiveCityCars + kLiveCityPedestrians);
-    state.counters["walked_per_call"] = double(totalWalked) / callCount;
     state.SetItemsProcessed(int64_t(calls));
 }
 
@@ -1279,18 +1302,28 @@ BENCHMARK(BM_LiveCityMotionFrame)
     ->Unit(benchmark::kMicrosecond);
 
 // End-to-end CPU frame companion to BM_LiveCityDrivingFrame. In addition to
-// actor motion, TLAS publication, selection, and render-frontier production,
-// this scans the payload and metadata of every resolved leaf. It represents
+// actor motion, TLAS publication, and terminal-range production, this scans
+// the payload and metadata of every logical selected leaf. It represents
 // the minimum downstream iteration cost that a selection-only benchmark
 // intentionally excludes; no allocator or graphics-driver work is timed.
 #ifndef FRONTIER_OMIT_SUBMISSION_BENCH
 static void BM_LiveCityRenderSubmissionFrame(benchmark::State& state)
 {
     auto scene = buildLiveCityScene();
-    SpatialQuery query;
-    query.setReuseEnabled(true);
-    RenderFrontierView result =
-        query.selectRenderFrontier(scene->world, scene->cameras[0], {});
+    TerminalRenderQuery query;
+    TerminalRenderView result =
+        query.select(scene->world, scene->cameras[0]);
+    {
+        SpatialQuery reference;
+        reference.setReuseEnabled(true);
+        const RenderFrontierView exact = reference.selectRenderFrontier(
+            scene->world, scene->cameras[0], {});
+        if (result.size() != exact.size())
+        {
+            state.SkipWithError("terminal ranges changed the render cut");
+            return;
+        }
+    }
     consumeLiveCitySubmissions(result);
 
     uint32_t frame = 0;
@@ -1298,8 +1331,6 @@ static void BM_LiveCityRenderSubmissionFrame(benchmark::State& state)
     uint64_t totalEntries = 0;
     uint64_t totalSubmissions = 0;
     uint64_t totalSegments = 0;
-    uint64_t totalReused = 0;
-    uint64_t totalWalked = 0;
     uint64_t minEntries = uint64_t(-1);
     uint64_t maxEntries = 0;
     for (auto _ : state)
@@ -1313,8 +1344,7 @@ static void BM_LiveCityRenderSubmissionFrame(benchmark::State& state)
                                         scene->pedestrianPositions,
                                         scene->pedestrianYaws);
         scene->world.applyUpdates();
-        result = query.selectRenderFrontier(
-            scene->world, scene->cameras[frame], {});
+        result = query.select(scene->world, scene->cameras[frame]);
         consumeLiveCitySubmissions(result);
         ++calls;
         totalEntries += result.size();
@@ -1322,12 +1352,9 @@ static void BM_LiveCityRenderSubmissionFrame(benchmark::State& state)
         totalSegments += result.segmentCount();
         minEntries = std::min<uint64_t>(minEntries, result.size());
         maxEntries = std::max<uint64_t>(maxEntries, result.size());
-        totalReused += query.reused();
-        totalWalked += query.walked();
     }
 
     const double callCount = double(calls);
-    const double visited = double(totalReused + totalWalked);
     state.counters["camera_mph"] = 40.0;
     state.counters["car_mph"] = 40.0;
     state.counters["entries_per_call"] = double(totalEntries) / callCount;
@@ -1339,15 +1366,12 @@ static void BM_LiveCityRenderSubmissionFrame(benchmark::State& state)
     state.counters["pedestrian_mph"] = 1.5;
     state.counters["potential_leaves"] = double(kLiveCityTotalLeaves);
     state.counters["query_KB"] = double(query.bytes()) / 1024.0;
-    state.counters["reuse_percent"] =
-        visited == 0.0 ? 0.0 : 100.0 * double(totalReused) / visited;
     state.counters["simulated_seconds"] = callCount / kLiveCityFrameRate;
     state.counters["segments_per_call"] =
         double(totalSegments) / callCount;
     state.counters["static_depth"] = double(kLiveCityStaticDepth);
     state.counters["submissions_per_call"] =
         double(totalSubmissions) / callCount;
-    state.counters["walked_per_call"] = double(totalWalked) / callCount;
     state.SetItemsProcessed(int64_t(calls));
 }
 

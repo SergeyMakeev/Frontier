@@ -101,6 +101,24 @@ fully-ready path. Consecutive placements of the same definition reuse the
 resolved immutable block while transform, error clamp, and generation advance
 through a dense stream.
 
+The fully resident terminal-render path changes the output unit. Its query
+builds one cold definition plan containing decoded terminal payloads and one
+`{begin,count}` range per definition node. During selection, a frustum-inside
+branch appends one pointer-plus-two-word `TerminalRenderRun` (16 bytes on a
+64-bit target) that references the plan range;
+only partial boundary branches visit lower wide blocks. Instance id and the
+constant zero-error code are stored once per run. This avoids constructing and
+then resolving one handle record per terminal leaf while retaining the same
+logical payload iteration downstream. Terminal leaf nodes reuse their own
+one-element range as the node-to-payload index, so the plan needs no duplicate
+node mapping stream.
+
+This is a separate archive member and a separate strict query type. The
+ordinary LOD/readiness walker and its flat three-bucket API are unchanged.
+Scenes with streaming readiness, nested mounts, nonzero terminal error, or
+deformed bounds remain on `SpatialQuery`; the range path deliberately trades
+those capabilities for a compact max-detail representation.
+
 ## Current and ideal coverage
 
 Registered definitions own readiness by node. Mounted nodes carry only derived

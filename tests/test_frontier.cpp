@@ -617,6 +617,23 @@ TEST(Frontier, RenderAsUnitCoarsensOnlyDescendantFrustumCulling)
     EXPECT_EQ(renderPayloads(renderQuery),
               (std::vector<UserPayload>{11, 12}));
 
+    TerminalRenderQuery terminalQuery;
+    const auto terminalPayloads = [&](bool coarsenRenderUnits)
+    {
+        const TerminalRenderView terminal = terminalQuery.select(
+            scene.database, camera, 4.0f, coarsenRenderUnits);
+        std::vector<UserPayload> result;
+        result.reserve(terminal.size());
+        for (const TerminalRenderRun run : terminal.runs())
+            result.insert(result.end(), run.payloadSpan().begin(),
+                          run.payloadSpan().end());
+        std::sort(result.begin(), result.end());
+        return result;
+    };
+    EXPECT_EQ(terminalPayloads(true),
+              (std::vector<UserPayload>{11, 12}));
+    EXPECT_EQ(terminalPayloads(false), exactPayloads);
+
     // The normal handle API remains descendant-exact despite the render hint.
     EXPECT_EQ(payloads(scene.database,
                        exactQuery.selectFrontier(scene.database, camera, {}),
@@ -682,4 +699,67 @@ TEST(Frontier, FullyRefinedBoundaryTraversalMatchesTheGeneralWalker)
     }
     EXPECT_TRUE(reachedBoundary)
         << "test scene never reached a partial-leaf frustum intersection";
+}
+
+TEST(Frontier, TerminalRenderRangesMatchTheFullyRefinedCurrentCut)
+{
+    SpatialDatabase database;
+    const SubtreeHandle subtree = database.registerSubtree(
+        makeFullyRefinedReferenceSubtree(0.0f));
+    const InstanceHandle instance = instantiateFor(
+        database, subtree, box(5.0f), 64.0f);
+    TestAccess::markAllNodesReady(database);
+
+    SpatialQuery referenceQuery;
+    referenceQuery.setReuseEnabled(false);
+    TerminalRenderQuery terminalQuery;
+    const Camera camera = cameraAt(-8.0f);
+
+    bool reachedBoundary = false;
+    for (uint32_t step = 1; step <= 160; ++step)
+    {
+        InstanceTransform transform;
+        transform.pos = float4::point(float(step) * 0.125f, 0.0f, 0.0f);
+        database.moveInstance(instance, transform);
+        database.applyUpdates();
+
+        std::vector<UserPayload> reference = payloads(
+            database,
+            referenceQuery.selectFrontier(database, camera, {}), false);
+        const TerminalRenderView terminal =
+            terminalQuery.select(database, camera);
+        std::vector<UserPayload> ranged;
+        ranged.reserve(terminal.size());
+        for (const TerminalRenderRun run : terminal.runs())
+        {
+            EXPECT_EQ(run.errorCode(), 0u);
+            ranged.insert(ranged.end(), run.payloadSpan().begin(),
+                          run.payloadSpan().end());
+        }
+        std::sort(reference.begin(), reference.end());
+        std::sort(ranged.begin(), ranged.end());
+        EXPECT_EQ(ranged, reference);
+        EXPECT_EQ(terminal.size(), reference.size());
+        if (!ranged.empty() && ranged.size() != 16)
+        {
+            reachedBoundary = true;
+            EXPECT_LT(terminal.segmentCount(), terminal.size());
+            break;
+        }
+    }
+    EXPECT_TRUE(reachedBoundary)
+        << "test scene never reached a partial terminal range";
+}
+
+TEST(Frontier, TerminalRenderRejectsNonzeroTerminalError)
+{
+    SpatialDatabase database;
+    const SubtreeHandle subtree = database.registerSubtree(
+        makeFullyRefinedReferenceSubtree(1.0f));
+    instantiateFor(database, subtree, box(5.0f), 64.0f);
+    TestAccess::markAllNodesReady(database);
+    database.applyUpdates();
+
+    TerminalRenderQuery query;
+    EXPECT_THROW(query.select(database, cameraAt(-8.0f)), std::logic_error);
 }

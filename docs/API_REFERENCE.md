@@ -1190,6 +1190,71 @@ reuse mode, and configured half-life. Call it for camera cuts or teleports.
 `bytes()` returns retained query/cache/scratch capacity in bytes, including
 any recurring-view output snapshots.
 
+### `TerminalRenderQuery`
+
+```cpp
+struct TerminalRenderRun {
+    const UserPayload* payloads;
+    uint32_t count;
+    uint32_t instanceAndError;
+
+    InstanceId instance() const;
+    uint8_t errorCode() const;
+    std::span<const UserPayload> payloadSpan() const;
+};
+
+class TerminalRenderView {
+public:
+    std::span<const TerminalRenderRun> runs() const;
+    size_t size() const;
+    size_t segmentCount() const;
+    bool empty() const;
+};
+
+class TerminalRenderQuery {
+public:
+    TerminalRenderView select(
+        const SpatialDatabase& database,
+        const Camera& camera,
+        float errorThreshold = 4.0f,
+        bool coarsenRenderUnits = true);
+    void reset();
+    size_t bytes() const;
+};
+```
+
+This is the max-detail output path for fully resident immutable scenes. It
+selects every visible zero-error terminal leaf and represents consecutive
+definition leaves as referenced payload ranges. The placement's stable
+`InstanceId` and constant terminal error code live once in the
+pointer-plus-two-word run (16 bytes on a 64-bit target)
+instead of being repeated in a 12-byte handle entry and a resolved payload/
+error record for every leaf. The renderer must still iterate every logical
+payload unless it has a higher-level instancing scheme; `size()` reports that
+logical leaf count, not the number of runs.
+
+The contract is intentionally narrower than `SpatialQuery`:
+
+- every selected mounted tree must be fully ready;
+- definitions must contain no nested mount points and every terminal node must
+  have zero geometric error;
+- selected instances must not have copy-on-write bound deformation;
+- the caller must publish changes with `applyUpdates()` first.
+
+Violations are contract errors; the query does not silently fall back to a
+proxy because that would change max-detail semantics. TLAS-only roots remain
+valid one-element runs. `errorThreshold` controls their threshold-relative
+error encoding; terminal leaves always use code zero.
+
+With `coarsenRenderUnits=true`, an instance opted into
+`setInstanceRenderAsUnit()` is descendant-conservative: once its root
+intersects the frustum, the whole terminal range is returned for renderer/GPU
+clipping. Pass `false` for exact descendant culling. Payload pointers and the
+run span remain valid only until the query's next `select()` or `reset()`, or
+until the database is mutated. Queries are movable, not copyable, bind to the
+first database they select, and may not be called concurrently; distinct
+queries may read one published snapshot concurrently.
+
 ## 9. Database configuration
 
 ### `TlasQuality`

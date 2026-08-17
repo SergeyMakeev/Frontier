@@ -393,6 +393,74 @@ private:
     size_t entryCount_ = 0;
 };
 
+// One immutable terminal-payload range selected for one top-level placement.
+// The instance/error word uses the same packing as FrontierEntry, but hoists
+// it out of every leaf. Payload storage remains owned by the query and is
+// stable until that query's next select() or reset().
+struct TerminalRenderRun
+{
+    const UserPayload* payloads = nullptr;
+    uint32_t count = 0;
+    uint32_t instanceAndError = kInvalidInstanceId;
+
+    InstanceId instance() const { return instanceAndError & kInstanceIdMask; }
+    uint8_t errorCode() const
+    {
+        return uint8_t(instanceAndError >> kInstanceIdBits);
+    }
+    std::span<const UserPayload> payloadSpan() const
+    {
+        return {payloads, count};
+    }
+};
+static_assert(sizeof(TerminalRenderRun) == sizeof(const UserPayload*) + 8,
+              "terminal render run must stay pointer plus two words");
+
+class TerminalRenderView
+{
+public:
+    TerminalRenderView() = default;
+    TerminalRenderView(std::span<const TerminalRenderRun> runs,
+                       size_t leafCount)
+        : runs_(runs), leafCount_(leafCount)
+    {}
+
+    std::span<const TerminalRenderRun> runs() const { return runs_; }
+    size_t size() const { return leafCount_; }
+    size_t segmentCount() const { return runs_.size(); }
+    bool empty() const { return leafCount_ == 0; }
+
+private:
+    std::span<const TerminalRenderRun> runs_;
+    size_t leafCount_ = 0;
+};
+
+// Specialized max-detail query for fully resident immutable definitions.
+// It returns referenced payload ranges instead of materializing one handle and
+// one resolved payload/error pair per leaf. See select() for the strict scene
+// contract and lifetime rules.
+class TerminalRenderQuery
+{
+public:
+    TerminalRenderQuery();
+    ~TerminalRenderQuery();
+    TerminalRenderQuery(TerminalRenderQuery&&) noexcept;
+    TerminalRenderQuery& operator=(TerminalRenderQuery&&) noexcept;
+    TerminalRenderQuery(const TerminalRenderQuery&) = delete;
+    TerminalRenderQuery& operator=(const TerminalRenderQuery&) = delete;
+
+    TerminalRenderView select(const SpatialDatabase& database,
+                              const Camera& camera,
+                              float errorThreshold = 4.0f,
+                              bool coarsenRenderUnits = true);
+    void reset();
+    size_t bytes() const;
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
 namespace detail {
 
 struct FrontierBuffers
@@ -1301,6 +1369,7 @@ public:
     struct TestAccess;   // defined by tests; full access to internals
 
 private:
+    friend class TerminalRenderQuery;
     friend struct TestAccess;
     friend struct QueryScratch;
     friend class SpatialQuery;

@@ -6,11 +6,20 @@ Date: 2026-08-17
 
 This round starts from repository commit `a8303c8`. That revision already
 contains the isolated realistic live-city render-submission benchmark and the
-paired Cortex-A72 acceptance harness. Every candidate is compared directly to
-that exact revision on CPU 4 of the SBC at a fixed observed 2.208 GHz. A change
-is kept only when a fresh-process paired run shows a practically meaningful,
+paired Cortex-A72 acceptance harness. Each experiment is compared with its
+immediately preceding accepted commit, while `a8303c8` remains the cumulative
+anchor. Runs use ordinary CMake `Release` binaries on CPU 4 of the SBC at a
+fixed observed 2.208 GHz, with PGO and project IPO disabled. A change is kept
+only when a fresh-process paired run shows a practically meaningful,
 repeatable improvement without material regressions in the selection, motion,
 or machine-control cases.
+
+The acceptance scope is deliberately limited to algorithms and data layouts.
+PGO, linker scripts, named hot/cold sections, source or archive ordering,
+forced inlining, and favorable address placement are not accepted optimization
+mechanisms. Historical layout and PGO experiments remain below as negative
+evidence, but their results are neither part of the cumulative speedup nor a
+dependency of any kept implementation.
 
 The realistic workload contains 100,000 authored leaf instances, 100 rotating
 cars with 50 leaves each, 1,000 rotating pedestrians with 10 leaves each, a
@@ -1712,3 +1721,179 @@ routine with sequential SoA publication of only the state that actually
 changes. It provides approximately 1.44x motion-phase throughput and 1.09-1.12x
 complete render-frame throughput on top of the already optimized exact-refit
 baseline, while preserving byte-identical generic library code for non-users.
+
+## Experiment 18: terminal payload-range frontier
+
+### Post-motion profile and theory
+
+Commit `e292abf` was rebuilt on the Cortex-A72 with `-O3 -pg` for diagnosis
+only. The acceptance path remained ordinary uninstrumented CMake `Release`
+with PGO and IPO disabled. Selection report directory
+`/home/codex-perf/frontier/results/gprof-e292abf-selection-20260817` measured
+24,072.7 logical entries per frame and attributed 37.45% of samples to the
+fully-refined boundary emitter. The emitter's inlined range generator still
+constructed a 12-byte `FrontierEntry` for every inside terminal leaf. Rigid SoA
+publication was now 17.98%, exact TLAS refit 13.86%, and child extent scans
+8.24%.
+
+The render profile in
+`/home/codex-perf/frontier/results/gprof-e292abf-render-20260817` measured
+24,139.3 submitted leaves per frame. Fully-refined entry construction used
+26.18% of samples and `resolveRenderLeaves` another 15.14%. The renderer then
+scanned the same payloads a third time. This made output representation, not
+tree search, the dominant opportunity: an inside subtree's terminal payloads
+are immutable and consecutive in definition traversal order, while instance id
+and zero error are constant for the whole sequence.
+
+The theory was to change the output unit from a leaf record to a referenced
+definition range. This cannot make downstream submission disappear: the live
+benchmark must still load and checksum every logical payload. It can remove the
+intermediate per-leaf handle construction, handle validation, payload lookup,
+resolved-payload copy, and repeated instance/error words.
+
+### API and data layout
+
+`TerminalRenderQuery` is an explicit max-detail query for fully resident
+content. On a 64-bit target it returns a span of 16-byte
+`TerminalRenderRun` records:
+
+```
+{ const UserPayload* payloads; uint32_t count; uint32_t instanceAndError; }
+```
+
+The packed word is identical in meaning to `FrontierEntry`'s instance/error
+word, but occurs once per range. `TerminalRenderView::size()` remains the
+logical leaf count; `segmentCount()` exposes the physical run count.
+
+Each query lazily builds one definition plan outside the timed steady state.
+The plan owns decoded terminal payloads in the exact ordinary DFS order and one
+8-byte `{begin,count}` range per packed node. An inside branch appends its range
+without visiting descendants. A partial branch retains the same wide frustum
+tests and emits one-element terminal ranges at its boundary. Terminal nodes use
+their own one-element range as the node-to-payload index, avoiding a duplicate
+32-bit mapping array; that final layout removed roughly 450 KiB from the
+live-city prototype.
+
+Exact terminal selection passes `coarsenRenderUnits=false`, preserving
+descendant frustum culling and the existing 24,072.7-entry cut. Renderer output
+uses the established actor-unit policy: a visible car or pedestrian root keeps
+the actor's small terminal range whole for GPU clipping, matching the existing
+24,139.3-leaf render cut. Both benchmark warmups compare range and ordinary
+result cardinality before timing, and focused tests compare the full sorted
+payload set at a moving frustum boundary.
+
+The implementation lives in `src/terminal_render.cpp`, an ordinary static
+archive member. It does not alter the general selector implementation. This is
+representation and algorithm specialization, with no PGO, IPO, section name,
+linker script, source-order requirement, forced inline decision, or target
+intrinsic.
+
+### Correctness contract and tradeoffs
+
+The narrow contract is the source of the saving. Every selected mounted tree
+must be fully ready, overlay-free, contain no nested mounts, and terminate in
+zero-error leaves. The query emits the max-detail terminal cut rather than
+performing general geometric-error LOD. TLAS-only roots remain legal one-entry
+ranges. Streaming readiness, nested topology, nonzero terminal error, and
+deformation continue to use `SpatialQuery`.
+
+Payload pointers and runs are query-owned views valid until the next selection
+or reset, or a database mutation. The plan trades cold per-definition payload
+and node-range storage for far less per-frame output traffic. In the live city,
+the first prototype retained about 1.686 MiB before removal of the duplicate
+node mapping, versus about 1.224 MiB for handle selection and 2.253 MiB for the
+old renderer cache.
+
+Two focused Debug tests passed on ARM before performance measurement:
+`TerminalRenderRangesMatchTheFullyRefinedCurrentCut` checks the complete
+payload set and actual range compression at a partial frustum boundary;
+`TerminalRenderRejectsNonzeroTerminalError` checks the specialized contract.
+
+### First executing-path observation
+
+An ordinary-Release payload32 smoke run of the first layout measured 223 us for
+terminal range selection and 254 us while scanning all 24,139 render payloads.
+After separating exact descendant culling from renderer actor-unit policy, the
+exact 24,072.7-leaf selection measured 186 us. These were unpaired directional
+observations under the scaling warning, not acceptance numbers. A controlled
+ABBA comparison against an isolated `e292abf` source snapshot was started next;
+the final no-duplicate-map layout must be rebuilt and gated again before a keep
+decision.
+
+### Prototype paired result
+
+The first controlled report,
+`/home/codex-perf/frontier/results/frontier-paired-20260817T230831Z`, still
+contained the redundant 32-bit terminal-node map. Against isolated ordinary
+Release commit `e292abf`, exact selection improved by 46.67% payload32 and
+46.31% payload64; render plus complete payload scanning improved by 37.11% and
+39.54%. The motion-only case was flat. This established that the saving came
+from the output algorithm rather than the later memory reduction, but this
+prototype is not the accepted implementation.
+
+### Final SBC result
+
+The duplicate-map-free candidate was rebuilt from source and compared with the
+same frozen `e292abf` build in report
+`/home/codex-perf/frontier/results/frontier-paired-20260817T232701Z`. Four ABBA
+cycles and two samples per revision/cycle produced:
+
+| Case | Payload | Baseline | Candidate | Paired change | 95% interval |
+|---|---:|---:|---:|---:|---:|
+| exact live-city selection | 32 | 357.050 us | 188.766 us | **-46.99%** | [-47.72%, -46.12%] |
+| exact live-city selection | 64 | 358.371 us | 183.736 us | **-48.24%** | [-49.41%, -46.68%] |
+| render + payload scan | 32 | 364.204 us | 222.023 us | **-38.82%** | [-40.30%, -37.03%] |
+| render + payload scan | 64 | 420.997 us | 246.070 us | **-40.54%** | [-41.63%, -39.36%] |
+| motion only | 32 | 81.677 us | 81.961 us | +0.64% | [-0.11%, +1.80%] |
+| motion only | 64 | 81.748 us | 81.803 us | -0.00% | [-0.40%, +0.35%] |
+
+Every selection and render cycle improved. All 160 processes observed exactly
+2.208 GHz; temperature stayed between 44.384 and 47.153 C, maximum CPU/wall
+divergence was 0.032%, and system load stayed between 0.778 and 1.158. The
+final query retained 1,241.26 KiB for payload32 and 1,573.49 KiB for payload64,
+versus roughly 1.686 MiB for the first payload32 prototype. It represented the
+average 24,072.7-entry exact cut with 461.6 physical segments and the
+24,139.3-entry renderer cut with 460.0 segments.
+
+The payload32 `identity_100` control's paired point estimate was +0.86%, with
+a [+0.15%, +1.72%] interval, while the other controls were inconclusive around
+zero. This is not attributable to candidate code: SHA-256 proved the complete
+machine-control executables byte-identical at
+`0f77d52bade50770c185b35e6f275d7a4f28b083e4aacf471f91726150c50845`.
+The generic payload32 and payload64 `spatial_database.cpp` objects were also
+byte-identical to `e292abf`, at `ebd0d52f...9367b3` and
+`37bfc277...e081a` respectively. The control movement is therefore retained
+as measurement noise instead of being addressed through link-layout tuning.
+
+### Correctness and decision
+
+The complete Debug matrix passes 444/444 tests on both x64 Windows and the
+Cortex-A72, across BVH4, BVH8, payload32, and payload64. In addition to exact
+boundary payload-set comparison and contract rejection, the actor-unit test
+now compares both coarsened and exact terminal-range output directly with the
+established renderer and handle cuts. The run-size assertion is expressed as a
+pointer plus two 32-bit words, so the API does not impose an accidental
+64-bit-only build restriction.
+
+Keep and commit. This is a direct data-representation improvement: the
+renderer still observes every selected payload, instance id, and error code,
+but traversal communicates immutable contiguous spans instead of manufacturing
+and resolving one transient handle record per leaf. Relative to the first
+round-8 renderer baseline medians, the current ordinary-Release frame is about
+5.02x faster for payload32 (1,114.891 to 222.023 us) and 4.80x for payload64
+(1,180.451 to 246.070 us). Because those endpoints come from separate paired
+reports, they are a cumulative median ratio rather than one direct confidence
+interval; a direct frozen-anchor run is the remaining confirmation step.
+
+### Next radical experiment
+
+Motion publication and exact TLAS refit now consume roughly 82 us of a 222-246
+us frame. Homogeneous cars and pedestrians already exist in simulation-owned
+SoA arrays, yet the current API copies them into general per-instance records
+and rebuilds an acceleration structure every frame. The next experiment will
+let a terminal query consume immutable-definition actor batches directly from
+caller-owned position/yaw spans. Static roots remain in the TLAS; homogeneous
+moving batches receive wide root culling and only partial actors enter local
+hierarchy traversal. This is an algorithm/data-layout change with an explicit
+O(actor-count) per-view tradeoff, and should remove duplicate transform
+publication plus dynamic TLAS refit without changing the simulated scene.
