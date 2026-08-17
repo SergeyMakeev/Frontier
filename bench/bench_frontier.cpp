@@ -1216,6 +1216,42 @@ BENCHMARK(BM_LiveCityDrivingFrame)
     ->Iterations(kLiveCityFrames * 2)
     ->Unit(benchmark::kMicrosecond);
 
+// Isolates the dynamic-scene publication half of the live-city frame. This
+// keeps the identical contiguous car and pedestrian trajectories but omits
+// frontier selection, making transform-stream and TLAS-update regressions
+// visible even when result-buffer or traversal layout changes in the opposite
+// direction.
+static void BM_LiveCityMotionFrame(benchmark::State& state)
+{
+    auto scene = buildLiveCityScene();
+
+    uint32_t frame = 0;
+    uint64_t calls = 0;
+    for (auto _ : state)
+    {
+        frame = (frame + 1) & kLiveCityFrameMask;
+        updateLiveCityActorPositions(*scene, frame);
+        scene->world.moveInstances(scene->carMotion, scene->carTransforms);
+        scene->world.moveInstances(scene->pedestrianMotion,
+                                   scene->pedestrianTransforms);
+        scene->world.applyUpdates();
+        benchmark::DoNotOptimize(scene->world.mountedSubtreeCount());
+        ++calls;
+    }
+
+    state.counters["moving_roots"] =
+        double(kLiveCityCars + kLiveCityPedestrians);
+    state.counters["orientation_KB"] =
+        double(scene->world.instanceOrientationStateBytes()) / 1024.0;
+    state.counters["simulated_seconds"] =
+        double(calls) / kLiveCityFrameRate;
+    state.SetItemsProcessed(int64_t(calls));
+}
+
+BENCHMARK(BM_LiveCityMotionFrame)
+    ->Iterations(kLiveCityFrames * 2)
+    ->Unit(benchmark::kMicrosecond);
+
 // Same mounted population as the refined forest, viewed far enough away that
 // selection stops at every renderable TLAS root. Together the two benchmarks
 // separate top-level query/dispatch from mounted BLAS traversal.

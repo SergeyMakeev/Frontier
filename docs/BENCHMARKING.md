@@ -76,6 +76,10 @@ library's macro-based public payload customization.
   8,192 fixed frames, or 136.5 seconds of simulated 60 Hz time, so every host
   samples two complete deterministic trajectories. `orientation_KB` reports
   the optional cold yaw/local-bounds stream.
+- `BM_LiveCityMotionFrame` runs the identical actor trajectories and measures
+  only transform staging, the two rigid motion-group submissions, and
+  publication. Comparing it with the complete driving-frame case separates
+  actor/TLAS update cost from cached traversal and result production.
 - `BM_InstanceForestRootSelectionScale` uses the same mounted forest but a
   distant camera that stops at renderable TLAS roots, separating top-level
   query/dispatch cost from refined BLAS traversal.

@@ -33,6 +33,17 @@
 #include "node.h"
 #include "subtree.h"
 
+// GCC's AArch64 function reordering separated the rotated root walker from
+// the large cached selector that calls it. Keep this pair in one hot text
+// island and out of line; other toolchains retain their normal placement.
+#if defined(__GNUC__) && !defined(__clang__) && defined(__aarch64__)
+  #define FRONTIER_ORIENTED_TEXT                                      \
+      __attribute__((noinline, noclone,                               \
+                     section(".text.hot.frontier_oriented")))
+#else
+  #define FRONTIER_ORIENTED_TEXT
+#endif
+
 namespace frontier {
 
 class SpatialDatabase;
@@ -2013,6 +2024,7 @@ private:
     void runTlasRootInstance(uint32_t instIdx, const Camera& view,
                              const SelectionParams& params, uint8_t mask,
                              Worker& w) const;
+    FRONTIER_ORIENTED_TEXT
     void runOrientedTlasRootInstance(uint32_t instIdx, const Camera& view,
                                      const SelectionParams& params,
                                      uint8_t mask, Worker& w) const;
@@ -2053,9 +2065,11 @@ private:
                                     InstanceId instance,
                                     const Camera& rootLocal,
                                     Worker& w) const;
-    void selectFrontierCached(const Camera& camera, const SelectionParams& params,
-                         SpatialQuery& query, SpatialQuery* usage,
-                         FrontierResultSink& outResult) const;
+    FRONTIER_ORIENTED_TEXT
+    void selectFrontierCached(const Camera& camera,
+                              const SelectionParams& params,
+                              SpatialQuery& query, SpatialQuery* usage,
+                              FrontierResultSink& outResult) const;
     void selectFrontierUncached(const Camera& camera, const SelectionParams& params,
                            SpatialQuery& query, SpatialQuery* usage,
                            FrontierResultSink& outResult) const;
@@ -2216,3 +2230,5 @@ private:
 };
 
 } // namespace frontier
+
+#undef FRONTIER_ORIENTED_TEXT

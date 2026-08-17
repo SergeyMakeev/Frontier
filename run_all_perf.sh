@@ -201,6 +201,8 @@ write_report()
 - \`source.txt\`: exact Git revision and working-tree state
 - \`commands.txt\`: benchmark filters and sampling parameters
 - \`performance_state.txt\`: selected-core frequency, load, and thermal snapshots
+- \`oriented_text_layout.txt\`: linked addresses of the cached selector and
+  rotated-root walker when the platform exposes them
 
 Performance processes used ${affinity_description}. Each benchmark receives a
 ${benchmark_warmup_seconds}-second untimed warmup so demand-based governors can
@@ -513,6 +515,24 @@ failure_stage=benchmark-inventory
     2> "${report_dir}/benchmark_inventory_payload32.log"
 
 {
+    echo "payload64=${bench_exe}"
+    if command -v nm >/dev/null 2>&1; then
+        nm -n -C "${bench_exe}" 2>&1 |
+            grep -E 'SpatialDatabase::(selectFrontierCached|runOrientedTlasRootInstance)' || true
+    else
+        echo "nm unavailable"
+    fi
+    echo
+    echo "payload32=${bench32_exe}"
+    if command -v nm >/dev/null 2>&1; then
+        nm -n -C "${bench32_exe}" 2>&1 |
+            grep -E 'SpatialDatabase::(selectFrontierCached|runOrientedTlasRootInstance)' || true
+    else
+        echo "nm unavailable"
+    fi
+} > "${report_dir}/oriented_text_layout.txt"
+
+{
     cmake --version
     echo
     "${CXX:-c++}" --version 2>&1 || true
@@ -595,6 +615,7 @@ required_families=(
     BM_MovingObjectsSelectionScale
     BM_MovingCameraSelectionScale
     BM_LiveCityDrivingFrame
+    BM_LiveCityMotionFrame
     BM_FlatTlasSelectionScale
     BM_InstanceForestSelectionScale
     BM_FlatInstanceLifecycle
