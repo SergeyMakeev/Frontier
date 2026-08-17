@@ -186,9 +186,10 @@ paired SBC measurement is the acceptance gate.
 - Keeping two specialized walkers duplicates their common traversal-control
   body. This preserves the recovered identity fast path at a modest text-size
   cost; the experiment changes no retained data.
-- The full benchmark suite gains one realistic motion-only case, increasing
-  collection time slightly in exchange for removing ambiguity in future
-  dynamic-scene regressions.
+- The full benchmark suite gains realistic motion-only and render-submission
+  cases. Submission lives in a separate executable so its larger harness does
+  not perturb the LTO layout of the selection guards; this costs additional
+  build and collection time.
 
 ## Required target acceptance
 
@@ -204,6 +205,136 @@ Payload64 live city is a guard and must remain statistically flat. The new
 falsify the instruction-locality theory because the retained implementation
 does not affect actor motion or TLAS publication.
 
+## Direct paired SBC acceptance
+
+The target gate used GCC 13.3 Release/LTO BVH4 builds pinned to Cortex-A72 CPU
+4. Every data point was a fresh process with an untimed warmup. Four ABBA
+cycles (`baseline, candidate, candidate, baseline`) produced eight samples per
+revision and payload. Frequency stayed at 2.208 GHz for every sample and the
+temperature envelope stayed below 46.3 °C. The reported paired effect is the
+geometric mean of candidate/baseline after averaging each revision's two
+samples within a cycle; negative values are improvements.
+
+The first run, `frontier-paired-20260817T084751Z`, compared the intermediate
+ordinary-section build `993ed4e` with the traversal-local source layout
+`bc194d9`:
+
+| Case | payload32 | payload64 |
+|---|---:|---:|
+| live city | -0.40% | -0.16% |
+| 10k roots, 50% hierarchy | +0.64% | -0.64% |
+| 10k roots, 100% hierarchy | +0.34% | **-1.88%** |
+| motion-only control | +1.16% | +0.84% |
+
+The payload32 live-city recovery and payload64 hierarchy win were promising,
+but the motion-only result made this comparison insufficient on its own. The
+ordinary named-section baseline had already perturbed global text placement;
+it could be faster in unrelated code even while losing the selection target.
+
+A deliberately adversarial reverse run,
+`frontier-paired-20260817T090252Z`, therefore compared retained `bc194d9`
+against a candidate that restored the complete `fb8d395` implementation order.
+The table reports the effect of that restoration, so positive numbers are
+losses relative to the retained layout:
+
+| Case | payload32 restoration | payload64 restoration |
+|---|---:|---:|
+| live city | **+0.97%** | -0.10% |
+| 10k roots, 50% hierarchy | +1.34% | **+9.76%** |
+| 10k roots, 100% hierarchy | +1.23% | **+9.34%** |
+| motion-only control | -0.00% | -0.19% |
+
+All four payload64 hierarchy cycles lost by 6.23–11.84% when the old order was
+restored. Payload32 live city lost in all four cycles, while actor motion was
+flat. This isolates the gain to selection-side instruction layout and clears
+the negative control. The traversal-local walker placement is retained.
+
+## Direct SBC experiment pipeline
+
+Remote runs now use a dedicated unprivileged SBC account, NVMe-resident Git
+worktrees, and separate build directories for each revision. The paired runner
+records the exact commits, dirty patches, executable SHA-256 hashes, runner,
+toolchain, kernel, governor, per-process load average, selected-core frequency,
+and thermal envelope. Each benchmark sample is an isolated process pinned to
+one big core and scheduled in ABBA order.
+
+The paired report format adds four paired machine controls (integer dependency,
+unpredictable branch dispatch, distance/error arithmetic, and 2 MiB sequential
+read) and a realistic end-to-end city frame. That companion frame iterates the
+two-span current cut, resolves every immutable payload, and writes a
+preallocated render-submission stream. It intentionally excludes allocator and
+graphics-driver work, keeping those platform-specific costs outside the scene
+database comparison while removing the former downstream-iteration caveat.
+
+### Instrumentation-layout defect and correction
+
+Expanded report `frontier-paired-20260817T091446Z` initially compiled the new
+submission case into the same executable as the established selection guards.
+Although both revisions received identical benchmark source, the extra large
+function changed whole-program LTO/link placement. Previously stable guards
+changed direction: payload32 live city improved 1.02%, but its 50% and 100%
+hierarchy guards lost 1.50% and 3.07%, while payload64 live city lost 1.08%.
+This report was rejected as an acceptance result because instrumentation had
+changed the code layout being measured.
+
+The report also demonstrated why controls must be sampled as isolated
+processes. The baseline and candidate machine executables were byte-identical,
+yet the cache-hit control's first quartet differed by 7.53% and its overall CV
+was about 2%. A same-process seven-repetition screen showed 0.04% CV, proving
+that it concealed process-to-process variance rather than characterizing it.
+That probe was removed from the paired gate in favor of the distance/error
+kernel, whose screen had 0.01% CV.
+
+The corrected build puts `BM_LiveCityRenderSubmissionFrame` only in
+`frontier_submission_bench` and its payload32 twin. The primary executables
+define `FRONTIER_OMIT_SUBMISSION_BENCH`, so the preprocessor removes the new
+helper and benchmark completely before LTO. The established selection,
+motion, and hierarchy guards therefore retain their old harness token stream.
+The paired runner selects the submission executable only for the end-to-end
+case and archives hashes for both executable families.
+
+## Final isolated-harness acceptance
+
+Report `frontier-paired-20260817T094501Z` is the authoritative comparison. It
+uses exact library commits `fb8d395` and `bc194d9`, the isolated executable
+families above, four ABBA cycles, and 224 fresh processes. All 224 samples ran
+at 2.208 GHz; temperature ranged from 44.384 to 47.153 °C; maximum CPU-time
+versus wall-time divergence was 0.033%. The four byte-identical machine
+controls had a +0.17% paired geomean, inside the ±0.25% practical-equivalence
+band.
+
+| Workload | payload32 effect | payload64 effect |
+|---|---:|---:|
+| live-city selection frame | -0.00% | -0.19% |
+| live-city frame + render submission | **-1.71%** | +0.45% (inconclusive) |
+| motion/publication only | -0.04% | +0.20% (inconclusive) |
+| 10k roots, 50% hierarchy | +4.24% (noisy) | **-8.42%** |
+| 10k roots, 100% hierarchy | -0.00% | **-9.52%** |
+
+The four-cycle payload32 50%-hierarchy row had 6.16% candidate CV and one
++11.65% cycle, so it was not accepted at face value. A 12-cycle focused follow-
+up, `frontier-paired-20260817T100640Z`, reduced candidate CV to 0.97% and found
++0.28% with a 95% interval of -0.18% to +0.83%. That is inconclusive at the
+±0.25% practical threshold, not a reproduced regression. The same follow-up
+confirmed an 8.14% payload64 improvement with a wholly negative interval.
+
+The retained candidate's SBC medians in the final full matrix were:
+
+- selection-only live city: 658.378 us payload32, 660.555 us payload64;
+- end-to-end live city plus CPU submission: 1,117.066 us payload32,
+  1,170.916 us payload64;
+- actor motion and TLAS publication: 143.804 us payload32, 143.745 us
+  payload64;
+- 10k-root payload64 uncached hierarchy: 1,615.909 us at 50% hierarchy and
+  2,969.672 us at 100% hierarchy.
+
+**Decision: retain `bc194d9`.** The realistic payload32 frame improves 1.71%,
+the payload64 hierarchy path improves 8–10%, neither motion-only control nor
+core live-city selection has a reproduced regression, and the long payload32
+guard is statistically unresolved around zero. The source-order result remains
+layout-sensitive, so the isolated executable boundary and paired target gate
+are part of the optimization, not merely test scaffolding.
+
 ## Local verification
 
 - Debug BVH4/BVH8 with both 8-byte and 4-byte payloads: 404/404 tests passed.
@@ -211,7 +342,12 @@ does not affect actor motion or TLAS publication.
 - MSVC no-exceptions `/EHs-c- /WX`: passed.
 - Release payload32 and payload64 benchmark targets: built successfully.
 - Both benchmark inventories contain the driving-frame and motion-only cases.
+- The primary inventories omit render submission; both isolated submission
+  inventories contain exactly one render-submission case and execute it.
 - Linux collector shell syntax: validated with `bash -n`.
+- The analyzer validated the 224-sample full report and 96-sample focused
+  report without missing, duplicate, or misordered ABBA samples.
 
-GCC 13 AArch64 linked order and the performance accept/reject conditions above
-remain target-board gates.
+The GCC 13 AArch64 target gate passed at `bc194d9`; future compiler or source
+layout changes must repeat the paired SBC matrix because source adjacency is a
+soft optimizer hint rather than an ABI guarantee.

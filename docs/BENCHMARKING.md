@@ -80,6 +80,16 @@ library's macro-based public payload customization.
   only transform staging, the two rigid motion-group submissions, and
   publication. Comparing it with the complete driving-frame case separates
   actor/TLAS update cost from cached traversal and result production.
+- `BM_LiveCityRenderSubmissionFrame` extends the complete driving frame by
+  iterating the two-span current cut, resolving every immutable payload, and
+  writing `{payload, instance, error}` records to a preallocated CPU render
+  stream. This covers downstream result consumption without adding allocator
+  or graphics-driver variance. Compare it with `BM_LiveCityDrivingFrame` to
+  isolate payload resolution and command-generation cost. It is compiled only
+  into `frontier_submission_bench` and
+  `frontier_submission_bench_payload32`; keeping it out of the primary
+  executables prevents the additional function from perturbing the LTO/link
+  layout of the established selection guards.
 - `BM_InstanceForestRootSelectionScale` uses the same mounted forest but a
   distant camera that stops at renderable TLAS roots, separating top-level
   query/dispatch cost from refined BLAS traversal.
@@ -131,6 +141,41 @@ directory instead, for example
 
 Replace `frontier_bench` with `frontier_bench_payload32` for the matched
 four-byte build.
+
+## Paired revision gate
+
+On Linux, use `run_paired_perf.sh` when accepting a small change. Give it two
+already-configured Release build directories and a report root:
+
+```sh
+./run_paired_perf.sh build-baseline build-candidate perf_reports 4
+```
+
+Set `FRONTIER_PAIRED_CASES` to a comma-separated label list for a longer
+focused follow-up, for example `FRONTIER_PAIRED_CASES=identity_50` with 12
+cycles. The unfiltered matrix remains the required first acceptance pass.
+
+The runner pins every benchmark process to one CPU and executes four ABBA
+cycles per workload. It covers selection-only and render-submission city
+frames, motion-only publication, 50% and 100% uncached hierarchy guards, and
+integer/branch/distance/memory machine controls. Each report archives the exact
+runner, commits and dirty patches, executable hashes, build paths, compiler,
+kernel, governor, per-sample load average, frequency, and temperature.
+
+Summarize a collected report with:
+
+```sh
+python3 analyze_paired_perf.py perf_reports/frontier-paired-TIMESTAMP \
+  --output perf_reports/frontier-paired-TIMESTAMP/SUMMARY.md
+```
+
+The analyzer verifies the ABBA schedule and complete cycle quartets, reports
+raw medians/CVs and cycle-paired effects, bootstraps a cycle-level interval,
+checks CPU-time versus wall-time agreement, and computes an independent
+machine-control geomean. Verdicts require the complete interval to clear a
+±0.25% practical-equivalence band; negative candidate changes are
+improvements. Do not retain a narrow workload win when the controls or an
+unaffected decomposition case move materially in the same run.
 
 The repository retains the keyless serialized-bytes API comparison in:
 
