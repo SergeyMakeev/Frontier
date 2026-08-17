@@ -1488,3 +1488,109 @@ embedding application's link graph.
 larger measured selection regression, and no code-placement compensation will
 be pursued. Both binaries used ordinary Release with PGO and IPO disabled; all
 160 full-gate samples ran at 2.208 GHz between 44.384 and 47.153 C.
+
+## Experiment 16: share immutable actor payload ranges
+
+### Theory
+
+The live-city render query resolves about 24,100 logical leaves even though the
+5,000 car-detail leaves come from 100 placements of one immutable 50-leaf
+definition and the 10,000 pedestrian-part leaves come from 1,000 placements of
+one immutable 10-leaf definition. The renderer still needs one instance id per
+actor, but it does not need a private copy of identical payload and zero-error
+bytes for every placement.
+
+The proposed representation made a render run either:
+
+- an offset/count into the query-owned resolved payload and error streams; or
+- a direct pointer/count into an immutable definition payload stream plus one
+  constant error byte.
+
+`RenderFrontierSpan::errorCode(i)` abstracted the two representations. Eligible
+actors had to be explicitly `renderAsUnit`, completely ready, overlay-free,
+root-leaves-only, free of nested mount points, and composed entirely of
+zero-error leaves. Their root still ran the normal screen-error decision. Every
+other tree and the exact handle-returning API retained the existing cached
+walker. Definition registration encoded the narrow eligibility fact in an
+existing cold runtime float; it did not add a per-instance allocation.
+
+This would have removed per-placement cut caching and payload/error resolution
+for the repeated car and pedestrian definitions while downstream submission
+continued to scan every logical leaf. Therefore any accepted gain would have
+represented less library work, not a weakened benchmark consumer.
+
+### Proposed data-layout trade
+
+The immutable definition already owns its packed payload array for as long as a
+mounted placement can be selected, so direct ranges required no new payload
+storage. The proposed run descriptor grew from 12 to 24 bytes on the 64-bit
+ABI to hold a pointer and constant error. At roughly 293 live-city runs this is
+about 3.5 KiB of additional transient descriptor bytes, exchanged for avoiding
+15,000 repeated actor payload values, 15,000 error bytes, and their cache/write
+traffic. Direct pointers would remain valid only for the published database
+snapshot and query-view lifetime; this was an intentional API/data-layout
+change, not a backwards-compatibility shim.
+
+### Experiment sequence
+
+The first prototype placed the direct-run recognition inline in the generic
+cached selector. Focused reports showed a promising render improvement:
+`frontier-paired-20260817T205434Z` measured -3.09% payload32 and -6.99%
+payload64. The broader report `frontier-paired-20260817T210134Z` measured
+-3.14% and -6.51%, but also moved the unrelated payload32 100%-hierarchy
+control by +1.53%.
+
+A second version removed eager fully-refined plan allocation for eligible flat
+definitions. Report `frontier-paired-20260817T211502Z` improved render by
+3.95% payload32 and 6.33% payload64, but the same non-executing control
+regressed 4.60%. The allocation reduction was real cold-state cleanup, but it
+did not make the produced binary robust.
+
+Next, renderer-only recognition moved to an ordinary responsibility-specific
+translation unit. This used no section name, ordering rule, inline/noinline
+attribute, profile, IPO, or target-specific compiler mechanism. Six-cycle ABBA
+report `/home/codex-perf/frontier/results/frontier-paired-20260817T212716Z`
+measured:
+
+| Case | Payload | Baseline | Candidate | Paired change | 95% interval |
+|---|---:|---:|---:|---:|---:|
+| live-city render | 32 | 407.044 us | 397.139 us | **-2.01%** | [-2.78%, -1.02%] |
+| live-city render | 64 | 457.798 us | 439.053 us | **-3.76%** | [-4.50%, -2.99%] |
+| uncached hierarchy, 100% | 32 | 2896.937 us | 3033.830 us | **+4.30%** | [+3.81%, +4.70%] |
+| uncached hierarchy, 100% | 64 | 2921.075 us | 2907.912 us | -0.23% | [-1.13%, +0.73%] |
+
+All 96 samples ran at 2.208 GHz between 45.307 and 46.230 C; maximum
+CPU-time/wall-time divergence was 0.027%. The payload32 regression is much
+larger than both the render gain and measurement variation.
+
+Finally, the complete cached selector was specialized into compile-time exact
+and segmented-render modes. The exact specialization contained no direct-range
+branch and no runtime segmented-render conditions, while only the render
+specialization called the new helper. This was a legitimate algorithmic path
+split rather than a layout directive, but it generated a second copy of a very
+large selector. The decisive control-only report
+`/home/codex-perf/frontier/results/frontier-paired-20260817T213843Z` became
+worse: payload32 regressed 4.65%, interval [+4.03%, +5.18%], and payload64
+regressed 3.07%, interval [+1.92%, +4.29%]. All 48 samples again ran at exactly
+2.208 GHz between 45.307 and 46.230 C.
+
+### Decision and architectural lesson
+
+**Reject and revert every implementation and API change.** The direct-range
+idea reduces work on its intended path, but the current integration changes the
+generated library binary enough to cause a larger, repeatable regression in an
+unrelated hot traversal. Growing the public run record also imposes a permanent
+cost on every scene, including those with no shareable actor definitions.
+
+No PGO corpus, custom text section, source-order tuning, linker order file,
+`hot`/`cold` annotation, forced inline decision, or function placement will be
+used to turn this into an accepted win. Such a result would depend on the
+standalone benchmark's link graph and could disappear as soon as the static
+library is embedded in a real renderer.
+
+Future work should preserve the ordinary-Release acceptance rule and pursue a
+layout whose benefit dominates binary perturbations—for example, a renderer
+output format selected at query construction whose compact descriptor layout
+does not enlarge the common run, or an actor-definition instance stream
+consumed directly by a batch renderer. Either design must pass unrelated
+payload32 and payload64 hierarchy controls without placement compensation.
