@@ -435,6 +435,13 @@ TerminalRenderView TerminalRenderQuery::select(
 
         uint8_t mask = itemMask(packedVisible);
         if (coarsenRenderUnits && instance.renderAsUnit()) mask = 0;
+        if (mask == 0)
+        {
+            const Impl::Range range = plan.ranges[0];
+            appendRun(plan.payloads.data() + range.begin, range.count,
+                      instanceWord);
+            continue;
+        }
         Camera instanceLocal;
         if (database.instanceOrientations_.empty())
             instanceLocal = toLocal(view, instance.pos, instance.scale, mask);
@@ -508,14 +515,22 @@ TerminalRenderView TerminalRenderQuery::select(
                 continue;
             if (coarsenRenderUnits && batch.renderAsUnit) mask = 0;
 
-            const Camera local =
-                identityYaw(yaw)
-                    ? toLocal(camera, position, batch.scale, mask)
-                    : toLocal(camera, position, batch.scale, yaw, mask);
-            appendDefinition(
-                plan, subtree, local, mask,
-                packInstanceError(
-                    batch.firstInstance + InstanceId(i), 0));
+            const uint32_t instanceWord = packInstanceError(
+                batch.firstInstance + InstanceId(i), 0);
+            if (mask == 0)
+            {
+                const Impl::Range range = plan.ranges[0];
+                appendRun(plan.payloads.data() + range.begin, range.count,
+                          instanceWord);
+                continue;
+            }
+
+            const Camera local = identityYaw(yaw)
+                                     ? toLocal(camera, position, batch.scale,
+                                               mask)
+                                     : toLocal(camera, position, batch.scale,
+                                               yaw, mask);
+            appendDefinition(plan, subtree, local, mask, instanceWord);
         }
     }
 

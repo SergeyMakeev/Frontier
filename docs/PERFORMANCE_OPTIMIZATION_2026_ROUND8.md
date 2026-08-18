@@ -2033,3 +2033,91 @@ temperature stayed between 44.384 and 46.230 C, and maximum CPU/wall divergence
 was 0.038%. This direct result establishes a 6.69-7.60x cumulative improvement
 under the accepted algorithm-and-data-layout-only policy, exceeding the 5x goal
 without deployment-specific binary-layout assumptions.
+
+## Experiment 20: root-resolved terminal range dispatch
+
+### Theory and profile evidence
+
+The accepted actor-batch query still transforms the camera into every visible
+instance and enters `appendDefinition` through a scratch-vector push/pop even
+when the instance root is already fully inside the frustum. The same redundant
+path occurs for every `renderAsUnit` actor after render coarsening forces its
+root mask to zero. In both cases the answer is already the immutable payload
+range stored for definition node zero; no local camera or hierarchy walk can
+change it.
+
+The SBC does not currently provide `perf` and the remote account has no
+passwordless sudo, so a separate `-pg -g` diagnostic build was used only for
+hotspot attribution. It is not an accepted benchmark build. Over the complete
+8,192-frame payload32 trajectory, gprof sampled the definition-dispatch lambda
+at 40.95% of exact-selection time and 40.65% of render-submission time, with
+2,385,049 calls (291.14 per frame). The enclosing query body accounted for a
+further 43.81% and 31.71%; motion generation was 7.62% and 6.50%.
+
+The experiment will append the root plan range directly whenever culling has
+cleared the root plane mask, or render-unit coarsening deliberately clears it.
+Only partially intersecting roots will construct a transformed camera and
+enter descendant traversal. The output range, instance/error metadata, caller
+owned transform layout, culling result, and strict terminal-query contract are
+unchanged.
+
+### Prototype and paired screen
+
+Both mounted general instances and external actor batches now test the resolved
+root mask before constructing a local camera. A zero mask appends
+`plan.ranges[0]` directly with the same instance/error word; the existing
+descendant walker remains the only path for a nonzero mask. The full ARM Debug
+matrix passes all 448 tests across BVH4/BVH8 and payload32/payload64.
+
+Two-cycle paired screen
+`/home/codex-perf/frontier/results/frontier-paired-20260818T003835Z` compared
+the preserved `1cc5c21` ordinary-Release binaries with the prototype. Exact
+selection improved 13.72% payload32 and 11.34% payload64. Render plus complete
+payload scanning improved 9.22% and 8.11%. All intervals excluded zero, all 32
+samples observed 2.208 GHz, temperature stayed between 45.307 and 47.153 C,
+and maximum CPU/wall divergence was 0.028%. A four-cycle run including motion,
+generic selection, and machine controls is required before acceptance.
+
+### Final SBC result and decision
+
+Full report
+`/home/codex-perf/frontier/results/frontier-paired-20260818T004038Z` ran four
+ABBA cycles for the target cases, motion, two generic-selector populations,
+and four independent machine controls:
+
+| Case | Payload | `1cc5c21` median | Candidate median | Paired effect | 95% interval |
+|---|---:|---:|---:|---:|---:|
+| exact selection | 32 | 103.589 us | 91.311 us | -11.97% | [-14.35%, -9.57%] |
+| exact selection | 64 | 103.251 us | 91.491 us | -10.56% | [-11.61%, -8.64%] |
+| render plus complete payload scan | 32 | 130.056 us | 117.796 us | -9.46% | [-9.57%, -9.36%] |
+| render plus complete payload scan | 64 | 126.195 us | 114.069 us | -9.66% | [-10.07%, -9.02%] |
+| motion writer | 32 | 8.135 us | 8.158 us | +0.03% | [-0.31%, +0.38%] |
+| motion writer | 64 | 8.198 us | 8.184 us | -0.12% | [-0.27%, +0.02%] |
+
+All 224 samples observed 2.208 GHz, temperature stayed between 44.384 and
+48.076 C, and maximum CPU/wall divergence was 0.059%. The four machine
+controls had a +0.28% paired geomean and the integer control was flat to 0.01%.
+
+The combined benchmark executable reported 1.67% and 2.53% payload32 losses in
+the unrelated 50% and 100% generic-selector cases; payload64 was contradictory.
+This is not a changed generic algorithm or data layout. The baseline and
+candidate `spatial_database.cpp.o` files are byte-identical for payload32
+(`ebd0d52fb0ee1ad086873eec87141119132f6784adf645c28efe78f1219367b3`)
+and payload64
+(`37bfc27752c659f569478177f1dfca8386a475e38543fb1b0d8d8d8d713cce081a`).
+The machine executable is also byte-identical
+(`0f77d52bade50770c185b35e6f275d7a4f28b083e4aacf471f91726150c50845`).
+Only the combined benchmark text size moved, by 768 bytes, because its live-city
+case references the changed terminal archive member. The generic timing delta
+is therefore incidental executable address placement--exactly the effect this
+round refuses to count as an optimization. A follow-up harness isolation will
+make generic controls independent of terminal-query linkage rather than tuning
+production layout around this artifact.
+
+Keep and commit. The root-resolved dispatch produces a repeatable 10.56-11.97%
+selection gain and 9.46-9.66% end-to-end render gain with unchanged motion,
+output, contracts, and generic traversal objects. Composing paired effects with
+the direct round-start report places cumulative algorithm/data-layout-only
+throughput at approximately 7.48-7.63x for exact selection and 7.63-8.42x for
+complete render consumption; a later direct frozen-anchor run will replace
+that composed estimate after the next architectural experiment.
