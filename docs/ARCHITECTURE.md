@@ -128,14 +128,17 @@ actors transform the camera and visit definition blocks. This static-TLAS plus
 flat-dynamic split avoids copying simulation transforms, allocating mount
 placements, updating orientation records, and refitting dynamic TLAS leaves.
 An optional immutable partition of spatially contiguous actor ranges adds an
-exact two-level broadphase without duplicating mutable state: the query reduces
-current member transforms into one cluster union, rejects or accepts whole
-clusters, and passes only a boundary cluster's unresolved plane mask to member
-tests. Its cost remains O(batch population) for every view but replaces most
-six-plane actor tests with min/max reductions and one test per cluster. The
-trade is spatially ordered actor storage and a deliberately narrower cohort
-contract: consecutive external ids, constant bounds/scale/mask and one
-definition, no per-actor handles, streaming state, or deformed bounds.
+exact two-level broadphase. By default the query reduces current member
+transforms into one cluster union, rejects or accepts whole clusters, and
+passes only a boundary cluster's unresolved plane mask to member tests. A
+parallel optional AABB stream can replace that reduction with conservative
+caller-authored envelopes. Lifetime envelopes are immutable and free per
+frame; published snapshots follow the normal publish-before-query rule and are
+coverage-checked in contract builds. Conservative looseness changes only the
+amount of member work, while under-bounds violate correctness. The trade is
+spatially ordered actor storage, optional envelope memory, and a deliberately
+narrower cohort contract: consecutive external ids, constant bounds/scale/mask
+and one definition, no per-actor handles, streaming state, or deformed bounds.
 
 ## Current and ideal coverage
 

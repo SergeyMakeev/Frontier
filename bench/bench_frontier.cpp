@@ -302,6 +302,8 @@ struct LiveCityScene
     std::vector<YawRotation> pedestrianYaws;
     std::vector<TerminalInstanceCluster> carClusters;
     std::vector<TerminalInstanceCluster> pedestrianClusters;
+    std::vector<AABB> carClusterBounds;
+    std::vector<AABB> pedestrianClusterBounds;
     std::vector<Camera> cameras;
     size_t immutableBytes = 0;
 };
@@ -393,6 +395,33 @@ void updateLiveCityActorPositions(LiveCityScene& scene, uint32_t frame)
     }
 }
 
+void buildLiveCityClusterEnvelopes(
+    std::span<const float4> centers,
+    std::span<const TerminalInstanceCluster> clusters,
+    float motionRadius, const AABB& localBounds,
+    std::vector<AABB>& envelopes)
+{
+    envelopes.resize(clusters.size());
+    const float4 motionExtent =
+        float4::vec(motionRadius, 0.0f, motionRadius);
+    for (size_t clusterIndex = 0; clusterIndex < clusters.size();
+         ++clusterIndex)
+    {
+        const TerminalInstanceCluster cluster = clusters[clusterIndex];
+        float4 minCenter = centers[cluster.first];
+        float4 maxCenter = minCenter;
+        const size_t end = size_t(cluster.first) + cluster.count;
+        for (size_t i = cluster.first + 1; i < end; ++i)
+        {
+            minCenter = min4(minCenter, centers[i]);
+            maxCenter = max4(maxCenter, centers[i]);
+        }
+        envelopes[clusterIndex] = AABB::fromMinMax(
+            localBounds.mn + minCenter - motionExtent,
+            localBounds.mx + maxCenter + motionExtent);
+    }
+}
+
 std::unique_ptr<LiveCityScene> buildLiveCityScene(
     bool terminalBatches = false)
 {
@@ -459,11 +488,19 @@ std::unique_ptr<LiveCityScene> buildLiveCityScene(
         scene->carClusters);
     scene->carPositions.resize(kLiveCityCars);
     scene->carYaws.resize(kLiveCityCars);
+    buildLiveCityClusterEnvelopes(
+        scene->carCenters, scene->carClusters,
+        liveCityTrackRadius(40.0f, 4), box(5.0f),
+        scene->carClusterBounds);
     buildLiveCityActorLayout(
         kLiveCityPedestrians, 32, 8, 27.0f, scene->pedestrianCenters,
         scene->pedestrianClusters);
     scene->pedestrianPositions.resize(kLiveCityPedestrians);
     scene->pedestrianYaws.resize(kLiveCityPedestrians);
+    buildLiveCityClusterEnvelopes(
+        scene->pedestrianCenters, scene->pedestrianClusters,
+        liveCityTrackRadius(1.5f, 1), box(1.5f),
+        scene->pedestrianClusterBounds);
     updateLiveCityActorPositions(*scene, 0);
 
     std::vector<InstanceHandle> carHandles;
@@ -522,6 +559,7 @@ std::array<TerminalInstanceBatch, 2> liveCityActorBatches(
     batches[0].positions = scene.carPositions;
     batches[0].yaws = scene.carYaws;
     batches[0].clusters = scene.carClusters;
+    batches[0].clusterBounds = scene.carClusterBounds;
     batches[0].firstInstance =
         kLiveCityStaticBlocks + kLiveCityStaticSingles;
     batches[0].yawInvariantBounds = true;
@@ -531,6 +569,7 @@ std::array<TerminalInstanceBatch, 2> liveCityActorBatches(
     batches[1].positions = scene.pedestrianPositions;
     batches[1].yaws = scene.pedestrianYaws;
     batches[1].clusters = scene.pedestrianClusters;
+    batches[1].clusterBounds = scene.pedestrianClusterBounds;
     batches[1].firstInstance = batches[0].firstInstance + kLiveCityCars;
     batches[1].yawInvariantBounds = true;
     return batches;

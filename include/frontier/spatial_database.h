@@ -436,9 +436,9 @@ private:
 };
 
 // One contiguous spatial neighborhood in a TerminalInstanceBatch. Clusters
-// form an ordered, gap-free partition of the placement stream. They contain no
-// mutable bounds: TerminalRenderQuery derives an exact current union from the
-// authoritative transforms before culling the members.
+// form an ordered, gap-free partition of the placement stream. Bounds remain
+// a separate optional stream so immutable partitions can be paired with either
+// query-derived current unions or caller-authored conservative envelopes.
 struct TerminalInstanceCluster
 {
     uint32_t first = 0;
@@ -456,6 +456,10 @@ struct TerminalInstanceBatch
     std::span<const float4> positions;
     std::span<const YawRotation> yaws;
     std::span<const TerminalInstanceCluster> clusters;
+    // Optional conservative bounds, one per cluster. Empty derives exact
+    // current unions from positions/yaws. Nonempty bounds must cover every
+    // current member root; contract builds verify that publication invariant.
+    std::span<const AABB> clusterBounds;
     InstanceId firstInstance = 0;
     float scale = 1.0f;
     uint32_t mask = ~0u;

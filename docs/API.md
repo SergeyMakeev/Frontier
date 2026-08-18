@@ -640,6 +640,7 @@ cars.localBounds = carRootBounds;
 cars.positions = simulation.carPositions();
 cars.yaws = simulation.carYaws();
 cars.clusters = simulation.carSpatialClusters(); // optional {first,count}
+cars.clusterBounds = simulation.carClusterEnvelopes(); // optional conservative bounds
 cars.firstInstance = carInstanceBase;
 cars.yawInvariantBounds = true;
 
@@ -657,12 +658,17 @@ thousands of same-shape actors; use ordinary instances when streaming,
 deformation, per-actor scale/mask variation, handle operations, or a dynamic
 broadphase is more important than zero-copy publication.
 
-Optional clusters are immutable index ranges, not cached bounds. They must
-partition a spatially ordered position stream. Selection computes each exact
-current union from the actor transforms, so no separate broadphase publication
-can become stale. A cluster outside the frustum skips all members; a fully
-inside cluster emits each actor's root range; only a boundary cluster performs
-per-actor plane tests.
+Optional clusters are immutable index ranges and must partition a spatially
+ordered position stream. With an empty `clusterBounds` span, selection computes
+each exact current union from actor transforms, so this safe default cannot
+become stale. A caller may instead provide one conservative AABB per cluster.
+That can be a lifetime motion envelope built once (ideal for actors constrained
+to a road/cell), or a current snapshot published before `select()`. Every bound
+must contain every current member root; contract builds verify coverage. An
+outside cluster skips all members, a fully inside cluster emits each actor's
+root range, and only a boundary cluster performs per-actor plane tests. Looser
+envelopes remain correct but cause more member work; an under-bound envelope is
+a contract violation.
 
 ## 8. Stream topology and render readiness independently
 

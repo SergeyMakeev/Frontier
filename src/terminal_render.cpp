@@ -471,6 +471,11 @@ TerminalRenderView TerminalRenderQuery::select(
                            batch.yaws.size() == batch.positions.size(),
                        "TerminalRenderQuery::select: batch yaw count does not "
                        "match its position count");
+        FRONTIER_CHECK(batch.clusterBounds.empty() ||
+                           batch.clusterBounds.size() ==
+                               batch.clusters.size(),
+                       "TerminalRenderQuery::select: cluster bound count does "
+                       "not match its cluster count");
         FRONTIER_CHECK(batch.scale > 0.0f && std::isfinite(batch.scale) &&
                            std::isfinite(1.0f / batch.scale),
                        "TerminalRenderQuery::select: invalid batch scale");
@@ -574,12 +579,17 @@ TerminalRenderView TerminalRenderQuery::select(
                 "TerminalRenderQuery::select: invalid batch transform");
 #endif
 
-        for (const TerminalInstanceCluster cluster : batch.clusters)
+        for (size_t clusterIndex = 0;
+             clusterIndex < batch.clusters.size(); ++clusterIndex)
         {
+            const TerminalInstanceCluster cluster =
+                batch.clusters[clusterIndex];
             const size_t first = cluster.first;
             const size_t end = first + cluster.count;
-            AABB clusterBounds = AABB::empty();
-            if (batch.yawInvariantBounds)
+            AABB clusterBounds = batch.clusterBounds.empty()
+                                     ? AABB::empty()
+                                     : batch.clusterBounds[clusterIndex];
+            if (batch.clusterBounds.empty() && batch.yawInvariantBounds)
             {
                 float4 minPosition = batch.positions[first];
                 float4 maxPosition = minPosition;
@@ -599,7 +609,7 @@ TerminalRenderView TerminalRenderQuery::select(
                     batch.localBounds.mn * batch.scale + minPosition,
                     batch.localBounds.mx * batch.scale + maxPosition);
             }
-            else
+            else if (batch.clusterBounds.empty())
             {
                 for (size_t i = first; i < end; ++i)
                     clusterBounds.expand(worldBoundsAt(i));
@@ -607,6 +617,14 @@ TerminalRenderView TerminalRenderQuery::select(
             FRONTIER_CHECK(finiteNonEmptyBounds(clusterBounds),
                            "TerminalRenderQuery::select: clustered batch "
                            "bounds overflow");
+#if FRONTIER_CONTRACT_CHECKS
+            if (!batch.clusterBounds.empty())
+                for (size_t i = first; i < end; ++i)
+                    FRONTIER_CHECK(
+                        clusterBounds.contains(worldBoundsAt(i)),
+                        "TerminalRenderQuery::select: published cluster "
+                        "bounds do not cover their current actors");
+#endif
 
             uint8_t clusterMask = kAllPlanes;
             if (testAabb(clusterBounds, camera.frustum, clusterMask) ==

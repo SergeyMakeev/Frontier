@@ -2388,3 +2388,117 @@ clusters. The result narrows the design space: retain the flat exact clusters
 and optimize either their authoritative bound production or the much more
 expensive partial-definition work, without adding a per-frame hierarchy-build
 pass.
+
+## Experiment 24: simulation-published current cluster bounds
+
+### Theory and safety contract
+
+The flat-cluster query rereads all 1,100 actor positions to reduce 175 bounds,
+immediately after the simulation loop wrote those same positions. This is an
+avoidable producer/consumer pass. The simulation already visits actors in the
+cluster order; it can accumulate each current min/max while generating the
+transforms, write one AABB per cluster, and let selection begin directly with
+plane classification.
+
+Add an optional `clusterBounds` span alongside the immutable `{first,count}`
+partition. Empty retains the self-derived path. A nonempty span must match the
+cluster count and conservatively contain every current member root. Debug/
+contract builds recompute actor roots and verify coverage; Release trusts the
+published snapshot, matching the database's existing requirement that callers
+publish/apply mutable state before querying. Conservative bounds preserve exact
+culling; stale under-bounds are a contract violation.
+
+The live-city producer fuses min/max reduction into the existing transform
+loops and the isolated motion benchmark consumes the resulting AABB arrays, so
+maintenance is timed rather than hidden. The tradeoffs are 175 writable AABBs
+(5.47 KiB) and an explicit publication invariant. Acceptance requires a net
+complete-frame improvement after the additional writes, unchanged exact/render
+entry streams, all ARM tests, and a paired ordinary-Release result.
+
+### Producer prototype 1: reject generic runtime-count loop
+
+All 452 ARM tests passed. Screen `frontier-paired-20260818T020311Z` showed that
+selection avoided approximately 5 us of query-side reduction, but the first
+generic producer lambda changed compile-time cohort counts into a runtime
+64-bit division per actor. Isolated motion rose from 8.190 to 15.599 us for
+payload32 and 8.138 to 15.764 us for payload64 (+90.46%/+93.70%). The complete
+frame consequently regressed 0.32%/3.20% in exact mode and 2.58%/1.83% in
+render mode. Machine controls were effectively flat (+0.09% geomean).
+
+Reject that producer implementation, not yet the publication architecture.
+Restore the original two constant-count trajectory loops and their exact phase
+arithmetic, then add only fixed-width 2/8 min/max accumulators and one AABB
+write at each cluster boundary. This preserves the compiler-visible constants
+and original actor order. Rescreen before any formal run.
+
+The rescreen `frontier-paired-20260818T020607Z` rejected that tuning too.
+Motion rose from 8.210 to 16.365 us for payload32 and 8.094 to 16.455 us for
+payload64 (+99.33%/+103.30%); the dependent reductions and bound writes, not
+only the removed division, inhibit the efficient transform loop. Exact frames
+regressed 3.34%/3.39% and render frames 3.83%/3.02%. Per-frame bound publication
+is therefore not viable for this producer.
+
+### Producer prototype 2: immutable motion envelopes
+
+The API accepts conservative bounds, not necessarily tight current unions. A
+cohort constrained to a known road/animation cell can build a lifetime cluster
+envelope once from its spatial centers, maximum motion radius, and actor root
+extent. Selection remains exact: outside/inside classification of a containing
+envelope is safe, and a partial envelope still tests current actors. This has
+zero per-frame writer cost and cannot become stale, at the cost of looser
+clusters and therefore more member/descendant work. Restore the byte-for-byte
+original motion loops, build trajectory envelopes outside timing, and screen
+this alternative before deciding whether the optional bound stream belongs in
+the API.
+
+Screen `frontier-paired-20260818T020856Z` is promising: exact frames improved
+8.00%/6.57% for payload32/payload64 and end-to-end render improved 4.35%/1.84%,
+while motion was -0.01%/+0.31%. All samples held 2.208 GHz at 43.461-46.230 C.
+The one-cycle machine controls were noisy (+0.81% geomean, driven by the
+distance control), so advance to four ABBA cycles with full identity and
+machine controls. Acceptance additionally requires identical 8,192-frame
+entry/segment extrema and averages, plus symbol/hash inspection of the restored
+motion writer.
+
+### Formal result and decision
+
+Report `frontier-paired-20260818T021027Z` compared immutable road envelopes
+with the frozen `f12fa0f` ordinary-Release binaries over four ABBA cycles:
+
+| Case | Payload | `f12fa0f` median | Envelope median | Paired effect | 95% interval |
+|---|---:|---:|---:|---:|---:|
+| exact selection | 32 | 74.047 us | 69.948 us | -6.04% | [-6.86%, -5.55%] |
+| exact selection | 64 | 74.434 us | 70.089 us | -5.83% | [-5.99%, -5.70%] |
+| render plus complete payload scan | 32 | 100.549 us | 96.156 us | -4.38% | [-4.45%, -4.29%] |
+| render plus complete payload scan | 64 | 96.509 us | 92.242 us | -4.62% | [-5.06%, -4.17%] |
+| motion writer | 32 | 8.179 us | 8.157 us | -0.15% | [-0.34%, +0.02%] |
+| motion writer | 64 | 8.151 us | 8.169 us | +0.26% | [-0.03%, +0.56%] |
+
+All 224 samples ran at 2.208 GHz, temperature stayed between 42.538 and
+46.230 C, and maximum CPU/wall divergence was 0.063%. The machine-control
+geomean was +0.36%; integer and memory controls were flat, while the independent
+distance control was noisy. Generic identity results again contradicted each
+other by payload width. The underlying generic traversal objects remain
+byte-identical at
+`ebd0d52fb0ee1ad086873eec87141119132f6784adf645c28efe78f1219367b3`
+(payload32) and
+`37bfc27752c659f569478177f1dfca8386a475e38543fb1b0d8d8d713cce081a`
+(payload64); the machine executable is also byte-identical. The restored motion
+writer is exactly 0x19c bytes in all four benchmark binaries and merely shifted
+from `0x9ee0` to `0x9f20`, matching its interval around zero.
+
+Every sample reported identical 8,192-frame results between revisions. Exact
+selection averaged 24,072.7099609375 entries and 461.639404296875 segments,
+with 16,455/28,076 entry extrema. Render averaged 24,139.2685546875 entries and
+459.97802734375 segments, with 16,576/28,205 extrema; its complete submission
+count matched the entry count. Both represented 136.53333333333333 simulated
+seconds.
+
+Keep and commit the optional conservative-bound stream and immutable-envelope
+benchmark architecture. This result has no per-frame maintenance, no stale
+snapshot, and includes exact member/descendant work caused by envelope
+looseness. It trades 5.47 KiB of scene-owned AABBs and a known-motion-region
+contract for 5.83-6.04% faster exact frames and 4.38-4.62% faster complete
+render frames. Empty bounds retain the self-derived safe default; the rejected
+current-bound producer documents why users should not manufacture per-frame
+snapshots unless their simulation already obtains them essentially for free.

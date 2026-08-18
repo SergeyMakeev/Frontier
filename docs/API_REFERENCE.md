@@ -1222,6 +1222,7 @@ struct TerminalInstanceBatch {
     std::span<const float4> positions;
     std::span<const YawRotation> yaws;
     std::span<const TerminalInstanceCluster> clusters;
+    std::span<const AABB> clusterBounds;
     InstanceId firstInstance;
     float scale;
     uint32_t mask;
@@ -1289,13 +1290,22 @@ Output ids are `firstInstance + actorIndex`; the exclusive end must not exceed
 other and from normal instance ids in the same result.
 
 `clusters` is optional. When present, its `{first,count}` records must be an
-ordered, gap-free, nonempty partition of the position stream. The query derives
-each cluster's exact current union from the authoritative transforms; callers
-do not publish mutable cluster bounds. Outside clusters reject all members,
-inside clusters emit root ranges directly, and partial clusters pass their
-narrowed plane mask to exact member tests. Spatially neighboring actors should
-therefore be contiguous. Incoherent partitions remain correct but can cost more
-than leaving `clusters` empty.
+ordered, gap-free, nonempty partition of the position stream. Spatially
+neighboring actors should be contiguous. Incoherent partitions remain correct
+but can cost more than leaving `clusters` empty.
+
+`clusterBounds` is independently optional and, when nonempty, must contain one
+finite conservative AABB per cluster. Empty makes the query derive each exact
+current union from authoritative transforms. Nonempty lets the caller provide
+either a lifetime motion envelope or a current bound snapshot. Each AABB must
+contain every current member root; contract builds recompute roots and verify
+coverage, while Release trusts the same publication contract as other mutable
+scene state. Outside bounds reject all members, inside bounds emit root ranges
+directly, and partial bounds pass their narrowed plane mask to exact member
+tests. Loose bounds reduce acceleration only; under-bounds can cull visible
+actors and are a contract violation. Prefer immutable lifetime envelopes when
+motion is constrained, exact self-derived unions when it is not, and per-frame
+snapshots only when the simulation already produces them cheaply.
 
 Batch spans need remain valid only during `select()`. The actors are not
 inserted into the database, have no `InstanceHandle`, mount/readiness state, or

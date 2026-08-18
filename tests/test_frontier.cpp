@@ -870,6 +870,19 @@ TEST(Frontier, TerminalActorClustersMatchUngroupedPlacementStream)
     ungrouped.renderAsUnit = true;
     TerminalInstanceBatch clustered = ungrouped;
     clustered.clusters = clusters;
+    std::array<AABB, 2> clusterBounds;
+    for (size_t clusterIndex = 0; clusterIndex < clusters.size();
+         ++clusterIndex)
+    {
+        clusterBounds[clusterIndex] = AABB::empty();
+        const TerminalInstanceCluster cluster = clusters[clusterIndex];
+        for (size_t i = cluster.first; i < cluster.first + cluster.count; ++i)
+            clusterBounds[clusterIndex].expand(
+                toWorld(clustered.localBounds, positions[i],
+                        clustered.scale, yaws[i]));
+    }
+    TerminalInstanceBatch published = clustered;
+    published.clusterBounds = clusterBounds;
 
     const auto selected = [&](TerminalRenderQuery& query,
                               const TerminalInstanceBatch& batch,
@@ -894,13 +907,29 @@ TEST(Frontier, TerminalActorClustersMatchUngroupedPlacementStream)
         cameraAt(-35.0f, float4::point(18.0f, 0.0f, 0.0f))};
     TerminalRenderQuery ungroupedQuery;
     TerminalRenderQuery clusteredQuery;
+    TerminalRenderQuery publishedQuery;
     for (const Camera& camera : cameras)
     {
         EXPECT_EQ(selected(clusteredQuery, clustered, camera, false),
                   selected(ungroupedQuery, ungrouped, camera, false));
+        EXPECT_EQ(selected(publishedQuery, published, camera, false),
+                  selected(ungroupedQuery, ungrouped, camera, false));
         EXPECT_EQ(selected(clusteredQuery, clustered, camera, true),
                   selected(ungroupedQuery, ungrouped, camera, true));
+        EXPECT_EQ(selected(publishedQuery, published, camera, true),
+                  selected(ungroupedQuery, ungrouped, camera, true));
     }
+
+    std::array<AABB, 2> underBounds = clusterBounds;
+    underBounds[0] = box(0.1f, positions[0]);
+    TerminalInstanceBatch invalidPublished = published;
+    invalidPublished.clusterBounds = underBounds;
+    TerminalRenderQuery invalidQuery;
+    EXPECT_THROW(
+        invalidQuery.select(
+            database, cameras[0],
+            std::span<const TerminalInstanceBatch>(&invalidPublished, 1)),
+        std::logic_error);
 }
 
 TEST(Frontier, TerminalRenderRejectsNonzeroTerminalError)
