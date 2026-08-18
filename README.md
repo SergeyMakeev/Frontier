@@ -205,16 +205,12 @@ Payload64 median database time per simulated frame is:
 | Intel i9-12900K | **38.143 us** | 2.497 us | 0.229% |
 | AMD EPYC 9654 | **23.144 us** | 1.992 us | 0.139% |
 
-The authoritative ordinary non-IPO SBC comparison is 9.72-9.92x faster for
-exact selection and 9.29-10.36x faster through complete CPU payload scanning
-than the round-start implementation. The gain comes from algorithms,
-ownership, and data layout; PGO is not used, and enabling IPO changes the
-latest SBC city result by less than 0.3%. Reusable assembly separately reduces
-400-house construction latency by 60-83% and retained memory by 63-64%.
+The current reusable-assembly path completes the measured 400-house build in
+17.464-96.355 us and retains 73.293-77.191 KiB, depending on native BVH width.
 Payload32 saves about 773 KiB in the measured city but has no portable timing
 advantage. These medians are workload measurements, not latency guarantees;
 see the
-[cross-platform performance snapshot](docs/PERFORMANCE_RESULTS_2026_08_18.md)
+[current performance report](docs/PERFORMANCE.md)
 for both payload widths, generic controls, raw traversal, forced misses,
 assembly, lifecycle, kernel context, and measurement caveats.
 
@@ -225,11 +221,9 @@ bash ./run_unit_tests.sh  # Debug, checks enabled, BVH4 + BVH8
 bash ./run_perf_bench.sh  # Release, native BVH width, 4/8-byte payload comparison
 ```
 
-GCC PGO remains available through `run_arm_pgo.sh` for applications that can
-train and ship compiler/source/workload-specific profiles. It is optional and
-is not used by any headline result above. The portable performance contract is
-the ordinary-Release algorithm and data layout, not a trained binary or a
-particular link arrangement.
+GCC PGO is available through `run_arm_pgo.sh` for applications that can train
+and ship compiler/source/workload-specific profiles. It is optional; the
+four-device snapshot above uses Release with IPO and without PGO.
 
 On Windows, use `run_unit_tests.bat` and `run_perf_bench.bat`.
 
@@ -259,13 +253,13 @@ off because they require a separate optimized build. When the project is
 included with `add_subdirectory()`, both default off and the
 `frontier` target propagates its C++20 requirement to consumers.
 
-See the progressive [API guide](docs/API.md) for the integration flow, the
+See the [documentation index](docs/README.md), the
+[current codebase map](docs/CODEBASE.md), the progressive
+[API guide](docs/API.md) for the integration flow, the
 exhaustive [API reference](docs/API_REFERENCE.md) for exact contracts,
 [ARCHITECTURE.md](docs/ARCHITECTURE.md) for implementation details, and
-[BENCHMARKING.md](docs/BENCHMARKING.md) for measurement guidance. The latest
-optimization campaign, including rejected experiments and raw-result names,
-is recorded in
-[PERFORMANCE_OPTIMIZATION_2026_ROUND8.md](docs/PERFORMANCE_OPTIMIZATION_2026_ROUND8.md).
-The current release candidate's M2 Max, Cortex-A72 SBC, i9-12900K, and EPYC 9654
-results are summarized separately in the
-[cross-platform performance snapshot](docs/PERFORMANCE_RESULTS_2026_08_18.md).
+[BENCHMARKING.md](docs/BENCHMARKING.md) for measurement guidance. The current
+M2 Max, Cortex-A72 SBC, i9-12900K, and EPYC 9654 results are in the
+[current performance report](docs/PERFORMANCE.md).
+Historical designs and experiments are kept separately in
+[HISTORY.md](docs/HISTORY.md) and the [documentation archive](docs/archive/README.md).

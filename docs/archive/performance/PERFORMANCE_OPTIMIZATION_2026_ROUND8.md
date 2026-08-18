@@ -1,5 +1,8 @@
 # Performance optimization round 8: render-native cut resolution
 
+> Archived engineering journal. Revisions, APIs, measurements, and conclusions
+> in this file are historical and are not current product documentation.
+
 Date: 2026-08-17
 
 ## Baseline and acceptance policy
@@ -2566,4 +2569,4 @@ values differ from the accepted ordinary non-IPO candidate by only
 0.24-0.30%, reinforcing that the direct approximately 10x result is not an
 IPO, PGO, or code-placement effect. The complete four-device tables and
 protocol caveats are in
-[PERFORMANCE_RESULTS_2026_08_18.md](PERFORMANCE_RESULTS_2026_08_18.md).
+[PERFORMANCE.md](../../PERFORMANCE.md).

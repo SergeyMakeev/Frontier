@@ -1,17 +1,13 @@
-# Cross-platform performance snapshot (2026-08-18)
+# Current performance
 
-This report summarizes four format-v3 bundles captured from Frontier commit
-`63f2e3f`. The performance implementation is commit `c4edb43`; the intervening
-commits document and verify that result. All four bundles contain the same
-source and the complete 85-case `frontier_bench` registry for both four- and
-eight-byte payloads.
+Measurements were captured on 2026-08-18. This report describes Frontier
+commit `63f2e3f`. All four format-v3 bundles contain the same source and the
+complete 85-case
+`frontier_bench` registry for both four- and eight-byte payloads.
 
-This is an absolute cross-platform snapshot. Cross-machine timings combine
-different processors, compilers, operating systems, SIMD widths, schedulers,
-and power controls; they are portability and capacity-planning data, not a
-before/after optimization experiment. The algorithm-only speedup is established
-separately by the paired ordinary-Release SBC result in
-[the round-8 report](PERFORMANCE_OPTIMIZATION_2026_ROUND8.md).
+Cross-machine timings combine different processors, compilers, operating
+systems, SIMD widths, schedulers, and power controls. They are absolute
+portability and capacity-planning data for the current codebase.
 
 ## Machines and measurement protocol
 
@@ -89,29 +85,11 @@ decision. Payload widths produce identical counts on each machine. BVH4 and
 BVH8 have the same entry counts but differ by eight segment descriptors over
 the full trajectory because their physical grouping differs.
 
-### Accepted algorithm-only improvement
-
-The authoritative before/after result rebuilt the original round-start
-`a8303c8` and final `c4edb43` behavior as ordinary non-IPO, non-PGO CMake
-Release binaries on the pinned Cortex-A72. Four fresh-process ABBA cycles
-produced:
-
-| Case | Payload | Original | Final | Direct speedup | 95% speedup interval |
-|---|---:|---:|---:|---:|---:|
-| Exact city selection | 32 | 694.669 us | 69.923 us | **9.92x** | 9.89-9.96x |
-| Exact city selection | 64 | 681.546 us | 70.075 us | **9.72x** | 9.69-9.75x |
-| Render + complete payload scan | 32 | 895.825 us | 96.112 us | **9.29x** | 9.24-9.32x |
-| Render + complete payload scan | 64 | 967.931 us | 92.899 us | **10.36x** | 10.28-10.46x |
-
-The latest IPO-enabled SBC city medians are only 0.24-0.30% below those final
-non-IPO medians. IPO therefore does not explain the approximately 10x result;
-the retained gain comes from algorithms, ownership, and data layout.
-
 The four comprehensive bundles run the complete primary `frontier_bench`
 registry but not the separately linked `frontier_submission_bench`. They
-refresh motion and exact selection on every platform, but the complete
-downstream payload-scan measurement above remains the paired SBC result. No
-cross-platform render-submission value is inferred from selection time.
+measure motion and exact selection on every platform, but do not provide
+cross-platform render-submission or downstream payload-scan values. None is
+inferred from selection time.
 
 ## General selection controls
 
@@ -136,7 +114,7 @@ should disable reuse.
 Root-only work represents 20.7-27.9% of the corresponding refined raw call.
 The remaining 72.1-79.3% is mounted-definition traversal and additional
 output. This explains why terminal ranges, coherent record reuse, and avoiding
-per-leaf resolution dominate the final architecture.
+per-leaf resolution dominate the current architecture.
 
 ### Recurring and continuously unique cameras
 
@@ -252,7 +230,7 @@ normalized per processed lane; append bandwidth uses the 12-byte
 
 The M2 is 6.0-15.3x faster than the SBC in the isolated traversal,
 validation, and output kernels but only 3.83x faster in the complete city
-frame. The final architecture reduces the amount of those brute-force kernels
+frame. The current architecture reduces the amount of those brute-force kernels
 executed, making frame time less dependent on peak SIMD and bandwidth.
 
 ## Variability and interpretation
@@ -273,14 +251,11 @@ with a focused paired non-IPO run before changing production code.
 
 ## Conclusions
 
-- The final implementation passes the complete 452-test matrix on all four
+- The current implementation passes the complete 452-test matrix on all four
   devices and produces consistent live-city output across NEON/BVH4 and
   AVX2/BVH8.
 - The 100,000-leaf moving city costs 18.254-69.866 us per payload64 database
   frame, or 0.110-0.419% of a 60 Hz frame budget.
-- The accepted ordinary-Release SBC comparison remains 9.72-9.92x faster for
-  exact selection and 9.29-10.36x faster through complete CPU payload
-  consumption. Neither PGO nor IPO is required for that result.
 - Exact recurring camera poses are 10-68 ns memo lookups; they must not be used
   as a proxy for continuous motion. The city workload supplies that coverage.
 - Reusable assembly reduces construction by 60-83% and retained memory by
@@ -288,7 +263,7 @@ with a focused paired non-IPO run before changing production code.
 - Payload32 saves 773 KiB in the measured city but offers no portable timing
   advantage.
 - The broad four-device bundles omit the isolated submission executable, so
-  only the SBC currently has a complete render-plus-payload-scan result.
+  this snapshot does not report complete render-plus-payload-scan timing.
 
 The analyzed bundles are:
 

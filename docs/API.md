@@ -195,7 +195,7 @@ publish once after a mutation batch, and disable reuse when the caller knows
 every cached record must miss. Absolute time depends on output size, scene
 shape, compiler, and processor. The complete workloads, per-machine tables,
 and caveats are in the
-[cross-platform performance snapshot](PERFORMANCE_RESULTS_2026_08_18.md).
+[current performance report](PERFORMANCE.md).
 
 ## 3. Describe one renderable node
 

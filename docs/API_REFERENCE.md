@@ -234,9 +234,9 @@ inline constexpr uint32_t kWide = FRONTIER_BVH_WIDTH;
 ```
 
 `fmadd()` returns the backend-matching multiply-add result. `kWide` is the
-number of lanes in `float8` and `WideBounds`. `float8` retains its historical
-source-compatible name; it contains four lanes in a BVH4 build and eight lanes
-in a BVH8 build.
+number of lanes in `float8` and `WideBounds`. Despite its fixed public type
+name, `float8` contains four lanes in a BVH4 build and eight lanes in a BVH8
+build.
 
 ```cpp
 struct alignas(16) float4 {
@@ -1108,7 +1108,7 @@ const SelectionStats& lastSelectionStats() const;
   reuse for coherent views; disable it when the host knows no record can
   survive. The continuously moving 100,000-leaf city takes 18.254-69.866 us
   per complete payload64 database frame across the four measured machines.
-  See the [cross-platform snapshot](PERFORMANCE_RESULTS_2026_08_18.md) for
+  See the [current performance report](PERFORMANCE.md) for
   conditions.
 - `setReuseEnabled()` resets damping/reuse/usage state when the value changes,
   while retaining allocations and the configured half-life.

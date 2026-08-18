@@ -256,7 +256,7 @@ and is not a continuous-camera measurement. The realistic 100,000-leaf city
 times continuous camera motion, 1,100 moving roots, publication, and exact
 selection directly at 18.254-69.866 us per payload64 frame; motion and
 publication alone take 1.953-8.140 us. See the full
-[cross-platform snapshot](PERFORMANCE_RESULTS_2026_08_18.md).
+[current performance report](PERFORMANCE.md).
 
 The placement-state counter includes definition-local shared
 readiness/coverage words and retained private coverage slabs; it is
@@ -266,12 +266,15 @@ immutable definition bytes are shared.
 Canonical wide-lane bounds are responsible for much of the current immutable
 footprint. Every real node bound is stored once in its parent's `WideBlock`
 lane, with the aggregate definition bound in the serialized header; there is
-no duplicate scalar bound stream. In the local before/after experiment this
-reduced immutable bytes by about 36%, improved construction by roughly
-32--48%, and improved batched copy-on-write bound updates by 25--77% for
-32--256 edits. Selection moved by at most about 3%, within run-to-run noise.
+no duplicate scalar bound stream. A BVH4 node uses a 128-byte hot bound block
+plus 32 bytes of cold metadata; BVH8 uses 256 plus 64 bytes. In the current
+payload64 400-house workload, immutable definition state is 200.6 KiB when
+flattened and 22.9-23.1 KiB when the house definition is shared. Updating and
+flushing 256 copy-on-write bounds takes 3.574-25.649 us across the four
+measured machines.
 
 These numbers are implementation checkpoints rather than guarantees for a new
 scene or machine. Reproduce them with the matched profiles in
 [BENCHMARKING.md](BENCHMARKING.md); historical API and layout measurements are
-kept in [HISTORY.md](HISTORY.md) and `bench_results/`.
+kept in [HISTORY.md](HISTORY.md), the [archive](archive/README.md), and
+`bench_results/`.

@@ -1,5 +1,8 @@
 # Dynamic-scene performance campaign (round 2)
 
+> Archived engineering journal. Revisions, APIs, measurements, and conclusions
+> in this file are historical and are not current product documentation.
+
 ## Goal
 
 Improve moving-camera and moving-object frame performance by at least 2x

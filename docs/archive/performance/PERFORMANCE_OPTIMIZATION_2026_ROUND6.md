@@ -1,5 +1,8 @@
 # Identity-yaw traversal recovery
 
+> Archived engineering journal. Revisions, APIs, measurements, and conclusions
+> in this file are historical and are not current product documentation.
+
 ## Goal
 
 The controlled AArch64 result for `f78ffdc` found a localized regression in

@@ -166,7 +166,7 @@ reuse; deliberately forcing all records to miss costs 44.5-51.5% more than a
 reuse-disabled raw walk. The continuously moving 100,000-leaf city, which
 cannot use an exact recurring-view memo, completes motion, publication, and
 exact payload64 selection in 18.254-69.866 us. See
-[PERFORMANCE_RESULTS_2026_08_18.md](PERFORMANCE_RESULTS_2026_08_18.md).
+[PERFORMANCE.md](PERFORMANCE.md).
 
 ## 11. Collection
 
@@ -198,4 +198,4 @@ after all placements are gone.
 The complexity bounds describe scaling, not constants. Current representative
 latencies and the measured split between TLAS work, mounted refinement,
 publication, and selection are maintained in the
-[cross-platform performance snapshot](PERFORMANCE_RESULTS_2026_08_18.md).
+[current performance report](PERFORMANCE.md).

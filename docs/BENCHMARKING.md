@@ -19,7 +19,7 @@ library's macro-based public payload customization.
 
 ## End-to-end subtree benchmark
 
-`frontier_bench` contains the paired city/house experiment:
+`frontier_bench` contains the city/house workloads:
 
 - `BM_SubtreeAssembly_FrontierCost` compares a flattened city definition with
   a city whose house nodes mount one shared house definition;
@@ -180,11 +180,6 @@ machine-control geomean. Verdicts require the complete interval to clear a
 improvements. Do not retain a narrow workload win when the controls or an
 unaffected decomposition case move materially in the same run.
 
-The repository retains the keyless serialized-bytes API comparison in:
-
-- `bench_results/bytes_api_before.json`
-- `bench_results/bytes_api_after.json`
-
 ## Comparing BVH4 and BVH8
 
 Branch width changes both SIMD work and memory layout, so compare complete
@@ -283,12 +278,11 @@ The current primary registry contains 85 cases per payload build. With five
 a complete report normally takes roughly 10-20 minutes depending on build and
 host speed.
 
-The latest analyzed release snapshot covers M2 Max, Cortex-A72 SBC,
+The current analyzed release snapshot covers M2 Max, Cortex-A72 SBC,
 i9-12900K, and EPYC 9654 format-v3 results from commit `63f2e3f`; see
-[PERFORMANCE_RESULTS_2026_08_18.md](PERFORMANCE_RESULTS_2026_08_18.md). It
-uses median real time and keeps cross-machine current-state results separate
-from the pinned before/after optimization score. All four primary reports
-contain 85 medians for both payload widths and pass all 452 Debug tests.
+[PERFORMANCE.md](PERFORMANCE.md). It
+uses median real time. All four primary reports contain 85 medians for both
+payload widths and pass all 452 Debug tests.
 
 At a high level, its payload64 continuously moving 100,000-leaf city completes
 actor motion, publication, and exact selection in 18.254-69.866 us per frame;

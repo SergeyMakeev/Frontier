@@ -1,5 +1,8 @@
 # AArch64 payload32 live-city recovery
 
+> Archived engineering journal. Revisions, APIs, measurements, and conclusions
+> in this file are historical and are not current product documentation.
+
 ## Goal and target evidence
 
 The clean AArch64 `fb8d395` validation recovered the identity-only hierarchy

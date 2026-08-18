@@ -124,7 +124,7 @@ cases for both payload widths on each of four machines, and every machine
 passed the 452-test payload32/payload64 by BVH4/BVH8 Debug matrix. Its
 100,000-leaf live-city results, representative generic controls, phase split,
 and measurement caveats are in
-[PERFORMANCE_RESULTS_2026_08_18.md](PERFORMANCE_RESULTS_2026_08_18.md).
+[PERFORMANCE.md](PERFORMANCE.md).
 `BM_LiveCityRenderSubmissionFrame` is linked only into the isolated submission
 executables and is not currently collected by the comprehensive four-device
 runner; the snapshot labels the SBC-only downstream result explicitly.

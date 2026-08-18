@@ -1,5 +1,8 @@
 # SBC follow-up: benchmark integrity, raw traversal, and measurement control
 
+> Archived engineering journal. Revisions, APIs, measurements, and conclusions
+> in this file are historical and are not current product documentation.
+
 ## Scope and immutable baseline
 
 The follow-up starts from clean commit `d2f308a`, after the final round-3 audit.

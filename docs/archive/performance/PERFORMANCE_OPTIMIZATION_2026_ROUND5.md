@@ -1,5 +1,8 @@
 # Live-city continuous-motion benchmark
 
+> Archived engineering journal. Revisions, APIs, measurements, and conclusions
+> in this file are historical and are not current product documentation.
+
 ## Goal
 
 The existing moving-camera benchmark intentionally alternates two exact poses

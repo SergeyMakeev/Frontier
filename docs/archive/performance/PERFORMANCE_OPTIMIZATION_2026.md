@@ -1,5 +1,8 @@
 # Performance optimization campaign (2026-08)
 
+> Archived engineering journal. Revisions, APIs, measurements, and conclusions
+> in this file are historical and are not current product documentation.
+
 This report records the autonomous optimization campaign whose target is at
 least a 20% speed increase on representative Frontier workloads. It is a
 working engineering log, not a list of wins: rejected experiments and invalid
@@ -458,7 +461,7 @@ portability evidence, not an independent recalculation of the historical
 22.7% score above or the later direct 9.72-9.92x round-8 city result. Complete
 per-machine selection, motion, assembly, payload-width, kernel, lifecycle, and
 measurement-caveat tables are in
-[PERFORMANCE_RESULTS_2026_08_18.md](PERFORMANCE_RESULTS_2026_08_18.md).
+[PERFORMANCE.md](../../PERFORMANCE.md).
 
 ## Original round final validation
 
