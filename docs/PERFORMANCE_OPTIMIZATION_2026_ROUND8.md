@@ -2257,3 +2257,81 @@ This direct result replaces the composed estimate. The retained architecture
 is therefore independently measured at 9.11-9.35x faster for exact selection
 and 8.92-9.73x faster for complete render consumption, using only portable
 algorithm and data-layout changes in conventional Release builds.
+
+## Experiment 22: fixed-capacity descendant scratch
+
+### Theory and protocol
+
+After root and cluster classification, the remaining partially visible actor
+definitions still enter `appendDefinition`. Its depth-first worklist is a
+`std::vector<uint32_t>` that is cleared, pushed, queried, and popped for every
+actor that intersects the frustum boundary. Capacity is stable after warmup,
+so no allocation occurs, but each library operation still maintains vector
+size state and repeats capacity/empty checks around a stack whose maximum
+requirement is already known from the immutable definition.
+
+The proposed representation sizes the query-owned descendant scratch once
+when a terminal plan is built, then treats it as a fixed-capacity array with a
+local stack pointer during selection. This does not change traversal order,
+culling, payload ranges, the public API, or output. It only specializes a
+general growable container into the actual data structure required by the hot
+loop. The risk is a larger persistent scratch allocation equal to the largest
+eligible definition's packed node count; the benefit should scale with the
+number of boundary descendants.
+
+Before editing, freeze the accepted `f12fa0f` ordinary-Release binaries and
+refresh a separate `-pg` diagnostic build. Profiling is used only to attribute
+time and call counts; acceptance will compare conventional Release binaries in
+paired ABBA runs. Test the stack change alone. Keep and commit it only if the
+complete ARM correctness matrix passes and both payload widths show a stable
+live-city gain without motion or generic-control regression.
+
+The refreshed diagnostic profile observed 162,534 descendant descents across
+8,193 exact queries (19.84/query) and 104,840 across 8,193 render queries
+(12.80/query). `appendDefinition` received 45.71% of exact samples and 31.37%
+of render samples. The prototype derives the maximum number of simultaneously
+pending inner nodes while the immutable payload-range plan is built. It grows
+the shared scratch to the maximum required by any cached plan, then uses a raw
+array pointer plus local stack index in the hot loop. This retains an overflow
+assertion in contract builds and avoids reserving space for every node in a
+definition.
+
+### Initial screen
+
+All 452 ARM Debug tests pass. One ABBA screen
+`frontier-paired-20260818T013917Z` reported -2.75%/-0.46% exact selection for
+payload32/payload64, +0.25%/-0.68% render, and +0.65%/+0.48% motion. Machine
+controls had a -0.09% geomean, but the payload32 selection baseline had 6.29%
+CV and the generic identity cases again moved in contradictory directions by
+payload width. This is too small and inconsistent to accept from one cycle.
+Proceed to a four-cycle live-city and motion run against the frozen binary;
+reject unless both payload widths and the end-to-end consumer establish a
+repeatable improvement.
+
+### Formal result and decision
+
+Report `frontier-paired-20260818T014118Z` compared the isolated prototype with
+the frozen `f12fa0f` ordinary-Release binaries over four ABBA cycles:
+
+| Case | Payload | `f12fa0f` median | Prototype median | Paired effect | 95% interval |
+|---|---:|---:|---:|---:|---:|
+| exact selection | 32 | 74.132 us | 73.677 us | -1.35% | [-2.93%, -0.47%] |
+| exact selection | 64 | 74.345 us | 73.876 us | -0.54% | [-0.64%, -0.46%] |
+| render plus complete payload scan | 32 | 100.443 us | 100.853 us | +0.28% | [+0.01%, +0.69%] |
+| render plus complete payload scan | 64 | 96.647 us | 96.617 us | +0.42% | [-0.72%, +1.57%] |
+| motion writer | 32 | 8.148 us | 8.160 us | +0.27% | [-0.00%, +0.67%] |
+| motion writer | 64 | 8.212 us | 8.219 us | +0.30% | [+0.09%, +0.47%] |
+
+All 224 samples held 2.208 GHz, temperature was 44.384-47.153 C, maximum
+CPU/wall divergence was 0.050%, and the four machine controls had a +0.21%
+paired geomean. The generic identity results again contradicted each other and
+cannot be caused by the terminal stack implementation.
+
+Reject and revert. The only clean selection result is a small 0.54% payload64
+gain, while the complete render consumer fails to improve at either payload
+width and motion trends about 0.3% slower. Modern optimization already removes
+most of the growable-vector abstraction cost once capacity is stable; exposing
+its size as a local index does not remove the actual wide-AABB and payload-run
+work that dominates boundary descent. Retain `f12fa0f` production code and use
+the profile to pursue a change that eliminates descendant work rather than
+micro-specializing its worklist.
