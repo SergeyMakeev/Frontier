@@ -2335,3 +2335,56 @@ its size as a local index does not remove the actual wide-AABB and payload-run
 work that dominates boundary descent. Retain `f12fa0f` production code and use
 the profile to pursue a change that eliminates descendant work rather than
 micro-specializing its worklist.
+
+## Experiment 23: exact transient hierarchy over actor clusters
+
+### Theory
+
+Experiment 21 classifies 175 exact current cluster bounds independently: 50
+two-car groups and 125 eight-pedestrian row segments. A cluster that is outside
+or inside saves member work, but the query still performs one root-to-plane
+classification for every cluster even when a large contiguous region shares
+the same result. The spatial ordering added in that experiment is sufficient
+to construct a balanced hierarchy over the cluster sequence without changing
+the public placement layout.
+
+The prototype first derives every leaf cluster bound from the authoritative
+current position/yaw spans exactly as before. It then unions those bounds into
+a query-owned implicit binary tree. Traversal carries narrowed plane masks.
+An outside internal node skips all enclosed clusters and actors; an inside node
+emits the definition root range for its complete contiguous actor span; only a
+partial leaf invokes per-actor bounds and descendant culling. Left-first
+traversal preserves actor order. The tree is transient and rebuilt inside the
+timed query, so there is no stale caller state and its complete maintenance cost
+is included in the live-city result.
+
+The tradeoff is two query-owned scratch arrays: roughly two AABBs per rounded-
+up cluster and a shallow traversal stack. This adds a bottom-up min/max pass
+each frame. It wins only if hierarchical plane-test and boundary-work savings
+exceed that pass, so it will be screened and accepted independently against
+the frozen `f12fa0f` binaries.
+
+### Result and decision
+
+All 452 ARM Debug tests passed, but the one-cycle paired screen
+`frontier-paired-20260818T015213Z` was decisive:
+
+| Case | Payload | `f12fa0f` median | Hierarchy median | Paired effect |
+|---|---:|---:|---:|---:|
+| exact selection | 32 | 77.523 us | 86.817 us | +11.99% |
+| exact selection | 64 | 74.590 us | 84.244 us | +12.94% |
+| render plus complete payload scan | 32 | 100.769 us | 111.089 us | +10.24% |
+| render plus complete payload scan | 64 | 96.997 us | 107.310 us | +10.63% |
+
+Motion was +0.20%/+0.66%; all samples held 2.208 GHz at 43.461-46.230 C,
+maximum CPU/wall divergence was 0.049%, and the machine-control geomean was
+-0.12%. The regression is far outside measurement noise, so a longer run is
+unnecessary.
+
+Reject and revert. The accepted width-2/8 leaves are already small and
+spatially useful. Building approximately 430 internal/leaf AABBs and walking a
+binary tree costs substantially more than directly classifying 175 flat
+clusters. The result narrows the design space: retain the flat exact clusters
+and optimize either their authoritative bound production or the much more
+expensive partial-definition work, without adding a per-frame hierarchy-build
+pass.
