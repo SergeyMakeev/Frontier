@@ -557,7 +557,7 @@ struct InstanceTransform {
 ```
 
 `YawRotation` is a finite unit cosine/sine pair for rotation around +Y.
-Keeping the pair instead of an angle lets animation systems submit an existing
+This representation lets animation systems submit an existing
 forward vector without database-side trigonometry. `InstanceTransform`
 occupies 32 bytes and applies only to top-level placements; mounted subtrees
 continue to use `Transform`.
@@ -1254,13 +1254,11 @@ public:
 
 This is the max-detail output path for fully resident immutable scenes. It
 selects every visible zero-error terminal leaf and represents consecutive
-definition leaves as referenced payload ranges. The placement's stable
-`InstanceId` and constant terminal error code live once in the
-pointer-plus-two-word run (16 bytes on a 64-bit target)
-instead of being repeated in a 12-byte handle entry and a resolved payload/
-error record for every leaf. The renderer must still iterate every logical
-payload unless it has a higher-level instancing scheme; `size()` reports that
-logical leaf count, not the number of runs.
+definition leaves as referenced payload ranges. Each run stores one stable
+`InstanceId`, one terminal error code, a payload pointer, and a payload count.
+The descriptor occupies 16 bytes on a 64-bit target. The renderer must still
+iterate every logical payload unless it has a higher-level instancing scheme;
+`size()` reports that logical leaf count, not the number of runs.
 
 The contract is intentionally narrower than `SpatialQuery`:
 

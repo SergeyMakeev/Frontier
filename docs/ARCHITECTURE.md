@@ -77,9 +77,9 @@ Mount-link arrays are allocated only for placements that gain mounted
 children. Node-state blocks come from definition-local geometric slabs, avoiding
 one heap allocation per placement.
 
-Each placement stores the root slot of its mounted tree. Descendant topology or
-readiness mutations bump the root content stamp, so a cached assembled-city cut
-normally validates one exact dependency rather than every house placement.
+Each placement stores the root slot of its mounted tree. A cached cut records
+one dependency for that root. Descendant topology or readiness mutations bump
+the root content stamp used to validate the dependency.
 
 ## Traversal
 

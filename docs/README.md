@@ -3,6 +3,10 @@
 These documents describe the current codebase, public contract, architecture,
 build, tests, benchmarks, and measured behavior.
 
+Current documents state the active contract and implementation directly.
+Descriptions of superseded APIs, layouts, and design alternatives belong in
+the historical records.
+
 ## Current documentation
 
 - [README](../README.md): project overview, supported workflows, build options,

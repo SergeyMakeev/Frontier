@@ -158,9 +158,9 @@ Reuse is exact for node membership. A cached record is valid only while:
 Compact encoded error magnitude can age within that proven interval, but its
 above/below-threshold classification remains correct.
 
-The four-platform Release snapshot confirms the intended payoff: a previously
-admitted exact view over a 10,000-root hierarchy returns from the two-entry
-whole-cut memo in 10-68 ns. This does not include iterating the returned
+Once admitted, an exact view over a 10,000-root hierarchy returns from the
+two-entry whole-cut memo in 10-68 ns on the four measured platforms. This does
+not include iterating the returned
 20,000-entry view. A caller that knows every record is invalid should disable
 reuse; deliberately forcing all records to miss costs 44.5-51.5% more than a
 reuse-disabled raw walk. The continuously moving 100,000-leaf city, which

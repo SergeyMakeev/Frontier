@@ -48,12 +48,12 @@ This makes a one-node object exceptionally cheap: it has no definition bytes or
 mount state. Deep assemblies remain composable—a city definition can contain a
 million mountable house nodes, all populated from the same house handle.
 
-`UserPayload` defaults to `uint64_t`. Applications may instead define
+`UserPayload` defaults to `uint64_t`. Applications may define
 `FRONTIER_USER_PAYLOAD` and `FRONTIER_INVALID_PAYLOAD` build-wide; for example,
 `uint32_t` and `UINT32_MAX`, or `void*` and `nullptr`. Four-byte payloads halve
-serialized and TLAS-root payload storage. The invalid value is reserved so
-`tryGetPayload()` can return a payload directly and report a stale handle
-without an out-parameter or `std::optional`. See the
+serialized and TLAS-root payload storage. The configured invalid value is
+reserved and cannot be authored. `tryGetPayload()` returns that value when its
+`NodeHandle` is stale or invalid. See the
 [API reference](docs/API_REFERENCE.md#3-node-authoring-types) for the exact type
 and serialization contract.
 

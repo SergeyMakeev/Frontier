@@ -95,7 +95,7 @@ inferred from selection time.
 
 These payload64 cases isolate behavior outside the specialized city path. The
 mounted forest contains 10,000 roots and emits 20,000 entries; the flat case
-emits 10,000 entries. Stable hit is a previously admitted exact view returned
+emits 10,000 entries. Stable hit is an admitted exact view returned
 by the two-entry whole-cut memo and is shown in nanoseconds.
 
 | Machine | Flat raw | Mounted raw | Stable exact-view hit | Forced record miss | Root-only raw |
@@ -149,7 +149,7 @@ Payload64 median frame time:
 | i9-12900K | 16.351 us | 9,999.906 | 7.109 us | 9,999.088 |
 | EPYC 9654 | 13.499 us | 9,999.906 | 6.396 us | 9,999.100 |
 
-Percentage moved is therefore no longer a proxy for percentage re-walked.
+Percentage moved does not determine the percentage of the hierarchy re-walked.
 The realistic city case remains the better mixed moving/static workload.
 
 ## Reusable assembly

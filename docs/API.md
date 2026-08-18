@@ -213,8 +213,8 @@ NodeDesc proxy{
 
 - `payload` is an opaque application render-resource identifier. Equal values
   may identify the same resource, but do not couple library readiness state.
-  `kInvalidPayload` is reserved so stale-safe lookup can return the payload
-  directly without an out-parameter or `std::optional`.
+  `kInvalidPayload` is reserved and cannot be authored. `tryGetPayload()`
+  returns it when the supplied `NodeHandle` is stale or invalid.
 - `geometricError` is the authored deviation from finer detail, expressed in
   the node hierarchy's local units. Frontier scales and projects it for the
   current camera; zero means this node has no error-driven reason to refine.
@@ -623,17 +623,17 @@ intermediate per-leaf `NodeHandle`, instance id, error byte, payload-resolution
 lookup, and query-owned resolved copy. The view and payload pointers remain
 valid until this query's next selection/reset or a database mutation.
 
-This path is strict rather than a compatibility wrapper. Every selected
-mounted tree must be fully ready, overlay-free, free of nested mount points,
-and end in zero-error leaves. Use ordinary `SpatialQuery` for streamed LOD,
-partial readiness, deformation, or nested topology. By default instances
+This path requires every selected mounted tree to be fully ready, overlay-free,
+free of nested mount points, and terminated by zero-error leaves. Use ordinary
+`SpatialQuery` for streamed LOD, partial readiness, deformation, or nested
+topology. By default instances
 marked with `setInstanceRenderAsUnit()` retain their whole terminal range when
 the root intersects the frustum; pass `false` as the fourth `select()` argument
 when exact descendant culling is required.
 
 Large homogeneous moving populations can keep transforms in the simulation's
-own split streams instead of publishing duplicate general instances and
-refitting them into the TLAS every frame:
+own split streams and submit them through `TerminalInstanceBatch`. These batch
+instances do not enter the general-instance TLAS:
 
 ```cpp
 TerminalInstanceBatch cars;
@@ -882,8 +882,8 @@ the TLAS population reuse grow-only swept leaf envelopes; larger cohorts
 replace scattered per-mover ancestor walks with one exact bottom-up TLAS refit.
 
 Here **dense order** means Frontier's compact internal instance-slot order. It
-may change during `optimize()`, unlike public `InstanceHandle` identity and the
-caller order retained by `MotionGroup`.
+may change during `optimize()`. Public `InstanceHandle` identity remains stable,
+and `MotionGroup` retains caller order.
 
 This is the recommended path when the same collection moves repeatedly, such
 as traffic, particles, units, or a streamed terrain patch set. The application
