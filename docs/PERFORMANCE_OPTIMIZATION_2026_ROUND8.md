@@ -2502,3 +2502,41 @@ contract for 5.83-6.04% faster exact frames and 4.38-4.62% faster complete
 render frames. Empty bounds retain the self-derived safe default; the rejected
 current-bound producer documents why users should not manufacture per-frame
 snapshots unless their simulation already obtains them essentially for free.
+
+The final direct frozen-anchor report
+`/home/codex-perf/frontier/results/frontier-paired-20260818T022058Z` compares
+the original `a8303c8` ordinary-Release binaries directly with committed
+`c4edb43` behavior over four ABBA cycles:
+
+| Case | Payload | `a8303c8` median | `c4edb43` median | Paired effect | Direct speedup | 95% interval |
+|---|---:|---:|---:|---:|---:|---:|
+| exact selection | 32 | 694.669 us | 69.923 us | -89.92% | 9.92x | [-89.96%, -89.89%] |
+| exact selection | 64 | 681.546 us | 70.075 us | -89.71% | 9.72x | [-89.73%, -89.68%] |
+| render plus complete payload scan | 32 | 895.825 us | 96.112 us | -89.23% | 9.29x | [-89.27%, -89.18%] |
+| render plus complete payload scan | 64 | 967.931 us | 92.899 us | -90.35% | 10.36x | [-90.44%, -90.27%] |
+
+All 64 samples held 2.208 GHz, temperature stayed between 42.538 and
+45.307 C, and maximum CPU/wall divergence was 0.027%. Cycle effects span only
+0.07 percentage point for payload32 exact, 0.07 point for payload64 exact,
+0.13 point for payload32 render, and 0.21 point for payload64 render. The
+payload64 render baseline's raw CV is 6.24%, but paired cycles all report
+10.23-10.46x and yield the tight interval above.
+
+The remote measurement worktree retains an older bookkeeping commit, so source
+identity was checked explicitly. The measured/current terminal query is
+`1f7a07d21817d544bf500a569c9465bd285f26596927479bad250faa769ff259`,
+the public header is
+`a7262e8c9859c73e7a2e14013a361fa4b1b79d28028b331171e54b70eabe8083`,
+the benchmark is
+`41479e40fb7cb7e4004e90ebfc821ad744b813341b117ae7c40c59911e1d49cf`,
+and the test translation unit is
+`0885d82aa0b2556bd9a6c1aee3f692a629fa5da32dcfd5cd11afc34035f4f3ca`.
+The header initially differed remotely only in final comments; synchronizing
+the exact committed file and rebuilding reproduced every measured candidate
+executable SHA-256 exactly, proving the comments did not alter code generation.
+
+This direct result supersedes every composed estimate. The final retained
+architecture is 9.72-9.92x faster for exact live-city selection and
+9.29-10.36x faster for complete CPU render consumption than the round-start
+repository, with conventional Release builds and only algorithm, ownership,
+and data-layout changes.
