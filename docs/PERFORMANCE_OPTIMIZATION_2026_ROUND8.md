@@ -2225,7 +2225,35 @@ address (`0x9ea0` versus `0x9ee0`), matching its interval around no change.
 Keep and commit. Exact clustered bounds are rebuilt inside the timed query, so
 the 18.59-19.09% selection and 14.21-14.67% render improvements contain their
 own broadphase-maintenance cost and cannot depend on stale external state.
-Composing paired effects with the direct round-start report places cumulative
-algorithm/data-layout-only throughput at approximately 9.19-9.44x for exact
-selection and 8.89-9.87x for complete render consumption. A direct frozen-
-anchor run will replace that composed estimate after the commit.
+
+The subsequent direct frozen-anchor report
+`/home/codex-perf/frontier/results/frontier-paired-20260818T012314Z` compares
+the unmodified round-start `a8303c8` ordinary-Release binaries directly with
+the committed `f12fa0f` source over four ABBA cycles:
+
+| Case | Payload | `a8303c8` median | `f12fa0f` median | Paired effect | Direct speedup | 95% interval |
+|---|---:|---:|---:|---:|---:|---:|
+| exact selection | 32 | 692.069 us | 74.172 us | -89.30% | 9.35x | [-89.35%, -89.24%] |
+| exact selection | 64 | 685.753 us | 74.571 us | -89.02% | 9.11x | [-89.22%, -88.73%] |
+| render plus complete payload scan | 32 | 895.278 us | 100.557 us | -88.79% | 8.92x | [-88.86%, -88.75%] |
+| render plus complete payload scan | 64 | 913.836 us | 96.575 us | -89.72% | 9.73x | [-90.25%, -89.43%] |
+
+All 64 samples ran at 2.208 GHz, temperature stayed between 45.307 and
+47.153 C, maximum CPU/wall divergence was 0.035%, and the unchanged machine
+control executable had the same SHA-256 in both builds. The remote restored
+worktree deliberately remained based at an older bookkeeping commit, so the
+report manifest's candidate commit field is not the source identity. The four
+candidate inputs were verified byte-for-byte against local `f12fa0f` instead:
+`terminal_render.cpp` is
+`ee280a663bfc5c8594d2629d308bbbf158488c162df504045ce759b4ae6c01e2`,
+the public header is
+`73f9dc7a89dedbd9d3274cc74003d462e36fafcc60826bf84bb5f62bc0fe0e89`,
+the benchmark is
+`2359292fb3122c1810c376f13c41addf0b80dc1b9301759e2f5e15468b92e834`,
+and the correctness test translation unit is
+`79c250f23e0edb2836a4ebe2655b9b12e8fa064b143cefd54432748634e20f63`.
+
+This direct result replaces the composed estimate. The retained architecture
+is therefore independently measured at 9.11-9.35x faster for exact selection
+and 8.92-9.73x faster for complete render consumption, using only portable
+algorithm and data-layout changes in conventional Release builds.
