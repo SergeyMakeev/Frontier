@@ -2012,10 +2012,24 @@ sublinear dynamic broadphase queries for zero-copy publication and a cheap flat
 root scan. Mixed scenes can use batches and general instances in the same
 terminal query, so the tradeoff is chosen per cohort rather than globally.
 
-Combining the ordinary non-IPO round-start medians from direct report
-`frontier-paired-20260817T235041Z` with the final candidate medians gives
-approximately 6.63-6.70x exact-selection throughput and 6.89-7.48x complete
-render-frame throughput. Both endpoints use the same compiler/build policy and
-fixed 2.208 GHz SBC; a final direct frozen-anchor ABBA run can attach a single
-confidence interval to that cumulative ratio, but the 5x goal is already
-exceeded by a wide margin at the observed medians.
+Final direct frozen-anchor report
+`/home/codex-perf/frontier/results/frontier-paired-20260818T001945Z` compared
+round-start `a8303c8` directly with committed candidate `1cc5c21`. Both were
+ordinary non-IPO CMake Release builds; neither used PGO, linker/source/archive
+reordering, hot/cold sections, forced inlining, or favorable address placement.
+Four fresh-process ABBA cycles produced:
+
+| Case | Payload | `a8303c8` median | `1cc5c21` median | Paired improvement | Direct speedup | 95% speedup interval |
+|---|---:|---:|---:|---:|---:|---:|
+| exact selection | 32 | 693.261 us | 103.250 us | 85.12% | 6.72x | 6.69-6.75x |
+| exact selection | 64 | 687.425 us | 103.208 us | 85.05% | 6.69x | 6.66-6.74x |
+| render plus complete payload scan | 32 | 895.242 us | 129.725 us | 85.53% | 6.91x | 6.88-6.94x |
+| render plus complete payload scan | 64 | 925.336 us | 125.837 us | 86.85% | 7.60x | 7.40-7.73x |
+
+The speedups invert the paired candidate/baseline geometric-mean effects; their
+intervals likewise invert the deterministic 50,000-resample 95% bootstrap
+limits. Candidate CV was 0.08-0.26%. All 64 samples observed 2.208 GHz,
+temperature stayed between 44.384 and 46.230 C, and maximum CPU/wall divergence
+was 0.038%. This direct result establishes a 6.69-7.60x cumulative improvement
+under the accepted algorithm-and-data-layout-only policy, exceeding the 5x goal
+without deployment-specific binary-layout assumptions.
