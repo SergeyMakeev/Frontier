@@ -435,6 +435,16 @@ private:
     size_t leafCount_ = 0;
 };
 
+// One contiguous spatial neighborhood in a TerminalInstanceBatch. Clusters
+// form an ordered, gap-free partition of the placement stream. They contain no
+// mutable bounds: TerminalRenderQuery derives an exact current union from the
+// authoritative transforms before culling the members.
+struct TerminalInstanceCluster
+{
+    uint32_t first = 0;
+    uint32_t count = 0;
+};
+
 // Non-owning placement stream for homogeneous, fully resident actors. The
 // immutable hierarchy is registered once in database; current transforms stay
 // in caller-owned simulation SoA storage and are consumed directly by a
@@ -445,6 +455,7 @@ struct TerminalInstanceBatch
     AABB localBounds = AABB::empty();
     std::span<const float4> positions;
     std::span<const YawRotation> yaws;
+    std::span<const TerminalInstanceCluster> clusters;
     InstanceId firstInstance = 0;
     float scale = 1.0f;
     uint32_t mask = ~0u;

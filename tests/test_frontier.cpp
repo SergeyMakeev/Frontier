@@ -841,6 +841,68 @@ TEST(Frontier, TerminalActorBatchMatchesMountedYawedInstance)
     EXPECT_EQ(terminalPayloads(batchQuery, camera, true), renderPayloads);
 }
 
+TEST(Frontier, TerminalActorClustersMatchUngroupedPlacementStream)
+{
+    SpatialDatabase database;
+    const SubtreeHandle definition = database.registerSubtree(
+        makeFullyRefinedReferenceSubtree(0.0f));
+    TestAccess::markAllNodesReady(database);
+    database.applyUpdates();
+
+    std::array<float4, 6> positions{
+        float4::point(-18.0f, 0.0f, -2.0f),
+        float4::point(-9.0f, 0.0f, 1.0f),
+        float4::point(-1.0f, 0.0f, 0.0f),
+        float4::point(7.0f, 0.0f, -1.0f),
+        float4::point(15.0f, 0.0f, 2.0f),
+        float4::point(28.0f, 0.0f, 0.0f)};
+    std::array<YawRotation, 6> yaws{
+        yawRotation(0.1f), yawRotation(0.7f), yawRotation(-0.3f),
+        yawRotation(1.1f), yawRotation(-0.9f), yawRotation(0.4f)};
+    std::array<TerminalInstanceCluster, 2> clusters{{{0, 3}, {3, 3}}};
+
+    TerminalInstanceBatch ungrouped;
+    ungrouped.definition = definition;
+    ungrouped.localBounds = box(3.0f);
+    ungrouped.positions = positions;
+    ungrouped.yaws = yaws;
+    ungrouped.firstInstance = 41;
+    ungrouped.renderAsUnit = true;
+    TerminalInstanceBatch clustered = ungrouped;
+    clustered.clusters = clusters;
+
+    const auto selected = [&](TerminalRenderQuery& query,
+                              const TerminalInstanceBatch& batch,
+                              const Camera& camera, bool coarsen)
+    {
+        const TerminalRenderView view = query.select(
+            database, camera,
+            std::span<const TerminalInstanceBatch>(&batch, 1), 4.0f,
+            coarsen);
+        std::vector<std::pair<InstanceId, UserPayload>> result;
+        result.reserve(view.size());
+        for (const TerminalRenderRun run : view.runs())
+            for (const UserPayload payload : run.payloadSpan())
+                result.emplace_back(run.instance(), payload);
+        std::sort(result.begin(), result.end());
+        return result;
+    };
+
+    const std::array<Camera, 3> cameras{
+        cameraAt(-12.0f),
+        cameraAt(-25.0f, float4::point(-12.0f, 0.0f, 0.0f)),
+        cameraAt(-35.0f, float4::point(18.0f, 0.0f, 0.0f))};
+    TerminalRenderQuery ungroupedQuery;
+    TerminalRenderQuery clusteredQuery;
+    for (const Camera& camera : cameras)
+    {
+        EXPECT_EQ(selected(clusteredQuery, clustered, camera, false),
+                  selected(ungroupedQuery, ungrouped, camera, false));
+        EXPECT_EQ(selected(clusteredQuery, clustered, camera, true),
+                  selected(ungroupedQuery, ungrouped, camera, true));
+    }
+}
+
 TEST(Frontier, TerminalRenderRejectsNonzeroTerminalError)
 {
     SpatialDatabase database;

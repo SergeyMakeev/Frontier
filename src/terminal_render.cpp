@@ -493,7 +493,11 @@ TerminalRenderView TerminalRenderQuery::select(
         if ((batch.mask & camera.viewMask) == 0) continue;
 
         const detail::SubtreeView& subtree = definition->view;
-        for (size_t i = 0; i < batch.positions.size(); ++i)
+        const Impl::Range rootRange = plan.ranges[0];
+        const UserPayload* const rootPayloads =
+            plan.payloads.data() + rootRange.begin;
+
+        const auto worldBoundsAt = [&](size_t i) -> AABB
         {
             const float4 position = batch.positions[i];
             const YawRotation yaw = batch.yaws.empty()
@@ -509,20 +513,28 @@ TerminalRenderView TerminalRenderQuery::select(
             FRONTIER_CHECK(finiteNonEmptyBounds(worldBounds),
                            "TerminalRenderQuery::select: transformed batch "
                            "bounds overflow");
-            uint8_t mask = kAllPlanes;
+            return worldBounds;
+        };
+
+        const auto appendActor = [&](size_t i, uint8_t inheritedMask)
+        {
+            const float4 position = batch.positions[i];
+            const YawRotation yaw = batch.yaws.empty()
+                                        ? YawRotation{}
+                                        : batch.yaws[i];
+            const AABB worldBounds = worldBoundsAt(i);
+            uint8_t mask = inheritedMask;
             if (testAabb(worldBounds, camera.frustum, mask) ==
                 CullState::Outside)
-                continue;
+                return;
             if (coarsenRenderUnits && batch.renderAsUnit) mask = 0;
 
             const uint32_t instanceWord = packInstanceError(
                 batch.firstInstance + InstanceId(i), 0);
             if (mask == 0)
             {
-                const Impl::Range range = plan.ranges[0];
-                appendRun(plan.payloads.data() + range.begin, range.count,
-                          instanceWord);
-                continue;
+                appendRun(rootPayloads, rootRange.count, instanceWord);
+                return;
             }
 
             const Camera local = identityYaw(yaw)
@@ -531,6 +543,94 @@ TerminalRenderView TerminalRenderQuery::select(
                                      : toLocal(camera, position, batch.scale,
                                                yaw, mask);
             appendDefinition(plan, subtree, local, mask, instanceWord);
+        };
+
+        if (batch.clusters.empty())
+        {
+            for (size_t i = 0; i < batch.positions.size(); ++i)
+                appendActor(i, kAllPlanes);
+            continue;
+        }
+
+#if FRONTIER_CONTRACT_CHECKS
+        size_t expectedFirst = 0;
+        for (const TerminalInstanceCluster cluster : batch.clusters)
+        {
+            FRONTIER_CHECK(cluster.count != 0 &&
+                               cluster.first == expectedFirst &&
+                               uint64_t(cluster.first) + cluster.count <=
+                                   batch.positions.size(),
+                           "TerminalRenderQuery::select: clusters must form "
+                           "an ordered gap-free partition");
+            expectedFirst += cluster.count;
+        }
+        FRONTIER_CHECK(expectedFirst == batch.positions.size(),
+                       "TerminalRenderQuery::select: clusters do not cover "
+                       "the placement stream");
+        for (size_t i = 0; i < batch.positions.size(); ++i)
+            FRONTIER_CHECK(
+                finitePosition(batch.positions[i]) &&
+                    (batch.yaws.empty() || validYaw(batch.yaws[i])),
+                "TerminalRenderQuery::select: invalid batch transform");
+#endif
+
+        for (const TerminalInstanceCluster cluster : batch.clusters)
+        {
+            const size_t first = cluster.first;
+            const size_t end = first + cluster.count;
+            AABB clusterBounds = AABB::empty();
+            if (batch.yawInvariantBounds)
+            {
+                float4 minPosition = batch.positions[first];
+                float4 maxPosition = minPosition;
+                FRONTIER_CHECK(finitePosition(minPosition),
+                               "TerminalRenderQuery::select: invalid batch "
+                               "position");
+                for (size_t i = first + 1; i < end; ++i)
+                {
+                    const float4 position = batch.positions[i];
+                    FRONTIER_CHECK(finitePosition(position),
+                                   "TerminalRenderQuery::select: invalid "
+                                   "batch position");
+                    minPosition = min4(minPosition, position);
+                    maxPosition = max4(maxPosition, position);
+                }
+                clusterBounds = AABB::fromMinMax(
+                    batch.localBounds.mn * batch.scale + minPosition,
+                    batch.localBounds.mx * batch.scale + maxPosition);
+            }
+            else
+            {
+                for (size_t i = first; i < end; ++i)
+                    clusterBounds.expand(worldBoundsAt(i));
+            }
+            FRONTIER_CHECK(finiteNonEmptyBounds(clusterBounds),
+                           "TerminalRenderQuery::select: clustered batch "
+                           "bounds overflow");
+
+            uint8_t clusterMask = kAllPlanes;
+            if (testAabb(clusterBounds, camera.frustum, clusterMask) ==
+                CullState::Outside)
+                continue;
+            if (clusterMask == 0)
+            {
+                for (size_t i = first; i < end; ++i)
+                {
+                    FRONTIER_CHECK(
+                        finitePosition(batch.positions[i]) &&
+                            (batch.yaws.empty() || validYaw(batch.yaws[i])),
+                        "TerminalRenderQuery::select: invalid batch "
+                        "transform");
+                    appendRun(
+                        rootPayloads, rootRange.count,
+                        packInstanceError(
+                            batch.firstInstance + InstanceId(i), 0));
+                }
+                continue;
+            }
+
+            for (size_t i = first; i < end; ++i)
+                appendActor(i, clusterMask);
         }
     }
 

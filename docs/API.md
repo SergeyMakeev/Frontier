@@ -639,6 +639,7 @@ cars.definition = carDefinition;
 cars.localBounds = carRootBounds;
 cars.positions = simulation.carPositions();
 cars.yaws = simulation.carYaws();
+cars.clusters = simulation.carSpatialClusters(); // optional {first,count}
 cars.firstInstance = carInstanceBase;
 cars.yawInvariantBounds = true;
 
@@ -655,6 +656,13 @@ definitions, and no general `InstanceHandle`. They are best for hundreds or
 thousands of same-shape actors; use ordinary instances when streaming,
 deformation, per-actor scale/mask variation, handle operations, or a dynamic
 broadphase is more important than zero-copy publication.
+
+Optional clusters are immutable index ranges, not cached bounds. They must
+partition a spatially ordered position stream. Selection computes each exact
+current union from the actor transforms, so no separate broadphase publication
+can become stale. A cluster outside the frustum skips all members; a fully
+inside cluster emits each actor's root range; only a boundary cluster performs
+per-actor plane tests.
 
 ## 8. Stream topology and render readiness independently
 

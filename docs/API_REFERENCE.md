@@ -1211,11 +1211,17 @@ public:
     bool empty() const;
 };
 
+struct TerminalInstanceCluster {
+    uint32_t first;
+    uint32_t count;
+};
+
 struct TerminalInstanceBatch {
     SubtreeHandle definition;
     AABB localBounds;
     std::span<const float4> positions;
     std::span<const YawRotation> yaws;
+    std::span<const TerminalInstanceCluster> clusters;
     InstanceId firstInstance;
     float scale;
     uint32_t mask;
@@ -1281,6 +1287,15 @@ bound policy, and renderer-coarsening policy are constant for the cohort.
 Output ids are `firstInstance + actorIndex`; the exclusive end must not exceed
 `kInvalidInstanceId`, and the caller must keep batch ranges disjoint from each
 other and from normal instance ids in the same result.
+
+`clusters` is optional. When present, its `{first,count}` records must be an
+ordered, gap-free, nonempty partition of the position stream. The query derives
+each cluster's exact current union from the authoritative transforms; callers
+do not publish mutable cluster bounds. Outside clusters reject all members,
+inside clusters emit root ranges directly, and partial clusters pass their
+narrowed plane mask to exact member tests. Spatially neighboring actors should
+therefore be contiguous. Incoherent partitions remain correct but can cost more
+than leaving `clusters` empty.
 
 Batch spans need remain valid only during `select()`. The actors are not
 inserted into the database, have no `InstanceHandle`, mount/readiness state, or

@@ -2121,3 +2121,111 @@ the direct round-start report places cumulative algorithm/data-layout-only
 throughput at approximately 7.48-7.63x for exact selection and 7.63-8.42x for
 complete render consumption; a later direct frozen-anchor run will replace
 that composed estimate after the next architectural experiment.
+
+## Experiment 21: exact spatially ordered actor clusters
+
+### Theory
+
+The post-Experiment-20 diagnostic profile reduced descendant-dispatch calls
+from 291.14 to 19.84 per exact frame and 12.80 per render frame. The enclosing
+query body still consumed 37.93% of sampled exact time and 19.83% of render
+time. Every frame currently constructs and tests 1,100 actor-root AABBs against
+up to six frustum planes even though actors are naturally partitioned into
+small spatial neighborhoods.
+
+The next data layout will partition each spatially ordered homogeneous cohort
+with immutable `{first,count}` cluster spans. The query
+will compute each cluster's exact current union directly from the authoritative
+position/yaw spans, then classify the cluster once. An outside cluster skips all
+member work. A fully inside cluster appends each actor's definition root range
+without actor AABB tests, local cameras, or descendant traversal. Only a partial
+cluster tests its members, and those tests inherit the cluster's narrowed plane
+mask.
+
+Unlike a caller-published broadphase bound, the cluster union cannot be stale:
+it is rebuilt inside the timed query from the same transforms selection consumes.
+The cost of the min/max reduction is therefore included in the frame benchmark.
+Clusters are exact for both yaw-invariant and yaw-dependent actor bounds. Empty
+cluster spans retain the current ungrouped path; clustered spans must form an
+ordered, gap-free partition of the position stream. This exchanges spatially
+ordered actor storage and a tiny immutable partition table for fewer branchy
+scalar plane tests while preserving the exact per-actor result.
+
+### Prototype, rejected layouts, and cluster-width tuning
+
+`TerminalInstanceCluster` stores only two 32-bit words. In contract builds the
+records must be nonempty and form an ordered, gap-free partition; all member
+transforms remain validated. Release selection reduces each current cluster
+union, tests it once, emits root ranges for a fully inside group, and retests
+only members of a partial group with the already narrowed plane mask. A new
+clustered-versus-ungrouped test compares instance/payload pairs for yawed actors
+under three cameras and both exact and render-unit modes. The complete ARM
+matrix now passes 452 tests.
+
+The first benchmark layout used 2x2 car tiles and 4x4 pedestrian tiles. Screen
+`frontier-paired-20260818T005909Z` showed the expected 20.08-21.49% selection
+and 15.74-16.50% render gains, but recovering each actor's original trajectory
+index made the isolated motion writer 13.51-14.29% slower. Precomputed motion
+seeds made that loss 18.62-18.81% in
+`frontier-paired-20260818T010222Z`. Both layouts were rejected.
+
+The accepted benchmark layout retains the original row-major position/yaw
+order and byte-for-byte trajectory logic. Cars use adjacent pairs and
+pedestrians use short contiguous row segments. This keeps every physical
+trajectory and all exact/render leaf-count extrema unchanged while allowing
+the query to exploit spatial coherence. Width tuning on the fixed 2-car groups
+gave:
+
+| Pedestrian group width | Report | Selection candidate, p32/p64 | Render candidate, p32/p64 | Result |
+|---:|---|---:|---:|---|
+| 4 | `frontier-paired-20260818T010534Z` | 75.259/75.435 us | 101.457/97.252 us | viable |
+| 8 | `frontier-paired-20260818T011008Z` | 74.354/74.482 us | 100.531/96.676 us | best |
+| 16 | `frontier-paired-20260818T011153Z` | 76.579/76.699 us | 102.912/99.546 us | reject |
+
+Width 16 creates elongated clusters that remain partial too often. Width 8
+reduces cluster-test count enough to beat width 4 without losing useful whole-
+cluster rejection. The one-cycle tuning reports choose the candidate only; a
+fresh four-cycle acceptance run against frozen `d20f67c` binaries is still
+required for the retained effect and motion/control gates.
+
+### Final SBC result and decision
+
+Full report
+`/home/codex-perf/frontier/results/frontier-paired-20260818T011613Z` compared
+the tuned 2/8 row-cluster candidate with frozen `d20f67c` ordinary-Release
+binaries over four ABBA cycles:
+
+| Case | Payload | `d20f67c` median | Candidate median | Paired effect | 95% interval |
+|---|---:|---:|---:|---:|---:|
+| exact selection | 32 | 91.413 us | 74.114 us | -19.09% | [-19.42%, -18.89%] |
+| exact selection | 64 | 91.547 us | 74.451 us | -18.59% | [-18.79%, -18.38%] |
+| render plus complete payload scan | 32 | 117.347 us | 100.624 us | -14.21% | [-14.38%, -13.99%] |
+| render plus complete payload scan | 64 | 113.551 us | 96.806 us | -14.67% | [-15.16%, -13.94%] |
+| motion writer | 32 | 8.158 us | 8.144 us | -0.11% | [-0.50%, +0.27%] |
+| motion writer | 64 | 8.166 us | 8.174 us | +0.70% | [-0.36%, +2.50%] |
+
+All 224 samples observed 2.208 GHz, temperature stayed between 44.384 and
+47.153 C, maximum CPU/wall divergence was 0.071%, and the four machine controls
+had a +0.17% paired geomean. The 8,192-frame exact and render entry averages,
+minima, maxima, segment counts, and simulated duration are identical between
+revisions.
+
+The combined executable again moved the unrelated identity controls in opposite
+directions by payload width: payload32 reported losses while payload64 reported
+an improvement or an interval spanning zero. The actual generic traversal
+objects remain byte-identical at
+`ebd0d52fb0ee1ad086873eec87141119132f6784adf645c28efe78f1219367b3`
+for payload32 and
+`37bfc27752c659f569478177f1dfca8386a475e38543fb1b0d8d8d713cce081a`
+for payload64. The machine executable is byte-identical at
+`0f77d52bade50770c185b35e6f275d7a4f28b083e4aacf471f91726150c50845`.
+The motion-writer symbol is the same 0x19c bytes and differs only in load
+address (`0x9ea0` versus `0x9ee0`), matching its interval around no change.
+
+Keep and commit. Exact clustered bounds are rebuilt inside the timed query, so
+the 18.59-19.09% selection and 14.21-14.67% render improvements contain their
+own broadphase-maintenance cost and cannot depend on stale external state.
+Composing paired effects with the direct round-start report places cumulative
+algorithm/data-layout-only throughput at approximately 9.19-9.44x for exact
+selection and 8.89-9.87x for complete render consumption. A direct frozen-
+anchor run will replace that composed estimate after the commit.
