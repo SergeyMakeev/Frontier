@@ -158,13 +158,15 @@ Reuse is exact for node membership. A cached record is valid only while:
 Compact encoded error magnitude can age within that proven interval, but its
 above/below-threshold classification remains correct.
 
-The four-platform Release snapshot confirms the intended payoff: stable reuse
-is 3.7-8.5 times faster than raw traversal for a 10,000-root hierarchical
-scene, and a 16-unit camera step still reuses about 99.4% of roots. A caller
-that knows every record is invalid should disable reuse; deliberately forcing
-all cache records to miss costs 37-51% more than a reuse-disabled raw walk in
-the same snapshot. See
-[PERFORMANCE_RESULTS_2026_08_15.md](PERFORMANCE_RESULTS_2026_08_15.md).
+The four-platform Release snapshot confirms the intended payoff: a previously
+admitted exact view over a 10,000-root hierarchy returns from the two-entry
+whole-cut memo in 10-68 ns. This does not include iterating the returned
+20,000-entry view. A caller that knows every record is invalid should disable
+reuse; deliberately forcing all records to miss costs 44.5-51.5% more than a
+reuse-disabled raw walk. The continuously moving 100,000-leaf city, which
+cannot use an exact recurring-view memo, completes motion, publication, and
+exact payload64 selection in 18.254-69.866 us. See
+[PERFORMANCE_RESULTS_2026_08_18.md](PERFORMANCE_RESULTS_2026_08_18.md).
 
 ## 11. Collection
 
@@ -196,4 +198,4 @@ after all placements are gone.
 The complexity bounds describe scaling, not constants. Current representative
 latencies and the measured split between TLAS work, mounted refinement,
 publication, and selection are maintained in the
-[cross-platform performance snapshot](PERFORMANCE_RESULTS_2026_08_15.md).
+[cross-platform performance snapshot](PERFORMANCE_RESULTS_2026_08_18.md).

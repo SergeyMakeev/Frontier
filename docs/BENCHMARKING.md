@@ -45,7 +45,10 @@ library's macro-based public payload customization.
 - `BM_MovingObjectsSelectionScale` moves a distributed 10% or 100% of a
   mounted 1,000/10,000-root forest, publishes the update, and selects the next
   frontier through the same rigid-translation API. Counters separate roots
-  reused from roots re-walked.
+  reused from roots re-walked. Conservative placement envelopes and validity
+  certificates may preserve a record across the small translation, so the
+  moved percentage is intentionally not assumed to equal the walked
+  percentage.
 - `BM_SubtreeBuilder_ConstructCost` isolates serialized definition building
   before registration and instantiation.
 - `BM_SubtreeRegistration` isolates validation and zero-copy registration for
@@ -275,22 +278,30 @@ records the chosen CPU, capacity, maximum frequency, governor, warmup, and
 before/after frequency, load, and thermal snapshots in `manifest.txt`,
 `REPORT.md`, and `performance_state.txt`.
 
-The current registry contains 84 cases per payload build. With five
+The current primary registry contains 85 cases per payload build. With five
 0.5-second-minimum repetitions plus correctness and machine characterization,
 a complete report normally takes roughly 10-20 minutes depending on build and
 host speed.
 
-The latest analyzed release snapshot covers M2 Max, RK3399, i9-12900K, and
-EPYC 9654 format-v3 results from commit `35e7b3f`; see
-[PERFORMANCE_RESULTS_2026_08_15.md](PERFORMANCE_RESULTS_2026_08_15.md). It
+The latest analyzed release snapshot covers M2 Max, Cortex-A72 SBC,
+i9-12900K, and EPYC 9654 format-v3 results from commit `63f2e3f`; see
+[PERFORMANCE_RESULTS_2026_08_18.md](PERFORMANCE_RESULTS_2026_08_18.md). It
 uses median real time and keeps cross-machine current-state results separate
-from the pinned before/after optimization score.
+from the pinned before/after optimization score. All four primary reports
+contain 85 medians for both payload widths and pass all 452 Debug tests.
 
-At a high level, its eight-byte-payload 10,000-root hierarchical workload
-emits 20,000 entries in 108-524 us on a stable cached cut, 112-575 us after a
-16-unit camera step, and 171-1,084 us for a complete frame that moves 10% of
-roots, publishes, and selects. Those ranges span very different processors and
-are portability evidence, not a cross-machine ranking or latency guarantee.
+At a high level, its payload64 continuously moving 100,000-leaf city completes
+actor motion, publication, and exact selection in 18.254-69.866 us per frame;
+the isolated motion/publication phase takes 1.953-8.140 us. An admitted exact
+view in the separate recurring-camera control returns from the two-entry memo
+in 10-68 ns, but that lookup neither consumes the 20,000-entry view nor models
+continuous camera motion. These ranges span very different processors and are
+portability evidence, not a cross-machine ranking or latency guarantee.
+
+The format-v3 comprehensive collector currently inventories `frontier_bench`
+and `frontier_bench_payload32`. It does not run the isolated
+`frontier_submission_bench` pair, so the current four-machine snapshot does
+not claim cross-platform downstream payload-scan timings.
 
 ## macOS hardware counters
 

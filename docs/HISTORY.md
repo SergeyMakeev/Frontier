@@ -8,7 +8,7 @@
 > [ARCHITECTURE.md](ARCHITECTURE.md) for the current implementation, and
 > [frontier_design.md](frontier_design.md) for the current behavioral contract.
 > Current measurements are in the
-> [cross-platform performance snapshot](PERFORMANCE_RESULTS_2026_08_15.md).
+> [cross-platform performance snapshot](PERFORMANCE_RESULTS_2026_08_18.md).
 
 This document preserves the optimization experiments and measurements that
 shaped the library. It is evidence and rationale, not integration guidance.

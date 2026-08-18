@@ -193,25 +193,30 @@ camera should influence retention.
 
 ## Measured release performance
 
-The current format-v3 release snapshot measures an eight-byte-payload,
-fully hierarchical 10,000-instance scene that emits 20,000 frontier entries:
+The current format-v3 release snapshot measures a realistic continuously
+moving city with 100,000 logical leaves, 100 rotating/moving cars, 1,000
+pedestrians, an 85,000-leaf depth-five static world, and a 40 mph camera.
+Payload64 median database time per simulated frame is:
 
-| Platform | Stable cached selection | 16-unit camera step | Move 10% + publish + select |
+| Platform | Complete motion + publication + exact selection | Motion + publication only | Share of 60 Hz budget |
 |---|---:|---:|---:|
-| Apple M2 Max | 108 us | 112 us | 171 us |
-| RK3399 | 524 us | 575 us | 1,084 us |
-| Intel i9-12900K | 125 us | 137 us | 263 us |
-| AMD EPYC 9654 | 112 us | 123 us | 245 us |
+| Apple M2 Max | **18.254 us** | 1.953 us | 0.110% |
+| Cortex-A72 SBC | **69.866 us** | 8.140 us | 0.419% |
+| Intel i9-12900K | **38.143 us** | 2.497 us | 0.229% |
+| AMD EPYC 9654 | **23.144 us** | 1.992 us | 0.139% |
 
-The 16-unit step retains about 99.4% root reuse. Moving and invalidating all
-10,000 roots costs 0.913-9.243 ms across these targets. In a separate
-400-house scene, reusable assembly reduces construction latency by 55-81% and
-retained memory by 63-64%. Payload32 saves memory but is not consistently
-faster. These medians describe specific Release workloads, not latency
-guarantees; see the
-[cross-platform performance snapshot](docs/PERFORMANCE_RESULTS_2026_08_15.md)
-for raw traversal, forced misses, stage attribution, payload comparison, and
-measurement conditions.
+The authoritative ordinary non-IPO SBC comparison is 9.72-9.92x faster for
+exact selection and 9.29-10.36x faster through complete CPU payload scanning
+than the round-start implementation. The gain comes from algorithms,
+ownership, and data layout; PGO is not used, and enabling IPO changes the
+latest SBC city result by less than 0.3%. Reusable assembly separately reduces
+400-house construction latency by 60-83% and retained memory by 63-64%.
+Payload32 saves about 773 KiB in the measured city but has no portable timing
+advantage. These medians are workload measurements, not latency guarantees;
+see the
+[cross-platform performance snapshot](docs/PERFORMANCE_RESULTS_2026_08_18.md)
+for both payload widths, generic controls, raw traversal, forced misses,
+assembly, lifecycle, kernel context, and measurement caveats.
 
 ## Building
 
@@ -220,18 +225,11 @@ bash ./run_unit_tests.sh  # Debug, checks enabled, BVH4 + BVH8
 bash ./run_perf_bench.sh  # Release, native BVH width, 4/8-byte payload comparison
 ```
 
-For a maximum-throughput native ARM64 deployment, GCC profile-guided
-optimization can train on the realistic moving-camera/moving-actor city
-trajectory and rebuild the public archive under LTO:
-
-```sh
-FRONTIER_PGO_CPU=4 FRONTIER_PGO_JOBS=4 bash ./run_arm_pgo.sh build-arm-pgo
-```
-
-The script creates a fresh profile corpus on every invocation and trains the
-public library plus both benchmark payload layouts. The equivalent manual
-CMake phases are `FRONTIER_PGO_MODE=GENERATE` followed by `USE`, with both
-pointing at the same `FRONTIER_PGO_DIR`. PGO currently requires GCC.
+GCC PGO remains available through `run_arm_pgo.sh` for applications that can
+train and ship compiler/source/workload-specific profiles. It is optional and
+is not used by any headline result above. The portable performance contract is
+the ordinary-Release algorithm and data layout, not a trained binary or a
+particular link arrangement.
 
 On Windows, use `run_unit_tests.bat` and `run_perf_bench.bat`.
 
@@ -267,7 +265,7 @@ exhaustive [API reference](docs/API_REFERENCE.md) for exact contracts,
 [BENCHMARKING.md](docs/BENCHMARKING.md) for measurement guidance. The latest
 optimization campaign, including rejected experiments and raw-result names,
 is recorded in
-[PERFORMANCE_OPTIMIZATION_2026.md](docs/PERFORMANCE_OPTIMIZATION_2026.md).
-The current release candidate's M2 Max, RK3399, i9-12900K, and EPYC 9654
+[PERFORMANCE_OPTIMIZATION_2026_ROUND8.md](docs/PERFORMANCE_OPTIMIZATION_2026_ROUND8.md).
+The current release candidate's M2 Max, Cortex-A72 SBC, i9-12900K, and EPYC 9654
 results are summarized separately in the
-[cross-platform performance snapshot](docs/PERFORMANCE_RESULTS_2026_08_15.md).
+[cross-platform performance snapshot](docs/PERFORMANCE_RESULTS_2026_08_18.md).

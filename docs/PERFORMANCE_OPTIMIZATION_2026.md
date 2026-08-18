@@ -437,34 +437,30 @@ and `final-*-updates-pinned.json` files.
 
 ### Cross-platform release snapshot
 
-The optimized `d3f12a0` library implementation was subsequently collected on
-an Apple M2 Max, an RK3399, an Intel i9-12900K, and an AMD EPYC 9654. The
-latest format-v3 bundles report commit `35e7b3f`; the intervening changes add
-documentation, benchmark coverage, the comprehensive collector, and an
-ignore-list entry rather than changing the library. All four reports completed
-and passed the 360-test payload32/payload64 by BVH4/BVH8 Debug matrix. Their
-matched assembly workload found a 55-81% construction-latency reduction and a
-63-64% retained-memory reduction for a shared 400-house scene. A cached
-assembled cut differed from the flattened cut by at most 0.275 us; uncached
-assembly ranged from 39% faster to 43% slower as the mount-indirection versus
-working-set tradeoff changed by target.
+The final `c4edb43` performance implementation was subsequently collected on
+an Apple M2 Max, a Cortex-A72 SBC, an Intel i9-12900K, and an AMD EPYC 9654.
+The format-v3 bundles report commit `63f2e3f`; the intervening commits document
+and verify the implementation. All four reports completed, contained every
+one of the 85 primary cases for both payload widths, and passed the 452-test
+payload32/payload64 by BVH4/BVH8 Debug matrix.
 
-The comprehensive suite also measured a fully hierarchical 10,000-root scene
-that emits 20,000 entries. Stable cached selection takes 108-524 us across the
-four targets; a 16-unit camera step retains about 99.4% reuse and takes
-112-575 us. Moving 10% of roots, publishing, and selecting takes 171-1,084 us,
-while moving every root takes 913-9,243 us. These absolute ranges are
-cross-platform current-state context, not part of the pinned optimization
-score.
+The realistic continuously moving 100,000-leaf city takes 18.254-69.866 us per
+payload64 database frame across those devices, including actor staging,
+publication, the 40 mph camera trajectory, and exact selection. Motion and
+publication alone take 1.953-8.140 us. The same snapshot finds a 60-83%
+construction-latency reduction and 63-64% retained-memory reduction for the
+shared 400-house scene. Exact recurring views now return from the whole-cut
+memo in 10-68 ns; that control does not include consuming its output and is
+kept separate from continuous city motion.
 
-Those bundles contain only the final implementation and ran without affinity,
-so they are a current-state portability snapshot, not an independent
-recalculation of the pinned 22.7% before/after score above. Complete per-machine
-selection, moving-camera, moving-object, assembly, payload-width, kernel, and
-lifecycle tables plus measurement caveats are in
-[PERFORMANCE_RESULTS_2026_08_15.md](PERFORMANCE_RESULTS_2026_08_15.md).
+These bundles contain only the final implementation. They are current-state
+portability evidence, not an independent recalculation of the historical
+22.7% score above or the later direct 9.72-9.92x round-8 city result. Complete
+per-machine selection, motion, assembly, payload-width, kernel, lifecycle, and
+measurement-caveat tables are in
+[PERFORMANCE_RESULTS_2026_08_18.md](PERFORMANCE_RESULTS_2026_08_18.md).
 
-## Final validation
+## Original round final validation
 
 - Debug BVH8/BVH4: 180/180 tests passed.
 - Debug payload64/payload32 times BVH8/BVH4: 360/360 tests passed.

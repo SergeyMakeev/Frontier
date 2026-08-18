@@ -111,16 +111,23 @@ shared readiness fanout, serialized registration, TLAS scale, instance
 lifecycle, mount lifecycle and retention, stable motion groups, and bounds
 overrides. It also measures complete move/publish/select frames and translated
 cameras at zero, sub-unit, and large per-frame steps while reporting the
-resulting reuse/walk ratio. Each result records `frontier_payload_bytes` in its
-benchmark context so files remain self-describing after collection.
+resulting reuse/walk ratio. The realistic city cases add a continuously unique
+camera trajectory, 100 rotating/moving cars, 1,000 pedestrians, 100,000 total
+leaves, and a separately isolated motion/publication phase. Each result records
+`frontier_payload_bytes` in its benchmark context so files remain
+self-describing after collection.
 `frontier_machine_bench` characterizes kernels and the machine independently.
 See [BENCHMARKING.md](BENCHMARKING.md) for the cases and collection procedure.
 
-The current format-v3 release snapshot contains all 83 inventoried cases for
-both payload widths on each of four machines, and every machine passed the
-360-test payload32/payload64 by BVH4/BVH8 Debug matrix. Its representative
-10,000-root results, dynamic-frame breakdown, and measurement caveats are in
-[PERFORMANCE_RESULTS_2026_08_15.md](PERFORMANCE_RESULTS_2026_08_15.md).
+The current format-v3 release snapshot contains all 85 inventoried primary
+cases for both payload widths on each of four machines, and every machine
+passed the 452-test payload32/payload64 by BVH4/BVH8 Debug matrix. Its
+100,000-leaf live-city results, representative generic controls, phase split,
+and measurement caveats are in
+[PERFORMANCE_RESULTS_2026_08_18.md](PERFORMANCE_RESULTS_2026_08_18.md).
+`BM_LiveCityRenderSubmissionFrame` is linked only into the isolated submission
+executables and is not currently collected by the comprehensive four-device
+runner; the snapshot labels the SBC-only downstream result explicitly.
 
 Benchmarks are measurements, not correctness tests. Repository performance
 runners build Release with `FRONTIER_STATS=OFF`,

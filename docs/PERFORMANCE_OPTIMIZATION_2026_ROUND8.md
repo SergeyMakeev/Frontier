@@ -2540,3 +2540,30 @@ architecture is 9.72-9.92x faster for exact live-city selection and
 9.29-10.36x faster for complete CPU render consumption than the round-start
 repository, with conventional Release builds and only algorithm, ownership,
 and data-layout changes.
+
+## Four-device final-state validation
+
+Four comprehensive format-v3 reports subsequently rebuilt commit `63f2e3f`
+(the same `c4edb43` performance implementation) on M2 Max, Cortex-A72 SBC,
+i9-12900K, and EPYC 9654. All four reports completed, contained all 85 primary
+benchmarks for both payload widths, and passed 452/452 Debug tests.
+
+Payload64 median real time:
+
+| Machine | Exact live-city frame | Motion + publication only | Approx. selection remainder | CV, exact frame |
+|---|---:|---:|---:|---:|
+| M2 Max | 18.254 us | 1.953 us | 16.301 us | 0.51% |
+| Cortex-A72 SBC | 69.866 us | 8.140 us | 61.726 us | 0.12% |
+| i9-12900K | 38.143 us | 2.497 us | 35.646 us | 0.73% |
+| EPYC 9654 | 23.144 us | 1.992 us | 21.152 us | 0.61% |
+
+Payload32 exact-frame medians are 18.366, 69.755, 36.989, and 23.578 us in
+the same order. The i9 payload32 point has 6.78% CV; every other exact-frame
+CV is at most 1.13%. There is no portable payload32 time advantage.
+
+The comprehensive performance builds enabled IPO but not PGO. The latest SBC
+values differ from the accepted ordinary non-IPO candidate by only
+0.24-0.30%, reinforcing that the direct approximately 10x result is not an
+IPO, PGO, or code-placement effect. The complete four-device tables and
+protocol caveats are in
+[PERFORMANCE_RESULTS_2026_08_18.md](PERFORMANCE_RESULTS_2026_08_18.md).

@@ -180,12 +180,14 @@ Four rules explain most of the architecture:
 
 ### Measured release behavior
 
-In the current four-platform Release snapshot, a stable cached selection over
-10,000 fully hierarchical instances emits 20,000 entries in 108-524 us and is
-3.7-8.5 times faster than raw traversal. A 16-unit camera step still reuses
-about 99.4% of roots and completes in 112-575 us. Moving 10% of roots,
-publishing, and selecting the complete cut takes 171-1,084 us; moving all
-10,000 takes 913-9,243 us.
+In the current four-platform Release snapshot, a complete payload64 database
+frame over the continuously moving 100,000-leaf city takes 18.254-69.866 us.
+That includes transform staging, 1,100 moving actor roots, publication, a
+continuously changing 40 mph camera, and exact selection of an average
+24,072.71-entry cut. The isolated motion/publication phase takes 1.953-8.140
+us. Exact recurring views over the generic 10,000-root hierarchy are served by
+the two-entry whole-cut memo in 10-68 ns after admission; that lookup does not
+include downstream iteration of the returned 20,000 entries.
 
 These figures explain the intended integration pattern: keep one
 `SpatialQuery` per coherent view, use `MotionGroup` for stable moving cohorts,
@@ -193,7 +195,7 @@ publish once after a mutation batch, and disable reuse when the caller knows
 every cached record must miss. Absolute time depends on output size, scene
 shape, compiler, and processor. The complete workloads, per-machine tables,
 and caveats are in the
-[cross-platform performance snapshot](PERFORMANCE_RESULTS_2026_08_15.md).
+[cross-platform performance snapshot](PERFORMANCE_RESULTS_2026_08_18.md).
 
 ## 3. Describe one renderable node
 
