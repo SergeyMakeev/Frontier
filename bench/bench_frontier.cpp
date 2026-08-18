@@ -1,6 +1,7 @@
 #include <benchmark/benchmark.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <memory>
 #include <string>
@@ -290,6 +291,8 @@ struct LiveCityScene
     SpatialDatabase world;
     SpatialDatabase::RigidMotionGroup carMotion;
     SpatialDatabase::RigidMotionGroup pedestrianMotion;
+    SubtreeHandle carDefinition;
+    SubtreeHandle pedestrianDefinition;
     std::vector<float4> unitCircle;
     std::vector<float4> carCenters;
     std::vector<float4> pedestrianCenters;
@@ -356,7 +359,8 @@ void updateLiveCityActorPositions(LiveCityScene& scene, uint32_t frame)
     }
 }
 
-std::unique_ptr<LiveCityScene> buildLiveCityScene()
+std::unique_ptr<LiveCityScene> buildLiveCityScene(
+    bool terminalBatches = false)
 {
     auto scene = std::make_unique<LiveCityScene>();
     scene->unitCircle.reserve(kLiveCityFrames);
@@ -408,11 +412,13 @@ std::unique_ptr<LiveCityScene> buildLiveCityScene()
         2000000, kLiveCityCarLeaves, 0.8f, 0.8f, 5, 0.3f);
     scene->immutableBytes += carBytes.size();
     const SubtreeHandle car = scene->world.registerSubtree(std::move(carBytes));
+    scene->carDefinition = car;
     SubtreeBytes pedestrianBytes = makeLiveCityActor(
         3000000, kLiveCityPedestrianLeaves, 0.4f, 0.4f, 5, 0.15f);
     scene->immutableBytes += pedestrianBytes.size();
     const SubtreeHandle pedestrian =
         scene->world.registerSubtree(std::move(pedestrianBytes));
+    scene->pedestrianDefinition = pedestrian;
 
     scene->carCenters.reserve(kLiveCityCars);
     scene->carPositions.resize(kLiveCityCars);
@@ -431,44 +437,71 @@ std::unique_ptr<LiveCityScene> buildLiveCityScene()
     updateLiveCityActorPositions(*scene, 0);
 
     std::vector<InstanceHandle> carHandles;
-    carHandles.reserve(kLiveCityCars);
-    for (uint32_t i = 0; i < kLiveCityCars; ++i)
-    {
-        InstanceDesc desc;
-        desc.pos = scene->carPositions[i];
-        desc.yaw = scene->carYaws[i];
-        NodeDesc carRoot =
-            node(20000 + i, 10000.0f, box(5.0f), true);
-        carRoot.flags |= NodeDesc::FlagYawInvariantBounds;
-        const InstanceHandle instance = scene->world.instantiate(
-            carRoot, desc);
-        scene->world.setInstanceRenderAsUnit(instance);
-        scene->world.mountSubtree(instance.rootNode(), car);
-        carHandles.push_back(instance);
-    }
-
     std::vector<InstanceHandle> pedestrianHandles;
-    pedestrianHandles.reserve(kLiveCityPedestrians);
-    for (uint32_t i = 0; i < kLiveCityPedestrians; ++i)
+    if (!terminalBatches)
     {
-        InstanceDesc desc;
-        desc.pos = scene->pedestrianPositions[i];
-        desc.yaw = scene->pedestrianYaws[i];
-        NodeDesc pedestrianRoot =
-            node(30000 + i, 10000.0f, box(1.5f), true);
-        pedestrianRoot.flags |= NodeDesc::FlagYawInvariantBounds;
-        const InstanceHandle instance = scene->world.instantiate(
-            pedestrianRoot, desc);
-        scene->world.setInstanceRenderAsUnit(instance);
-        scene->world.mountSubtree(instance.rootNode(), pedestrian);
-        pedestrianHandles.push_back(instance);
+        carHandles.reserve(kLiveCityCars);
+        for (uint32_t i = 0; i < kLiveCityCars; ++i)
+        {
+            InstanceDesc desc;
+            desc.pos = scene->carPositions[i];
+            desc.yaw = scene->carYaws[i];
+            NodeDesc carRoot =
+                node(20000 + i, 10000.0f, box(5.0f), true);
+            carRoot.flags |= NodeDesc::FlagYawInvariantBounds;
+            const InstanceHandle instance = scene->world.instantiate(
+                carRoot, desc);
+            scene->world.setInstanceRenderAsUnit(instance);
+            scene->world.mountSubtree(instance.rootNode(), car);
+            carHandles.push_back(instance);
+        }
+
+        pedestrianHandles.reserve(kLiveCityPedestrians);
+        for (uint32_t i = 0; i < kLiveCityPedestrians; ++i)
+        {
+            InstanceDesc desc;
+            desc.pos = scene->pedestrianPositions[i];
+            desc.yaw = scene->pedestrianYaws[i];
+            NodeDesc pedestrianRoot =
+                node(30000 + i, 10000.0f, box(1.5f), true);
+            pedestrianRoot.flags |= NodeDesc::FlagYawInvariantBounds;
+            const InstanceHandle instance = scene->world.instantiate(
+                pedestrianRoot, desc);
+            scene->world.setInstanceRenderAsUnit(instance);
+            scene->world.mountSubtree(instance.rootNode(), pedestrian);
+            pedestrianHandles.push_back(instance);
+        }
     }
 
     TestAccess::markAllNodesReady(scene->world);
     scene->world.optimize();
-    scene->carMotion.reset(carHandles);
-    scene->pedestrianMotion.reset(pedestrianHandles);
+    if (!terminalBatches)
+    {
+        scene->carMotion.reset(carHandles);
+        scene->pedestrianMotion.reset(pedestrianHandles);
+    }
     return scene;
+}
+
+std::array<TerminalInstanceBatch, 2> liveCityActorBatches(
+    const LiveCityScene& scene)
+{
+    std::array<TerminalInstanceBatch, 2> batches;
+    batches[0].definition = scene.carDefinition;
+    batches[0].localBounds = box(5.0f);
+    batches[0].positions = scene.carPositions;
+    batches[0].yaws = scene.carYaws;
+    batches[0].firstInstance =
+        kLiveCityStaticBlocks + kLiveCityStaticSingles;
+    batches[0].yawInvariantBounds = true;
+
+    batches[1].definition = scene.pedestrianDefinition;
+    batches[1].localBounds = box(1.5f);
+    batches[1].positions = scene.pedestrianPositions;
+    batches[1].yaws = scene.pedestrianYaws;
+    batches[1].firstInstance = batches[0].firstInstance + kLiveCityCars;
+    batches[1].yawInvariantBounds = true;
+    return batches;
 }
 
 void consume(const FrontierResultView& cut)
@@ -1181,25 +1214,30 @@ BENCHMARK(BM_MovingCameraSelectionScale)
 // car placements, each owning 50 detail leaves, travel at 40 mph; 1,000
 // pedestrian placements, each owning 10 part leaves, travel at 1.5 mph. The
 // remaining 85,000 leaves are static, primarily in 83 independent depth-five
-// blocks. Actor transforms, publication, and exact descendant-culling
-// terminal-range selection are timed; immutable scene/camera and one-time
-// definition-plan construction are not.
+// blocks. Simulation-owned actor transforms and exact descendant-culling
+// terminal-range selection are timed. The actor SoA spans are consumed in
+// place, so no duplicate per-instance publication or dynamic TLAS refit exists;
+// immutable scene/camera and one-time definition-plan construction are not
+// timed.
 static void BM_LiveCityDrivingFrame(benchmark::State& state)
 {
-    auto scene = buildLiveCityScene();
-    TerminalRenderQuery query;
-    const TerminalRenderView first =
-        query.select(scene->world, scene->cameras[0], 4.0f, false);
+    auto scene = buildLiveCityScene(true);
+    const auto batches = liveCityActorBatches(*scene);
+    size_t referenceSize = 0;
     {
+        auto referenceScene = buildLiveCityScene(false);
         SpatialQuery reference;
         reference.setReuseEnabled(false);
-        const FrontierResultView exact = reference.selectFrontier(
-            scene->world, scene->cameras[0], {});
-        if (first.size() != exact.size())
-        {
-            state.SkipWithError("terminal selection changed the exact cut");
-            return;
-        }
+        referenceSize = reference.selectFrontier(
+            referenceScene->world, referenceScene->cameras[0], {}).size();
+    }
+    TerminalRenderQuery query;
+    const TerminalRenderView first =
+        query.select(scene->world, scene->cameras[0], batches, 4.0f, false);
+    if (first.size() != referenceSize)
+    {
+        state.SkipWithError("batched actors changed the exact cut");
+        return;
     }
     benchmark::DoNotOptimize(first.runs().data());
 
@@ -1214,14 +1252,7 @@ static void BM_LiveCityDrivingFrame(benchmark::State& state)
     {
         frame = (frame + 1) & kLiveCityFrameMask;
         updateLiveCityActorPositions(*scene, frame);
-        scene->world.moveRigidInstances(scene->carMotion,
-                                        scene->carPositions,
-                                        scene->carYaws);
-        scene->world.moveRigidInstances(scene->pedestrianMotion,
-                                        scene->pedestrianPositions,
-                                        scene->pedestrianYaws);
-        scene->world.applyUpdates();
-        result = query.select(scene->world, scene->cameras[frame],
+        result = query.select(scene->world, scene->cameras[frame], batches,
                               4.0f, false);
         benchmark::DoNotOptimize(result.runs().data());
         benchmark::DoNotOptimize(result.size());
@@ -1262,14 +1293,13 @@ BENCHMARK(BM_LiveCityDrivingFrame)
     ->Iterations(kLiveCityFrames * 2)
     ->Unit(benchmark::kMicrosecond);
 
-// Isolates the dynamic-scene publication half of the live-city frame. This
-// keeps the identical contiguous car and pedestrian trajectories but omits
-// frontier selection, making transform-stream and TLAS-update regressions
-// visible even when result-buffer or traversal layout changes in the opposite
-// direction.
+// Isolates simulation transform generation for the terminal actor-batch
+// architecture. The query consumes these arrays directly, so this is the
+// complete moving-object writer cost: there is no second transform copy or
+// dynamic TLAS publication hidden outside the benchmark.
 static void BM_LiveCityMotionFrame(benchmark::State& state)
 {
-    auto scene = buildLiveCityScene();
+    auto scene = buildLiveCityScene(true);
 
     uint32_t frame = 0;
     uint64_t calls = 0;
@@ -1277,14 +1307,9 @@ static void BM_LiveCityMotionFrame(benchmark::State& state)
     {
         frame = (frame + 1) & kLiveCityFrameMask;
         updateLiveCityActorPositions(*scene, frame);
-        scene->world.moveRigidInstances(scene->carMotion,
-                                        scene->carPositions,
-                                        scene->carYaws);
-        scene->world.moveRigidInstances(scene->pedestrianMotion,
-                                        scene->pedestrianPositions,
-                                        scene->pedestrianYaws);
-        scene->world.applyUpdates();
-        benchmark::DoNotOptimize(scene->world.mountedSubtreeCount());
+        benchmark::DoNotOptimize(scene->carPositions.data());
+        benchmark::DoNotOptimize(scene->pedestrianPositions.data());
+        benchmark::ClobberMemory();
         ++calls;
     }
 
@@ -1302,27 +1327,30 @@ BENCHMARK(BM_LiveCityMotionFrame)
     ->Unit(benchmark::kMicrosecond);
 
 // End-to-end CPU frame companion to BM_LiveCityDrivingFrame. In addition to
-// actor motion, TLAS publication, and terminal-range production, this scans
-// the payload and metadata of every logical selected leaf. It represents
+// actor motion and terminal-range production, this scans the payload and
+// metadata of every logical selected leaf. It represents
 // the minimum downstream iteration cost that a selection-only benchmark
 // intentionally excludes; no allocator or graphics-driver work is timed.
 #ifndef FRONTIER_OMIT_SUBMISSION_BENCH
 static void BM_LiveCityRenderSubmissionFrame(benchmark::State& state)
 {
-    auto scene = buildLiveCityScene();
-    TerminalRenderQuery query;
-    TerminalRenderView result =
-        query.select(scene->world, scene->cameras[0]);
+    auto scene = buildLiveCityScene(true);
+    const auto batches = liveCityActorBatches(*scene);
+    size_t referenceSize = 0;
     {
+        auto referenceScene = buildLiveCityScene(false);
         SpatialQuery reference;
         reference.setReuseEnabled(true);
-        const RenderFrontierView exact = reference.selectRenderFrontier(
-            scene->world, scene->cameras[0], {});
-        if (result.size() != exact.size())
-        {
-            state.SkipWithError("terminal ranges changed the render cut");
-            return;
-        }
+        referenceSize = reference.selectRenderFrontier(
+            referenceScene->world, referenceScene->cameras[0], {}).size();
+    }
+    TerminalRenderQuery query;
+    TerminalRenderView result =
+        query.select(scene->world, scene->cameras[0], batches);
+    if (result.size() != referenceSize)
+    {
+        state.SkipWithError("batched actors changed the render cut");
+        return;
     }
     consumeLiveCitySubmissions(result);
 
@@ -1337,14 +1365,7 @@ static void BM_LiveCityRenderSubmissionFrame(benchmark::State& state)
     {
         frame = (frame + 1) & kLiveCityFrameMask;
         updateLiveCityActorPositions(*scene, frame);
-        scene->world.moveRigidInstances(scene->carMotion,
-                                        scene->carPositions,
-                                        scene->carYaws);
-        scene->world.moveRigidInstances(scene->pedestrianMotion,
-                                        scene->pedestrianPositions,
-                                        scene->pedestrianYaws);
-        scene->world.applyUpdates();
-        result = query.select(scene->world, scene->cameras[frame]);
+        result = query.select(scene->world, scene->cameras[frame], batches);
         consumeLiveCitySubmissions(result);
         ++calls;
         totalEntries += result.size();

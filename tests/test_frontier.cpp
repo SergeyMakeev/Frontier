@@ -751,6 +751,96 @@ TEST(Frontier, TerminalRenderRangesMatchTheFullyRefinedCurrentCut)
         << "test scene never reached a partial terminal range";
 }
 
+TEST(Frontier, TerminalActorBatchMatchesMountedYawedInstance)
+{
+    SpatialDatabase mountedDatabase;
+    SpatialDatabase batchDatabase;
+    const SubtreeHandle mountedDefinition = mountedDatabase.registerSubtree(
+        makeFullyRefinedReferenceSubtree(0.0f));
+    const SubtreeHandle batchDefinition = batchDatabase.registerSubtree(
+        makeFullyRefinedReferenceSubtree(0.0f));
+
+    InstanceDesc desc;
+    desc.yaw = yawRotation(0.6f);
+    NodeDesc root = node(9000, 64.0f, box(5.0f), true);
+    root.flags |= NodeDesc::FlagYawInvariantBounds;
+    const InstanceHandle instance = mountedDatabase.instantiate(root, desc);
+    mountedDatabase.setInstanceRenderAsUnit(instance);
+    mountedDatabase.mountSubtree(instance.rootNode(), mountedDefinition);
+    TestAccess::markAllNodesReady(mountedDatabase);
+    TestAccess::markAllNodesReady(batchDatabase);
+    mountedDatabase.optimize();
+    batchDatabase.applyUpdates();
+
+    std::array<float4, 1> positions{desc.pos};
+    std::array<YawRotation, 1> yaws{desc.yaw};
+    TerminalInstanceBatch batch;
+    batch.definition = batchDefinition;
+    batch.localBounds = box(5.0f);
+    batch.positions = positions;
+    batch.yaws = yaws;
+    batch.firstInstance = 17;
+    batch.yawInvariantBounds = true;
+
+    const auto terminalPayloads = [&](TerminalRenderQuery& query,
+                                      const Camera& camera,
+                                      bool coarsen)
+    {
+        const TerminalRenderView view = query.select(
+            batchDatabase, camera,
+            std::span<const TerminalInstanceBatch>(&batch, 1), 4.0f,
+            coarsen);
+        std::vector<UserPayload> result;
+        result.reserve(view.size());
+        for (const TerminalRenderRun run : view.runs())
+        {
+            EXPECT_EQ(run.instance(), 17u);
+            result.insert(result.end(), run.payloadSpan().begin(),
+                          run.payloadSpan().end());
+        }
+        std::sort(result.begin(), result.end());
+        return result;
+    };
+
+    SpatialQuery mountedQuery;
+    mountedQuery.setReuseEnabled(false);
+    TerminalRenderQuery batchQuery;
+    const Camera camera = cameraAt(-8.0f);
+    std::vector<UserPayload> exact;
+    bool reachedBoundary = false;
+    for (uint32_t step = 1; step <= 160; ++step)
+    {
+        InstanceTransform transform;
+        transform.pos = float4::point(float(step) * 0.125f, 0.0f, 0.0f);
+        transform.yaw = desc.yaw;
+        positions[0] = transform.pos;
+        mountedDatabase.moveInstance(instance, transform);
+        mountedDatabase.applyUpdates();
+        exact = payloads(
+            mountedDatabase,
+            mountedQuery.selectFrontier(mountedDatabase, camera, {}), false);
+        std::sort(exact.begin(), exact.end());
+        EXPECT_EQ(terminalPayloads(batchQuery, camera, false), exact);
+        if (!exact.empty() && exact.size() != 16)
+        {
+            reachedBoundary = true;
+            break;
+        }
+    }
+    ASSERT_TRUE(reachedBoundary);
+
+    TerminalRenderQuery mountedTerminalQuery;
+    const TerminalRenderView mountedRender = mountedTerminalQuery.select(
+        mountedDatabase, camera, 4.0f, true);
+    std::vector<UserPayload> renderPayloads;
+    renderPayloads.reserve(mountedRender.size());
+    for (const TerminalRenderRun run : mountedRender.runs())
+        renderPayloads.insert(renderPayloads.end(), run.payloadSpan().begin(),
+                              run.payloadSpan().end());
+    std::sort(renderPayloads.begin(), renderPayloads.end());
+    EXPECT_EQ(terminalPayloads(batchQuery, camera, true), renderPayloads);
+}
+
 TEST(Frontier, TerminalRenderRejectsNonzeroTerminalError)
 {
     SpatialDatabase database;

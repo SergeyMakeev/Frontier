@@ -1878,12 +1878,19 @@ pointer plus two 32-bit words, so the API does not impose an accidental
 Keep and commit. This is a direct data-representation improvement: the
 renderer still observes every selected payload, instance id, and error code,
 but traversal communicates immutable contiguous spans instead of manufacturing
-and resolving one transient handle record per leaf. Relative to the first
-round-8 renderer baseline medians, the current ordinary-Release frame is about
-5.02x faster for payload32 (1,114.891 to 222.023 us) and 4.80x for payload64
-(1,180.451 to 246.070 us). Because those endpoints come from separate paired
-reports, they are a cumulative median ratio rather than one direct confidence
-interval; a direct frozen-anchor run is the remaining confirmation step.
+and resolving one transient handle record per leaf.
+
+Direct cumulative report
+`/home/codex-perf/frontier/results/frontier-paired-20260817T235041Z` rebuilt both
+round-start `a8303c8` and committed `1c72a99` as ordinary non-IPO Release and
+ran four ABBA cycles. Exact selection improved 73.07% payload32 and 73.15%
+payload64, while render plus complete payload scanning improved 74.67% and
+73.89%. The corresponding direct speedups are approximately 3.71-3.72x for
+selection and 3.83-3.95x for end-to-end rendering. All 64 processes observed
+2.208 GHz, temperature stayed between 43.461 and 46.230 C, and maximum
+CPU/wall divergence was 0.031%. This direct result supersedes the larger
+cross-report median ratio previously estimated from differently configured
+historical binaries.
 
 ### Next radical experiment
 
@@ -1897,3 +1904,118 @@ moving batches receive wide root culling and only partial actors enter local
 hierarchy traversal. This is an algorithm/data-layout change with an explicit
 O(actor-count) per-view tradeoff, and should remove duplicate transform
 publication plus dynamic TLAS refit without changing the simulated scene.
+
+## Experiment 19: simulation-owned terminal actor batches
+
+### Theory
+
+The live city has two homogeneous moving cohorts: 100 cars share one immutable
+50-leaf definition and 1,000 pedestrians share one immutable 10-leaf
+definition. Their current positions and yaws already exist in simulation-owned
+SoA arrays. The general instance architecture copied those 1,100 transforms
+into dense database records, updated orientation state, accumulated exact TLAS
+leaf bounds, and refit affected parents before selection could read them. That
+publication remained about 82 us of the 222-246 us terminal-range frame.
+
+For populations of this size, rebuilding/refitting a dynamic acceleration
+structure can cost more than directly testing the roots. Keep the 91 static
+world roots in the quality TLAS, but describe each homogeneous dynamic cohort
+as a non-owning `TerminalInstanceBatch`:
+
+```
+{ definition, localBounds, positions[], yaws[], firstInstance,
+  scale, mask, yawInvariantBounds, renderAsUnit }
+```
+
+The batch does not copy or own transforms. `TerminalRenderQuery` first selects
+static/general roots through the unchanged TLAS, then root-culls each batch
+placement directly from the caller spans. Fully inside or renderer-coarsened
+actors append the definition's terminal range immediately; only partial actors
+build a local camera and enter definition traversal. This changes the dynamic
+broadphase from per-frame TLAS refit plus logarithmic query to a simple
+O(actor-count) scan per view, while eliminating a complete duplicate transform
+publication phase.
+
+### Prototype and correctness
+
+The first implementation adds a public batch overload without changing the
+existing query. A database with no TLAS roots can own definitions solely for
+batch use. Contracts validate definition generation, bounds, scale, transform
+counts, yaw values, view mask, terminal eligibility, and the 24-bit output id
+range. Batch ids are caller-assigned and must not collide with normal instance
+ids used in the same result.
+
+The realistic benchmark constructs the identical static hierarchy and actor
+definitions but does not instantiate the 1,100 actors in the general database.
+It still generates every position and yaw inside the timed frame. Selection
+reads those spans directly; the motion-only companion measures the complete
+writer cost, with `ClobberMemory` keeping the generated arrays observable. A
+separate legacy scene outside the timer verifies the frame-zero exact/render
+cardinality before measurement.
+
+The complete local Debug matrix passes 448/448 tests across BVH4, BVH8,
+payload32, and payload64. The new focused test moves a yawed mounted instance
+across a partial frustum boundary and compares its exact and actor-unit terminal
+payload sets with a batch-only database; it also verifies the caller-assigned
+instance id. The full 8,192-frame local benchmark retains exactly 24,072.7
+selected and 24,139.3 submitted leaves per frame, including the same minima and
+maxima. Query storage falls slightly because dynamic TLAS scratch disappears;
+orientation storage falls to zero and retained mounted-instance state drops by
+about 193 KiB in the local configuration.
+
+Local Release timings are directional only and show a large reduction in all
+three live-city cases. No result is accepted until ordinary non-IPO Release
+binaries pass the paired Cortex-A72 gate against committed `1c72a99`.
+
+### Final SBC result
+
+Report `/home/codex-perf/frontier/results/frontier-paired-20260818T001202Z`
+compares the actor-batch candidate with a clean bundle/build of committed
+`1c72a99`. Both are ordinary non-IPO Release builds with contract checks and
+subtree revalidation disabled equally. Four ABBA cycles produced:
+
+| Case | Payload | Baseline | Candidate | Paired change | 95% interval |
+|---|---:|---:|---:|---:|---:|
+| exact live-city selection | 32 | 186.263 us | 103.523 us | **-44.69%** | [-45.61%, -44.03%] |
+| exact live-city selection | 64 | 184.403 us | 103.204 us | **-44.24%** | [-45.39%, -43.15%] |
+| render + payload scan | 32 | 232.202 us | 129.836 us | **-44.83%** | [-47.72%, -43.16%] |
+| render + payload scan | 64 | 257.124 us | 125.824 us | **-51.83%** | [-53.22%, -50.40%] |
+| moving-object writer | 32 | 81.568 us | 8.171 us | **-89.99%** | [-90.06%, -89.94%] |
+| moving-object writer | 64 | 81.660 us | 8.196 us | **-89.98%** | [-90.02%, -89.94%] |
+
+Every executing-path cycle improved. Candidate CV was 0.15-0.24% for selection
+and payload32 render, 0.86% for payload64 render, and below 0.5% for motion.
+All 160 processes observed exactly 2.208 GHz; temperature stayed between
+45.307 and 46.230 C and maximum CPU/wall divergence was 0.044%.
+
+The identity controls reported mixed point estimates, including positive
+`identity_100` intervals. They cannot be candidate regressions: baseline and
+candidate machine-control executables are byte-identical at SHA-256
+`0f77d52bade50770c185b35e6f275d7a4f28b083e4aacf471f91726150c50845`.
+The general payload32 and payload64 `spatial_database.cpp` objects are likewise
+byte-identical at the hashes recorded in Experiment 18. No address/layout
+tuning was attempted; these contradictory timings remain environment noise.
+
+The Cortex-A72 smoke counters retained the exact 8,192-frame leaf counts and
+extrema. Query storage was 1,239.48 KiB payload32, orientation state was zero,
+and mounted-instance state fell from 430.891 to 243.238 KiB. The static 91-root
+TLAS remains a normal quality hierarchy; 1,100 actor roots now live only in the
+two simulation spans.
+
+### Decision and cumulative position
+
+Keep and commit. This is the intended radical architecture change: simulation
+state becomes the single source of truth for homogeneous actor transforms,
+while immutable hierarchy/payload data remains shared through the database.
+It exchanges general handles, per-actor scale/mask, readiness/deformation, and
+sublinear dynamic broadphase queries for zero-copy publication and a cheap flat
+root scan. Mixed scenes can use batches and general instances in the same
+terminal query, so the tradeoff is chosen per cohort rather than globally.
+
+Combining the ordinary non-IPO round-start medians from direct report
+`frontier-paired-20260817T235041Z` with the final candidate medians gives
+approximately 6.63-6.70x exact-selection throughput and 6.89-7.48x complete
+render-frame throughput. Both endpoints use the same compiler/build policy and
+fixed 2.208 GHz SBC; a final direct frozen-anchor ABBA run can attach a single
+confidence interval to that cumulative ratio, but the 5x goal is already
+exceeded by a wide margin at the observed medians.

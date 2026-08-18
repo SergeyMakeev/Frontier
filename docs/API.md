@@ -629,6 +629,33 @@ marked with `setInstanceRenderAsUnit()` retain their whole terminal range when
 the root intersects the frustum; pass `false` as the fourth `select()` argument
 when exact descendant culling is required.
 
+Large homogeneous moving populations can keep transforms in the simulation's
+own split streams instead of publishing duplicate general instances and
+refitting them into the TLAS every frame:
+
+```cpp
+TerminalInstanceBatch cars;
+cars.definition = carDefinition;
+cars.localBounds = carRootBounds;
+cars.positions = simulation.carPositions();
+cars.yaws = simulation.carYaws();
+cars.firstInstance = carInstanceBase;
+cars.yawInvariantBounds = true;
+
+std::array batches{cars};
+TerminalRenderView view = query.select(database, camera, batches);
+```
+
+Static and heterogeneous instances in `database` still use its TLAS. Batch
+roots are tested directly from caller memory; fully visible actors append one
+payload range and only partial actors descend the definition. Position/yaw
+storage must remain valid for the call. Batches use consecutive caller-assigned
+instance ids, constant scale/mask/bounds per cohort, fully resident terminal
+definitions, and no general `InstanceHandle`. They are best for hundreds or
+thousands of same-shape actors; use ordinary instances when streaming,
+deformation, per-actor scale/mask variation, handle operations, or a dynamic
+broadphase is more important than zero-copy publication.
+
 ## 8. Stream topology and render readiness independently
 
 Mounting makes finer topology known. Marking a node ready says the renderer has

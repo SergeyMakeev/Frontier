@@ -119,6 +119,18 @@ Scenes with streaming readiness, nested mounts, nonzero terminal error, or
 deformed bounds remain on `SpatialQuery`; the range path deliberately trades
 those capabilities for a compact max-detail representation.
 
+Homogeneous terminal actors may bypass general instance publication entirely.
+A `TerminalInstanceBatch` references immutable definition data plus
+caller-owned position and yaw streams. The query first traverses the normal
+TLAS for static/heterogeneous roots, then scans batch roots directly. Root
+inside/coarsened actors append the plan's complete payload range; only partial
+actors transform the camera and visit definition blocks. This static-TLAS plus
+flat-dynamic split avoids copying simulation transforms, allocating mount
+placements, updating orientation records, and refitting dynamic TLAS leaves.
+Its cost is O(batch population) for every view and a deliberately narrower
+cohort contract: consecutive external ids, constant bounds/scale/mask and one
+definition, no per-actor handles, streaming state, or deformed bounds.
+
 ## Current and ideal coverage
 
 Registered definitions own readiness by node. Mounted nodes carry only derived

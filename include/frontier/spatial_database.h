@@ -435,6 +435,23 @@ private:
     size_t leafCount_ = 0;
 };
 
+// Non-owning placement stream for homogeneous, fully resident actors. The
+// immutable hierarchy is registered once in database; current transforms stay
+// in caller-owned simulation SoA storage and are consumed directly by a
+// TerminalRenderQuery instead of being copied into general TLAS instances.
+struct TerminalInstanceBatch
+{
+    SubtreeHandle definition;
+    AABB localBounds = AABB::empty();
+    std::span<const float4> positions;
+    std::span<const YawRotation> yaws;
+    InstanceId firstInstance = 0;
+    float scale = 1.0f;
+    uint32_t mask = ~0u;
+    bool yawInvariantBounds = false;
+    bool renderAsUnit = true;
+};
+
 // Specialized max-detail query for fully resident immutable definitions.
 // It returns referenced payload ranges instead of materializing one handle and
 // one resolved payload/error pair per leaf. See select() for the strict scene
@@ -453,6 +470,11 @@ public:
                               const Camera& camera,
                               float errorThreshold = 4.0f,
                               bool coarsenRenderUnits = true);
+    TerminalRenderView select(
+        const SpatialDatabase& database, const Camera& camera,
+        std::span<const TerminalInstanceBatch> batches,
+        float errorThreshold = 4.0f,
+        bool coarsenRenderUnits = true);
     void reset();
     size_t bytes() const;
 

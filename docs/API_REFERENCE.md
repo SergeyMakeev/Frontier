@@ -1211,11 +1211,29 @@ public:
     bool empty() const;
 };
 
+struct TerminalInstanceBatch {
+    SubtreeHandle definition;
+    AABB localBounds;
+    std::span<const float4> positions;
+    std::span<const YawRotation> yaws;
+    InstanceId firstInstance;
+    float scale;
+    uint32_t mask;
+    bool yawInvariantBounds;
+    bool renderAsUnit;
+};
+
 class TerminalRenderQuery {
 public:
     TerminalRenderView select(
         const SpatialDatabase& database,
         const Camera& camera,
+        float errorThreshold = 4.0f,
+        bool coarsenRenderUnits = true);
+    TerminalRenderView select(
+        const SpatialDatabase& database,
+        const Camera& camera,
+        std::span<const TerminalInstanceBatch> batches,
         float errorThreshold = 4.0f,
         bool coarsenRenderUnits = true);
     void reset();
@@ -1254,6 +1272,26 @@ run span remain valid only until the query's next `select()` or `reset()`, or
 until the database is mutated. Queries are movable, not copyable, bind to the
 first database they select, and may not be called concurrently; distinct
 queries may read one published snapshot concurrently.
+
+`TerminalInstanceBatch` is a non-owning homogeneous placement stream. Its
+definition belongs to `database`, `positions` is one current world-space point
+per actor, and `yaws` is either empty for identity orientation or has the same
+length. `localBounds`, positive uniform `scale`, layer `mask`, yaw-invariant
+bound policy, and renderer-coarsening policy are constant for the cohort.
+Output ids are `firstInstance + actorIndex`; the exclusive end must not exceed
+`kInvalidInstanceId`, and the caller must keep batch ranges disjoint from each
+other and from normal instance ids in the same result.
+
+Batch spans need remain valid only during `select()`. The actors are not
+inserted into the database, have no `InstanceHandle`, mount/readiness state, or
+per-actor scale/mask, and are tested in O(batch actor count) per view. The
+definition must satisfy the same no-nested-mount/zero-terminal-error contract,
+and its render resources are caller-guaranteed resident. A database with no
+TLAS roots may own definitions exclusively for batches. Static/general roots
+still use the TLAS in the same call; fully inside batch roots append one range,
+while partial roots use exact yawed local traversal. With
+`coarsenRenderUnits=true`, `renderAsUnit` makes a partially intersecting actor
+emit its whole terminal range.
 
 ## 9. Database configuration
 

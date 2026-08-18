@@ -58,6 +58,19 @@ inline bool identityYaw(YawRotation yaw)
     return yaw.cosine == 1.0f && yaw.sine == 0.0f;
 }
 
+inline bool validYaw(YawRotation yaw)
+{
+    if (!std::isfinite(yaw.cosine) || !std::isfinite(yaw.sine)) return false;
+    const float lengthSq = yaw.cosine * yaw.cosine + yaw.sine * yaw.sine;
+    return std::fabs(lengthSq - 1.0f) <= 1.0e-4f;
+}
+
+inline bool finiteNonEmptyBounds(const AABB& bounds)
+{
+    return !bounds.isEmpty() && finitePosition(bounds.mn) &&
+           finitePosition(bounds.mx);
+}
+
 inline uint32_t packItem(uint32_t value, uint8_t mask)
 {
     return (value & kInstanceIdMask) |
@@ -111,6 +124,14 @@ TerminalRenderView TerminalRenderQuery::select(
     const SpatialDatabase& database, const Camera& camera,
     float errorThreshold, bool coarsenRenderUnits)
 {
+    return select(database, camera, {}, errorThreshold, coarsenRenderUnits);
+}
+
+TerminalRenderView TerminalRenderQuery::select(
+    const SpatialDatabase& database, const Camera& camera,
+    std::span<const TerminalInstanceBatch> batches, float errorThreshold,
+    bool coarsenRenderUnits)
+{
     FRONTIER_CHECK(validCamera(camera),
                    "TerminalRenderQuery::select: invalid camera");
     FRONTIER_CHECK(errorThreshold > 0.0f &&
@@ -128,7 +149,7 @@ TerminalRenderView TerminalRenderQuery::select(
                        database.tlasItemsTmp_.empty(),
                    "TerminalRenderQuery::select: call applyUpdates() after "
                    "database changes");
-    if (database.tlasRoot_ < 0)
+    if (database.tlasRoot_ < 0 && batches.empty())
         return {{}, 0};
 
     const Camera view =
@@ -143,7 +164,13 @@ TerminalRenderView TerminalRenderQuery::select(
     std::vector<uint32_t>& visible = impl_->visible;
     std::vector<uint32_t>& stack = impl_->tlasStack;
     visible.clear();
-    if (camera.viewMask == ~0u && database.tlasRootContainsPopulation(view))
+    if (database.tlasRoot_ < 0)
+    {
+        // A database may exist only to own immutable definitions consumed by
+        // external actor batches.
+    }
+    else if (camera.viewMask == ~0u &&
+             database.tlasRootContainsPopulation(view))
     {
         visible.reserve(database.liveInstances_.size());
         for (const InstanceId dense : database.liveInstances_)
@@ -305,6 +332,68 @@ TerminalRenderView TerminalRenderQuery::select(
         impl_->leafCount += count;
     };
 
+    const auto appendDefinition = [&](Impl::Plan& plan,
+                                      const detail::SubtreeView& subtree,
+                                      const Camera& local, uint8_t rootMask,
+                                      uint32_t instanceWord)
+    {
+        std::vector<uint32_t>& nodeStack = impl_->nodeStack;
+        nodeStack.clear();
+        nodeStack.push_back(packItem(0, rootMask));
+        while (!nodeStack.empty())
+        {
+            const uint32_t item = nodeStack.back();
+            nodeStack.pop_back();
+            const uint32_t node = itemValue(item);
+            const uint8_t nodeMask = itemMask(item);
+            if (nodeMask == 0)
+            {
+                const Impl::Range range = plan.ranges[node];
+                appendRun(plan.payloads.data() + range.begin, range.count,
+                          instanceWord);
+                continue;
+            }
+
+            const uint32_t first = subtree.wideOffset(node);
+            const uint32_t blocks = subtree.wideBlockCount(node);
+            for (uint32_t b = 0; b < blocks; ++b)
+            {
+                const uint32_t block = first + b;
+                const detail::WideBlock& children = subtree.wide_[block];
+                const uint32_t lanes = subtree.blockMask_[block];
+                uint8_t outMasks[kWide];
+                const uint32_t survivors =
+                    testWideAabb(children.bounds, local.frustum, nodeMask,
+                                 outMasks) &
+                    detail::blockValidLanes(lanes);
+                uint32_t leaves =
+                    survivors & detail::blockLeafLanes(lanes);
+                while (leaves)
+                {
+                    const uint32_t lane =
+                        uint32_t(std::countr_zero(leaves));
+                    leaves &= leaves - 1;
+                    const Impl::Range terminalRange =
+                        plan.ranges[children.child[lane]];
+                    FRONTIER_ASSERT(terminalRange.count == 1,
+                                    "terminal plan leaf is missing");
+                    appendRun(plan.payloads.data() + terminalRange.begin, 1,
+                              instanceWord);
+                }
+                uint32_t inner =
+                    survivors & ~detail::blockLeafLanes(lanes);
+                while (inner)
+                {
+                    const uint32_t lane =
+                        uint32_t(std::countr_zero(inner));
+                    inner &= inner - 1;
+                    nodeStack.push_back(packItem(children.child[lane],
+                                                 outMasks[lane]));
+                }
+            }
+        }
+    };
+
     // A terminal query is intentionally strict: it represents the fully
     // resident zero-error cut, so it never silently substitutes an unavailable
     // proxy or applies a copy-on-write overlay to immutable definition ranges.
@@ -362,61 +451,71 @@ TerminalRenderView TerminalRenderQuery::select(
             database.mountLocalCamera(instanceLocal, rootSlot, mask);
         const detail::SubtreeView& subtree =
             database.subtrees_[mounted.definition].view;
+        appendDefinition(plan, subtree, local, mask, instanceWord);
+    }
 
-        std::vector<uint32_t>& nodeStack = impl_->nodeStack;
-        nodeStack.clear();
-        nodeStack.push_back(packItem(0, mask));
-        while (!nodeStack.empty())
+    // Homogeneous actor batches deliberately stay outside the mutable TLAS.
+    // Their simulation-owned SoA transforms are the current publication; this
+    // query performs one exact root cull and only descends partially visible
+    // actors. Static/general instances above retain normal TLAS acceleration.
+    for (const TerminalInstanceBatch& batch : batches)
+    {
+        FRONTIER_CHECK(batch.yaws.empty() ||
+                           batch.yaws.size() == batch.positions.size(),
+                       "TerminalRenderQuery::select: batch yaw count does not "
+                       "match its position count");
+        FRONTIER_CHECK(batch.scale > 0.0f && std::isfinite(batch.scale) &&
+                           std::isfinite(1.0f / batch.scale),
+                       "TerminalRenderQuery::select: invalid batch scale");
+        FRONTIER_CHECK(finiteNonEmptyBounds(batch.localBounds),
+                       "TerminalRenderQuery::select: invalid batch bounds");
+        FRONTIER_CHECK(
+            uint64_t(batch.firstInstance) + batch.positions.size() <=
+                uint64_t(kInvalidInstanceId),
+            "TerminalRenderQuery::select: batch instance range exceeds the "
+            "24-bit id space");
+        const SpatialDatabase::SubtreeDefinitionRt* definition =
+            database.resolveSubtree(batch.definition);
+        FRONTIER_CHECK(definition != nullptr,
+                       "TerminalRenderQuery::select: stale batch definition");
+        Impl::Plan& plan = buildPlan(batch.definition.slot);
+        FRONTIER_CHECK(plan.eligible,
+                       "TerminalRenderQuery::select: batch definition "
+                       "contains nested mounts or non-terminal geometric "
+                       "error");
+        if ((batch.mask & camera.viewMask) == 0) continue;
+
+        const detail::SubtreeView& subtree = definition->view;
+        for (size_t i = 0; i < batch.positions.size(); ++i)
         {
-            const uint32_t item = nodeStack.back();
-            nodeStack.pop_back();
-            const uint32_t node = itemValue(item);
-            const uint8_t nodeMask = itemMask(item);
-            if (nodeMask == 0)
-            {
-                const Impl::Range range = plan.ranges[node];
-                appendRun(plan.payloads.data() + range.begin, range.count,
-                          instanceWord);
+            const float4 position = batch.positions[i];
+            const YawRotation yaw = batch.yaws.empty()
+                                        ? YawRotation{}
+                                        : batch.yaws[i];
+            FRONTIER_CHECK(finitePosition(position) && validYaw(yaw),
+                           "TerminalRenderQuery::select: invalid batch "
+                           "transform");
+            const AABB worldBounds =
+                batch.yawInvariantBounds || identityYaw(yaw)
+                    ? toWorld(batch.localBounds, position, batch.scale)
+                    : toWorld(batch.localBounds, position, batch.scale, yaw);
+            FRONTIER_CHECK(finiteNonEmptyBounds(worldBounds),
+                           "TerminalRenderQuery::select: transformed batch "
+                           "bounds overflow");
+            uint8_t mask = kAllPlanes;
+            if (testAabb(worldBounds, camera.frustum, mask) ==
+                CullState::Outside)
                 continue;
-            }
+            if (coarsenRenderUnits && batch.renderAsUnit) mask = 0;
 
-            const uint32_t first = subtree.wideOffset(node);
-            const uint32_t blocks = subtree.wideBlockCount(node);
-            for (uint32_t b = 0; b < blocks; ++b)
-            {
-                const uint32_t block = first + b;
-                const detail::WideBlock& children = subtree.wide_[block];
-                const uint32_t lanes = subtree.blockMask_[block];
-                uint8_t outMasks[kWide];
-                const uint32_t survivors =
-                    testWideAabb(children.bounds, local.frustum, nodeMask,
-                                 outMasks) &
-                    detail::blockValidLanes(lanes);
-                uint32_t leaves =
-                    survivors & detail::blockLeafLanes(lanes);
-                while (leaves)
-                {
-                    const uint32_t lane =
-                        uint32_t(std::countr_zero(leaves));
-                    leaves &= leaves - 1;
-                    const Impl::Range terminalRange =
-                        plan.ranges[children.child[lane]];
-                    FRONTIER_ASSERT(terminalRange.count == 1,
-                                    "terminal plan leaf is missing");
-                    appendRun(plan.payloads.data() + terminalRange.begin, 1,
-                              instanceWord);
-                }
-                uint32_t inner =
-                    survivors & ~detail::blockLeafLanes(lanes);
-                while (inner)
-                {
-                    const uint32_t lane =
-                        uint32_t(std::countr_zero(inner));
-                    inner &= inner - 1;
-                    nodeStack.push_back(packItem(children.child[lane],
-                                                 outMasks[lane]));
-                }
-            }
+            const Camera local =
+                identityYaw(yaw)
+                    ? toLocal(camera, position, batch.scale, mask)
+                    : toLocal(camera, position, batch.scale, yaw, mask);
+            appendDefinition(
+                plan, subtree, local, mask,
+                packInstanceError(
+                    batch.firstInstance + InstanceId(i), 0));
         }
     }
 
