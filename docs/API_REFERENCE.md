@@ -1015,8 +1015,10 @@ struct SelectionParams {
   falls back to a ready ancestor, normally producing fewer, coarser entries.
 - `threshold` is the screen-error refinement threshold in pixels and must be
   positive and finite.
-- `minPix` enables top-level contribution culling when greater than zero;
-  zero disables it. It must be finite and non-negative.
+- `minPix` enables top-level contribution culling when greater than zero. An
+  instance is rejected only when the conservative projected diameter of its
+  world-space bounds is smaller than `minPix`; authored geometric error is not
+  used for this decision. Zero disables it. It must be finite and non-negative.
 - `currentCutPolicy` selects the replacement rule above. Changing it
   invalidates that query's reusable frontier records in O(1); allocations and
   damping state are retained. Reserved enumerator values are rejected.

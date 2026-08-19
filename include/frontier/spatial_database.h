@@ -582,7 +582,9 @@ enum class CurrentCutPolicy : uint8_t
 struct SelectionParams
 {
     float threshold = 4.0f;   // refine when screen error exceeds this (px)
-    float minPix    = 0.0f;   // contribution culling at the top level; 0 = off
+    // Cull a top-level instance only when the conservative projected diameter
+    // of its world-space bounds is smaller than this many pixels. 0 = off.
+    float minPix    = 0.0f;
     CurrentCutPolicy currentCutPolicy =
         CurrentCutPolicy::PreferReadyDescendants;
 };
@@ -1953,7 +1955,11 @@ private:
 
     struct TlasMeta
     {
-        float8   maxErr{};
+        // Maximum world-space bounds diameter below each lane. This is kept
+        // separate from authored geometric error: contribution culling asks
+        // whether an object can affect a pixel, not how closely an LOD
+        // approximates that object.
+        float8   maxContribution{};
         uint32_t laneMask[kWide]{}; // union of subtree instance masks
     };
     static_assert(sizeof(TlasMeta) == (kWide == 8 ? 64 : 32),
@@ -2327,10 +2333,11 @@ private:
     void tlasRemove(InstanceId id);
     // Grow a lane box up the parent chain, stopping as soon as an ancestor
     // already covers it. Returns the lane area added, for the drift trigger.
-    float tlasGrowUp(uint32_t nodeIdx, const AABB& box, float maxErr, uint32_t laneMask);
+    float tlasGrowUp(uint32_t nodeIdx, const AABB& box,
+                     float maxContribution, uint32_t laneMask);
     int32_t tlasAllocNode();
     // Union of a node's valid lanes, which is what its parent's lane must hold.
-    AABB tlasNodeExtent(uint32_t node, float& maxErr,
+    AABB tlasNodeExtent(uint32_t node, float& maxContribution,
                         uint32_t& laneMask) const;
     void tlasNoteEdit();
 

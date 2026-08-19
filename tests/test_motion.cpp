@@ -500,6 +500,38 @@ TEST(Motion, SweptTlasLeafRetestsItsExactCurrentBounds)
               (std::vector<UserPayload>{1, 2}));
 }
 
+TEST(Motion, ContributionCullRetestsExactBoundsAfterScaleChanges)
+{
+    SpatialDatabase database;
+    const InstanceHandle scaled =
+        database.instantiate(node(1, 0.0f, box(10.0f)));
+    for (uint32_t i = 0; i < 7; ++i)
+    {
+        InstanceDesc desc;
+        desc.pos = float4::point(float(i + 1) * 4.0f, 0.0f, 0.0f);
+        database.instantiate(node(2 + i, 0.0f, box(0.1f)), desc);
+    }
+    database.applyUpdates();
+
+    SpatialQuery query;
+    SelectionParams params;
+    params.minPix = 10.0f;
+    const Camera camera = cameraAt(-1000.0f);
+    EXPECT_EQ(payloads(database, query.selectFrontier(database, camera, params)),
+              (std::vector<UserPayload>{1}));
+
+    database.moveInstance(
+        scaled, Transform{float4::point(0.0f, 0.0f, 0.0f), 0.01f});
+    database.applyUpdates();
+    EXPECT_TRUE(query.selectFrontier(database, camera, params).empty());
+
+    database.moveInstance(
+        scaled, Transform{float4::point(0.0f, 0.0f, 0.0f), 1.0f});
+    database.applyUpdates();
+    EXPECT_EQ(payloads(database, query.selectFrontier(database, camera, params)),
+              (std::vector<UserPayload>{1}));
+}
+
 TEST(Motion, RejectsInvalidTransformsWithoutCorruptingTlas)
 {
     SpatialDatabase database;

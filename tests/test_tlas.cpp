@@ -63,16 +63,44 @@ TEST(Tlas, LayerMaskCullsAtTopLevel)
     EXPECT_EQ(payloads(database, cut), (std::vector<UserPayload>{1}));
 }
 
-TEST(Tlas, ContributionCullUsesRootError)
+TEST(Tlas, ContributionCullUsesProjectedBoundsNotGeometricError)
 {
     SpatialDatabase database;
-    database.instantiate(node(1, 1.0f, box()));
+    // The large zero-error object must remain visible, while the tiny object
+    // with an enormous authored error must be culled. Geometric error chooses
+    // an LOD; it is not a measure of the object's image contribution.
+    database.instantiate(node(1, 0.0f, box(10.0f)));
+    database.instantiate(node(2, 10000.0f, box(0.1f)));
     SpatialQuery query;
     SelectionParams params;
-    params.minPix = 100.0f;
+    params.minPix = 10.0f;
     const FrontierResultView cut =
         select(database, query, cameraAt(-1000.0f), params);
-    EXPECT_TRUE(cut.empty());
+    EXPECT_EQ(payloads(database, cut), (std::vector<UserPayload>{1}));
+}
+
+TEST(Tlas, ContributionCullPreservesLargeObjectThroughInternalNodes)
+{
+    SpatialDatabase database;
+    constexpr uint32_t largePayload = 1042;
+    for (uint32_t i = 0; i < 80; ++i)
+    {
+        InstanceDesc desc;
+        desc.pos = float4::point(float(int(i % 10) - 5) * 8.0f,
+                                 float(int(i / 10) - 4) * 8.0f, 0.0f);
+        const bool large = i == 42;
+        database.instantiate(node(1000 + i, 0.0f,
+                                  box(large ? 10.0f : 0.1f)),
+                             desc);
+    }
+
+    SpatialQuery query;
+    SelectionParams params;
+    params.minPix = 10.0f;
+    const FrontierResultView cut =
+        select(database, query, cameraAt(-1000.0f), params);
+    EXPECT_EQ(payloads(database, cut),
+              (std::vector<UserPayload>{largePayload}));
 }
 
 TEST(Tlas, StaleInstanceHandleCannotMoveReusedSlot)

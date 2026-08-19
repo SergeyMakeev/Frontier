@@ -38,6 +38,15 @@ inline float surfaceArea(const AABB& b)
     return 2.0f * (e.x * e.y + e.y * e.z + e.z * e.x);
 }
 
+// A view-independent upper bound for an instance's projected diameter. The
+// full AABB diagonal is intentionally conservative for every camera angle.
+// Unlike geometric error, this measures whether the instance itself can still
+// contribute to the image, regardless of which LOD represents it.
+inline float contributionDiameter(const AABB& b)
+{
+    return b.isEmpty() ? 0.0f : length3(b.mx - b.mn);
+}
+
 inline uint32_t nextMountGeneration(uint32_t generation)
 {
     generation = (generation + 1u) & NodeHandle::kGenerationMask;
@@ -2643,15 +2652,16 @@ void SpatialDatabase::tlasNoteGrowth(float addedArea)
 
 // Grow-only propagation up the parent chain, shared by motion refit and by
 // incremental insertion. Stops at the first ancestor that already covers the
-// box, its error and its layer mask -- which is what keeps a small move O(1)
+// box, its contribution diameter and its layer mask -- which is what keeps a
+// small move O(1)
 // rather than O(depth).
 //
 // The layer mask matters here and does not for a pure move: an ancestor's
 // laneMask must be a superset of its subtree's instance masks, or tlasQuery's
 // layer filter will cull a visible instance. A move cannot change a mask, so
 // that term is always already satisfied on the motion path.
-float SpatialDatabase::tlasGrowUp(uint32_t nodeIdx, const AABB& box, float maxErr,
-                        uint32_t laneMask)
+float SpatialDatabase::tlasGrowUp(uint32_t nodeIdx, const AABB& box,
+                                  float maxContribution, uint32_t laneMask)
 {
     float added = 0.0f;
     TlasNode* node = &tlasNodes_[nodeIdx];
@@ -2666,32 +2676,35 @@ float SpatialDatabase::tlasGrowUp(uint32_t nodeIdx, const AABB& box, float maxEr
             if ((node->validMask & (1u << l)) && node->child[l] == childIdx) break;
         if (l == kWide) break;   // already unlinked; nothing above to grow
         AABB laneBox = node->bounds.lane(l);
-        if (laneBox.contains(box) && meta.maxErr.v[l] >= maxErr &&
+        if (laneBox.contains(box) &&
+            meta.maxContribution.v[l] >= maxContribution &&
             (meta.laneMask[l] & laneMask) == laneMask)
             break;
         const float was = surfaceArea(laneBox);
         laneBox.expand(box);
         node->bounds.setLane(l, laneBox);
-        meta.maxErr.v[l] = std::max(meta.maxErr.v[l], maxErr);
+        meta.maxContribution.v[l] =
+            std::max(meta.maxContribution.v[l], maxContribution);
         meta.laneMask[l] |= laneMask;
         added += surfaceArea(laneBox) - was;
     }
     return added;
 }
 
-AABB SpatialDatabase::tlasNodeExtent(uint32_t node, float& maxErr,
+AABB SpatialDatabase::tlasNodeExtent(uint32_t node, float& maxContribution,
                                      uint32_t& laneMask) const
 {
     const TlasNode& n = tlasNodes_[node];
     const TlasMeta& meta = tlasMeta_[node];
     AABB u = AABB::empty();
-    maxErr = 0.0f;
+    maxContribution = 0.0f;
     laneMask = 0;
     for (uint32_t l = 0; l < kWide; ++l)
     {
         if (!(n.validMask & (1u << l))) continue;
         u.expand(n.bounds.lane(l));
-        maxErr = std::max(maxErr, meta.maxErr.v[l]);
+        maxContribution =
+            std::max(maxContribution, meta.maxContribution.v[l]);
         laneMask |= meta.laneMask[l];
     }
     return u;
@@ -2706,7 +2719,7 @@ int32_t SpatialDatabase::tlasAllocNode()
         TlasNode& n = tlasNodes_[uint32_t(idx)];
         TlasMeta& meta = tlasMeta_[uint32_t(idx)];
         n.bounds = WideBounds::allEmpty();
-        meta.maxErr = float8::splat(0.0f);
+        meta.maxContribution = float8::splat(0.0f);
         n.validMask = 0;
         n.parent = -1;
         for (uint32_t l = 0; l < kWide; ++l)
@@ -2722,7 +2735,7 @@ int32_t SpatialDatabase::tlasAllocNode()
     TlasNode& n = tlasNodes_.emplace_back();
     TlasMeta& meta = tlasMeta_.emplace_back();
     n.bounds = WideBounds::allEmpty();
-    meta.maxErr = float8::splat(0.0f);
+    meta.maxContribution = float8::splat(0.0f);
     n.parent = -1;
     for (uint32_t l = 0; l < kWide; ++l)
     {
@@ -2794,13 +2807,14 @@ void SpatialDatabase::tlasInsert(InstanceId id)
         TlasMeta& mMeta = tlasMeta_[uint32_t(mIdx)];
         TlasNode& l0 = tlasNodes_[cur];
 
-        float    childErr = 0.0f;
+        float    childContribution = 0.0f;
         uint32_t childMask = 0;
-        const AABB childBox = tlasNodeExtent(cur, childErr, childMask);
+        const AABB childBox =
+            tlasNodeExtent(cur, childContribution, childMask);
 
         m.parent = l0.parent;
         m.bounds.setLane(0, childBox);
-        mMeta.maxErr.v[0] = childErr;
+        mMeta.maxContribution.v[0] = childContribution;
         m.child[0] = int32_t(cur);
         mMeta.laneMask[0] = childMask;
         m.validMask = 1u;
@@ -2825,14 +2839,16 @@ void SpatialDatabase::tlasInsert(InstanceId id)
     TlasMeta& hMeta = tlasMeta_[host];
     const uint32_t lane = uint32_t(std::countr_zero(~h.validMask & full));
     h.bounds.setLane(lane, inst.worldBox);
-    hMeta.maxErr.v[lane] = inst.maxErrWorld;
+    const float contribution = contributionDiameter(inst.worldBox);
+    hMeta.maxContribution.v[lane] = contribution;
     h.child[lane] = ~int32_t(id);
     hMeta.laneMask[lane] = inst.mask;
     h.setLeafLane(lane);
     inst.setTlasPlacement(host, lane);
     ++tlasLeafCount_;
 
-    tlasNoteGrowth(tlasGrowUp(host, inst.worldBox, inst.maxErrWorld, inst.mask));
+    tlasNoteGrowth(
+        tlasGrowUp(host, inst.worldBox, contribution, inst.mask));
     tlasNoteEdit();
 }
 
@@ -2901,9 +2917,10 @@ void SpatialDatabase::tlasOnInstanceMoved(InstanceId id)
     TlasNode& node = tlasNodes_[nodeIdx];
     TlasMeta& meta = tlasMeta_[nodeIdx];
     const AABB oldLeafBounds = node.bounds.lane(lane);
+    const float contribution = contributionDiameter(inst.worldBox);
     const bool envelopeAlreadyCovers =
         oldLeafBounds.contains(inst.worldBox) &&
-        meta.maxErr.v[lane] >= inst.maxErrWorld;
+        meta.maxContribution.v[lane] >= contribution;
     if (envelopeAlreadyCovers)
     {
         if (oldLeafBounds.mn.x != inst.worldBox.mn.x ||
@@ -2912,7 +2929,7 @@ void SpatialDatabase::tlasOnInstanceMoved(InstanceId id)
             oldLeafBounds.mx.x != inst.worldBox.mx.x ||
             oldLeafBounds.mx.y != inst.worldBox.mx.y ||
             oldLeafBounds.mx.z != inst.worldBox.mx.z ||
-            meta.maxErr.v[lane] != inst.maxErrWorld)
+            meta.maxContribution.v[lane] != contribution)
             instanceTlasLoose_[id] = 1;
         return;
     }
@@ -2920,11 +2937,12 @@ void SpatialDatabase::tlasOnInstanceMoved(InstanceId id)
     AABB envelope = oldLeafBounds;
     envelope.expand(inst.worldBox);
     node.bounds.setLane(lane, envelope);
-    meta.maxErr.v[lane] = std::max(meta.maxErr.v[lane], inst.maxErrWorld);
+    meta.maxContribution.v[lane] =
+        std::max(meta.maxContribution.v[lane], contribution);
     instanceTlasLoose_[id] = 1;
 
     const float added =
-        tlasGrowUp(nodeIdx, envelope, inst.maxErrWorld, inst.mask);
+        tlasGrowUp(nodeIdx, envelope, contribution, inst.mask);
 
     tlasNoteGrowth(added);
 }
@@ -3003,24 +3021,24 @@ void SpatialDatabase::tlasRefitAllExact()
             lanes &= lanes - 1;
             const int32_t child = node.child[lane];
             AABB bounds;
-            float maxError;
+            float maxContribution;
             uint32_t layerMask;
             if (child < 0)
             {
                 const InstanceId dense = InstanceId(~child);
                 const Instance& instance = instances_[dense];
                 bounds = instance.worldBox;
-                maxError = instance.maxErrWorld;
+                maxContribution = contributionDiameter(instance.worldBox);
                 layerMask = instance.mask;
                 instanceTlasLoose_[dense] = 0;
             }
             else
             {
-                bounds = tlasNodeExtent(uint32_t(child), maxError,
+                bounds = tlasNodeExtent(uint32_t(child), maxContribution,
                                         layerMask);
             }
             node.bounds.setLane(lane, bounds);
-            meta.maxErr.v[lane] = maxError;
+            meta.maxContribution.v[lane] = maxContribution;
             meta.laneMask[lane] = layerMask;
             exactArea += surfaceArea(bounds);
         }
@@ -3214,7 +3232,8 @@ int32_t SpatialDatabase::tlasBuildRange(std::vector<uint32_t>& items, int lo, in
             TlasNode& n = tlasNodes_[idx];
             TlasMeta& meta = tlasMeta_[idx];
             n.bounds.setLane(uint32_t(k), inst.worldBox);
-            meta.maxErr.v[k] = inst.maxErrWorld;
+            meta.maxContribution.v[k] =
+                contributionDiameter(inst.worldBox);
             n.child[k] = ~int32_t(instIdx);
             meta.laneMask[k] = inst.mask;
             n.setLeafLane(uint32_t(k));
@@ -3256,14 +3275,14 @@ int32_t SpatialDatabase::tlasBuildRange(std::vector<uint32_t>& items, int lo, in
             const int end = std::min(begin + int(kWide), hi);
             const int32_t child =
                 tlasBuildRange(items, begin, end, idx);
-            float maxError = 0.0f;
+            float maxContribution = 0.0f;
             uint32_t layerMask = 0;
             const AABB bounds = tlasNodeExtent(
-                uint32_t(child), maxError, layerMask);
+                uint32_t(child), maxContribution, layerMask);
             TlasNode& node = tlasNodes_[idx];
             TlasMeta& meta = tlasMeta_[idx];
             node.bounds.setLane(lane, bounds);
-            meta.maxErr.v[lane] = maxError;
+            meta.maxContribution.v[lane] = maxContribution;
             node.child[lane] = child;
             meta.laneMask[lane] = layerMask;
             node.validMask |= 1u << lane;
@@ -3289,7 +3308,7 @@ int32_t SpatialDatabase::tlasBuildRange(std::vector<uint32_t>& items, int lo, in
 
         // Union the child's lanes into our lane for it.
         AABB u = AABB::empty();
-        float me = 0.0f;
+        float maxContribution = 0.0f;
         uint32_t lm = 0;
         const TlasNode& cn = tlasNodes_[child];
         const TlasMeta& childMeta = tlasMeta_[child];
@@ -3297,13 +3316,14 @@ int32_t SpatialDatabase::tlasBuildRange(std::vector<uint32_t>& items, int lo, in
         {
             if (!(cn.validMask & (1u << l))) continue;
             u.expand(cn.bounds.lane(l));
-            me = std::max(me, childMeta.maxErr.v[l]);
+            maxContribution = std::max(
+                maxContribution, childMeta.maxContribution.v[l]);
             lm |= childMeta.laneMask[l];
         }
         TlasNode& n = tlasNodes_[idx];
         TlasMeta& meta = tlasMeta_[idx];
         n.bounds.setLane(g, u);
-        meta.maxErr.v[g] = me;
+        meta.maxContribution.v[g] = maxContribution;
         n.child[g] = child;
         meta.laneMask[g] = lm;
         n.validMask |= 1u << g;
@@ -3434,7 +3454,7 @@ void SpatialDatabase::reorderInstancesByTlas()
 // Two-tier rebuild policy:
 //  - structural rebuilds (add/remove) take the quality path: rare,
 //    long-lived, quality matters (contribution culling leans on tight
-//    maxErr/bounds lanes);
+//    contribution/bounds lanes);
 //  - motion rebuilds (area threshold) take the Morton path: one sort plus
 //    contiguous groups of kWide per level, ~5x faster to build while keeping
 //    grow-only ancestor bloat bounded.
@@ -3511,7 +3531,8 @@ void SpatialDatabase::tlasRebuild(bool reorderInstances)
                     const uint32_t instIdx = tlasKeys_[base + k].instance;
                     Instance& inst = instances_[instIdx];
                     n.bounds.setLane(k, inst.worldBox);
-                    meta.maxErr.v[k] = inst.maxErrWorld;
+                    meta.maxContribution.v[k] =
+                        contributionDiameter(inst.worldBox);
                     n.child[k] = ~int32_t(instIdx);
                     meta.laneMask[k] = inst.mask;
                     n.setLeafLane(k);
@@ -3539,17 +3560,19 @@ void SpatialDatabase::tlasRebuild(bool reorderInstances)
                         const TlasMeta& childMeta = tlasMeta_[childIdx];
                         cn.parent = idx;
                         AABB u = AABB::empty();
-                        float me = 0.0f;
+                        float maxContribution = 0.0f;
                         uint32_t lm = 0;
                         for (uint32_t l = 0; l < kWide; ++l)
                         {
                             if (!(cn.validMask & (1u << l))) continue;
                             u.expand(cn.bounds.lane(l));
-                            me = std::max(me, childMeta.maxErr.v[l]);
+                            maxContribution = std::max(
+                                maxContribution,
+                                childMeta.maxContribution.v[l]);
                             lm |= childMeta.laneMask[l];
                         }
                         n.bounds.setLane(k, u);
-                        meta.maxErr.v[k] = me;
+                        meta.maxContribution.v[k] = maxContribution;
                         n.child[k] = childIdx;
                         meta.laneMask[k] = lm;
                         n.validMask |= 1u << k;
@@ -3638,9 +3661,11 @@ void SpatialDatabase::tlasQueryImpl(const Camera& view, float minPix,
         {
             const TlasMeta& meta = tlasMeta_[it.node()];
             const float8 d2 = distanceToBoxesSq(n.bounds, qmn, qmx);
-            const float8 errs = screenErrorFromSq8(meta.maxErr, view.k, d2);
+            const float8 contributions = screenErrorFromSq8(
+                meta.maxContribution, view.k, d2);
             for (uint32_t l = 0; l < kWide; ++l)
-                if (errs.v[l] < minPix) survivors &= ~(1u << l);
+                if (contributions.v[l] < minPix)
+                    survivors &= ~(1u << l);
         }
 
         while (survivors)
@@ -3665,8 +3690,10 @@ void SpatialDatabase::tlasQueryImpl(const Camera& view, float minPix,
                     {
                         const float distance =
                             distanceToBox(inst.worldBox, qmn, qmx);
-                        if (screenError(inst.maxErrWorld, view.k, distance) <
-                            minPix)
+                        const float contribution = screenError(
+                            contributionDiameter(inst.worldBox), view.k,
+                            distance);
+                        if (contribution < minPix)
                             continue;
                     }
                 }

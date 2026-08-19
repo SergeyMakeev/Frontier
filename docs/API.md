@@ -476,7 +476,9 @@ FrontierResultView cut = mainView.selectFrontier(
 
 `threshold` is the desired maximum projected geometric error in pixels: lower
 values refine more aggressively. `minPix` optionally rejects top-level
-instances whose projected contribution is too small. Query-local **damping**
+instances whose conservative projected bounds diameter is too small. It is
+independent of authored geometric error, so a large object is not discarded
+merely because its coarse representation is accurate. Query-local **damping**
 smooths LOD decisions over camera motion by evaluating a conservative temporal
 camera envelope; it does not modify scene state. The query's reuse cache is a
 separate optimization that returns a previous exact cut while its recorded
