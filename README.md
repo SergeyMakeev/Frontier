@@ -227,10 +227,36 @@ four-device snapshot above uses Release with IPO and without PGO.
 
 On Windows, use `run_unit_tests.bat` and `run_perf_bench.bat`.
 
+### Dynamic city sample
+
+An opt-in [bgfx city sample](examples/city/README.md) exercises Frontier in a
+visible, continuously changing 3-by-3 district scene: 2,088 reusable houses,
+54 deeply nested skyscrapers, 1,152 trees, 432 smoothly turning cars, 864
+moving pedestrians,
+per-frame rigid motion, current/ideal readiness, LOD selection, frustum
+culling, automatic/free cameras, and ImGui controls for simulation freeze,
+hierarchy tinting, and a visualized frozen culling frustum.
+
+```sh
+cmake -S . -B build-city \
+  -DFRONTIER_BUILD_CITY_SAMPLE=ON \
+  -DFRONTIER_BUILD_TESTS=OFF
+cmake --build build-city --config Release --target frontier_city
+```
+
+Or configure, build, and launch it in one command with
+`bash ./run_city_sample.sh` on macOS/Linux or `run_city_sample.bat` on Windows.
+Set `FRONTIER_CITY_BUILD_DIR` to override the default `build-city` directory;
+additional command-line arguments are forwarded to the bgfx application.
+
+The sample fetches a pinned bgfx CMake distribution and its matching bgfx, bx,
+and bimg revisions only when `FRONTIER_BUILD_CITY_SAMPLE=ON`.
+
 The full correctness matrix, deterministic torture tests, sanitizer jobs, and
 release verification commands are described in [docs/TESTING.md](docs/TESTING.md).
 
 Important options are `FRONTIER_BUILD_TESTS`, `FRONTIER_BUILD_BENCH`,
+`FRONTIER_BUILD_CITY_SAMPLE`,
 `FRONTIER_BVH_WIDTH`, `FRONTIER_AVX2`, `FRONTIER_FORCE_SCALAR`,
 `FRONTIER_IPO`, `FRONTIER_PGO_MODE`, `FRONTIER_PGO_DIR`, `FRONTIER_STATS`,
 `FRONTIER_CONTRACT_CHECKS`, and

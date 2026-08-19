@@ -5,6 +5,8 @@ project(Frontier VERSION 0.7.0 LANGUAGES CXX)
 # embedded with add_subdirectory(), do not fetch or build its test-only
 # dependencies unless the parent explicitly opts in.
 option(FRONTIER_BUILD_TESTS "Build unit tests" ${PROJECT_IS_TOP_LEVEL})
+option(FRONTIER_BUILD_CITY_SAMPLE
+       "Build the cross-platform bgfx dynamic-city sample" OFF)
 option(FRONTIER_TEST_PAYLOAD32
        "Build additional BVH4/BVH8 unit tests with four-byte payload words" OFF)
 option(FRONTIER_BUILD_BENCH "Build performance tests" OFF)
@@ -254,4 +256,8 @@ if(FRONTIER_BUILD_BENCH)
     FetchContent_MakeAvailable(benchmark)
 
     add_subdirectory(bench)
+endif()
+
+if(FRONTIER_BUILD_CITY_SAMPLE)
+    add_subdirectory(examples/city)
 endif()
