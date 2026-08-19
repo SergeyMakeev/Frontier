@@ -539,7 +539,7 @@ private:
         ImGui::SliderFloat("LOD threshold (px)", &lodThreshold_, 0.5f, 12.0f,
                            "%.1f");
         ImGui::SliderFloat("Contribution cull (px)",
-                           &contributionCullPixels_, 0.0f, 5.0f, "%.2f");
+                           &contributionCullPixels_, 0.0f, 100.0f, "%.2f");
 
         ImGui::Text("Camera");
         ImGui::Separator();
