@@ -110,9 +110,19 @@ unit must use the same value. BVH4 uses one 128-bit SIMD group. BVH8 uses AVX2
 when enabled, or two 128-bit SSE2/NEON groups.
 
 The CMake `FRONTIER_AVX2=ON` option applies AVX2/FMA flags to BVH8 library and
-consumer builds; it does not add runtime CPU dispatch. Disable it for an
-SSE2-baseline x86-64 BVH8 binary or build separate ISA variants in the host.
-BVH4 always uses the 128-bit x86 backend and does not require AVX2.
+consumer builds; it does not add runtime CPU dispatch. `FRONTIER_SSE2_ONLY=ON`
+is the deployment-safe baseline option for older x86/x64 processors. It
+overrides `FRONTIER_AVX2`, selects BVH4 for `AUTO`, forces the SSE2 intrinsic
+backend, and applies compiler flags that disable SSE3, SSE4, AVX, and FMA code
+generation. Explicit BVH8 remains supported as two 128-bit groups. The option
+is invalid on non-x86 targets and is mutually exclusive with
+`FRONTIER_FORCE_SCALAR`.
+
+Non-CMake integrations may define `FRONTIER_SSE2_ONLY=1` consistently for the
+library and all consumers, but must also configure their compiler for an SSE2
+ISA baseline. The macro controls Frontier's explicit intrinsics; compiler flags
+are what prevent unrelated scalar code and auto-vectorization from emitting a
+higher ISA.
 
 `FRONTIER_IPO=ON` enables compiler-supported interprocedural optimization for
 Frontier targets. It defaults off for predictable integration builds; the

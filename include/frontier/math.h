@@ -29,11 +29,16 @@
 // SIMD backend selection. At most one of FRONTIER_SIMD_AVX2 / FRONTIER_SIMD_NEON /
 // FRONTIER_SIMD_SSE2 is defined; with none of them the wide paths fall back to
 // portable scalar loops. Define FRONTIER_FORCE_SCALAR (CMake option of the same
-// name) to force the scalar fallback everywhere.
+// name) to force the scalar fallback everywhere. FRONTIER_SSE2_ONLY selects
+// only the SSE2 backend on x86 even when ambient compiler macros expose a
+// higher ISA; CMake also constrains compiler-generated code in that mode.
 // ---------------------------------------------------------------------------
 
 #if !defined(FRONTIER_FORCE_SCALAR)
-  #if FRONTIER_BVH_WIDTH == 8 && defined(__AVX2__)
+  #if FRONTIER_SSE2_ONLY
+    #include <immintrin.h>
+    #define FRONTIER_SIMD_SSE2 1
+  #elif FRONTIER_BVH_WIDTH == 8 && defined(__AVX2__)
     #include <immintrin.h>
     #define FRONTIER_SIMD_AVX2 1
   #elif defined(__aarch64__) || defined(_M_ARM64) || defined(_M_ARM64EC)
@@ -57,7 +62,7 @@ namespace frontier {
 // exactly when the wide intrinsics fuse. The only backend without hardware
 // FMA is plain SSE; there mul+add is used on both sides (and the target has
 // no fma instruction the compiler could contract to, keeping them in sync).
-#if FRONTIER_SIMD_SSE2 && !defined(__FMA__)
+#if FRONTIER_SIMD_SSE2 && (!defined(__FMA__) || FRONTIER_SSE2_ONLY)
 inline float fmadd(float a, float b, float c) { return a * b + c; }
 #else
 inline float fmadd(float a, float b, float c) { return std::fma(a, b, c); }
@@ -382,7 +387,7 @@ inline __m128 select4(__m128 mask, __m128 a, __m128 b)
 // Fused only when the target has FMA, mirroring frontier::fmadd.
 inline __m128 fmadd4(__m128 a, __m128 b, __m128 c)
 {
-#if defined(__FMA__)
+#if defined(__FMA__) && !FRONTIER_SSE2_ONLY
     return _mm_fmadd_ps(a, b, c);
 #else
     return _mm_add_ps(_mm_mul_ps(a, b), c);

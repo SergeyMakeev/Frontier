@@ -191,12 +191,12 @@ cmake -S . -B build-bvh4 -DCMAKE_BUILD_TYPE=Release \
   -DFRONTIER_BUILD_TESTS=OFF -DFRONTIER_BUILD_BENCH=ON \
   -DFRONTIER_IPO=ON -DFRONTIER_CONTRACT_CHECKS=OFF \
   -DFRONTIER_VALIDATE_SUBTREES=OFF \
-  -DFRONTIER_BVH_WIDTH=4 -DFRONTIER_AVX2=OFF
+  -DFRONTIER_BVH_WIDTH=4 -DFRONTIER_SSE2_ONLY=ON
 cmake -S . -B build-bvh8 -DCMAKE_BUILD_TYPE=Release \
   -DFRONTIER_BUILD_TESTS=OFF -DFRONTIER_BUILD_BENCH=ON \
   -DFRONTIER_IPO=ON -DFRONTIER_CONTRACT_CHECKS=OFF \
   -DFRONTIER_VALIDATE_SUBTREES=OFF \
-  -DFRONTIER_BVH_WIDTH=8 -DFRONTIER_AVX2=OFF
+  -DFRONTIER_BVH_WIDTH=8 -DFRONTIER_SSE2_ONLY=ON
 ```
 
 This is the matched 128-bit comparison on x86. Also measure a BVH8 AVX2 build
@@ -316,6 +316,7 @@ Useful overrides include `FRONTIER_PROFILE_FILTER`,
 | `FRONTIER_BUILD_BENCH` | `OFF` | build benchmark executables; repository performance runners enable it in a dedicated Release build |
 | `FRONTIER_BVH_WIDTH` | `AUTO` | select BVH8 for AVX2 and BVH4 for SSE2/NEON/scalar; explicit `4` or `8` overrides it; serialized bytes must match |
 | `FRONTIER_AVX2` | `ON` | enable AVX2/FMA for BVH8 on supported x86-64 targets; BVH4 stays 128-bit |
+| `FRONTIER_SSE2_ONLY` | `OFF` | force an SSE2-only x86/x64 binary and override AVX2; `AUTO` selects BVH4 |
 | `FRONTIER_FORCE_SCALAR` | `OFF` | disable intrinsic implementations |
 | `FRONTIER_PROFILE_SYMBOLS` | `OFF` | keep optimized Clang line tables |
 | `FRONTIER_IPO` | `OFF` | enable supported interprocedural optimization for Frontier and its benchmark executables; performance runners set it to `ON` |

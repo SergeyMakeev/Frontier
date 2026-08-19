@@ -258,7 +258,8 @@ release verification commands are described in [docs/TESTING.md](docs/TESTING.md
 
 Important options are `FRONTIER_BUILD_TESTS`, `FRONTIER_BUILD_BENCH`,
 `FRONTIER_BUILD_CITY_SAMPLE`,
-`FRONTIER_BVH_WIDTH`, `FRONTIER_AVX2`, `FRONTIER_FORCE_SCALAR`,
+`FRONTIER_BVH_WIDTH`, `FRONTIER_AVX2`, `FRONTIER_SSE2_ONLY`,
+`FRONTIER_FORCE_SCALAR`,
 `FRONTIER_IPO`, `FRONTIER_PGO_MODE`, `FRONTIER_PGO_DIR`, `FRONTIER_STATS`,
 `FRONTIER_DEBUG_TOOLS`,
 `FRONTIER_CONTRACT_CHECKS`, and
@@ -272,9 +273,12 @@ preprocessor macro is numeric (`4` or `8`), and branch width is a build-wide
 layout choice, including serialized subtrees.
 
 On x86-64, `FRONTIER_AVX2=ON` with BVH8 produces an AVX2/FMA-targeted binary
-without runtime dispatch. Set it to `OFF` when the executable must run on the
-SSE2 baseline or when the host performs its own per-ISA library dispatch. BVH4
-uses the 128-bit backend and does not require AVX2.
+without runtime dispatch. Use `FRONTIER_SSE2_ONLY=ON` when the executable must
+run on an SSE2-only processor. It overrides `FRONTIER_AVX2`, applies an SSE2
+compiler baseline to Frontier and consumers, selects BVH4 for `AUTO`, and still
+supports explicit BVH8 through two 128-bit groups. Merely setting
+`FRONTIER_AVX2=OFF` selects the 128-bit backend but does not sanitize higher-ISA
+flags inherited from a parent build.
 
 Tests default on only for a standalone Frontier checkout; benchmarks default
 off because they require a separate optimized build. When the project is

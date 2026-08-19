@@ -21,7 +21,7 @@ jobs:
             cmake_args: -DCMAKE_CXX_COMPILER=g++ -DFRONTIER_AVX2=ON
           - name: linux-x64-gcc-sse2-trusted-subtrees
             os: ubuntu-latest
-            cmake_args: -DCMAKE_CXX_COMPILER=g++ -DFRONTIER_AVX2=OFF -DFRONTIER_BVH_WIDTH=4 -DFRONTIER_VALIDATE_SUBTREES=OFF
+            cmake_args: -DCMAKE_CXX_COMPILER=g++ -DFRONTIER_SSE2_ONLY=ON -DFRONTIER_BVH_WIDTH=4 -DFRONTIER_VALIDATE_SUBTREES=OFF
           - name: linux-x64-gcc-scalar
             os: ubuntu-latest
             cmake_args: -DCMAKE_CXX_COMPILER=g++ -DFRONTIER_AVX2=OFF -DFRONTIER_FORCE_SCALAR=ON
@@ -30,7 +30,7 @@ jobs:
             cmake_args: -DCMAKE_CXX_COMPILER=clang++ -DFRONTIER_AVX2=ON -DFRONTIER_TEST_PAYLOAD32=ON
           - name: linux-x64-clang-sse2
             os: ubuntu-latest
-            cmake_args: -DCMAKE_CXX_COMPILER=clang++ -DFRONTIER_AVX2=OFF
+            cmake_args: -DCMAKE_CXX_COMPILER=clang++ -DFRONTIER_SSE2_ONLY=ON
           - name: linux-x64-clang-scalar
             os: ubuntu-latest
             cmake_args: -DCMAKE_CXX_COMPILER=clang++ -DFRONTIER_AVX2=OFF -DFRONTIER_FORCE_SCALAR=ON
@@ -55,7 +55,7 @@ jobs:
             cmake_args: -DFRONTIER_AVX2=ON
           - name: windows-x64-msvc-sse2
             os: windows-latest
-            cmake_args: -DFRONTIER_AVX2=OFF -DFRONTIER_BVH_WIDTH=4
+            cmake_args: -DFRONTIER_SSE2_ONLY=ON -DFRONTIER_BVH_WIDTH=4
           - name: windows-x64-msvc-scalar
             os: windows-latest
             cmake_args: -DFRONTIER_AVX2=OFF -DFRONTIER_FORCE_SCALAR=ON
@@ -64,7 +64,7 @@ jobs:
             cmake_args: -T ClangCL -DFRONTIER_AVX2=ON
           - name: windows-x64-clangcl-sse2
             os: windows-latest
-            cmake_args: -T ClangCL -DFRONTIER_AVX2=OFF
+            cmake_args: -T ClangCL -DFRONTIER_SSE2_ONLY=ON
 
           # ---- Windows ARM64: MSVC, NEON / scalar --------------------------
           - name: windows-arm64-msvc-neon
@@ -88,7 +88,7 @@ jobs:
             cmake_args: -DFRONTIER_AVX2=ON
           - name: macos-x64-clang-sse2
             os: macos-15-intel
-            cmake_args: -DFRONTIER_AVX2=OFF
+            cmake_args: -DFRONTIER_SSE2_ONLY=ON
           - name: macos-x64-clang-scalar
             os: macos-15-intel
             cmake_args: -DFRONTIER_AVX2=OFF -DFRONTIER_FORCE_SCALAR=ON

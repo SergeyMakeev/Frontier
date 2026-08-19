@@ -69,6 +69,12 @@ forced scalar). An application can explicitly select `4` or `8` after profiling
 its target content and hardware. Serialized subtree bytes record the selected
 width and must be rebuilt when it changes.
 
+For binaries that must run on SSE2-only x86/x64 processors, configure with
+`-DFRONTIER_SSE2_ONLY=ON`. This overrides AVX2, makes `AUTO` choose BVH4, and
+forces both Frontier's explicit intrinsics and compiler-generated code to the
+SSE2 baseline. An explicit BVH8 build remains valid and uses two 128-bit SIMD
+groups.
+
 ### Nodes, errors, and cuts
 
 Each hierarchy node is a renderable representation of everything below it. Its

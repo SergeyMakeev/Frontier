@@ -198,6 +198,7 @@ propagation stops when an existing bound already contains the change.
 | `FRONTIER_USER_PAYLOAD` / `FRONTIER_INVALID_PAYLOAD` | Build-wide payload type and reserved invalid value |
 | `FRONTIER_BVH_WIDTH` | `AUTO`, `4`, or `8`; changes SIMD and serialized layout |
 | `FRONTIER_AVX2` | Enables the x86 BVH8 AVX2/FMA backend; no runtime dispatch |
+| `FRONTIER_SSE2_ONLY` | Forces an SSE2 x86/x64 compiler and intrinsic baseline; overrides AVX2 |
 | `FRONTIER_FORCE_SCALAR` | Selects the scalar backend |
 | `FRONTIER_CONTRACT_CHECKS` | Caller-precondition validation |
 | `FRONTIER_VALIDATE_SUBTREES` | Complete serialized-definition validation |
@@ -208,7 +209,9 @@ propagation stops when an existing bound already contains the change.
 
 Payload type and BVH width are ABI and serialized-format choices. Every linked
 translation unit must use matching values. AVX2 builds require a compatible
-CPU or application-level binary dispatch.
+CPU or application-level binary dispatch. SSE2-only builds propagate their
+baseline flags to CMake consumers; custom build systems must apply equivalent
+flags themselves.
 
 ## Correctness and measured capacity
 

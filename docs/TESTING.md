@@ -73,10 +73,15 @@ fallbacks in that configuration.
 Locally, the most important additional configurations are:
 
 ```sh
+cmake -S . -B build-sse2 -DFRONTIER_SSE2_ONLY=ON
 cmake -S . -B build-scalar -DFRONTIER_FORCE_SCALAR=ON
 cmake -S . -B build-stats -DFRONTIER_STATS=ON
 cmake -S . -B build-bvh4 -DFRONTIER_BVH_WIDTH=4
 ```
+
+The SSE2-only tests compile both branch widths, assert that the SSE2 intrinsic
+backend is selected, and reject compiler target macros for SSE3, SSE4, AVX, or
+FMA.
 
 The stats configuration has a contract test that confirms counters are
 actually populated. Normal builds test that the API returns immutable zero

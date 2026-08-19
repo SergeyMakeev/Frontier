@@ -11,6 +11,8 @@ option(FRONTIER_TEST_PAYLOAD32
        "Build additional BVH4/BVH8 unit tests with four-byte payload words" OFF)
 option(FRONTIER_BUILD_BENCH "Build performance tests" OFF)
 option(FRONTIER_AVX2 "Enable AVX2 code generation for BVH8 (x86-64 only)" ON)
+option(FRONTIER_SSE2_ONLY
+       "Force an SSE2-only x86/x64 binary, overriding FRONTIER_AVX2" OFF)
 option(FRONTIER_FORCE_SCALAR "Disable SIMD intrinsics; use the portable scalar paths" OFF)
 set(FRONTIER_BVH_WIDTH "AUTO" CACHE STRING
     "BVH branching factor and wide traversal width (AUTO, 4, or 8)")
@@ -41,19 +43,47 @@ if(FRONTIER_BUILD_TESTS OR FRONTIER_BUILD_BENCH)
     find_package(Threads REQUIRED)
 endif()
 
-# AVX2 flags only make sense on x86-64; other architectures pick their SIMD
-# path (NEON on arm64, SSE2 baseline on x86) automatically in math.h.
+# AVX2 flags only make sense on x86-64; SSE2-only accepts either x86 width.
+# Other architectures pick their SIMD path (NEON on arm64) in math.h.
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|x64)$")
-    set(FRONTIER_ARCH_X64 TRUE)
+    set(FRONTIER_ARCH_X86 TRUE)
+    if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+        set(FRONTIER_ARCH_X64 TRUE)
+    else()
+        set(FRONTIER_ARCH_X64 FALSE)
+    endif()
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86|i[3-6]86|IA32|Win32)$")
+    set(FRONTIER_ARCH_X64 FALSE)
+    set(FRONTIER_ARCH_X86 TRUE)
 else()
     set(FRONTIER_ARCH_X64 FALSE)
+    set(FRONTIER_ARCH_X86 FALSE)
+endif()
+
+if(FRONTIER_SSE2_ONLY)
+    if(NOT FRONTIER_ARCH_X86)
+        message(FATAL_ERROR
+            "FRONTIER_SSE2_ONLY is supported only on x86/x64 targets")
+    endif()
+    if(FRONTIER_FORCE_SCALAR)
+        message(FATAL_ERROR
+            "FRONTIER_SSE2_ONLY and FRONTIER_FORCE_SCALAR are mutually "
+            "exclusive")
+    endif()
+    if(FRONTIER_AVX2)
+        message(STATUS
+            "Frontier ISA baseline: SSE2 (FRONTIER_SSE2_ONLY overrides FRONTIER_AVX2)")
+    else()
+        message(STATUS "Frontier ISA baseline: SSE2")
+    endif()
 endif()
 
 if(FRONTIER_BVH_WIDTH STREQUAL "AUTO")
     # AVX2 is the only eight-lane backend. SSE2 and NEON are four lanes, so
     # their natural default is BVH4. Scalar builds also prefer the compact
     # BVH4 layout; callers can explicitly request BVH8 for comparisons.
-    if(FRONTIER_AVX2 AND FRONTIER_ARCH_X64 AND NOT FRONTIER_FORCE_SCALAR)
+    if(FRONTIER_AVX2 AND FRONTIER_ARCH_X64 AND NOT FRONTIER_SSE2_ONLY AND
+       NOT FRONTIER_FORCE_SCALAR)
         set(FRONTIER_EFFECTIVE_BVH_WIDTH 8)
     else()
         set(FRONTIER_EFFECTIVE_BVH_WIDTH 4)
@@ -135,20 +165,35 @@ function(frontier_configure_library target width)
 
     if(MSVC)
         target_compile_options(${target} PRIVATE /W4 /permissive-)
-        if(FRONTIER_AVX2 AND FRONTIER_ARCH_X64 AND NOT FRONTIER_FORCE_SCALAR AND
-           width EQUAL 8)
+        if(FRONTIER_SSE2_ONLY)
+            target_compile_options(${target} PUBLIC /arch:SSE2)
+        elseif(FRONTIER_AVX2 AND FRONTIER_ARCH_X64 AND
+               NOT FRONTIER_FORCE_SCALAR AND width EQUAL 8)
             target_compile_options(${target} PUBLIC /arch:AVX2)
         endif()
     else()
         target_compile_options(${target} PRIVATE -Wall -Wextra)
-        if(FRONTIER_AVX2 AND FRONTIER_ARCH_X64 AND NOT FRONTIER_FORCE_SCALAR AND
-           width EQUAL 8)
+        if(FRONTIER_SSE2_ONLY)
+            if(FRONTIER_ARCH_X64)
+                target_compile_options(${target} PUBLIC -march=x86-64)
+            else()
+                target_compile_options(${target} PUBLIC -march=pentium4)
+            endif()
+            target_compile_options(${target} PUBLIC
+                -mno-sse3 -mno-ssse3 -mno-sse4.1 -mno-sse4.2
+                -mno-avx -mno-avx2 -mno-fma)
+        elseif(FRONTIER_AVX2 AND FRONTIER_ARCH_X64 AND
+               NOT FRONTIER_FORCE_SCALAR AND width EQUAL 8)
             target_compile_options(${target} PUBLIC -mavx2 -mfma)
         endif()
     endif()
 
     if(FRONTIER_FORCE_SCALAR)
         target_compile_definitions(${target} PUBLIC FRONTIER_FORCE_SCALAR=1)
+    endif()
+
+    if(FRONTIER_SSE2_ONLY)
+        target_compile_definitions(${target} PUBLIC FRONTIER_SSE2_ONLY=1)
     endif()
 
     if(FRONTIER_STATS)

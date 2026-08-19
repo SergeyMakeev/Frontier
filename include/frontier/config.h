@@ -41,13 +41,36 @@
   #error "FRONTIER_CONTRACT_CHECKS must be 0 or 1"
 #endif
 
+// Force the x86 SIMD implementation and the surrounding build to the SSE2
+// baseline. CMake also applies compiler ISA flags so auto-vectorized code does
+// not silently require SSE3, SSE4, AVX, or FMA. Non-CMake integrations must
+// provide equivalent compiler flags themselves.
+#ifndef FRONTIER_SSE2_ONLY
+  #define FRONTIER_SSE2_ONLY 0
+#endif
+
+#if FRONTIER_SSE2_ONLY != 0 && FRONTIER_SSE2_ONLY != 1
+  #error "FRONTIER_SSE2_ONLY must be 0 or 1"
+#endif
+
+#if FRONTIER_SSE2_ONLY && defined(FRONTIER_FORCE_SCALAR)
+  #error "FRONTIER_SSE2_ONLY and FRONTIER_FORCE_SCALAR are mutually exclusive"
+#endif
+
+#if FRONTIER_SSE2_ONLY && \
+    !defined(__i386__) && !defined(__x86_64__) && \
+    !defined(_M_IX86) && !defined(_M_X64)
+  #error "FRONTIER_SSE2_ONLY requires an x86 or x64 target"
+#endif
+
 // Build-wide branching factor for both BLAS fragments and the dynamic TLAS.
 // Four maps to one 128-bit SIMD vector; eight maps to one AVX2 vector or two
 // SSE2/NEON vectors. Serialized subtree bytes record this value and cannot be
 // registered by a build using the other width. Without an explicit definition,
 // AVX2 selects eight and four-wide SIMD/scalar targets select four.
 #ifndef FRONTIER_BVH_WIDTH
-  #if defined(__AVX2__) && !defined(FRONTIER_FORCE_SCALAR)
+  #if defined(__AVX2__) && !defined(FRONTIER_FORCE_SCALAR) && \
+      !FRONTIER_SSE2_ONLY
     #define FRONTIER_BVH_WIDTH 8
   #else
     #define FRONTIER_BVH_WIDTH 4
