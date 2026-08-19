@@ -1937,9 +1937,9 @@ private:
     bool drawCullFrustum_ = true;
     bool seedFreeCamera_ = false;
     bool captureCullCamera_ = false;
-    bool showFrontierDebug_ = false;
+    bool showFrontierDebug_ = true;
     bool showSceneStats_ = false;
-    bool showPerformance_ = true;
+    bool showPerformance_ = false;
     bool showSceneHierarchy_ = false;
     FrozenCullState frozenCull_;
     uint32_t houseCount_ = 0;

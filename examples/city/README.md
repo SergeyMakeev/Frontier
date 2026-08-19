@@ -27,7 +27,7 @@ The UI is split into independent, movable ImGui windows so diagnostics do not
 cover one another. The global **Debug windows** menu in the top bar toggles
 each widget independently and provides **Show all** / **Hide all** actions;
 each window can also be closed with its title-bar button. Only
-**Performance** is open by default. **Frontier debug**
+**Frontier debug** is open by default. **Frontier debug**
 controls simulation freeze,
 hierarchy-level tinting (green top nodes, yellow intermediate nodes, red
 leaves), optional scene-wide wireframe rendering, LOD and contribution
