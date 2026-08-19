@@ -644,7 +644,7 @@ private:
     void drawPerformanceBar(const char* label, float valueMs,
                             float totalMs, const ImVec4& color)
     {
-        ImGui::Text("%-18s %7.3f ms", label, valueMs);
+        ImGui::Text("%-18s %8.1f us", label, valueMs * 1000.0f);
         ImGui::PushStyleColor(ImGuiCol_PlotHistogram, color);
         ImGui::ProgressBar(
             std::clamp(valueMs / std::max(totalMs, 0.001f), 0.0f, 1.0f),
@@ -664,70 +664,39 @@ private:
             return;
         }
         ImGui::Text("Smoothed frame breakdown");
-        ImGui::Separator();
-        ImGui::Text("Sample CPU  %.3f ms  (%.0f fps)",
-                    performance_.totalMs,
-                    performance_.totalMs > 0.0f
-                        ? 1000.0f / performance_.totalMs
-                        : 0.0f);
-        ImGui::Text("GPU         %.3f ms", performance_.gpuMs);
-
-        if (performanceHistoryCount_ != 0)
-        {
-            const int offset = performanceHistoryCount_ ==
-                                       kPerformanceHistorySize
-                                   ? int(performanceHistoryCursor_)
-                                   : 0;
-            const float scaleMax =
-                std::max(16.667f, performance_.totalMs * 1.5f);
-            ImGui::PlotHistogram(
-                "##cpu-frame-history", performanceHistory_.data(),
-                int(performanceHistoryCount_), offset,
-                "CPU frame history", 0.0f, scaleMax,
-                ImVec2(-1.0f, 56.0f));
-        }
-
         const float measured =
             performance_.uiMs + performance_.simulationMs +
             performance_.cameraMs + performance_.selectionMs +
             performance_.cutStatsMs + performance_.renderMs +
             performance_.streamingMs + performance_.frameSubmitMs;
         const float other = std::max(0.0f, performance_.totalMs - measured);
-        drawPerformanceBar("ImGui", performance_.uiMs,
-                           performance_.totalMs,
-                           ImVec4(0.35f, 0.70f, 1.0f, 1.0f));
-        drawPerformanceBar("Simulation + DB", performance_.simulationMs,
-                           performance_.totalMs,
-                           ImVec4(0.35f, 0.90f, 0.50f, 1.0f));
-        drawPerformanceBar("Camera + views", performance_.cameraMs,
-                           performance_.totalMs,
-                           ImVec4(0.55f, 0.80f, 0.95f, 1.0f));
+
+        ImGui::TextColored(ImVec4(1.0f, 0.78f, 0.20f, 1.0f), "Frontier");
+        ImGui::Separator();
         drawPerformanceBar("Frontier select", performance_.selectionMs,
                            performance_.totalMs,
                            ImVec4(1.0f, 0.78f, 0.20f, 1.0f));
-        drawPerformanceBar("Cut accounting", performance_.cutStatsMs,
+        drawPerformanceBar("Motion + DB apply", performance_.simulationMs,
                            performance_.totalMs,
-                           ImVec4(0.80f, 0.68f, 0.28f, 1.0f));
-        drawPerformanceBar("Debug draw", performance_.renderMs,
-                           performance_.totalMs,
-                           ImVec4(0.90f, 0.45f, 0.85f, 1.0f));
+                           ImVec4(0.35f, 0.90f, 0.50f, 1.0f));
         drawPerformanceBar("Resource publish", performance_.streamingMs,
                            performance_.totalMs,
                            ImVec4(0.90f, 0.60f, 0.25f, 1.0f));
+
+        ImGui::TextColored(ImVec4(0.90f, 0.45f, 0.85f, 1.0f), "bgfx");
+        ImGui::Separator();
+        drawPerformanceBar("Debug draw", performance_.renderMs,
+                           performance_.totalMs,
+                           ImVec4(0.90f, 0.45f, 0.85f, 1.0f));
         drawPerformanceBar("bgfx::frame", performance_.frameSubmitMs,
                            performance_.totalMs,
                            ImVec4(0.95f, 0.35f, 0.35f, 1.0f));
-        if (other > 0.001f)
-            drawPerformanceBar("Other", other, performance_.totalMs,
-                               ImVec4(0.55f, 0.55f, 0.60f, 1.0f));
-
-        ImGui::Text("Backend");
-        ImGui::Separator();
-        ImGui::Text("Render thread %.3f ms | GPU %.3f ms",
-                    performance_.renderThreadMs, performance_.gpuMs);
-        ImGui::Text("Wait render %.3f ms | submit %.3f ms",
-                    performance_.waitRenderMs,
-                    performance_.waitSubmitMs);
+        ImGui::Text("Render thread %.1f us | GPU %.1f us",
+                    performance_.renderThreadMs * 1000.0f,
+                    performance_.gpuMs * 1000.0f);
+        ImGui::Text("Wait render %.1f us | submit %.1f us",
+                    performance_.waitRenderMs * 1000.0f,
+                    performance_.waitSubmitMs * 1000.0f);
         ImGui::Text("%u draws | %u triangles", performance_.drawCalls,
                     performance_.triangles);
         ImGui::Text("Transient VB %.1f KiB | IB %.1f KiB",
@@ -735,6 +704,44 @@ private:
                         1024.0f,
                     float(std::max(performance_.transientIndexBytes, 0)) /
                         1024.0f);
+
+        ImGui::TextColored(ImVec4(0.35f, 0.70f, 1.0f, 1.0f), "Other");
+        ImGui::Separator();
+        drawPerformanceBar("ImGui", performance_.uiMs,
+                           performance_.totalMs,
+                           ImVec4(0.35f, 0.70f, 1.0f, 1.0f));
+        drawPerformanceBar("Camera + views", performance_.cameraMs,
+                           performance_.totalMs,
+                           ImVec4(0.55f, 0.80f, 0.95f, 1.0f));
+        drawPerformanceBar("Cut accounting", performance_.cutStatsMs,
+                           performance_.totalMs,
+                           ImVec4(0.80f, 0.68f, 0.28f, 1.0f));
+        if (other > 0.001f)
+            drawPerformanceBar("Other", other, performance_.totalMs,
+                               ImVec4(0.55f, 0.55f, 0.60f, 1.0f));
+
+        ImGui::Text("Frame summary");
+        ImGui::Separator();
+        ImGui::Text("Sample CPU %.1f us (%.0f fps) | GPU %.1f us",
+                    performance_.totalMs * 1000.0f,
+                    performance_.totalMs > 0.0f
+                        ? 1000.0f / performance_.totalMs
+                        : 0.0f,
+                    performance_.gpuMs * 1000.0f);
+        if (performanceHistoryCount_ != 0)
+        {
+            const int offset = performanceHistoryCount_ ==
+                                       kPerformanceHistorySize
+                                   ? int(performanceHistoryCursor_)
+                                   : 0;
+            const float scaleMax =
+                std::max(16667.0f, performance_.totalMs * 1500.0f);
+            ImGui::PlotHistogram(
+                "##cpu-frame-history", performanceHistory_.data(),
+                int(performanceHistoryCount_), offset,
+                "CPU frame history (us)", 0.0f, scaleMax,
+                ImVec2(-1.0f, 56.0f));
+        }
         ImGui::End();
     }
 
@@ -1123,7 +1130,8 @@ private:
         performance_.transientVertexBytes = sample.transientVertexBytes;
         performance_.transientIndexBytes = sample.transientIndexBytes;
 
-        performanceHistory_[performanceHistoryCursor_] = sample.totalMs;
+        performanceHistory_[performanceHistoryCursor_] =
+            sample.totalMs * 1000.0f;
         performanceHistoryCursor_ =
             (performanceHistoryCursor_ + 1) % kPerformanceHistorySize;
         performanceHistoryCount_ =

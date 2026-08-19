@@ -34,9 +34,10 @@ leaves), optional scene-wide wireframe rendering, LOD and contribution
 thresholds, and camera modes. Wireframe can also be toggled directly from the
 top-bar **Rendering** menu and composes with hierarchy tinting. **Scene stats**
 contains entity, cut, streaming, cache, simulation, and camera status.
-**Performance** graphs frame history and breaks sample CPU time into UI,
-simulation/database, camera, Frontier selection, debug draw, streaming, and
-bgfx submission, alongside bgfx render-thread, GPU, wait, draw, primitive, and
+**Performance** reports timings in microseconds and puts Frontier selection,
+motion/database work, and resource publication first. bgfx timing and backend
+counters follow, with UI, camera, and diagnostic overhead last. It also graphs
+frame history and reports render-thread, GPU, wait, draw, primitive, and
 transient-buffer counters. **Scene hierarchy** is a live ImGui tree of each
 reusable Frontier topology with current/ideal selected-entry counts.
 
