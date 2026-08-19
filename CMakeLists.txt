@@ -23,6 +23,8 @@ set_property(CACHE FRONTIER_PGO_MODE PROPERTY STRINGS OFF GENERATE USE)
 set(FRONTIER_PGO_DIR "" CACHE PATH
     "Directory containing GCC profile data for FRONTIER_PGO_MODE")
 option(FRONTIER_STATS "Enable per-query traversal statistics" OFF)
+option(FRONTIER_DEBUG_TOOLS
+       "Enable opt-in read-only runtime debug introspection" OFF)
 option(FRONTIER_CONTRACT_CHECKS "Enable public caller-contract checks" ON)
 option(FRONTIER_VALIDATE_SUBTREES
        "Validate complete serialized subtree structure during registration" ON)
@@ -151,6 +153,10 @@ function(frontier_configure_library target width)
 
     if(FRONTIER_STATS)
         target_compile_definitions(${target} PUBLIC FRONTIER_STATS=1)
+    endif()
+
+    if(FRONTIER_DEBUG_TOOLS)
+        target_compile_definitions(${target} PUBLIC FRONTIER_DEBUG_TOOLS=1)
     endif()
 
     if(FRONTIER_CONTRACT_CHECKS)

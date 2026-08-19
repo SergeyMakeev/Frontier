@@ -25,6 +25,17 @@ TEST(QueryCache, ReusesStableFrontiers)
     EXPECT_GT(query.walked(), 0u);
     (void)query.selectFrontier(database, cameraAt(-100), {});
     EXPECT_GT(query.reused(), 0u);
+#ifdef FRONTIER_DEBUG_TOOLS
+    const QueryCacheDebugSummary debug = query.debugCacheSummary();
+    EXPECT_EQ(debug.bytes, query.bytes());
+    EXPECT_EQ(debug.reused, query.reused());
+    EXPECT_EQ(debug.walked, query.walked());
+    EXPECT_GE(debug.recordSlots, 128u);
+    EXPECT_GE(debug.slabEntries, debug.liveEntries);
+    EXPECT_TRUE(debug.primed);
+    EXPECT_TRUE(debug.wholeReusable);
+    EXPECT_TRUE(debug.reuseEnabled);
+#endif
 }
 
 TEST(QueryCache, AngularMotionMatchesUncachedSelection)

@@ -320,5 +320,6 @@ Useful overrides include `FRONTIER_PROFILE_FILTER`,
 | `FRONTIER_PROFILE_SYMBOLS` | `OFF` | keep optimized Clang line tables |
 | `FRONTIER_IPO` | `OFF` | enable supported interprocedural optimization for Frontier and its benchmark executables; performance runners set it to `ON` |
 | `FRONTIER_STATS` | `OFF` | retain per-query traversal counters |
+| `FRONTIER_DEBUG_TOOLS` | `OFF` | expose on-demand read-only TLAS/query-cache inspection; adds no selection instrumentation |
 | `FRONTIER_CONTRACT_CHECKS` | `ON` | check caller preconditions; performance runners explicitly disable it for trusted workloads |
 | `FRONTIER_VALIDATE_SUBTREES` | `ON` | validate complete serialized subtree structure during registration; disable only for trusted compatible builder output |

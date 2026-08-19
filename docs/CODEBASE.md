@@ -202,6 +202,7 @@ propagation stops when an existing bound already contains the change.
 | `FRONTIER_CONTRACT_CHECKS` | Caller-precondition validation |
 | `FRONTIER_VALIDATE_SUBTREES` | Complete serialized-definition validation |
 | `FRONTIER_STATS` | Compile-time query instrumentation |
+| `FRONTIER_DEBUG_TOOLS` | Opt-in read-only TLAS/query-cache inspection API; no hot-path instrumentation |
 | `FRONTIER_IPO` | Interprocedural optimization for Frontier targets |
 | `FRONTIER_PGO_MODE` / `FRONTIER_PGO_DIR` | Optional GCC profile generation/use |
 

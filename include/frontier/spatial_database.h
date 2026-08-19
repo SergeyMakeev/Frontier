@@ -738,6 +738,29 @@ struct SelectionStats
 #endif
 };
 
+#ifdef FRONTIER_DEBUG_TOOLS
+// Read-only cache state assembled on demand. Exposing these already-maintained
+// values adds no query instrumentation or storage; the method itself is absent
+// unless FRONTIER_DEBUG_TOOLS is enabled for the complete build.
+struct QueryCacheDebugSummary
+{
+    size_t bytes = 0;
+    uint32_t recordSlots = 0;
+    uint32_t liveEntries = 0;
+    uint32_t garbageEntries = 0;
+    uint32_t slabEntries = 0;
+    uint32_t reused = 0;
+    uint32_t walked = 0;
+    uint32_t epoch = 0;
+    float positionTravel = 0.0f;
+    float projectionTravel = 0.0f;
+    bool primed = false;
+    bool wholeReusable = false;
+    bool reuseEnabled = false;
+    bool mountUsageEnabled = false;
+};
+#endif
+
 // Result of one mounted-topology collection pass. Definition-node readiness is
 // retained when a placement is removed.
 struct CollectResult
@@ -913,6 +936,10 @@ public:
     void reset();
 
     size_t bytes() const;
+
+#ifdef FRONTIER_DEBUG_TOOLS
+    QueryCacheDebugSummary debugCacheSummary() const;
+#endif
 
 private:
     friend class SpatialDatabase;
@@ -1091,6 +1118,56 @@ enum class TlasQuality : uint8_t
     Median,     // recursive longest-axis median split
     BinnedSAH,  // binned surface-area-heuristic split; best traversal cost
 };
+
+#ifdef FRONTIER_DEBUG_TOOLS
+enum class TlasDebugBoxKind : uint8_t
+{
+    Root,
+    Internal,
+    Instance,
+};
+
+struct TlasDebugSummary
+{
+    size_t bytes = 0;
+    uint32_t allocatedNodes = 0;
+    uint32_t activeNodes = 0;
+    uint32_t freeNodes = 0;
+    uint32_t instanceCount = 0;
+    uint32_t looseInstanceCount = 0;
+    uint32_t internalLaneCount = 0;
+    uint32_t instanceLaneCount = 0;
+    uint32_t maxDepth = 0;
+    uint32_t editsSinceRebuild = 0;
+    uint32_t qualityBaselineInstances = 0;
+    float averageLaneOccupancy = 0.0f;
+    float areaGrowthRatio = 0.0f;
+    bool rebuildPending = false;
+    TlasQuality configuredQuality = TlasQuality::BinnedSAH;
+};
+
+// One logical TLAS hierarchy box. Depth zero is the complete root extent.
+// A deeper requested level forms a complete hierarchy cut: internal lanes at
+// that level plus terminal instance lanes encountered at shallower levels.
+// `depth` records the box's actual level. Instance is valid only for Instance
+// boxes. Bounds are returned in world space, including a deferred rigid-
+// population offset.
+struct TlasDebugBox
+{
+    AABB bounds = AABB::empty();
+    InstanceId instance = kInvalidInstanceId;
+    uint32_t depth = 0;
+    TlasDebugBoxKind kind = TlasDebugBoxKind::Root;
+    bool loose = false;
+};
+
+struct LooseInstanceDebugBounds
+{
+    InstanceHandle instance{};
+    AABB envelope = AABB::empty();
+    AABB exact = AABB::empty();
+};
+#endif
 
 struct SpatialDatabaseConfig
 {
@@ -1404,6 +1481,20 @@ public:
     // Capacity owned by the optional top-level yaw stream. Zero until a
     // non-identity instance orientation is first submitted.
     size_t instanceOrientationStateBytes() const;
+
+#ifdef FRONTIER_DEBUG_TOOLS
+    // These functions inspect the already-published snapshot only. They do no
+    // persistent bookkeeping and allocate no memory. Span-returning methods
+    // write at most output.size() records and return the total matching count,
+    // allowing callers to detect truncation or resize their own storage.
+    // debugTlasBoxes() returns a complete cut at `depth`, retaining terminal
+    // instance lanes reached above that level.
+    TlasDebugSummary debugTlasSummary() const;
+    size_t debugTlasBoxes(uint32_t depth,
+                          std::span<TlasDebugBox> output) const;
+    size_t debugLooseInstanceBounds(
+        std::span<LooseInstanceDebugBounds> output) const;
+#endif
 
     struct TestAccess;   // defined by tests; full access to internals
 

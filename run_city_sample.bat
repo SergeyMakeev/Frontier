@@ -39,6 +39,7 @@ echo Configuring the Frontier bgfx city sample...
 cmake -S "%ROOT%" -B "%BUILD_DIR%" !GENERATOR_ARGS! ^
     -DCMAKE_BUILD_TYPE=Release ^
     -DFRONTIER_BUILD_CITY_SAMPLE=ON ^
+    -DFRONTIER_DEBUG_TOOLS=ON ^
     -DFRONTIER_BUILD_TESTS=OFF ^
     -DFRONTIER_BUILD_BENCH=OFF
 if errorlevel 1 exit /b 1

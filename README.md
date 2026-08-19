@@ -240,6 +240,7 @@ hierarchy tinting, and a visualized frozen culling frustum.
 ```sh
 cmake -S . -B build-city \
   -DFRONTIER_BUILD_CITY_SAMPLE=ON \
+  -DFRONTIER_DEBUG_TOOLS=ON \
   -DFRONTIER_BUILD_TESTS=OFF
 cmake --build build-city --config Release --target frontier_city
 ```
@@ -259,6 +260,7 @@ Important options are `FRONTIER_BUILD_TESTS`, `FRONTIER_BUILD_BENCH`,
 `FRONTIER_BUILD_CITY_SAMPLE`,
 `FRONTIER_BVH_WIDTH`, `FRONTIER_AVX2`, `FRONTIER_FORCE_SCALAR`,
 `FRONTIER_IPO`, `FRONTIER_PGO_MODE`, `FRONTIER_PGO_DIR`, `FRONTIER_STATS`,
+`FRONTIER_DEBUG_TOOLS`,
 `FRONTIER_CONTRACT_CHECKS`, and
 `FRONTIER_VALIDATE_SUBTREES`.
 

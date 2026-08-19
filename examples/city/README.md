@@ -39,7 +39,13 @@ motion/database work, and resource publication first. bgfx timing and backend
 counters follow, with UI, camera, and diagnostic overhead last. It also graphs
 frame history and reports render-thread, GPU, wait, draw, primitive, and
 transient-buffer counters. **Scene hierarchy** is a live ImGui tree of each
-reusable Frontier topology with current/ideal selected-entry counts.
+reusable Frontier topology with current/ideal selected-entry counts. **TLAS
+health** reports topology occupancy, depth, motion-area growth, rebuild state,
+and storage, and controls complete depth-cut TLAS AABB rendering plus loose-
+motion envelope comparison. **Query cache** reports reuse rate, record/slab
+storage, garbage, cache state, travel, and hit-rate history. The TLAS and
+loose-bound visualizations are also independently available from the
+**Rendering** menu. All four additions are closed or disabled by default.
 
 Free camera uses **WASD** to move, **Q/E** to descend/ascend, and right-mouse
 drag to look. **Freeze camera / cull state** captures the active culling camera,
@@ -51,6 +57,7 @@ From the repository root:
 ```sh
 cmake -S . -B build-city \
   -DFRONTIER_BUILD_CITY_SAMPLE=ON \
+  -DFRONTIER_DEBUG_TOOLS=ON \
   -DFRONTIER_BUILD_TESTS=OFF
 cmake --build build-city --config Release --target frontier_city
 ```
@@ -71,3 +78,7 @@ Visual Studio, run `build-city/examples/city/Release/frontier_city.exe`.
 The first configure downloads the bgfx CMake distribution at the commit pinned
 in `CMakeLists.txt`; that distribution brings its matching bgfx, bx, and bimg
 submodules. Normal Frontier builds do not download or compile those dependencies.
+`FRONTIER_DEBUG_TOOLS` is off by default in normal builds. The launch scripts
+enable it for this sample so the read-only TLAS/cache inspection API is present;
+no debug scan or bounds enumeration runs while its windows and rendering modes
+remain disabled.

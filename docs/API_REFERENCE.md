@@ -136,6 +136,13 @@ to selection and storage to `SpatialQuery`; without it, statistics read as
 zero and the traversal carries no instrumentation. This is also a build-wide
 ABI choice. CMake propagates it when configured with `-DFRONTIER_STATS=ON`.
 
+`FRONTIER_DEBUG_TOOLS` exposes read-only TLAS and query-cache snapshots. It is
+off by default and adds no fields, counters, or branches to selection. Debug
+queries inspect already-maintained state only when called and write variable
+output through caller-owned spans. CMake propagates the API declaration with
+`-DFRONTIER_DEBUG_TOOLS=ON`; define it consistently for the library and its
+consumers.
+
 `FRONTIER_CONTRACT_CHECKS` controls caller-precondition checks and defaults to
 `1`. Setting it to `0` removes those branches; violating any documented
 precondition is then undefined behavior. It does not disable Debug-only
@@ -1841,6 +1848,29 @@ size_t instanceOrientationStateBytes() const;
   immutable registered `SubtreeBytes` are excluded.
 - `instanceOrientationStateBytes()` returns the optional cold top-level yaw
   and authored-local-bounds stream. It is zero until non-identity yaw is used.
+
+With `FRONTIER_DEBUG_TOOLS` enabled, the following on-demand inspection API is
+also available:
+
+```cpp
+QueryCacheDebugSummary SpatialQuery::debugCacheSummary() const;
+
+TlasDebugSummary SpatialDatabase::debugTlasSummary() const;
+size_t SpatialDatabase::debugTlasBoxes(
+    uint32_t depth, std::span<TlasDebugBox> output) const;
+size_t SpatialDatabase::debugLooseInstanceBounds(
+    std::span<LooseInstanceDebugBounds> output) const;
+```
+
+The summaries read existing scalar state. `debugTlasSummary()` walks the live
+TLAS to calculate depth and occupancy. The span methods allocate nothing,
+write at most `output.size()` records, and return the complete matching count
+so the caller can detect truncation. `debugTlasBoxes()` returns a complete cut
+at the requested depth: internal lanes at that level and any terminal instance
+lanes encountered earlier. Each record retains its actual depth. TLAS boxes and
+exact/envelope bounds are returned in world space, including deferred
+population translation. Call these methods only for a published database
+snapshot; their work is performed only when explicitly requested.
 
 ## 11. Threading contract
 

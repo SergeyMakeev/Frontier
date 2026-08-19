@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <array>
 #include <vector>
 
 #include "helpers.h"
@@ -102,6 +103,51 @@ TEST(Tlas, ContributionCullPreservesLargeObjectThroughInternalNodes)
     EXPECT_EQ(payloads(database, cut),
               (std::vector<UserPayload>{largePayload}));
 }
+
+#ifdef FRONTIER_DEBUG_TOOLS
+TEST(Tlas, DebugToolsExposeHealthAndDepthBoxes)
+{
+    SpatialDatabase database;
+    constexpr uint32_t count = 80;
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        InstanceDesc desc;
+        desc.pos = i + 1 == count
+                       ? float4::point(10000.0f, 0.0f, 0.0f)
+                       : float4::point(float(i % 10) * 4.0f, 0.0f,
+                                       float(i / 10) * 4.0f);
+        database.instantiate(node(1000 + i, 0.0f, box()), desc);
+    }
+    database.applyUpdates();
+
+    const TlasDebugSummary summary = database.debugTlasSummary();
+    EXPECT_FALSE(summary.rebuildPending);
+    EXPECT_EQ(summary.instanceCount, count);
+    EXPECT_EQ(summary.instanceLaneCount, count);
+    EXPECT_GT(summary.activeNodes, 1u);
+    EXPECT_GT(summary.maxDepth, 1u);
+    EXPECT_GT(summary.averageLaneOccupancy, 0.0f);
+    EXPECT_LE(summary.averageLaneOccupancy, 1.0f);
+
+    std::array<TlasDebugBox, 1> root{};
+    ASSERT_EQ(database.debugTlasBoxes(0, root), 1u);
+    EXPECT_EQ(root[0].kind, TlasDebugBoxKind::Root);
+    EXPECT_EQ(root[0].depth, 0u);
+
+    std::vector<TlasDebugBox> boxes(count + summary.activeNodes);
+    const size_t total =
+        database.debugTlasBoxes(summary.maxDepth, boxes);
+    ASSERT_EQ(total, count);
+    bool foundShallowLeaf = false;
+    for (size_t i = 0; i < total; ++i)
+    {
+        EXPECT_EQ(boxes[i].kind, TlasDebugBoxKind::Instance);
+        EXPECT_LE(boxes[i].depth, summary.maxDepth);
+        foundShallowLeaf |= boxes[i].depth < summary.maxDepth;
+    }
+    EXPECT_TRUE(foundShallowLeaf);
+}
+#endif
 
 TEST(Tlas, StaleInstanceHandleCannotMoveReusedSlot)
 {

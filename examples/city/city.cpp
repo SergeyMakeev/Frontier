@@ -281,6 +281,25 @@ bx::Aabb box(float minX, float minY, float minZ,
     return {{minX, minY, minZ}, {maxX, maxY, maxZ}};
 }
 
+#ifdef FRONTIER_DEBUG_TOOLS
+bx::Aabb debugBox(const AABB& bounds)
+{
+    return {{bounds.mn.x, bounds.mn.y, bounds.mn.z},
+            {bounds.mx.x, bounds.mx.y, bounds.mx.z}};
+}
+
+const char* tlasQualityName(TlasQuality quality)
+{
+    switch (quality)
+    {
+    case TlasQuality::Morton: return "Morton";
+    case TlasQuality::Median: return "Median";
+    case TlasQuality::BinnedSAH: return "Binned SAH";
+    }
+    return "Unknown";
+}
+#endif
+
 void sampleSidewalkLoop(const PedestrianPath& path, float time,
                         float4& outPosition, float& outYaw)
 {
@@ -376,6 +395,12 @@ public:
             drawPerformanceUi();
         if (showSceneHierarchy_)
             drawSceneTreeUi();
+#ifdef FRONTIER_DEBUG_TOOLS
+        if (showTlasHealth_)
+            drawTlasHealthUi();
+        if (showQueryCache_)
+            drawQueryCacheUi();
+#endif
         const bool uiHasFocus = ImGui::MouseOverArea();
         imguiEndFrame();
         int64_t stageEnd = bx::getHPCounter();
@@ -439,6 +464,10 @@ public:
 
         stageStart = stageEnd;
         updateFrontierStats(frontier);
+#ifdef FRONTIER_DEBUG_TOOLS
+        if (showQueryCache_)
+            recordQueryCacheHistory();
+#endif
         stageEnd = bx::getHPCounter();
         performance.cutStatsMs = milliseconds(stageStart, stageEnd);
 
@@ -488,6 +517,10 @@ private:
             ImGui::MenuItem("Performance", nullptr, &showPerformance_);
             ImGui::MenuItem("Scene hierarchy", nullptr,
                             &showSceneHierarchy_);
+#ifdef FRONTIER_DEBUG_TOOLS
+            ImGui::MenuItem("TLAS health", nullptr, &showTlasHealth_);
+            ImGui::MenuItem("Query cache", nullptr, &showQueryCache_);
+#endif
             ImGui::Separator();
             if (ImGui::MenuItem("Show all"))
             {
@@ -495,6 +528,10 @@ private:
                 showSceneStats_ = true;
                 showPerformance_ = true;
                 showSceneHierarchy_ = true;
+#ifdef FRONTIER_DEBUG_TOOLS
+                showTlasHealth_ = true;
+                showQueryCache_ = true;
+#endif
             }
             if (ImGui::MenuItem("Hide all"))
             {
@@ -502,6 +539,10 @@ private:
                 showSceneStats_ = false;
                 showPerformance_ = false;
                 showSceneHierarchy_ = false;
+#ifdef FRONTIER_DEBUG_TOOLS
+                showTlasHealth_ = false;
+                showQueryCache_ = false;
+#endif
             }
             ImGui::EndMenu();
         }
@@ -510,6 +551,13 @@ private:
             ImGui::MenuItem("Wireframe scene", nullptr, &wireframeDebug_);
             ImGui::MenuItem("Hierarchy level tint", nullptr,
                             &hierarchyTint_);
+#ifdef FRONTIER_DEBUG_TOOLS
+            ImGui::Separator();
+            ImGui::MenuItem("TLAS AABBs by depth", nullptr,
+                            &drawTlasAabbs_);
+            ImGui::MenuItem("Loose vs exact bounds", nullptr,
+                            &drawLooseBounds_);
+#endif
             ImGui::EndMenu();
         }
         ImGui::TextDisabled("Frontier Dynamic City");
@@ -744,6 +792,197 @@ private:
         }
         ImGui::End();
     }
+
+#ifdef FRONTIER_DEBUG_TOOLS
+    void refreshTlasHealth()
+    {
+        if (tlasHealthValid_ && cameraTime_ < nextTlasHealthSampleTime_)
+            return;
+        tlasHealth_ = database_.debugTlasSummary();
+        tlasHealthValid_ = true;
+        nextTlasHealthSampleTime_ =
+            tlasHealth_.rebuildPending ? cameraTime_
+                                       : cameraTime_ + 0.25f;
+        tlasDebugDepth_ = std::clamp(
+            tlasDebugDepth_, 0, int(tlasHealth_.maxDepth));
+    }
+
+    void drawTlasHealthUi()
+    {
+        refreshTlasHealth();
+        ImGui::SetNextWindowPos(ImVec2(12.0f, 478.0f),
+                                ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(390.0f, 410.0f),
+                                 ImGuiCond_FirstUseEver);
+        if (!ImGui::Begin("TLAS health", &showTlasHealth_))
+        {
+            ImGui::End();
+            return;
+        }
+
+        ImGui::Text("Quality %s | width %u",
+                    tlasQualityName(tlasHealth_.configuredQuality), kWide);
+        ImGui::Text("Nodes %u active | %u allocated | %u free",
+                    tlasHealth_.activeNodes, tlasHealth_.allocatedNodes,
+                    tlasHealth_.freeNodes);
+        ImGui::Text("Instances %u | loose %u", tlasHealth_.instanceCount,
+                    tlasHealth_.looseInstanceCount);
+        ImGui::Text("Internal lanes %u | instance lanes %u",
+                    tlasHealth_.internalLaneCount,
+                    tlasHealth_.instanceLaneCount);
+        ImGui::Text("Max depth %u | edits since rebuild %u",
+                    tlasHealth_.maxDepth,
+                    tlasHealth_.editsSinceRebuild);
+        ImGui::Text("Quality baseline %u instances",
+                    tlasHealth_.qualityBaselineInstances);
+        ImGui::Text("TLAS storage %.1f KiB",
+                    float(tlasHealth_.bytes) / 1024.0f);
+
+        ImGui::Text("Lane occupancy %.1f%%",
+                    tlasHealth_.averageLaneOccupancy * 100.0f);
+        ImGui::ProgressBar(tlasHealth_.averageLaneOccupancy,
+                           ImVec2(-1.0f, 6.0f), "");
+        const float areaLimit = database_.config().tlasAreaDrift;
+        ImGui::Text("Motion area growth %.1f%% / %.1f%% limit",
+                    tlasHealth_.areaGrowthRatio * 100.0f,
+                    areaLimit * 100.0f);
+        ImGui::ProgressBar(
+            std::clamp(tlasHealth_.areaGrowthRatio /
+                           std::max(areaLimit, 1.0e-6f),
+                       0.0f, 1.0f),
+            ImVec2(-1.0f, 6.0f), "");
+        if (tlasHealth_.rebuildPending)
+            ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.20f, 1.0f),
+                               "TLAS update/rebuild pending");
+
+        ImGui::Separator();
+        ImGui::Text("Spatial visualizations");
+        ImGui::Checkbox("TLAS AABBs by depth", &drawTlasAabbs_);
+        if (tlasHealth_.maxDepth != 0)
+            ImGui::SliderInt("AABB depth", &tlasDebugDepth_, 0,
+                             int(tlasHealth_.maxDepth));
+        ImGui::SliderInt("AABB draw limit", &tlasDebugBoxLimit_, 64, 65536);
+        if (drawTlasAabbs_)
+        {
+            ImGui::Text("Drawing %zu / %zu boxes",
+                        lastTlasBoxesDrawn_, lastTlasBoxesTotal_);
+            ImGui::TextDisabled(
+                "Complete cut includes terminal leaves above this depth");
+            if (lastTlasBoxesDrawn_ < lastTlasBoxesTotal_)
+                ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.20f, 1.0f),
+                                   "Increase the draw limit to see all boxes");
+        }
+
+        ImGui::Checkbox("Loose envelopes vs exact bounds",
+                        &drawLooseBounds_);
+        ImGui::SliderInt("Loose draw limit", &looseBoundsDrawLimit_,
+                         16, 2048);
+        if (drawLooseBounds_)
+        {
+            ImGui::Text("Drawing %zu / %zu loose instances",
+                        lastLooseBoundsDrawn_, lastLooseBoundsTotal_);
+            if (lastLooseBoundsTotal_ == 0)
+                ImGui::TextDisabled(
+                    "Bulk motion uses exact refits, so loose bounds may be empty");
+        }
+        ImGui::Checkbox("X-ray debug bounds", &debugBoundsXray_);
+        ImGui::TextColored(ImVec4(0.20f, 0.85f, 1.0f, 1.0f),
+                           "Cyan: TLAS internal");
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(1.0f, 0.80f, 0.18f, 1.0f),
+                           "Gold: instance");
+        ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.10f, 1.0f),
+                           "Orange: loose envelope");
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(0.20f, 1.0f, 0.35f, 1.0f),
+                           "Green: exact");
+        ImGui::End();
+    }
+
+    void drawQueryCacheUi()
+    {
+        const QueryCacheDebugSummary cache = query_.debugCacheSummary();
+        const uint32_t total = cache.reused + cache.walked;
+        const float hitRate = total != 0
+                                  ? float(cache.reused) / float(total)
+                                  : 0.0f;
+        ImGui::SetNextWindowPos(ImVec2(776.0f, 700.0f),
+                                ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(390.0f, 330.0f),
+                                 ImGuiCond_FirstUseEver);
+        if (!ImGui::Begin("Query cache", &showQueryCache_))
+        {
+            ImGui::End();
+            return;
+        }
+
+        ImGui::Text("Last selection %u reused | %u walked",
+                    cache.reused, cache.walked);
+        ImGui::Text("Hit rate %.1f%%", hitRate * 100.0f);
+        ImGui::ProgressBar(hitRate, ImVec2(-1.0f, 7.0f), "");
+        ImGui::Text("State %s | epoch %u",
+                    cache.reuseEnabled ? "enabled" : "disabled",
+                    cache.epoch);
+        ImGui::Text("Primed %s | whole-cut reusable %s",
+                    cache.primed ? "yes" : "no",
+                    cache.wholeReusable ? "yes" : "no");
+        ImGui::Text("Record slots %u | live entries %u",
+                    cache.recordSlots, cache.liveEntries);
+        ImGui::Text("Garbage entries %u | slab entries %u",
+                    cache.garbageEntries, cache.slabEntries);
+        ImGui::Text("Cache memory %.1f KiB", float(cache.bytes) / 1024.0f);
+        ImGui::Text("Travel %.2f | projection travel %.2f",
+                    cache.positionTravel, cache.projectionTravel);
+        ImGui::Text("Mount usage tracking %s",
+                    cache.mountUsageEnabled ? "enabled" : "disabled");
+
+        if (queryCacheHistoryCount_ != 0)
+        {
+            const int offset = queryCacheHistoryCount_ ==
+                                       kPerformanceHistorySize
+                                   ? int(queryCacheHistoryCursor_)
+                                   : 0;
+            ImGui::PlotLines(
+                "##query-cache-history", queryCacheHitHistory_.data(),
+                int(queryCacheHistoryCount_), offset,
+                "Cache hit history (%)", 0.0f, 100.0f,
+                ImVec2(-1.0f, 64.0f));
+        }
+#ifdef FRONTIER_STATS
+        const SelectionStats& stats = query_.lastSelectionStats();
+        ImGui::Separator();
+        ImGui::Text("Traversal instrumentation");
+        ImGui::Text("Instances %llu | subtrees %llu | nodes %llu",
+                    static_cast<unsigned long long>(stats.instancesVisited),
+                    static_cast<unsigned long long>(stats.subtreesVisited),
+                    static_cast<unsigned long long>(stats.nodesVisited));
+        ImGui::Text("Wide blocks %llu | lanes survived %llu",
+                    static_cast<unsigned long long>(stats.wideBlocksTested),
+                    static_cast<unsigned long long>(stats.lanesSurvived));
+#else
+        ImGui::Separator();
+        ImGui::TextDisabled("FRONTIER_STATS is disabled");
+        ImGui::TextWrapped(
+            "Detailed traversal counters are unavailable. Enabling "
+            "FRONTIER_STATS instruments hot traversal paths and affects "
+            "measured performance.");
+#endif
+        ImGui::End();
+    }
+
+    void recordQueryCacheHistory()
+    {
+        const uint32_t total = lastQueryReused_ + lastQueryWalked_;
+        queryCacheHitHistory_[queryCacheHistoryCursor_] =
+            total != 0 ? 100.0f * float(lastQueryReused_) / float(total)
+                       : 0.0f;
+        queryCacheHistoryCursor_ =
+            (queryCacheHistoryCursor_ + 1) % kPerformanceHistorySize;
+        queryCacheHistoryCount_ =
+            std::min(queryCacheHistoryCount_ + 1,
+                     kPerformanceHistorySize);
+    }
+#endif
 
     uint32_t payloadCount(
         const std::array<uint32_t, kPayloadSlotCount>& counts,
@@ -1872,6 +2111,79 @@ private:
         encoder.pop();
     }
 
+#ifdef FRONTIER_DEBUG_TOOLS
+    void drawSpatialDebugBounds(DebugDrawEncoder& encoder)
+    {
+        if (!drawTlasAabbs_ && !drawLooseBounds_)
+        {
+            lastTlasBoxesTotal_ = lastTlasBoxesDrawn_ = 0;
+            lastLooseBoundsTotal_ = lastLooseBoundsDrawn_ = 0;
+            return;
+        }
+
+        float identity[16];
+        bx::mtxIdentity(identity);
+        encoder.push();
+        encoder.setTransform(identity);
+        encoder.setState(!debugBoundsXray_, false, false);
+        encoder.setWireframe(true);
+
+        if (drawTlasAabbs_)
+        {
+            tlasDebugBoxes_.resize(size_t(tlasDebugBoxLimit_));
+            lastTlasBoxesTotal_ = database_.debugTlasBoxes(
+                uint32_t(tlasDebugDepth_), tlasDebugBoxes_);
+            lastTlasBoxesDrawn_ =
+                std::min(lastTlasBoxesTotal_, tlasDebugBoxes_.size());
+            for (size_t index = 0; index < lastTlasBoxesDrawn_; ++index)
+            {
+                const TlasDebugBox& item = tlasDebugBoxes_[index];
+                switch (item.kind)
+                {
+                case TlasDebugBoxKind::Root:
+                    encoder.setColor(abgr(230, 70, 255));
+                    break;
+                case TlasDebugBoxKind::Internal:
+                    encoder.setColor(abgr(50, 205, 255));
+                    break;
+                case TlasDebugBoxKind::Instance:
+                    encoder.setColor(item.loose ? abgr(255, 85, 30)
+                                                : abgr(255, 205, 45));
+                    break;
+                }
+                encoder.draw(debugBox(item.bounds));
+            }
+        }
+        else
+        {
+            lastTlasBoxesTotal_ = lastTlasBoxesDrawn_ = 0;
+        }
+
+        if (drawLooseBounds_)
+        {
+            looseDebugBounds_.resize(size_t(looseBoundsDrawLimit_));
+            lastLooseBoundsTotal_ = database_.debugLooseInstanceBounds(
+                looseDebugBounds_);
+            lastLooseBoundsDrawn_ =
+                std::min(lastLooseBoundsTotal_, looseDebugBounds_.size());
+            for (size_t index = 0; index < lastLooseBoundsDrawn_; ++index)
+            {
+                const LooseInstanceDebugBounds& item =
+                    looseDebugBounds_[index];
+                encoder.setColor(abgr(255, 85, 25));
+                encoder.draw(debugBox(item.envelope));
+                encoder.setColor(abgr(45, 255, 85));
+                encoder.draw(debugBox(item.exact));
+            }
+        }
+        else
+        {
+            lastLooseBoundsTotal_ = lastLooseBoundsDrawn_ = 0;
+        }
+        encoder.pop();
+    }
+#endif
+
     void render(const FrontierResultView& frontier)
     {
         DebugDrawEncoder encoder;
@@ -1888,6 +2200,9 @@ private:
                         entities_[entry.instance()]);
         }
         drawFrozenCullFrustum(encoder);
+#ifdef FRONTIER_DEBUG_TOOLS
+        drawSpatialDebugBounds(encoder);
+#endif
         encoder.end();
     }
 
@@ -1949,6 +2264,28 @@ private:
     bool showSceneStats_ = false;
     bool showPerformance_ = false;
     bool showSceneHierarchy_ = false;
+#ifdef FRONTIER_DEBUG_TOOLS
+    bool showTlasHealth_ = false;
+    bool showQueryCache_ = false;
+    bool drawTlasAabbs_ = false;
+    bool drawLooseBounds_ = false;
+    bool debugBoundsXray_ = false;
+    bool tlasHealthValid_ = false;
+    int tlasDebugDepth_ = 0;
+    int tlasDebugBoxLimit_ = 2048;
+    int looseBoundsDrawLimit_ = 512;
+    float nextTlasHealthSampleTime_ = 0.0f;
+    TlasDebugSummary tlasHealth_{};
+    std::vector<TlasDebugBox> tlasDebugBoxes_;
+    std::vector<LooseInstanceDebugBounds> looseDebugBounds_;
+    size_t lastTlasBoxesTotal_ = 0;
+    size_t lastTlasBoxesDrawn_ = 0;
+    size_t lastLooseBoundsTotal_ = 0;
+    size_t lastLooseBoundsDrawn_ = 0;
+    std::array<float, kPerformanceHistorySize> queryCacheHitHistory_{};
+    size_t queryCacheHistoryCursor_ = 0;
+    size_t queryCacheHistoryCount_ = 0;
+#endif
     FrozenCullState frozenCull_;
     uint32_t houseCount_ = 0;
     uint32_t towerCount_ = 0;

@@ -3871,6 +3871,180 @@ void SpatialDatabase::tlasQuery(const Camera& view, float minPix,
         tlasQueryImpl<false, false>(view, minPix, outVisible, stack);
 }
 
+#ifdef FRONTIER_DEBUG_TOOLS
+TlasDebugSummary SpatialDatabase::debugTlasSummary() const
+{
+    TlasDebugSummary summary;
+    summary.bytes =
+        tlasNodes_.capacity() * sizeof(TlasNode) +
+        tlasMeta_.capacity() * sizeof(TlasMeta) +
+        tlasFreeNodes_.capacity() * sizeof(int32_t) +
+        instanceTlasLoose_.capacity() * sizeof(uint8_t);
+    summary.allocatedNodes = uint32_t(tlasNodes_.size());
+    summary.freeNodes = uint32_t(tlasFreeNodes_.size());
+    summary.instanceCount = uint32_t(liveInstances_.size());
+    summary.editsSinceRebuild = tlasEdits_;
+    summary.qualityBaselineInstances = tlasQualityCount_;
+    summary.areaGrowthRatio =
+        tlasBaseArea_ > 0.0f ? tlasGrownArea_ / tlasBaseArea_ : 0.0f;
+    summary.rebuildPending = tlasDirty_ || !pendingMoves_.empty() ||
+                             !tlasItemsTmp_.empty();
+    summary.configuredQuality = config_.tlasQuality;
+
+    for (const InstanceId dense : liveInstances_)
+        if (dense < instanceTlasLoose_.size() && instanceTlasLoose_[dense])
+            ++summary.looseInstanceCount;
+
+    if (summary.rebuildPending || tlasRoot_ < 0)
+        return summary;
+
+    uint64_t validLanes = 0;
+    const auto visit = [&](auto&& self, uint32_t nodeIndex,
+                           uint32_t nodeDepth) -> void
+    {
+        const TlasNode& node = tlasNodes_[nodeIndex];
+        ++summary.activeNodes;
+        const uint32_t lanes = node.validLanes();
+        validLanes += std::popcount(lanes);
+        uint32_t remaining = lanes;
+        while (remaining)
+        {
+            const uint32_t lane = uint32_t(std::countr_zero(remaining));
+            remaining &= remaining - 1;
+            summary.maxDepth = std::max(summary.maxDepth, nodeDepth + 1);
+            if (node.child[lane] >= 0)
+            {
+                ++summary.internalLaneCount;
+                self(self, uint32_t(node.child[lane]), nodeDepth + 1);
+            }
+            else
+            {
+                ++summary.instanceLaneCount;
+            }
+        }
+    };
+    visit(visit, uint32_t(tlasRoot_), 0);
+    if (summary.activeNodes != 0)
+        summary.averageLaneOccupancy =
+            float(validLanes) /
+            float(uint64_t(summary.activeNodes) * uint64_t(kWide));
+    return summary;
+}
+
+size_t SpatialDatabase::debugTlasBoxes(
+    uint32_t depth, std::span<TlasDebugBox> output) const
+{
+    if (tlasDirty_ || !pendingMoves_.empty() || !tlasItemsTmp_.empty() ||
+        tlasRoot_ < 0)
+        return 0;
+
+    const auto worldBounds = [this](const AABB& bounds)
+    {
+        return AABB::fromMinMax(bounds.mn + tlasGlobalOffset_,
+                                bounds.mx + tlasGlobalOffset_);
+    };
+    size_t total = 0;
+    const auto emit = [&](const TlasDebugBox& box)
+    {
+        if (total < output.size()) output[total] = box;
+        ++total;
+    };
+
+    if (depth == 0)
+    {
+        float contribution = 0.0f;
+        uint32_t layerMask = 0;
+        emit(TlasDebugBox{
+            .bounds = worldBounds(tlasNodeExtent(
+                uint32_t(tlasRoot_), contribution, layerMask)),
+            .depth = 0,
+            .kind = TlasDebugBoxKind::Root,
+        });
+        return total;
+    }
+
+    const auto visit = [&](auto&& self, uint32_t nodeIndex,
+                           uint32_t nodeDepth) -> void
+    {
+        const TlasNode& node = tlasNodes_[nodeIndex];
+        uint32_t remaining = node.validLanes();
+        while (remaining)
+        {
+            const uint32_t lane = uint32_t(std::countr_zero(remaining));
+            remaining &= remaining - 1;
+            const int32_t child = node.child[lane];
+            const uint32_t childDepth = nodeDepth + 1;
+            const bool terminal = child < 0;
+            if (childDepth == depth || terminal)
+            {
+                TlasDebugBox box;
+                box.bounds = worldBounds(node.bounds.lane(lane));
+                box.depth = childDepth;
+                if (!terminal)
+                {
+                    box.kind = TlasDebugBoxKind::Internal;
+                }
+                else
+                {
+                    const InstanceId dense = InstanceId(~child);
+                    box.kind = TlasDebugBoxKind::Instance;
+                    box.instance = publicInstanceId(dense);
+                    box.loose = dense < instanceTlasLoose_.size() &&
+                                instanceTlasLoose_[dense] != 0;
+                }
+                emit(box);
+            }
+            else if (childDepth < depth)
+            {
+                self(self, uint32_t(child), childDepth);
+            }
+        }
+    };
+    visit(visit, uint32_t(tlasRoot_), 0);
+    return total;
+}
+
+size_t SpatialDatabase::debugLooseInstanceBounds(
+    std::span<LooseInstanceDebugBounds> output) const
+{
+    if (tlasDirty_ || !pendingMoves_.empty() || !tlasItemsTmp_.empty())
+        return 0;
+
+    const auto worldBounds = [this](const AABB& bounds)
+    {
+        return AABB::fromMinMax(bounds.mn + tlasGlobalOffset_,
+                                bounds.mx + tlasGlobalOffset_);
+    };
+    size_t total = 0;
+    for (const InstanceId dense : liveInstances_)
+    {
+        if (dense >= instanceTlasLoose_.size() ||
+            !instanceTlasLoose_[dense])
+            continue;
+        const Instance& instance = instances_[dense];
+        const uint32_t nodeIndex = instance.tlasNode();
+        const uint32_t lane = instance.tlasLane();
+        if (nodeIndex == kInvalidInstanceId || nodeIndex >= tlasNodes_.size() ||
+            !(tlasNodes_[nodeIndex].validMask & (1u << lane)) ||
+            tlasNodes_[nodeIndex].child[lane] != ~int32_t(dense))
+            continue;
+
+        if (total < output.size())
+        {
+            output[total] = LooseInstanceDebugBounds{
+                .instance = InstanceHandle{publicInstanceId(dense),
+                                           instance.generation},
+                .envelope = worldBounds(
+                    tlasNodes_[nodeIndex].bounds.lane(lane)),
+                .exact = worldBounds(instance.worldBox),
+            };
+        }
+        ++total;
+    }
+    return total;
+}
+#endif
+
 CollectResult SpatialDatabase::collect(size_t maxMountedSubtrees,
                                        uint32_t minAge)
 {
@@ -5297,6 +5471,28 @@ size_t SpatialQuery::bytes() const
            dirtyMounts_.capacity() * sizeof(uint32_t) +
            (scratch_ ? scratch_->bytes() : 0);
 }
+
+#ifdef FRONTIER_DEBUG_TOOLS
+QueryCacheDebugSummary SpatialQuery::debugCacheSummary() const
+{
+    QueryCacheDebugSummary summary;
+    summary.bytes = bytes();
+    summary.recordSlots = uint32_t(rec_.size());
+    summary.liveEntries = used_ >= garbage_ ? used_ - garbage_ : 0;
+    summary.garbageEntries = garbage_;
+    summary.slabEntries = uint32_t(store_.size());
+    summary.reused = reused_;
+    summary.walked = walked_;
+    summary.epoch = epoch_;
+    summary.positionTravel = travel_;
+    summary.projectionTravel = kTravel_;
+    summary.primed = primed_;
+    summary.wholeReusable = wholeReusable_;
+    summary.reuseEnabled = reuseEnabled_;
+    summary.mountUsageEnabled = mountUsageEnabled_;
+    return summary;
+}
+#endif
 
 // Runs are allocated by bumping and abandoned when an instance's cut outgrows
 // its block, so the slab accumulates holes. Squeeze them out once the holes

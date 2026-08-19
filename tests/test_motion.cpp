@@ -525,6 +525,17 @@ TEST(Motion, ContributionCullRetestsExactBoundsAfterScaleChanges)
     database.applyUpdates();
     EXPECT_TRUE(query.selectFrontier(database, camera, params).empty());
 
+#ifdef FRONTIER_DEBUG_TOOLS
+    const TlasDebugSummary summary = database.debugTlasSummary();
+    EXPECT_EQ(summary.looseInstanceCount, 1u);
+    std::array<LooseInstanceDebugBounds, 1> looseBounds{};
+    ASSERT_EQ(database.debugLooseInstanceBounds(looseBounds), 1u);
+    EXPECT_EQ(looseBounds[0].instance, scaled);
+    EXPECT_TRUE(looseBounds[0].envelope.contains(looseBounds[0].exact));
+    EXPECT_GT(looseBounds[0].envelope.extent().x,
+              looseBounds[0].exact.extent().x);
+#endif
+
     database.moveInstance(
         scaled, Transform{float4::point(0.0f, 0.0f, 0.0f), 1.0f});
     database.applyUpdates();
