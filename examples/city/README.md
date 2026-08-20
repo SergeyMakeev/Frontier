@@ -31,15 +31,29 @@ each window can also be closed with its title-bar button. Only
 controls simulation freeze,
 hierarchy-level tinting (green top nodes, yellow intermediate nodes, red
 leaves), optional scene-wide wireframe rendering, LOD and contribution
-thresholds, and camera modes. Wireframe can also be toggled directly from the
-top-bar **Rendering** menu and composes with hierarchy tinting. **Scene stats**
-contains entity, cut, streaming, cache, simulation, and camera status.
+thresholds, camera modes, and workload generators. **Replace all with House
+A/B** removes all 2,088 current house instances and creates a newly randomized
+generation of the selected architectural style. The operation is deferred into
+the measured motion/database stage so its structural-update spike is visible
+in the performance charts. **Start worst-case wave animation** moves every
+Frontier instance independently up and down with a spatially phase-shifted
+cosine wave every simulation frame through one `RigidMotionGroup`. This avoids
+coherent rigid motion and deliberately forces the more expensive all-object
+motion case; stopping it restores the authored city layout. Simulation freeze
+also pauses this stress animation. Wireframe can also be toggled
+directly from the top-bar **Rendering** menu and composes with hierarchy
+tinting. **Scene stats** contains entity, cut, streaming, cache, simulation,
+and camera status.
 **Performance** reports timings in microseconds and puts Frontier selection,
 motion/database work, and resource publication first. bgfx timing and backend
-counters follow, with UI, camera, and diagnostic overhead last. It also graphs
-frame history and reports render-thread, GPU, wait, draw, primitive, and
-transient-buffer counters. **Scene hierarchy** is a live ImGui tree of each
-reusable Frontier topology with current/ideal selected-entry counts. **TLAS
+counters follow, with UI, camera, and diagnostic overhead last. Every timer has
+its own rolling raw-sample chart covering roughly 5-10 seconds, including
+Frontier, motion/database, bgfx submit/render/GPU/wait, UI, camera, accounting,
+unaccounted, and total-frame time. Each timer also reports the minimum, maximum,
+and average over its visible rolling window. Draw, primitive, and transient-
+buffer counters remain alongside the timing charts. **Scene hierarchy** is a live
+ImGui tree of each reusable Frontier topology with current/ideal selected-entry
+counts. **TLAS
 health** reports topology occupancy, depth, motion-area growth, rebuild state,
 and storage, and controls complete depth-cut TLAS AABB rendering plus loose-
 motion envelope comparison. **Query cache** reports reuse rate, record/slab

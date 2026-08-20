@@ -38,6 +38,8 @@ constexpr float kSidewalkInnerExtent = 6.35f;
 constexpr float kSidewalkPathHalfExtent = 7.25f;
 constexpr float kSidewalkCornerRadius = 1.20f;
 constexpr float kPi = 3.14159265358979323846f;
+constexpr float kWorstCaseWaveAmplitude = 7.0f;
+constexpr float kWorstCaseWaveFrequency = 1.8f;
 
 enum class Payload : UserPayload
 {
@@ -69,7 +71,36 @@ enum class Payload : UserPayload
 
 constexpr size_t kPayloadSlotCount =
     static_cast<size_t>(Payload::TowerCrown) + 1;
-constexpr size_t kPerformanceHistorySize = 120;
+constexpr size_t kPerformanceHistorySize = 300;
+constexpr float kPerformanceHistorySampleInterval = 1.0f / 60.0f;
+
+enum class PerformanceTimer : uint8_t
+{
+    Total,
+    Ui,
+    Simulation,
+    Camera,
+    Selection,
+    CutStats,
+    Render,
+    Streaming,
+    FrameSubmit,
+    RenderThread,
+    Gpu,
+    WaitRender,
+    WaitSubmit,
+    Other,
+    Count,
+};
+
+constexpr size_t kPerformanceTimerCount =
+    static_cast<size_t>(PerformanceTimer::Count);
+
+enum class HouseStyle : uint8_t
+{
+    HouseA,
+    HouseB,
+};
 
 enum class EntityKind : uint8_t
 {
@@ -82,11 +113,14 @@ enum class EntityKind : uint8_t
 
 struct Entity
 {
-    EntityKind kind = EntityKind::House;
+    float4 localPosition = float4::point(0.0f, 0.0f, 0.0f);
     float4 position = float4::point(0.0f, 0.0f, 0.0f);
     float scale = 1.0f;
+    float localYaw = 0.0f;
     float yaw = 0.0f;
     uint32_t color = 0xffffffff;
+    EntityKind kind = EntityKind::House;
+    HouseStyle houseStyle = HouseStyle::HouseA;
 };
 
 struct CarPath
@@ -407,10 +441,28 @@ public:
         performance.uiMs = milliseconds(stageStart, stageEnd);
 
         stageStart = stageEnd;
+        if (houseReplacementPending_)
+        {
+            replaceHouses(pendingHouseStyle_);
+            houseReplacementPending_ = false;
+        }
+        if (restoreSceneAfterStress_)
+        {
+            updateWholeSceneWave(simulationTime_, 0.0f);
+            restoreSceneAfterStress_ = false;
+        }
         if (!freezeSimulation_)
         {
             simulationTime_ += deltaTime;
-            updateActors(simulationTime_);
+            if (animateWholeScene_)
+            {
+                updateWholeSceneWave(simulationTime_,
+                                     kWorstCaseWaveAmplitude);
+            }
+            else
+            {
+                updateActors(simulationTime_);
+            }
         }
         database_.applyUpdates();
         stageEnd = bx::getHPCounter();
@@ -487,7 +539,7 @@ public:
         performance.frameSubmitMs = milliseconds(stageStart, stageEnd);
         performance.totalMs = milliseconds(now, stageEnd);
         captureBgfxPerformance(performance);
-        recordPerformance(performance);
+        recordPerformance(performance, deltaTime);
         return true;
     }
 
@@ -567,7 +619,7 @@ private:
     void drawDebugUi()
     {
         ImGui::SetNextWindowPos(ImVec2(12.0f, 36.0f), ImGuiCond_FirstUseEver);
-        ImGui::SetNextWindowSize(ImVec2(390.0f, 430.0f),
+        ImGui::SetNextWindowSize(ImVec2(390.0f, 590.0f),
                                  ImGuiCond_FirstUseEver);
         if (!ImGui::Begin("Frontier debug", &showFrontierDebug_))
         {
@@ -588,6 +640,39 @@ private:
                            "%.1f");
         ImGui::SliderFloat("Contribution cull (px)",
                            &contributionCullPixels_, 0.0f, 100.0f, "%.2f");
+
+        ImGui::Text("Workloads");
+        ImGui::Separator();
+        ImGui::Text("Active houses: %s | generation %u",
+                    activeHouseStyle_ == HouseStyle::HouseA
+                        ? "House A"
+                        : "House B",
+                    houseGeneration_);
+        if (ImGui::Button("Replace all with House A"))
+        {
+            pendingHouseStyle_ = HouseStyle::HouseA;
+            houseReplacementPending_ = true;
+        }
+        if (ImGui::Button("Replace all with House B"))
+        {
+            pendingHouseStyle_ = HouseStyle::HouseB;
+            houseReplacementPending_ = true;
+        }
+        if (houseReplacementPending_)
+            ImGui::TextDisabled("Replacement queued for this frame");
+
+        const char* stressLabel = animateWholeScene_
+                                      ? "Stop worst-case wave animation"
+                                      : "Start worst-case wave animation";
+        if (ImGui::Button(stressLabel))
+        {
+            animateWholeScene_ = !animateWholeScene_;
+            if (!animateWholeScene_)
+                restoreSceneAfterStress_ = true;
+        }
+        if (animateWholeScene_)
+            ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.20f, 1.0f),
+                               "Every instance has independent wave motion");
 
         ImGui::Text("Camera");
         ImGui::Separator();
@@ -653,7 +738,7 @@ private:
     {
         ImGui::SetNextWindowPos(ImVec2(414.0f, 36.0f),
                                 ImGuiCond_FirstUseEver);
-        ImGui::SetNextWindowSize(ImVec2(350.0f, 210.0f),
+        ImGui::SetNextWindowSize(ImVec2(350.0f, 250.0f),
                                  ImGuiCond_FirstUseEver);
         if (!ImGui::Begin("Scene stats", &showSceneStats_))
         {
@@ -665,6 +750,9 @@ private:
         ImGui::Separator();
         ImGui::Text("%u houses | %u towers | %u trees",
                     houseCount_, towerCount_, treeCount_);
+        ImGui::Text("House style %s | generation %u",
+                    activeHouseStyle_ == HouseStyle::HouseA ? "A" : "B",
+                    houseGeneration_);
         ImGui::Text("%u cars | %u pedestrians",
                     unsigned(carHandles_.size()),
                     unsigned(pedestrianHandles_.size()));
@@ -675,6 +763,8 @@ private:
                     lastQueryReused_, lastQueryWalked_);
         ImGui::Text("%.0f fps | simulation %.1f s", smoothedFps_,
                     simulationTime_);
+        ImGui::Text("Whole-scene stress: %s",
+                    animateWholeScene_ ? "ACTIVE" : "off");
         ImGui::TextColored(
             freezeSimulation_ ? ImVec4(1.0f, 0.55f, 0.2f, 1.0f)
                               : ImVec4(0.45f, 0.95f, 0.55f, 1.0f),
@@ -689,15 +779,90 @@ private:
         ImGui::End();
     }
 
-    void drawPerformanceBar(const char* label, float valueMs,
-                            float totalMs, const ImVec4& color)
+    static float measuredPerformanceMs(const PerformanceSample& sample)
     {
+        return sample.uiMs + sample.simulationMs + sample.cameraMs +
+               sample.selectionMs + sample.cutStatsMs + sample.renderMs +
+               sample.streamingMs + sample.frameSubmitMs;
+    }
+
+    static float performanceTimerMs(const PerformanceSample& sample,
+                                    PerformanceTimer timer)
+    {
+        switch (timer)
+        {
+        case PerformanceTimer::Total: return sample.totalMs;
+        case PerformanceTimer::Ui: return sample.uiMs;
+        case PerformanceTimer::Simulation: return sample.simulationMs;
+        case PerformanceTimer::Camera: return sample.cameraMs;
+        case PerformanceTimer::Selection: return sample.selectionMs;
+        case PerformanceTimer::CutStats: return sample.cutStatsMs;
+        case PerformanceTimer::Render: return sample.renderMs;
+        case PerformanceTimer::Streaming: return sample.streamingMs;
+        case PerformanceTimer::FrameSubmit: return sample.frameSubmitMs;
+        case PerformanceTimer::RenderThread: return sample.renderThreadMs;
+        case PerformanceTimer::Gpu: return sample.gpuMs;
+        case PerformanceTimer::WaitRender: return sample.waitRenderMs;
+        case PerformanceTimer::WaitSubmit: return sample.waitSubmitMs;
+        case PerformanceTimer::Other:
+            return std::max(0.0f,
+                            sample.totalMs - measuredPerformanceMs(sample));
+        case PerformanceTimer::Count: break;
+        }
+        return 0.0f;
+    }
+
+    void drawPerformanceTimer(const char* label, PerformanceTimer timer,
+                              const ImVec4& color)
+    {
+        const float valueMs = performanceTimerMs(performance_, timer);
         ImGui::Text("%-18s %8.1f us", label, valueMs * 1000.0f);
+        const auto& history =
+            performanceHistory_[static_cast<size_t>(timer)];
+        float historyMaximumUs = 1.0f;
+        if (performanceHistoryCount_ != 0)
+        {
+            float minimumUs = history[0];
+            float maximumUs = history[0];
+            double totalUs = 0.0;
+            for (size_t index = 0; index < performanceHistoryCount_; ++index)
+            {
+                minimumUs = std::min(minimumUs, history[index]);
+                maximumUs = std::max(maximumUs, history[index]);
+                totalUs += history[index];
+            }
+            historyMaximumUs = maximumUs;
+            const float averageUs =
+                float(totalUs / double(performanceHistoryCount_));
+            ImGui::TextDisabled("min %.1f | max %.1f | avg %.1f us",
+                                minimumUs, maximumUs, averageUs);
+        }
+        else
+        {
+            ImGui::TextDisabled("min -- | max -- | avg -- us");
+        }
         ImGui::PushStyleColor(ImGuiCol_PlotHistogram, color);
         ImGui::ProgressBar(
-            std::clamp(valueMs / std::max(totalMs, 0.001f), 0.0f, 1.0f),
+            std::clamp(valueMs /
+                           std::max(performance_.totalMs, 0.001f),
+                       0.0f, 1.0f),
             ImVec2(-1.0f, 5.0f), "");
         ImGui::PopStyleColor();
+
+        if (performanceHistoryCount_ == 0)
+            return;
+        const float scaleMax = historyMaximumUs * 1.10f;
+        const int offset = performanceHistoryCount_ ==
+                                   kPerformanceHistorySize
+                               ? int(performanceHistoryCursor_)
+                               : 0;
+        ImGui::PushID(label);
+        ImGui::PushStyleColor(ImGuiCol_PlotLines, color);
+        ImGui::PlotLines("##timer-history", history.data(),
+                         int(performanceHistoryCount_), offset, nullptr,
+                         0.0f, scaleMax, ImVec2(-1.0f, 30.0f));
+        ImGui::PopStyleColor();
+        ImGui::PopID();
     }
 
     void drawPerformanceUi()
@@ -711,40 +876,32 @@ private:
             ImGui::End();
             return;
         }
-        ImGui::Text("Smoothed frame breakdown");
-        const float measured =
-            performance_.uiMs + performance_.simulationMs +
-            performance_.cameraMs + performance_.selectionMs +
-            performance_.cutStatsMs + performance_.renderMs +
-            performance_.streamingMs + performance_.frameSubmitMs;
-        const float other = std::max(0.0f, performance_.totalMs - measured);
+        ImGui::Text("Smoothed values | rolling 5-10 second charts");
 
         ImGui::TextColored(ImVec4(1.0f, 0.78f, 0.20f, 1.0f), "Frontier");
         ImGui::Separator();
-        drawPerformanceBar("Frontier select", performance_.selectionMs,
-                           performance_.totalMs,
-                           ImVec4(1.0f, 0.78f, 0.20f, 1.0f));
-        drawPerformanceBar("Motion + DB apply", performance_.simulationMs,
-                           performance_.totalMs,
-                           ImVec4(0.35f, 0.90f, 0.50f, 1.0f));
-        drawPerformanceBar("Resource publish", performance_.streamingMs,
-                           performance_.totalMs,
-                           ImVec4(0.90f, 0.60f, 0.25f, 1.0f));
+        drawPerformanceTimer("Frontier select", PerformanceTimer::Selection,
+                             ImVec4(1.0f, 0.78f, 0.20f, 1.0f));
+        drawPerformanceTimer("Motion + DB apply",
+                             PerformanceTimer::Simulation,
+                             ImVec4(0.35f, 0.90f, 0.50f, 1.0f));
+        drawPerformanceTimer("Resource publish", PerformanceTimer::Streaming,
+                             ImVec4(0.90f, 0.60f, 0.25f, 1.0f));
 
         ImGui::TextColored(ImVec4(0.90f, 0.45f, 0.85f, 1.0f), "bgfx");
         ImGui::Separator();
-        drawPerformanceBar("Debug draw", performance_.renderMs,
-                           performance_.totalMs,
-                           ImVec4(0.90f, 0.45f, 0.85f, 1.0f));
-        drawPerformanceBar("bgfx::frame", performance_.frameSubmitMs,
-                           performance_.totalMs,
-                           ImVec4(0.95f, 0.35f, 0.35f, 1.0f));
-        ImGui::Text("Render thread %.1f us | GPU %.1f us",
-                    performance_.renderThreadMs * 1000.0f,
-                    performance_.gpuMs * 1000.0f);
-        ImGui::Text("Wait render %.1f us | submit %.1f us",
-                    performance_.waitRenderMs * 1000.0f,
-                    performance_.waitSubmitMs * 1000.0f);
+        drawPerformanceTimer("Debug draw", PerformanceTimer::Render,
+                             ImVec4(0.90f, 0.45f, 0.85f, 1.0f));
+        drawPerformanceTimer("bgfx::frame", PerformanceTimer::FrameSubmit,
+                             ImVec4(0.95f, 0.35f, 0.35f, 1.0f));
+        drawPerformanceTimer("Render thread", PerformanceTimer::RenderThread,
+                             ImVec4(0.82f, 0.42f, 0.88f, 1.0f));
+        drawPerformanceTimer("GPU", PerformanceTimer::Gpu,
+                             ImVec4(0.72f, 0.36f, 0.82f, 1.0f));
+        drawPerformanceTimer("Wait render", PerformanceTimer::WaitRender,
+                             ImVec4(0.95f, 0.52f, 0.58f, 1.0f));
+        drawPerformanceTimer("Wait submit", PerformanceTimer::WaitSubmit,
+                             ImVec4(0.95f, 0.62f, 0.48f, 1.0f));
         ImGui::Text("%u draws | %u triangles", performance_.drawCalls,
                     performance_.triangles);
         ImGui::Text("Transient VB %.1f KiB | IB %.1f KiB",
@@ -755,18 +912,14 @@ private:
 
         ImGui::TextColored(ImVec4(0.35f, 0.70f, 1.0f, 1.0f), "Other");
         ImGui::Separator();
-        drawPerformanceBar("ImGui", performance_.uiMs,
-                           performance_.totalMs,
-                           ImVec4(0.35f, 0.70f, 1.0f, 1.0f));
-        drawPerformanceBar("Camera + views", performance_.cameraMs,
-                           performance_.totalMs,
-                           ImVec4(0.55f, 0.80f, 0.95f, 1.0f));
-        drawPerformanceBar("Cut accounting", performance_.cutStatsMs,
-                           performance_.totalMs,
-                           ImVec4(0.80f, 0.68f, 0.28f, 1.0f));
-        if (other > 0.001f)
-            drawPerformanceBar("Other", other, performance_.totalMs,
-                               ImVec4(0.55f, 0.55f, 0.60f, 1.0f));
+        drawPerformanceTimer("ImGui", PerformanceTimer::Ui,
+                             ImVec4(0.35f, 0.70f, 1.0f, 1.0f));
+        drawPerformanceTimer("Camera + views", PerformanceTimer::Camera,
+                             ImVec4(0.55f, 0.80f, 0.95f, 1.0f));
+        drawPerformanceTimer("Cut accounting", PerformanceTimer::CutStats,
+                             ImVec4(0.80f, 0.68f, 0.28f, 1.0f));
+        drawPerformanceTimer("Unaccounted", PerformanceTimer::Other,
+                             ImVec4(0.55f, 0.55f, 0.60f, 1.0f));
 
         ImGui::Text("Frame summary");
         ImGui::Separator();
@@ -776,20 +929,8 @@ private:
                         ? 1000.0f / performance_.totalMs
                         : 0.0f,
                     performance_.gpuMs * 1000.0f);
-        if (performanceHistoryCount_ != 0)
-        {
-            const int offset = performanceHistoryCount_ ==
-                                       kPerformanceHistorySize
-                                   ? int(performanceHistoryCursor_)
-                                   : 0;
-            const float scaleMax =
-                std::max(16667.0f, performance_.totalMs * 1500.0f);
-            ImGui::PlotHistogram(
-                "##cpu-frame-history", performanceHistory_.data(),
-                int(performanceHistoryCount_), offset,
-                "CPU frame history (us)", 0.0f, scaleMax,
-                ImVec2(-1.0f, 56.0f));
-        }
+        drawPerformanceTimer("Total CPU frame", PerformanceTimer::Total,
+                             ImVec4(0.80f, 0.82f, 0.88f, 1.0f));
         ImGui::End();
     }
 
@@ -1066,10 +1207,14 @@ private:
                     "static-scene",
                     ImGuiTreeNodeFlags_DefaultOpen |
                         ImGuiTreeNodeFlags_SpanAvailWidth,
-                    "Static environment  (%u)", staticCount))
+                    "%s environment  (%u)",
+                    animateWholeScene_ ? "Animated" : "Static",
+                    staticCount))
             {
-                if (ImGui::TreeNode("houses", "Houses  (%u instances)",
-                                    houseCount_))
+                if (ImGui::TreeNode(
+                        "houses", "Houses %s, generation %u  (%u instances)",
+                        activeHouseStyle_ == HouseStyle::HouseA ? "A" : "B",
+                        houseGeneration_, houseCount_))
                 {
                     if (beginPayloadTreeNode("house-top", "Top / fallback",
                                              Payload::HouseTop, true))
@@ -1342,7 +1487,7 @@ private:
         sample.transientIndexBytes = stats->transientIbUsed;
     }
 
-    void recordPerformance(const PerformanceSample& sample)
+    void recordPerformance(const PerformanceSample& sample, float deltaTime)
     {
         const bool firstSample = performanceSampleCount_ == 0;
         const auto smooth = [firstSample](float& destination, float value)
@@ -1369,13 +1514,27 @@ private:
         performance_.transientVertexBytes = sample.transientVertexBytes;
         performance_.transientIndexBytes = sample.transientIndexBytes;
 
-        performanceHistory_[performanceHistoryCursor_] =
-            sample.totalMs * 1000.0f;
-        performanceHistoryCursor_ =
-            (performanceHistoryCursor_ + 1) % kPerformanceHistorySize;
-        performanceHistoryCount_ =
-            std::min(performanceHistoryCount_ + 1,
-                     kPerformanceHistorySize);
+        performanceHistoryElapsed_ += deltaTime;
+        if (performanceHistoryCount_ == 0 ||
+            performanceHistoryElapsed_ >=
+                kPerformanceHistorySampleInterval)
+        {
+            performanceHistoryElapsed_ = std::fmod(
+                performanceHistoryElapsed_,
+                kPerformanceHistorySampleInterval);
+            for (size_t timer = 0; timer < kPerformanceTimerCount; ++timer)
+            {
+                performanceHistory_[timer][performanceHistoryCursor_] =
+                    performanceTimerMs(
+                        sample, static_cast<PerformanceTimer>(timer)) *
+                    1000.0f;
+            }
+            performanceHistoryCursor_ =
+                (performanceHistoryCursor_ + 1) % kPerformanceHistorySize;
+            performanceHistoryCount_ =
+                std::min(performanceHistoryCount_ + 1,
+                         kPerformanceHistorySize);
+        }
         ++performanceSampleCount_;
     }
 
@@ -1397,21 +1556,41 @@ private:
             uint32_t(std::size(indices)), indices);
     }
 
-    SubtreeHandle createHouseDefinition()
+    static AABB houseBounds(HouseStyle style)
+    {
+        return style == HouseStyle::HouseA
+                   ? bounds(-3.4f, 0.0f, -3.4f, 3.4f, 8.8f, 3.4f)
+                   : bounds(-3.7f, 0.0f, -3.7f, 3.7f, 7.6f, 3.7f);
+    }
+
+    SubtreeHandle createHouseDefinition(HouseStyle style)
     {
         // Geometric errors are world-space deviations. Sub-meter values make
         // the default 3 px threshold span several LODs across this city rather
         // than forcing every visible object to its zero-error leaves.
         SubtreeBuilder builder;
-        const AABB all = bounds(-3.3f, 0.0f, -3.3f, 3.3f, 8.6f, 3.3f);
+        const bool houseA = style == HouseStyle::HouseA;
+        const AABB all = houseA
+                             ? bounds(-3.3f, 0.0f, -3.3f,
+                                      3.3f, 8.6f, 3.3f)
+                             : bounds(-3.6f, 0.0f, -3.0f,
+                                      3.6f, 7.4f, 3.0f);
         const auto coarse = builder.createNode(
             node(Payload::HouseCoarse, 0.28f, all));
-        builder.createNode(coarse, node(Payload::HouseBody, 0.0f,
-                                        bounds(-3.0f, 0.0f, -3.0f,
-                                               3.0f, 5.6f, 3.0f)));
-        builder.createNode(coarse, node(Payload::HouseRoof, 0.0f,
-                                        bounds(-3.3f, 5.3f, -3.3f,
-                                               3.3f, 8.6f, 3.3f)));
+        builder.createNode(
+            coarse,
+            node(Payload::HouseBody, 0.0f,
+                 houseA ? bounds(-3.0f, 0.0f, -3.0f,
+                                 3.0f, 5.6f, 3.0f)
+                        : bounds(-3.4f, 0.0f, -2.8f,
+                                 3.4f, 6.5f, 2.8f)));
+        builder.createNode(
+            coarse,
+            node(Payload::HouseRoof, 0.0f,
+                 houseA ? bounds(-3.3f, 5.3f, -3.3f,
+                                 3.3f, 8.6f, 3.3f)
+                        : bounds(-3.6f, 6.3f, -3.0f,
+                                 3.6f, 7.4f, 3.0f)));
         return database_.registerSubtree(builder.build());
     }
 
@@ -1496,23 +1675,119 @@ private:
                                     const Entity& entity,
                                     SubtreeHandle definition)
     {
+        Entity placed = entity;
+        placed.localPosition = entity.position;
+        placed.localYaw = entity.yaw;
         const NodeDesc root = node(
             fallback, error, localBounds,
             NodeDesc::FlagMountable | NodeDesc::FlagYawInvariantBounds);
         const InstanceDesc placement{
-            .pos = entity.position,
-            .scale = entity.scale,
-            .yaw = yawRotation(entity.yaw),
+            .pos = placed.position,
+            .scale = placed.scale,
+            .yaw = yawRotation(placed.yaw),
         };
         const InstanceHandle handle = database_.instantiate(root, placement);
         database_.mountSubtree(handle.rootNode(), definition);
-        rememberEntity(handle, entity);
+        rememberEntity(handle, placed);
         return handle;
+    }
+
+    Entity makeHouse(HouseStyle style, float4 position,
+                     uint32_t& random) const
+    {
+        Entity house;
+        house.kind = EntityKind::House;
+        house.houseStyle = style;
+        house.position = position;
+        if (style == HouseStyle::HouseA)
+        {
+            house.scale = 0.64f + random01(random) * 0.12f;
+            house.yaw = random01(random) > 0.5f ? 0.0f : kPi * 0.5f;
+            house.color = abgr(
+                uint8_t(145 + random01(random) * 80),
+                uint8_t(120 + random01(random) * 85),
+                uint8_t(95 + random01(random) * 95));
+        }
+        else
+        {
+            house.scale = 0.62f + random01(random) * 0.16f;
+            house.yaw = float(uint32_t(random01(random) * 4.0f)) *
+                        kPi * 0.5f;
+            house.color = abgr(
+                uint8_t(105 + random01(random) * 95),
+                uint8_t(135 + random01(random) * 85),
+                uint8_t(145 + random01(random) * 90));
+        }
+        return house;
+    }
+
+    void createHouseAt(HouseStyle style, float4 position, uint32_t& random)
+    {
+        const Entity house = makeHouse(style, position, random);
+        const size_t definition = static_cast<size_t>(style);
+        houseHandles_.push_back(instantiateActor(
+            Payload::HouseTop, 0.75f, houseBounds(style), house,
+            houseDefinitions_[definition]));
+    }
+
+    void resetWholeSceneMotionGroup()
+    {
+        wholeSceneHandles_.clear();
+        wholeSceneHandles_.reserve(
+            houseHandles_.size() + towerHandles_.size() +
+            treeHandles_.size() + carHandles_.size() +
+            pedestrianHandles_.size());
+        const auto append = [this](const auto& handles)
+        {
+            wholeSceneHandles_.insert(wholeSceneHandles_.end(),
+                                      handles.begin(), handles.end());
+        };
+        append(houseHandles_);
+        append(towerHandles_);
+        append(treeHandles_);
+        append(carHandles_);
+        append(pedestrianHandles_);
+        wholeScenePositions_.resize(wholeSceneHandles_.size());
+        wholeSceneYaws_.resize(wholeSceneHandles_.size());
+        wholeSceneMotion_.reset(wholeSceneHandles_);
+    }
+
+    void replaceHouses(HouseStyle style)
+    {
+        std::vector<float4> lots;
+        lots.reserve(houseHandles_.size());
+        for (InstanceHandle handle : houseHandles_)
+        {
+            if (handle.id < entities_.size())
+                lots.push_back(entities_[handle.id].localPosition);
+            database_.removeInstance(handle);
+        }
+
+        houseHandles_.clear();
+        houseHandles_.reserve(lots.size());
+        activeHouseStyle_ = style;
+        ++houseGeneration_;
+        uint32_t random = 0x5eed1234u ^
+                          (houseGeneration_ * 0x9e3779b9u) ^
+                          (style == HouseStyle::HouseA
+                               ? 0x13579bdfu
+                               : 0x2468ace0u);
+        for (float4 position : lots)
+            createHouseAt(style, position, random);
+        houseCount_ = uint32_t(houseHandles_.size());
+        resetWholeSceneMotionGroup();
+        if (animateWholeScene_)
+            updateWholeSceneWave(simulationTime_,
+                                 kWorstCaseWaveAmplitude);
+        query_.reset();
     }
 
     void createScene()
     {
-        const SubtreeHandle houseDefinition = createHouseDefinition();
+        houseDefinitions_[static_cast<size_t>(HouseStyle::HouseA)] =
+            createHouseDefinition(HouseStyle::HouseA);
+        houseDefinitions_[static_cast<size_t>(HouseStyle::HouseB)] =
+            createHouseDefinition(HouseStyle::HouseB);
         const SubtreeHandle carDefinition = createCarDefinition();
         const SubtreeHandle pedestrianDefinition =
             createPedestrianDefinition();
@@ -1520,8 +1795,6 @@ private:
         const SubtreeHandle towerDefinition = createTowerDefinition();
         uint32_t random = 0x5eed1234u;
 
-        const AABB houseBounds =
-            bounds(-3.4f, 0.0f, -3.4f, 3.4f, 8.8f, 3.4f);
         const AABB treeBounds =
             bounds(-1.9f, 0.0f, -1.9f, 1.9f, 6.7f, 1.9f);
         const AABB towerBounds =
@@ -1559,8 +1832,9 @@ private:
                         uint8_t(105 + random01(random) * 55),
                         uint8_t(125 + random01(random) * 60),
                         uint8_t(145 + random01(random) * 65));
-                    instantiateActor(Payload::TowerTop, 0.90f, towerBounds,
-                                     tower, towerDefinition);
+                    towerHandles_.push_back(instantiateActor(
+                        Payload::TowerTop, 0.90f, towerBounds,
+                        tower, towerDefinition));
                     ++towerCount_;
                 }
                 else
@@ -1569,24 +1843,11 @@ private:
                     {
                         for (float offsetX : offsets)
                         {
-                            const uint8_t red =
-                                uint8_t(145 + random01(random) * 80);
-                            const uint8_t green =
-                                uint8_t(120 + random01(random) * 85);
-                            const uint8_t blue =
-                                uint8_t(95 + random01(random) * 95);
-                            Entity house;
-                            house.kind = EntityKind::House;
-                            house.position = float4::point(
-                                centerX + offsetX, 0.0f, centerZ + offsetZ);
-                            house.scale = 0.64f + random01(random) * 0.12f;
-                            house.yaw = random01(random) > 0.5f
-                                            ? 0.0f
-                                            : kPi * 0.5f;
-                            house.color = abgr(red, green, blue);
-                            instantiateActor(Payload::HouseTop, 0.75f,
-                                             houseBounds, house,
-                                             houseDefinition);
+                            createHouseAt(
+                                HouseStyle::HouseA,
+                                float4::point(centerX + offsetX, 0.0f,
+                                              centerZ + offsetZ),
+                                random);
                             ++houseCount_;
                         }
                     }
@@ -1608,8 +1869,9 @@ private:
                         uint8_t(45 + random01(random) * 35),
                         uint8_t(115 + random01(random) * 80),
                         uint8_t(42 + random01(random) * 40));
-                    instantiateActor(Payload::TreeTop, 0.65f, treeBounds,
-                                     tree, treeDefinition);
+                    treeHandles_.push_back(instantiateActor(
+                        Payload::TreeTop, 0.65f, treeBounds,
+                        tree, treeDefinition));
                     ++treeCount_;
                 }
             }
@@ -1710,11 +1972,13 @@ private:
         }
         pedestrianMotion_.reset(pedestrianHandles_);
 
+        resetWholeSceneMotionGroup();
+
         database_.applyUpdates();
         database_.optimize();
     }
 
-    void updateActors(float time)
+    void updateMovingActorSources(float time)
     {
         for (size_t index = 0; index < carPaths_.size(); ++index)
         {
@@ -1722,27 +1986,67 @@ private:
             float4 position;
             float yaw;
             sampleRoundedLoop(path, time, position, yaw);
-            carPositions_[index] = position;
-            carYaws_[index] = yawRotation(yaw);
             Entity& entity = entities_[carHandles_[index].id];
-            entity.position = position;
-            entity.yaw = yaw;
+            entity.localPosition = position;
+            entity.localYaw = yaw;
         }
-        database_.moveRigidInstances(carMotion_, carPositions_, carYaws_);
 
         for (size_t index = 0; index < pedestrianPaths_.size(); ++index)
         {
             float4 position;
             float yaw;
             sampleSidewalkLoop(pedestrianPaths_[index], time, position, yaw);
-            pedestrianPositions_[index] = position;
-            pedestrianYaws_[index] = yawRotation(yaw);
             Entity& entity = entities_[pedestrianHandles_[index].id];
-            entity.position = position;
-            entity.yaw = yaw;
+            entity.localPosition = position;
+            entity.localYaw = yaw;
+        }
+    }
+
+    void updateActors(float time)
+    {
+        updateMovingActorSources(time);
+        for (size_t index = 0; index < carHandles_.size(); ++index)
+        {
+            Entity& entity = entities_[carHandles_[index].id];
+            entity.position = entity.localPosition;
+            entity.yaw = entity.localYaw;
+            carPositions_[index] = entity.position;
+            carYaws_[index] = yawRotation(entity.yaw);
+        }
+        database_.moveRigidInstances(carMotion_, carPositions_, carYaws_);
+
+        for (size_t index = 0; index < pedestrianHandles_.size(); ++index)
+        {
+            Entity& entity = entities_[pedestrianHandles_[index].id];
+            entity.position = entity.localPosition;
+            entity.yaw = entity.localYaw;
+            pedestrianPositions_[index] = entity.position;
+            pedestrianYaws_[index] = yawRotation(entity.yaw);
         }
         database_.moveRigidInstances(pedestrianMotion_, pedestrianPositions_,
                                      pedestrianYaws_);
+    }
+
+    void updateWholeSceneWave(float time, float amplitude)
+    {
+        updateMovingActorSources(time);
+        for (size_t index = 0; index < wholeSceneHandles_.size(); ++index)
+        {
+            const InstanceHandle handle = wholeSceneHandles_[index];
+            Entity& entity = entities_[handle.id];
+            const float phase = entity.localPosition.x * 0.045f +
+                                entity.localPosition.z * 0.037f +
+                                float(handle.id % 251u) * 0.017f;
+            entity.position = entity.localPosition;
+            entity.position.y += amplitude * std::cos(
+                time * kWorstCaseWaveFrequency + phase);
+            entity.yaw = entity.localYaw;
+            wholeScenePositions_[index] = entity.position;
+            wholeSceneYaws_[index] = yawRotation(entity.yaw);
+        }
+        database_.moveRigidInstances(wholeSceneMotion_,
+                                     wholeScenePositions_,
+                                     wholeSceneYaws_);
     }
 
     void updateAutomaticCamera(float time, float4& position,
@@ -1765,9 +2069,9 @@ private:
 
     void drawWorld(DebugDrawEncoder& encoder)
     {
-        float identity[16];
-        bx::mtxIdentity(identity);
-        encoder.setTransform(identity);
+        float worldTransform[16];
+        bx::mtxIdentity(worldTransform);
+        encoder.setTransform(worldTransform);
         encoder.setWireframe(wireframeDebug_);
         encoder.setColor(abgr(86, 130, 78));
         encoder.draw(box(-kCityHalfExtent - 18.0f, -0.35f,
@@ -1924,20 +2228,57 @@ private:
         case Payload::HouseTop:
         case Payload::HouseCoarse:
             paint(entity.color);
-            encoder.draw(box(-3.2f, 0.0f, -3.2f, 3.2f, 7.4f, 3.2f));
+            if (entity.houseStyle == HouseStyle::HouseA)
+                encoder.draw(box(-3.2f, 0.0f, -3.2f,
+                                 3.2f, 7.4f, 3.2f));
+            else
+                encoder.draw(box(-3.5f, 0.0f, -2.9f,
+                                 3.5f, 7.2f, 2.9f));
             break;
         case Payload::HouseBody:
             paint(entity.color);
-            encoder.draw(box(-3.0f, 0.0f, -3.0f, 3.0f, 5.5f, 3.0f));
-            paint(abgr(74, 50, 35));
-            encoder.draw(box(-0.7f, 0.0f, -3.08f, 0.7f, 2.4f, -2.92f));
-            paint(abgr(95, 183, 220));
-            encoder.draw(box(-2.3f, 2.5f, -3.09f, -1.1f, 3.8f, -2.91f));
-            encoder.draw(box(1.1f, 2.5f, -3.09f, 2.3f, 3.8f, -2.91f));
+            if (entity.houseStyle == HouseStyle::HouseA)
+            {
+                encoder.draw(box(-3.0f, 0.0f, -3.0f,
+                                 3.0f, 5.5f, 3.0f));
+                paint(abgr(74, 50, 35));
+                encoder.draw(box(-0.7f, 0.0f, -3.08f,
+                                 0.7f, 2.4f, -2.92f));
+                paint(abgr(95, 183, 220));
+                encoder.draw(box(-2.3f, 2.5f, -3.09f,
+                                 -1.1f, 3.8f, -2.91f));
+                encoder.draw(box(1.1f, 2.5f, -3.09f,
+                                 2.3f, 3.8f, -2.91f));
+            }
+            else
+            {
+                encoder.draw(box(-3.4f, 0.0f, -2.8f,
+                                 3.4f, 6.5f, 2.8f));
+                paint(abgr(50, 58, 66));
+                encoder.draw(box(-0.75f, 0.0f, -2.89f,
+                                 0.75f, 2.55f, -2.71f));
+                paint(abgr(105, 205, 225));
+                encoder.draw(box(-2.75f, 2.0f, -2.90f,
+                                 -1.0f, 5.35f, -2.70f));
+                encoder.draw(box(1.0f, 2.0f, -2.90f,
+                                 2.75f, 5.35f, -2.70f));
+            }
             break;
         case Payload::HouseRoof:
-            paint(abgr(132, 57, 48));
-            encoder.draw(roofGeometry_);
+            if (entity.houseStyle == HouseStyle::HouseA)
+            {
+                paint(abgr(132, 57, 48));
+                encoder.draw(roofGeometry_);
+            }
+            else
+            {
+                paint(abgr(72, 76, 82));
+                encoder.draw(box(-3.6f, 6.35f, -3.0f,
+                                 3.6f, 6.75f, 3.0f));
+                paint(abgr(118, 124, 130));
+                encoder.draw(box(-1.15f, 6.70f, -1.0f,
+                                 1.15f, 7.35f, 1.0f));
+            }
             break;
         case Payload::CarTop:
         case Payload::CarCoarse:
@@ -2228,6 +2569,11 @@ private:
     SpatialQuery query_;
     std::vector<Entity> entities_;
 
+    std::array<SubtreeHandle, 2> houseDefinitions_{};
+    std::vector<InstanceHandle> houseHandles_;
+    std::vector<InstanceHandle> towerHandles_;
+    std::vector<InstanceHandle> treeHandles_;
+
     std::vector<InstanceHandle> carHandles_;
     std::vector<CarPath> carPaths_;
     std::vector<float4> carPositions_;
@@ -2239,6 +2585,11 @@ private:
     std::vector<float4> pedestrianPositions_;
     std::vector<YawRotation> pedestrianYaws_;
     SpatialDatabase::RigidMotionGroup pedestrianMotion_;
+
+    std::vector<InstanceHandle> wholeSceneHandles_;
+    std::vector<float4> wholeScenePositions_;
+    std::vector<YawRotation> wholeSceneYaws_;
+    SpatialDatabase::RigidMotionGroup wholeSceneMotion_;
 
     GeometryHandle roofGeometry_ = {UINT16_MAX};
     entry::MouseState mouse_;
@@ -2253,6 +2604,9 @@ private:
     float lodThreshold_ = 3.0f;
     float contributionCullPixels_ = 0.75f;
     bool freezeSimulation_ = false;
+    bool animateWholeScene_ = false;
+    bool restoreSceneAfterStress_ = false;
+    bool houseReplacementPending_ = false;
     bool hierarchyTint_ = false;
     bool wireframeDebug_ = false;
     bool freeCamera_ = false;
@@ -2287,6 +2641,9 @@ private:
     size_t queryCacheHistoryCount_ = 0;
 #endif
     FrozenCullState frozenCull_;
+    HouseStyle activeHouseStyle_ = HouseStyle::HouseA;
+    HouseStyle pendingHouseStyle_ = HouseStyle::HouseA;
+    uint32_t houseGeneration_ = 0;
     uint32_t houseCount_ = 0;
     uint32_t towerCount_ = 0;
     uint32_t treeCount_ = 0;
@@ -2298,9 +2655,11 @@ private:
     std::array<uint32_t, kPayloadSlotCount> currentPayloadCounts_{};
     std::array<uint32_t, kPayloadSlotCount> idealPayloadCounts_{};
     PerformanceSample performance_;
-    std::array<float, kPerformanceHistorySize> performanceHistory_{};
+    std::array<std::array<float, kPerformanceHistorySize>,
+               kPerformanceTimerCount> performanceHistory_{};
     size_t performanceHistoryCursor_ = 0;
     size_t performanceHistoryCount_ = 0;
+    float performanceHistoryElapsed_ = 0.0f;
     uint64_t performanceSampleCount_ = 0;
 };
 
