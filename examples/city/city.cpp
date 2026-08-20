@@ -662,8 +662,8 @@ private:
             ImGui::TextDisabled("Replacement queued for this frame");
 
         const char* stressLabel = animateWholeScene_
-                                      ? "Stop worst-case wave animation"
-                                      : "Start worst-case wave animation";
+                                      ? "Stop stress test"
+                                      : "Start stress test";
         if (ImGui::Button(stressLabel))
         {
             animateWholeScene_ = !animateWholeScene_;

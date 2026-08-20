@@ -35,7 +35,7 @@ thresholds, camera modes, and workload generators. **Replace all with House
 A/B** removes all 2,088 current house instances and creates a newly randomized
 generation of the selected architectural style. The operation is deferred into
 the measured motion/database stage so its structural-update spike is visible
-in the performance charts. **Start worst-case wave animation** moves every
+in the performance charts. **Start stress test** moves every
 Frontier instance independently up and down with a spatially phase-shifted
 cosine wave every simulation frame through one `RigidMotionGroup`. This avoids
 coherent rigid motion and deliberately forces the more expensive all-object
