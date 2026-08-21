@@ -34,32 +34,43 @@ leaves), optional scene-wide wireframe rendering, LOD and contribution
 thresholds, camera modes, and workload generators. **Replace all with House
 A/B** removes all 2,088 current house instances and creates a newly randomized
 generation of the selected architectural style. The operation is deferred into
-the measured motion/database stage so its structural-update spike is visible
-in the performance charts. **Start stress test** moves every
+the measured motion and `applyUpdates` stages so its structural-update spike is
+visible in the performance charts. **Start stress test** moves every
 Frontier instance independently up and down with a spatially phase-shifted
 cosine wave every simulation frame through one `RigidMotionGroup`. This avoids
 coherent rigid motion and deliberately forces the more expensive all-object
 motion case; stopping it restores the authored city layout. Simulation freeze
-also pauses this stress animation. Wireframe can also be toggled
-directly from the top-bar **Rendering** menu and composes with hierarchy
-tinting. **Scene stats** contains entity, cut, streaming, cache, simulation,
-and camera status.
+also pauses this stress animation. The separate **TLAS maintenance** window
+configures a finite or unlimited node-repair budget for each `applyUpdates`
+call and three explicit optimization strategies: **Manual only**,
+unconditional **Periodic**, and **When recommended**. The two scheduled
+strategies use a configurable 0.25-to-60-second interval;
+recommendation-gated mode checks the latest `UpdateReport` at that cadence and
+skips `optimize()` unless Frontier advises it. **Optimize now** remains
+available under every strategy. The UI counts recommendation checks and
+skipped rebuilds so the policies can be compared. The sample defaults to
+**When recommended** with a two-second check interval.
+Wireframe can also be toggled directly from the top-bar
+**Rendering** menu and composes with hierarchy tinting. **Scene stats** contains
+entity, cut, streaming, cache, simulation, and camera status.
 **Performance** reports timings in microseconds and puts Frontier selection,
 motion/database work, and resource publication first. bgfx timing and backend
 counters follow, with UI, camera, and diagnostic overhead last. Every timer has
 its own rolling raw-sample chart covering roughly 5-10 seconds, including
-Frontier, motion/database, bgfx submit/render/GPU/wait, UI, camera, accounting,
-unaccounted, and total-frame time. Each timer also reports the minimum, maximum,
-and average over its visible rolling window. Draw, primitive, and transient-
-buffer counters remain alongside the timing charts. **Scene hierarchy** is a live
+Frontier selection, motion submission, `applyUpdates`, `optimize`, resource
+publication, bgfx submit/render/GPU/wait, UI, camera, accounting, unaccounted,
+and total-frame time. Each timer also reports the minimum, maximum, and average
+over its visible rolling window. Draw, primitive, and transient-buffer counters
+remain alongside the timing charts. **Scene hierarchy** is a live
 ImGui tree of each reusable Frontier topology with current/ideal selected-entry
 counts. **TLAS health** reports topology occupancy, depth, motion-area growth,
-the incremental repair queue, optimization advice, and storage. It controls the
-per-frame repair-node budget, complete depth-cut TLAS AABB rendering, and loose-
-motion envelope comparison. **Query cache** reports reuse rate, record/slab
-storage, garbage, cache state, travel, and hit-rate history. The TLAS and
+the incremental repair queue, active maintenance/optimization policy,
+optimization advice, and storage. It controls complete depth-cut TLAS AABB
+rendering and loose-motion envelope comparison. **Query cache** reports reuse
+rate, record/slab storage, garbage, cache state, travel, and hit-rate history. The TLAS and
 loose-bound visualizations are also independently available from the
-**Rendering** menu. All four additions are closed or disabled by default.
+**Rendering** menu. All windows except **Frontier debug** are closed by
+default; rendering overlays are disabled.
 
 Free camera uses **WASD** to move, **Q/E** to descend/ascend, and right-mouse
 drag to look. **Freeze camera / cull state** captures the active culling camera,

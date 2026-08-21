@@ -79,6 +79,8 @@ enum class PerformanceTimer : uint8_t
     Total,
     Ui,
     Simulation,
+    ApplyUpdates,
+    Optimize,
     Camera,
     Selection,
     CutStats,
@@ -100,6 +102,13 @@ enum class HouseStyle : uint8_t
 {
     HouseA,
     HouseB,
+};
+
+enum class OptimizeStrategy : uint8_t
+{
+    Manual,
+    Periodic,
+    WhenRecommended,
 };
 
 enum class EntityKind : uint8_t
@@ -165,6 +174,8 @@ struct PerformanceSample
     float totalMs = 0.0f;
     float uiMs = 0.0f;
     float simulationMs = 0.0f;
+    float applyUpdatesMs = 0.0f;
+    float optimizeMs = 0.0f;
     float cameraMs = 0.0f;
     float selectionMs = 0.0f;
     float cutStatsMs = 0.0f;
@@ -423,6 +434,8 @@ public:
         drawGlobalMenuBar();
         if (showFrontierDebug_)
             drawDebugUi();
+        if (showTlasMaintenance_)
+            drawTlasMaintenanceUi();
         if (showSceneStats_)
             drawSceneStatsUi();
         if (showPerformance_)
@@ -464,10 +477,67 @@ public:
                 updateActors(simulationTime_);
             }
         }
-        lastUpdateReport_ = database_.applyUpdates(
-            uint32_t(std::max(tlasMaintenanceBudget_, 0)));
         stageEnd = bx::getHPCounter();
         performance.simulationMs = milliseconds(stageStart, stageEnd);
+
+        stageStart = stageEnd;
+        const uint32_t maintenanceBudget = unlimitedTlasMaintenance_
+                                               ? kUnlimitedTlasMaintenance
+                                               : uint32_t(std::max(
+                                                     tlasMaintenanceBudget_,
+                                                     0));
+        lastUpdateReport_ = database_.applyUpdates(maintenanceBudget);
+        stageEnd = bx::getHPCounter();
+        performance.applyUpdatesMs = milliseconds(stageStart, stageEnd);
+
+        const bool optimizeScheduleEnabled =
+            optimizeStrategy_ != OptimizeStrategy::Manual;
+        if (optimizeScheduleEnabled)
+            timeSinceOptimize_ += deltaTime;
+        else
+            timeSinceOptimize_ = 0.0f;
+        const bool scheduledCheckDue =
+            optimizeScheduleEnabled &&
+            timeSinceOptimize_ >= optimizeIntervalSeconds_;
+        bool scheduledOptimize = false;
+        if (scheduledCheckDue)
+        {
+            timeSinceOptimize_ = 0.0f;
+            if (optimizeStrategy_ == OptimizeStrategy::Periodic)
+            {
+                scheduledOptimize = true;
+            }
+            else
+            {
+                ++optimizeRecommendationChecks_;
+                scheduledOptimize =
+                    lastUpdateReport_.optimizeRecommended;
+                if (!scheduledOptimize)
+                    ++optimizeRecommendationSkips_;
+            }
+        }
+
+        const bool manualOptimize = optimizeRequested_;
+        if (manualOptimize || scheduledOptimize)
+        {
+            stageStart = stageEnd;
+            database_.optimize();
+            stageEnd = bx::getHPCounter();
+            performance.optimizeMs = milliseconds(stageStart, stageEnd);
+            lastOptimizeMs_ = performance.optimizeMs;
+            ++optimizeCount_;
+            lastUpdateReport_.maintenanceNodesPending = 0;
+            lastUpdateReport_.areaGrowthRatio = 0.0f;
+            lastUpdateReport_.optimizeRecommended = false;
+            lastOptimizeTrigger_ = manualOptimize
+                                       ? OptimizeStrategy::Manual
+                                       : optimizeStrategy_;
+            optimizeRequested_ = false;
+            timeSinceOptimize_ = 0.0f;
+#ifdef FRONTIER_DEBUG_TOOLS
+            tlasHealthValid_ = false;
+#endif
+        }
 
         stageStart = stageEnd;
         cameraTime_ += deltaTime;
@@ -566,6 +636,8 @@ private:
         {
             ImGui::MenuItem("Frontier controls", nullptr,
                             &showFrontierDebug_);
+            ImGui::MenuItem("TLAS maintenance", nullptr,
+                            &showTlasMaintenance_);
             ImGui::MenuItem("Scene stats", nullptr, &showSceneStats_);
             ImGui::MenuItem("Performance", nullptr, &showPerformance_);
             ImGui::MenuItem("Scene hierarchy", nullptr,
@@ -578,6 +650,7 @@ private:
             if (ImGui::MenuItem("Show all"))
             {
                 showFrontierDebug_ = true;
+                showTlasMaintenance_ = true;
                 showSceneStats_ = true;
                 showPerformance_ = true;
                 showSceneHierarchy_ = true;
@@ -589,6 +662,7 @@ private:
             if (ImGui::MenuItem("Hide all"))
             {
                 showFrontierDebug_ = false;
+                showTlasMaintenance_ = false;
                 showSceneStats_ = false;
                 showPerformance_ = false;
                 showSceneHierarchy_ = false;
@@ -615,6 +689,18 @@ private:
         }
         ImGui::TextDisabled("Frontier Dynamic City");
         ImGui::EndMainMenuBar();
+    }
+
+    static const char* optimizeStrategyName(OptimizeStrategy strategy)
+    {
+        switch (strategy)
+        {
+        case OptimizeStrategy::Manual: return "manual";
+        case OptimizeStrategy::Periodic: return "periodic";
+        case OptimizeStrategy::WhenRecommended:
+            return "when recommended";
+        }
+        return "unknown";
     }
 
     void drawDebugUi()
@@ -735,11 +821,120 @@ private:
         ImGui::End();
     }
 
+    void drawTlasMaintenanceUi()
+    {
+        ImGui::SetNextWindowPos(ImVec2(414.0f, 36.0f),
+                                ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(390.0f, 480.0f),
+                                 ImGuiCond_FirstUseEver);
+        if (!ImGui::Begin("TLAS maintenance", &showTlasMaintenance_))
+        {
+            ImGui::End();
+            return;
+        }
+
+        ImGui::Text("applyUpdates");
+        ImGui::Separator();
+        ImGui::Checkbox("Unlimited applyUpdates budget",
+                        &unlimitedTlasMaintenance_);
+        if (!unlimitedTlasMaintenance_)
+            ImGui::SliderInt("Repair nodes / applyUpdates",
+                             &tlasMaintenanceBudget_, 0, 16384);
+        ImGui::Text("Last apply: %u repaired | %u pending",
+                    lastUpdateReport_.maintenanceNodesProcessed,
+                    lastUpdateReport_.maintenanceNodesPending);
+        ImGui::Text("Stored area growth %.1f%%",
+                    lastUpdateReport_.areaGrowthRatio * 100.0f);
+        if (lastUpdateReport_.requiredBuildPerformed)
+            ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.20f, 1.0f),
+                               "Correctness-required build performed");
+        if (lastUpdateReport_.optimizeRecommended)
+            ImGui::TextColored(ImVec4(1.0f, 0.78f, 0.20f, 1.0f),
+                               "Optimize recommended");
+
+        ImGui::Text("optimize");
+        ImGui::Separator();
+        ImGui::Text("Strategy");
+        if (ImGui::RadioButton(
+                "Manual only",
+                optimizeStrategy_ == OptimizeStrategy::Manual))
+        {
+            optimizeStrategy_ = OptimizeStrategy::Manual;
+            timeSinceOptimize_ = 0.0f;
+        }
+        if (ImGui::RadioButton(
+                "Periodic",
+                optimizeStrategy_ == OptimizeStrategy::Periodic))
+        {
+            optimizeStrategy_ = OptimizeStrategy::Periodic;
+            timeSinceOptimize_ = 0.0f;
+        }
+        if (ImGui::RadioButton(
+                "When recommended",
+                optimizeStrategy_ == OptimizeStrategy::WhenRecommended))
+        {
+            optimizeStrategy_ = OptimizeStrategy::WhenRecommended;
+            timeSinceOptimize_ = 0.0f;
+        }
+
+        if (optimizeStrategy_ == OptimizeStrategy::Manual)
+        {
+            ImGui::TextDisabled(
+                "Only the Optimize now button calls optimize()");
+        }
+        else
+        {
+            ImGui::SliderFloat("Strategy interval (seconds)",
+                               &optimizeIntervalSeconds_, 0.25f, 60.0f,
+                               "%.2f");
+            const float remaining = std::max(
+                0.0f, optimizeIntervalSeconds_ - timeSinceOptimize_);
+            if (optimizeStrategy_ == OptimizeStrategy::Periodic)
+            {
+                ImGui::TextWrapped(
+                    "Calls optimize() every interval, regardless of advice");
+                ImGui::Text("Next optimize in %.2f s", remaining);
+            }
+            else
+            {
+                ImGui::TextWrapped(
+                    "Checks UpdateReport every interval and calls optimize() "
+                    "only when recommended");
+                ImGui::Text("Next recommendation check in %.2f s", remaining);
+            }
+        }
+        if (ImGui::Button("Optimize now"))
+            optimizeRequested_ = true;
+        ImGui::SameLine();
+        if (optimizeCount_ == 0)
+        {
+            ImGui::Text("No runtime optimize calls");
+        }
+        else
+        {
+            ImGui::Text("%llu calls | last %.1f us (%s)",
+                        static_cast<unsigned long long>(optimizeCount_),
+                        lastOptimizeMs_ * 1000.0f,
+                        optimizeStrategyName(lastOptimizeTrigger_));
+        }
+        if (optimizeStrategy_ == OptimizeStrategy::WhenRecommended ||
+            optimizeRecommendationChecks_ != 0)
+        {
+            ImGui::Text("Recommendation checks %llu | skipped %llu",
+                        static_cast<unsigned long long>(
+                            optimizeRecommendationChecks_),
+                        static_cast<unsigned long long>(
+                            optimizeRecommendationSkips_));
+        }
+
+        ImGui::End();
+    }
+
     void drawSceneStatsUi()
     {
         ImGui::SetNextWindowPos(ImVec2(414.0f, 36.0f),
                                 ImGuiCond_FirstUseEver);
-        ImGui::SetNextWindowSize(ImVec2(350.0f, 250.0f),
+        ImGui::SetNextWindowSize(ImVec2(350.0f, 300.0f),
                                  ImGuiCond_FirstUseEver);
         if (!ImGui::Begin("Scene stats", &showSceneStats_))
         {
@@ -766,6 +961,24 @@ private:
                     simulationTime_);
         ImGui::Text("Whole-scene stress: %s",
                     animateWholeScene_ ? "ACTIVE" : "off");
+        if (unlimitedTlasMaintenance_)
+            ImGui::Text("applyUpdates budget unlimited | %u pending",
+                        lastUpdateReport_.maintenanceNodesPending);
+        else
+            ImGui::Text("applyUpdates budget %d | %u pending",
+                        tlasMaintenanceBudget_,
+                        lastUpdateReport_.maintenanceNodesPending);
+        if (optimizeStrategy_ == OptimizeStrategy::Manual)
+            ImGui::Text("Optimize manual only | %llu calls",
+                        static_cast<unsigned long long>(optimizeCount_));
+        else if (optimizeStrategy_ == OptimizeStrategy::Periodic)
+            ImGui::Text("Optimize periodic %.1f s | %llu calls",
+                        optimizeIntervalSeconds_,
+                        static_cast<unsigned long long>(optimizeCount_));
+        else
+            ImGui::Text("Optimize advised %.1f s | %llu calls",
+                        optimizeIntervalSeconds_,
+                        static_cast<unsigned long long>(optimizeCount_));
         ImGui::TextColored(
             freezeSimulation_ ? ImVec4(1.0f, 0.55f, 0.2f, 1.0f)
                               : ImVec4(0.45f, 0.95f, 0.55f, 1.0f),
@@ -783,6 +996,7 @@ private:
     static float measuredPerformanceMs(const PerformanceSample& sample)
     {
         return sample.uiMs + sample.simulationMs + sample.cameraMs +
+               sample.applyUpdatesMs + sample.optimizeMs +
                sample.selectionMs + sample.cutStatsMs + sample.renderMs +
                sample.streamingMs + sample.frameSubmitMs;
     }
@@ -795,6 +1009,8 @@ private:
         case PerformanceTimer::Total: return sample.totalMs;
         case PerformanceTimer::Ui: return sample.uiMs;
         case PerformanceTimer::Simulation: return sample.simulationMs;
+        case PerformanceTimer::ApplyUpdates: return sample.applyUpdatesMs;
+        case PerformanceTimer::Optimize: return sample.optimizeMs;
         case PerformanceTimer::Camera: return sample.cameraMs;
         case PerformanceTimer::Selection: return sample.selectionMs;
         case PerformanceTimer::CutStats: return sample.cutStatsMs;
@@ -883,9 +1099,13 @@ private:
         ImGui::Separator();
         drawPerformanceTimer("Frontier select", PerformanceTimer::Selection,
                              ImVec4(1.0f, 0.78f, 0.20f, 1.0f));
-        drawPerformanceTimer("Motion + DB apply",
-                             PerformanceTimer::Simulation,
+        drawPerformanceTimer("Motion submit", PerformanceTimer::Simulation,
                              ImVec4(0.35f, 0.90f, 0.50f, 1.0f));
+        drawPerformanceTimer("applyUpdates",
+                             PerformanceTimer::ApplyUpdates,
+                             ImVec4(0.28f, 0.82f, 0.58f, 1.0f));
+        drawPerformanceTimer("optimize", PerformanceTimer::Optimize,
+                             ImVec4(0.98f, 0.50f, 0.18f, 1.0f));
         drawPerformanceTimer("Resource publish", PerformanceTimer::Streaming,
                              ImVec4(0.90f, 0.60f, 0.25f, 1.0f));
 
@@ -998,8 +1218,13 @@ private:
         ImGui::Text("Last maintenance %u processed | %u pending",
                     lastUpdateReport_.maintenanceNodesProcessed,
                     lastUpdateReport_.maintenanceNodesPending);
-        ImGui::SliderInt("Repair nodes / frame", &tlasMaintenanceBudget_,
-                         0, 4096);
+        if (unlimitedTlasMaintenance_)
+            ImGui::Text("applyUpdates budget: unlimited");
+        else
+            ImGui::Text("applyUpdates budget: %d nodes",
+                        tlasMaintenanceBudget_);
+        ImGui::Text("Optimize strategy: %s",
+                    optimizeStrategyName(optimizeStrategy_));
         if (tlasHealth_.buildRequired)
             ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.20f, 1.0f),
                                "TLAS correctness build required");
@@ -1510,6 +1735,8 @@ private:
         smooth(performance_.totalMs, sample.totalMs);
         smooth(performance_.uiMs, sample.uiMs);
         smooth(performance_.simulationMs, sample.simulationMs);
+        smooth(performance_.applyUpdatesMs, sample.applyUpdatesMs);
+        smooth(performance_.optimizeMs, sample.optimizeMs);
         smooth(performance_.cameraMs, sample.cameraMs);
         smooth(performance_.selectionMs, sample.selectionMs);
         smooth(performance_.cutStatsMs, sample.cutStatsMs);
@@ -2626,10 +2853,21 @@ private:
     bool seedFreeCamera_ = false;
     bool captureCullCamera_ = false;
     bool showFrontierDebug_ = true;
+    bool showTlasMaintenance_ = false;
     bool showSceneStats_ = false;
     bool showPerformance_ = false;
     bool showSceneHierarchy_ = false;
+    bool unlimitedTlasMaintenance_ = false;
+    bool optimizeRequested_ = false;
     int tlasMaintenanceBudget_ = 256;
+    OptimizeStrategy optimizeStrategy_ = OptimizeStrategy::WhenRecommended;
+    OptimizeStrategy lastOptimizeTrigger_ = OptimizeStrategy::Manual;
+    float optimizeIntervalSeconds_ = 2.0f;
+    float timeSinceOptimize_ = 0.0f;
+    float lastOptimizeMs_ = 0.0f;
+    uint64_t optimizeCount_ = 0;
+    uint64_t optimizeRecommendationChecks_ = 0;
+    uint64_t optimizeRecommendationSkips_ = 0;
     UpdateReport lastUpdateReport_{};
 #ifdef FRONTIER_DEBUG_TOOLS
     bool showTlasHealth_ = false;
