@@ -50,8 +50,14 @@ library's macro-based public payload customization.
 - `BM_TlasTopologyRebuild` compares `refreshTlas()` with `optimize()` after a
   distributed 10% motion batch at 1,191 roots (the live-city population) and
   10,000 roots. Motion submission is outside the timed interval. Method zero is
-  the exact Morton rebuild that preserves dense layout; method one is the
-  configured Binned-SAH rebuild plus compaction and physical reordering.
+  the exact linear-pass SpatialBins rebuild that preserves dense layout; method
+  one is the configured Binned-SAH rebuild plus compaction and physical
+  reordering.
+- `BM_TlasPostRebuildSelection` starts from the same Binned-SAH scene and
+  distributed motion, performs either `refreshTlas()` or `optimize()`, then
+  times a selective close-camera query. This prevents a cheap builder from
+  hiding rebuild work by producing overlapping bounds that every later query
+  must traverse.
 - `BM_MovingObjectsSelectionScale` moves a distributed 10% or 100% of a
   mounted 1,000/10,000-root forest, publishes the update, and selects the next
   frontier through the same rigid-translation API. Counters separate roots
@@ -106,7 +112,7 @@ library's macro-based public payload customization.
 - `BM_InstanceForestRootSelectionScale` uses the same mounted forest but a
   distant camera that stops at renderable TLAS roots, separating top-level
   query/dispatch cost from refined BLAS traversal.
-- `BM_TlasQualitySelection` compares Morton, median, and binned-SAH TLAS
+- `BM_TlasQualitySelection` compares spatial-bin, median, and binned-SAH TLAS
   selection with all-visible and close-camera views, and reports entry count,
   node count, and TLAS bytes.
 - `BM_FlatInstanceLifecycle` measures steady-state TLAS spawn/remove plus its

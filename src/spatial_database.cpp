@@ -1,7 +1,6 @@
 #include "frontier/spatial_database.h"
 
 #include <algorithm>
-#include <array>
 #include <bit>
 #include <cmath>
 #include <memory>
@@ -335,7 +334,7 @@ void SpatialQuery::setMountUsageEnabled(bool enabled)
 SpatialDatabase::SpatialDatabase(const SpatialDatabaseConfig& config) : config_(config)
 {
     if (config_.context.workerCount == 0) config_.context.workerCount = 1;
-    FRONTIER_CHECK(config_.tlasQuality == TlasQuality::Morton ||
+    FRONTIER_CHECK(config_.tlasQuality == TlasQuality::SpatialBins ||
                        config_.tlasQuality == TlasQuality::Median ||
                        config_.tlasQuality == TlasQuality::BinnedSAH,
                    "SpatialDatabase: invalid TLAS quality");
@@ -2452,7 +2451,9 @@ UpdateReport SpatialDatabase::applyUpdates(uint32_t maintenanceNodeBudget)
     {
         const bool firstSpatialization =
             !instanceLayoutSpatialized_ && !liveInstances_.empty();
-        tlasRebuild(firstSpatialization, firstSpatialization);
+        tlasRebuild(firstSpatialization,
+                    firstSpatialization ? config_.tlasQuality
+                                        : TlasQuality::SpatialBins);
         report.requiredBuildPerformed = true;
     }
     report.maintenanceNodesProcessed = repairTlas(maintenanceNodeBudget);
@@ -2471,7 +2472,7 @@ void SpatialDatabase::refreshTlas()
     tlasItemsTmp_.clear();
     tlasBuildRequired_ = true;
     flushBounds();
-    tlasRebuild(false, false);
+    tlasRebuild(false, TlasQuality::SpatialBins);
 }
 
 void SpatialDatabase::optimize()
@@ -2481,7 +2482,7 @@ void SpatialDatabase::optimize()
     tlasItemsTmp_.clear();
     tlasBuildRequired_ = true;
     flushBounds();
-    tlasRebuild(true, true);
+    tlasRebuild(true, config_.tlasQuality);
 }
 
 void SpatialDatabase::flushBounds()
@@ -3095,7 +3096,7 @@ void SpatialDatabase::tlasRefitAllExact()
             const uint32_t nodeIndex = packed & kInstanceIdMask;
             if ((packed & ~kInstanceIdMask) != 0)
             {
-                tlasLevelTmp_.push_back(int32_t(nodeIndex));
+                tlasLevelTmp_.push_back(nodeIndex);
                 continue;
             }
 
@@ -3113,9 +3114,8 @@ void SpatialDatabase::tlasRefitAllExact()
     }
 
     double exactArea = 0.0;
-    for (const int32_t signedNodeIndex : tlasLevelTmp_)
+    for (const uint32_t nodeIndex : tlasLevelTmp_)
     {
-        const uint32_t nodeIndex = uint32_t(signedNodeIndex);
         TlasNode& node = tlasNodes_[nodeIndex];
         TlasMeta& meta = tlasMeta_[nodeIndex];
         uint32_t lanes = node.validLanes();
@@ -3153,63 +3153,88 @@ void SpatialDatabase::tlasRefitAllExact()
     std::fill(tlasRepairQueued_.begin(), tlasRepairQueued_.end(), uint8_t(0));
 }
 
-// 21 bits per axis -> 63-bit Morton key.
-static inline uint64_t expandBits21(uint64_t v)
+// Linear-pass spatial build used by refreshTlas(). Each large range is split
+// into kWide equal-width bins on its longest centroid axis. This preserves
+// geometric locality directly without flattening it into one global order.
+// Each level counts and scatters, then swaps source/destination roles for its
+// children instead of copying the partition back. Small or severely skewed
+// ranges use the exact Median builder as a bounded fallback.
+int32_t SpatialDatabase::tlasBuildSpatialBinsRange(
+    std::vector<uint32_t>& items, std::vector<uint32_t>& scratch,
+    int lo, int hi, int32_t parent)
 {
-    v &= 0x1FFFFFull;
-    v = (v | v << 32) & 0x1F00000000FFFFull;
-    v = (v | v << 16) & 0x1F0000FF0000FFull;
-    v = (v | v << 8)  & 0x100F00F00F00F00Full;
-    v = (v | v << 4)  & 0x10C30C30C30C30C3ull;
-    v = (v | v << 2)  & 0x1249249249249249ull;
-    return v;
-}
+    const int count = hi - lo;
+    if (count <= int(kWide * kWide))
+        return tlasBuildRange(items, lo, hi, parent);
 
-// Stable LSD radix sort of the 63-bit Morton coordinate. Up to six 11-bit
-// passes keep the histogram in L1 and turn the rebuild's O(N log N) comparison
-// sort into linear streaming passes. Equal coordinates retain live-instance
-// order; their order is immaterial to the tree and stability keeps it fully
-// deterministic without paying for a second comparison sort.
-template <class Item>
-static void radixSortMorton(std::vector<Item>& keys,
-                            std::vector<Item>& scratch,
-                            uint64_t keyVariation)
-{
-    if (keys.size() < 1024)
+    AABB centroidBounds = AABB::empty();
+    for (int k = lo; k < hi; ++k)
+        centroidBounds.expand(instances_[items[size_t(k)]].worldBox.center());
+    const float4 extent = centroidBounds.extent();
+    const int axis = (extent.x >= extent.y && extent.x >= extent.z)
+                         ? 0
+                         : (extent.y >= extent.z ? 1 : 2);
+    const float axisExtent = axisOf(extent, axis);
+    if (!(axisExtent > 0.0f))
+        return tlasBuildRange(items, lo, hi, parent);
+
+    const float base = axisOf(centroidBounds.mn, axis);
+    const float scale = float(kWide) / axisExtent;
+    uint32_t counts[kWide] = {};
+    const auto binOf = [&](uint32_t instance)
     {
-        std::sort(keys.begin(), keys.end());
-        return;
-    }
-    if (keyVariation == 0) return;
+        int bin = int((axisOf(instances_[instance].worldBox.center(), axis) -
+                       base) * scale);
+        return uint32_t(bin < 0 ? 0 : (bin >= int(kWide) ? kWide - 1 : bin));
+    };
+    for (int k = lo; k < hi; ++k)
+        ++counts[binOf(items[size_t(k)])];
 
-    constexpr uint32_t kBits = 11;
-    constexpr uint32_t kBuckets = 1u << kBits;
-    constexpr uint64_t kMask = kBuckets - 1;
-    std::array<uint32_t, kBuckets> offsets{};
-    scratch.resize(keys.size());
-
-    auto* src = &keys;
-    auto* dst = &scratch;
-    for (uint32_t shift = 0; shift < 63; shift += kBits)
+    uint32_t nonEmpty = 0;
+    uint32_t largest = 0;
+    for (uint32_t bin = 0; bin < kWide; ++bin)
     {
-        if (((keyVariation >> shift) & kMask) == 0) continue;
-        offsets.fill(0);
-        for (const auto& item : *src)
-            ++offsets[size_t((item.key() >> shift) & kMask)];
-
-        uint32_t next = 0;
-        for (uint32_t& count : offsets)
-        {
-            const uint32_t begin = next;
-            next += count;
-            count = begin;
-        }
-
-        for (const auto& item : *src)
-            (*dst)[offsets[size_t((item.key() >> shift) & kMask)]++] = item;
-        std::swap(src, dst);
+        nonEmpty += counts[bin] != 0;
+        largest = std::max(largest, counts[bin]);
     }
-    if (src != &keys) keys.swap(scratch);
+    if (nonEmpty < 2 || uint64_t(largest) * 8 > uint64_t(count) * 7)
+        return tlasBuildRange(items, lo, hi, parent);
+
+    uint32_t offsets[kWide + 1] = {};
+    for (uint32_t bin = 0; bin < kWide; ++bin)
+        offsets[bin + 1] = offsets[bin] + counts[bin];
+    uint32_t write[kWide];
+    std::copy_n(offsets, kWide, write);
+    for (int k = lo; k < hi; ++k)
+    {
+        const uint32_t instance = items[size_t(k)];
+        scratch[size_t(lo) + write[binOf(instance)]++] = instance;
+    }
+
+    const int32_t index = tlasAllocNode();
+    tlasNodes_[uint32_t(index)].parent = parent;
+    uint32_t lane = 0;
+    for (uint32_t bin = 0; bin < kWide; ++bin)
+    {
+        if (counts[bin] == 0) continue;
+        const int begin = lo + int(offsets[bin]);
+        const int end = lo + int(offsets[bin + 1]);
+        const int32_t child =
+            tlasBuildSpatialBinsRange(scratch, items, begin, end, index);
+        float maxContribution = 0.0f;
+        uint32_t layerMask = 0;
+        const AABB bounds =
+            tlasNodeExtent(uint32_t(child), maxContribution, layerMask);
+        TlasNode& node = tlasNodes_[uint32_t(index)];
+        TlasMeta& meta = tlasMeta_[uint32_t(index)];
+        node.bounds.setLane(lane, bounds);
+        meta.maxContribution.v[lane] = maxContribution;
+        node.child[lane] = child;
+        meta.laneMask[lane] = layerMask;
+        node.validMask |= 1u << lane;
+        ++lane;
+    }
+    return index;
 }
 
 // Partition items[lo, hi) into [lo, m) and [m, hi). BinnedSAH scans 16 bins on
@@ -3226,7 +3251,7 @@ int SpatialDatabase::tlasSplit(std::vector<uint32_t>& items, int lo, int hi)
         cb.expand(instances_[items[k]].worldBox.center());
     const float4 ext = cb.mx - cb.mn;
 
-    if (config_.tlasQuality == TlasQuality::BinnedSAH)
+    if (tlasBuiltQuality_ == TlasQuality::BinnedSAH)
     {
         constexpr int kBins = 16;
         float bestCost = FLT_MAX;
@@ -3315,8 +3340,8 @@ int SpatialDatabase::tlasSplit(std::vector<uint32_t>& items, int lo, int hi)
 }
 
 // Recursive kWide-way build: log2(kWide) levels of binary splits per node.
-// Slower than the Morton path but produces noticeably tighter trees. Used for
-// structural rebuilds (instances added/removed), which are rare and long-lived.
+// More comparison-heavy than SpatialBins. Used for explicit Median/BinnedSAH
+// quality builds, which are rare and long-lived.
 int32_t SpatialDatabase::tlasBuildRange(std::vector<uint32_t>& items, int lo, int hi, int32_t parent)
 {
     const int32_t idx = tlasAllocNode();
@@ -3555,7 +3580,7 @@ void SpatialDatabase::reorderInstancesByTlas()
 // requested by refreshTlas()/optimize(). Routine motion and topology drift
 // never reach this path implicitly.
 void SpatialDatabase::tlasRebuild(bool reorderInstances,
-                                  bool useConfiguredQuality)
+                                  TlasQuality quality)
 {
     // Rebuild enumerates instance bounds, so first bring a deferred uniform
     // translation into those records and the old TLAS nodes.
@@ -3573,119 +3598,25 @@ void SpatialDatabase::tlasRebuild(bool reorderInstances,
     for (const InstanceId dense : liveInstances_)
         instanceTlasLoose_[dense] = 0;
 
-    tlasBuiltQuality_ = useConfiguredQuality
-                            ? config_.tlasQuality
-                            : TlasQuality::Morton;
-    const bool quality = tlasBuiltQuality_ != TlasQuality::Morton;
-
-    if (quality)
+    tlasBuiltQuality_ = quality;
+    const bool qualityBuild = tlasBuiltQuality_ != TlasQuality::SpatialBins;
+    std::vector<uint32_t>& items = tlasItemsTmp_;
+    items.assign(liveInstances_.begin(), liveInstances_.end());
+    tlasLeafCount_ = uint32_t(items.size());
+    if (!items.empty())
     {
-        std::vector<uint32_t>& items = tlasItemsTmp_;
-        items.assign(liveInstances_.begin(), liveInstances_.end());
-        tlasLeafCount_ = uint32_t(items.size());
-        if (!items.empty())
+        if (qualityBuild)
             tlasRoot_ = tlasBuildRange(items, 0, int(items.size()), -1);
-    }
-    else
-    {
-        tlasKeys_.clear();
-        uint64_t firstMorton = 0;
-        uint64_t mortonVariation = 0;
-        AABB cb = AABB::empty();
-        for (const InstanceId i : liveInstances_)
-            cb.expand(instances_[i].worldBox.center());
-        const float4 lo = cb.mn;
-        const float4 ext = cb.extent();
-        const float sx = ext.x > 0.0f ? 2097151.0f / ext.x : 0.0f;
-        const float sy = ext.y > 0.0f ? 2097151.0f / ext.y : 0.0f;
-        const float sz = ext.z > 0.0f ? 2097151.0f / ext.z : 0.0f;
-        for (const InstanceId i : liveInstances_)
+        else
         {
-            const float4 c = instances_[i].worldBox.center();
-            const uint64_t kx = expandBits21(uint64_t((c.x - lo.x) * sx));
-            const uint64_t ky = expandBits21(uint64_t((c.y - lo.y) * sy));
-            const uint64_t kz = expandBits21(uint64_t((c.z - lo.z) * sz));
-            const uint64_t morton = (kx << 2) | (ky << 1) | kz;
-            if (tlasKeys_.empty()) firstMorton = morton;
-            else mortonVariation |= morton ^ firstMorton;
-            tlasKeys_.push_back({morton, i});
-        }
-        tlasLeafCount_ = uint32_t(tlasKeys_.size());
-        if (!tlasKeys_.empty())
-        {
-            radixSortMorton(tlasKeys_, tlasKeysTmp_, mortonVariation);
-
-            // Leaf level: consecutive groups of kWide instances.
-            std::vector<int32_t>& cur = tlasLevelTmp_;
-            cur.clear();
-            for (size_t base = 0; base < tlasKeys_.size(); base += kWide)
-            {
-                const int32_t idx = tlasAllocNode();
-                TlasNode& n = tlasNodes_[idx];
-                TlasMeta& meta = tlasMeta_[idx];
-                const uint32_t cnt =
-                    uint32_t(std::min<size_t>(kWide, tlasKeys_.size() - base));
-                for (uint32_t k = 0; k < cnt; ++k)
-                {
-                    const uint32_t instIdx = tlasKeys_[base + k].instance;
-                    Instance& inst = instances_[instIdx];
-                    n.bounds.setLane(k, inst.worldBox);
-                    meta.maxContribution.v[k] =
-                        contributionDiameter(inst.worldBox);
-                    n.child[k] = ~int32_t(instIdx);
-                    meta.laneMask[k] = inst.mask;
-                    n.setLeafLane(k);
-                    inst.setTlasPlacement(uint32_t(idx), k);
-                }
-                cur.push_back(idx);
-            }
-
-            // Inner levels: group kWide nodes until one remains.
-            std::vector<int32_t> next;
-            while (cur.size() > 1)
-            {
-                next.clear();
-                for (size_t base = 0; base < cur.size(); base += kWide)
-                {
-                    const int32_t idx = tlasAllocNode();
-                    TlasNode& n = tlasNodes_[idx];
-                    TlasMeta& meta = tlasMeta_[idx];
-                    const uint32_t cnt =
-                        uint32_t(std::min<size_t>(kWide, cur.size() - base));
-                    for (uint32_t k = 0; k < cnt; ++k)
-                    {
-                        const int32_t childIdx = cur[base + k];
-                        TlasNode& cn = tlasNodes_[childIdx];
-                        const TlasMeta& childMeta = tlasMeta_[childIdx];
-                        cn.parent = idx;
-                        AABB u = AABB::empty();
-                        float maxContribution = 0.0f;
-                        uint32_t lm = 0;
-                        for (uint32_t l = 0; l < kWide; ++l)
-                        {
-                            if (!(cn.validMask & (1u << l))) continue;
-                            u.expand(cn.bounds.lane(l));
-                            maxContribution = std::max(
-                                maxContribution,
-                                childMeta.maxContribution.v[l]);
-                            lm |= childMeta.laneMask[l];
-                        }
-                        n.bounds.setLane(k, u);
-                        meta.maxContribution.v[k] = maxContribution;
-                        n.child[k] = childIdx;
-                        meta.laneMask[k] = lm;
-                        n.validMask |= 1u << k;
-                    }
-                    next.push_back(idx);
-                }
-                cur.swap(next);
-            }
-            tlasRoot_ = cur[0];
+            tlasLevelTmp_.resize(items.size());
+            tlasRoot_ = tlasBuildSpatialBinsRange(
+                items, tlasLevelTmp_, 0, int(items.size()), -1);
         }
     }
 
     // Every exact topology rebuild establishes a fresh population baseline,
-    // whether it used the configured quality tier or the Morton fast path.
+    // whether it used the configured quality tier or the fast spatial path.
     tlasBuildCount_ = tlasLeafCount_;
 
     if (reorderInstances) reorderInstancesByTlas();

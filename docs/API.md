@@ -1078,8 +1078,9 @@ rebuild. Population drift, incremental edit count, and stored-area growth only s
 of two explicit safe-point operations:
 
 - `refreshTlas()` flushes pending state and rebuilds exact TLAS topology with
-  the linear Morton builder. It leaves dead dense slots and physical instance
-  order untouched, so cached `MotionGroup` mappings remain valid.
+  the linear-pass `SpatialBins` builder. It leaves dead dense slots and
+  physical instance order untouched, so cached `MotionGroup` mappings remain
+  valid.
 - `optimize()` flushes pending state, compacts dead dense instance slots,
   spatially reorders instance/query-record storage, and rebuilds with the
   configured quality tier.
@@ -1117,12 +1118,12 @@ SpatialDatabase database(config);
 ```
 
 `BinnedSAH` uses a binned surface-area heuristic to build a tighter TLAS at a
-higher rebuild cost. `Morton` is the cheapest, loosest build and `Median` is the
-middle option. The drift thresholds decide when `UpdateReport` recommends an
-explicit topology rebuild; they never cause one implicitly. Use
-`refreshTlas()` for a lower-cost Morton refresh during ordinary simulation and
-`optimize()` when compaction or the configured higher-quality topology is worth
-the extra cost.
+higher rebuild cost. `SpatialBins` uses linear count/scatter passes and
+`Median` uses comparison-based longest-axis partitioning. The drift thresholds
+decide when `UpdateReport` recommends an explicit topology rebuild; they never
+cause one implicitly. Use `refreshTlas()` for a lower-cost SpatialBins refresh
+during ordinary simulation and `optimize()` when compaction or the configured
+higher-quality topology is worth the extra cost.
 
 `parallelFor` must block until all requested tasks finish. Internal parallel
 selection is used only for uncached queries, above the configured visible

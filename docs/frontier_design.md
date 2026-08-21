@@ -136,8 +136,8 @@ motion publication. Changed leaves enter a deduplicated repair queue;
 `applyUpdates(maintenanceNodeBudget)` tightens at most that many nodes and
 propagates shrinkage by queuing parents. Unprocessed nodes remain conservative.
 Population drift, edit count, and current lane-area growth only set a topology-
-rebuild recommendation. `refreshTlas()` performs an exact Morton rebuild while
-preserving dense instance layout. `optimize()` performs configured-quality
+rebuild recommendation. `refreshTlas()` performs an exact SpatialBins rebuild
+while preserving dense instance layout. `optimize()` performs configured-quality
 rebuild, compaction, and spatial reordering. Both retain public instance ids.
 
 Flat TLAS roots have specialized emission paths and never touch mounted-state

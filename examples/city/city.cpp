@@ -343,7 +343,7 @@ const char* tlasQualityName(TlasQuality quality)
 {
     switch (quality)
     {
-    case TlasQuality::Morton: return "Morton";
+    case TlasQuality::SpatialBins: return "Spatial bins";
     case TlasQuality::Median: return "Median";
     case TlasQuality::BinnedSAH: return "Binned SAH";
     }
@@ -934,7 +934,7 @@ private:
             }
             ImGui::Text("Scheduled method");
             if (ImGui::RadioButton(
-                    "refreshTlas (Morton, preserves layout)",
+                    "refreshTlas (spatial bins, preserves layout)",
                     scheduledRebuildMethod_ == RebuildMethod::RefreshTlas))
                 scheduledRebuildMethod_ = RebuildMethod::RefreshTlas;
             if (ImGui::RadioButton(

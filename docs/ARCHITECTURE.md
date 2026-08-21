@@ -166,9 +166,9 @@ the existing query epoch.
 ## TLAS maintenance
 
 Initial builds and explicit `optimize()` calls use the configured `BinnedSAH`,
-`Median`, or `Morton` tier. `refreshTlas()` uses the linear Morton builder and
-does not change dense instance layout. Incremental insertion descends by least
-bound growth and splits a full leaf. Removal invalidates a lane. Instance
+`Median`, or `SpatialBins` tier. `refreshTlas()` uses the SpatialBins builder
+and does not change dense instance layout. Incremental insertion descends by
+least bound growth and splits a full leaf. Removal invalidates a lane. Instance
 motion updates exact dense instance state immediately but defers TLAS writes
 to `applyUpdates(maintenanceNodeBudget)`.
 
@@ -190,14 +190,15 @@ queue.
 
 Population drift, edit fraction, and current lane-area growth set
 `UpdateReport::topologyRebuildRecommended`; they never schedule an implicit
-topology rebuild. The application chooses `refreshTlas()` for an exact Morton
-refresh that preserves dense layout, or `optimize()` for configured-quality
-rebuild plus compaction and spatial reordering.
+topology rebuild. The application chooses `refreshTlas()` for an exact
+linear-pass spatial-bin refresh that preserves dense layout, or `optimize()`
+for configured-quality rebuild plus compaction and spatial reordering.
 
 The large-batch path reuses mutually exclusive build scratch: one 32-bit array
-holds pending dense instance ids and the temporary DFS stack, while another
-retains the TLAS postorder until topology changes. It adds no field or
-allocation to `SpatialDatabase`; a structural edit invalidates the retained
+holds pending dense instance ids and the temporary DFS stack, while another is
+the SpatialBins scatter during rebuild and retains the TLAS postorder until
+topology changes. It adds no field or allocation to `SpatialDatabase`; a
+structural edit invalidates the retained
 order. Pending node-bound edits are folded into exact instance boxes before the
 actor-motion publication pass.
 

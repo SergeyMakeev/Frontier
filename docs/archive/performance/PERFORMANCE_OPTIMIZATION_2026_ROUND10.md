@@ -156,3 +156,111 @@ A practical city policy is to answer routine drift advice with
 `refreshTlas()`, measure selection and retained dense capacity, and reserve
 `optimize()` for infrequent loading screens, large population churn, or an
 application-selected low-impact synchronization point.
+
+## Correction: rebuild latency was not sufficient evidence
+
+The first implementation above was rejected after the city TLAS visualization
+showed depth-four boxes spanning large fractions of a 4,590-instance scene
+immediately after `refreshTlas()`. The health panel reported 99.7% lane
+occupancy and zero area *growth*, but neither metric described absolute spatial
+overlap. The rebuild was exact with respect to containment while still being a
+poor broadphase.
+
+The benchmark defect was that `BM_TlasTopologyRebuild` measured only the
+safe-point rebuild. It did not measure a selective query using the topology
+that the rebuild produced. `BM_TlasQualitySelection` exposed the transferred
+cost on the 10,000-root close-camera grid, with the same 627 results:
+
+| Builder | Selection median |
+|---|---:|
+| fixed-group Morton | ~26.0 us |
+| Median | ~3.52 us |
+| BinnedSAH | ~3.73 us |
+
+The apparent 6-8x rebuild win therefore moved about 22 us into every selective
+query. High lane occupancy was not a sufficient quality proxy because fixed
+groups could be full while joining spatially distant regions.
+
+### Experiments
+
+1. **Median fallback.** `refreshTlas()` was first changed to the existing exact
+   Median builder. This restored query quality, but rebuild medians were 137 us
+   at 1,191 roots and 1,739 us at 10,000 roots, only about 1.74x and 1.51x
+   faster than `optimize()` respectively.
+2. **Prefix-aware Morton hierarchy.** Sorted Morton ranges were split at their
+   highest differing prefix bit rather than fixed group boundaries. The
+   close-camera query regressed further to ~39 us and the tree grew to 2,633
+   nodes. Rejected.
+3. **Morton leaves plus median upper hierarchy.** Sorting still supplied full
+   leaves, while a longest-axis hierarchy organized the leaf bounds. The query
+   remained ~28.7 us. Preventing leaves from crossing coarse Morton-cell
+   boundaries increased it to ~30.6 us. Both were rejected: even localized
+   curve discontinuities created enough broad leaves to dominate selective
+   traversal.
+4. **Direct spatial bins.** Every large range chooses its longest centroid
+   axis, counts instances into `kWide` equal-width bins, scatters 32-bit dense
+   ids through a retained scratch stream, and recurses into non-empty bins.
+   Ranges no larger than `kWide * kWide`, coincident ranges, and ranges with
+   more than seven eighths of their population in one bin use the Median
+   builder as a bounded fallback. This passed both rebuild and query gates.
+
+The first accepted version copied each scattered partition back into the input
+stream. A follow-up alternates the input and scratch streams at every recursive
+level instead. It removed one full range pass per level; the 10,000-root
+payload32 median moved from 643 us to 625 us (2.8%), while payload64 moved from
+639 us to 636 us (within the run-to-run margin but in the same direction).
+
+The public tier is named `TlasQuality::SpatialBins`; there is no Morton build
+path or Morton-key storage in the current implementation. `refreshTlas()` uses
+`SpatialBins`, while `optimize()` continues to use the configured tier and
+performs compaction and physical reordering.
+
+### Corrected measurements
+
+Windows x64 Release, BVH8, IPO on, contract/statistics/validation checks off,
+9 rebuild repetitions and 9 post-rebuild query repetitions. Values are median
+wall time; both payload widths return 627 entries in the query gate.
+
+| Payload | Roots | SpatialBins `refreshTlas()` | BinnedSAH `optimize()` | Rebuild speedup |
+|---|---:|---:|---:|---:|
+| 64-bit | 1,191 | 53.4 us | 232 us | **4.34x** |
+| 32-bit | 1,191 | 53.5 us | 238 us | **4.45x** |
+| 64-bit | 10,000 | 636 us | 2,615 us | **4.11x** |
+| 32-bit | 10,000 | 625 us | 2,611 us | **4.18x** |
+
+`BM_TlasPostRebuildSelection` now starts with a configured BinnedSAH tree,
+moves a distributed 10% cohort, performs one explicit rebuild outside the
+timed selection loop, and then measures the close-camera query:
+
+| Payload | after `refreshTlas()` | after `optimize()` | Refresh result |
+|---|---:|---:|---:|
+| 64-bit | **3.43 us** | 3.95 us | 13.2% faster |
+| 32-bit | **3.42 us** | 3.95 us | 13.4% faster |
+
+The independent quality-tier gate measured SpatialBins at 3.42 us, Median at
+3.57 us, and BinnedSAH at 3.83 us for the same visible set. SpatialBins used
+1,919 nodes versus 2,121 for Median and 2,185 for BinnedSAH. The new builder
+therefore retains its rebuild advantage without creating the giant overlapping
+boxes or charging subsequent selective queries.
+
+The Debug suite also contains a structural regression check on a 100x100 city
+grid. After `refreshTlas()`, near-leaf internal bounds must stay below one third
+of the world width; this directly catches the city-spanning pattern shown by
+the visualization in both BVH4 and BVH8 builds.
+
+### Current tradeoffs
+
+- SpatialBins reuses the retained 32-bit TLAS postorder stream as its scatter
+  buffer during a build. Removing the two 12-byte-per-root Morton sort buffers
+  reduces retained build-scratch capacity without adding another stream.
+- Equal-width bins do not guarantee balanced populations. The seven-eighths
+  skew guard and small-range Median path guarantee progress and contain the
+  pathological case, at the cost of comparison work for those ranges.
+- `refreshTlas()` is still a full O(live roots) safe-point operation and does
+  not provide a hard frame-time bound. It avoids compaction and dense stream
+  permutation, so `optimize()` remains the explicit choice for reclaiming dead
+  slots or restoring configured physical order.
+- Area growth remains a drift metric relative to the most recent topology. It
+  is not an absolute overlap score. Rebuild acceptance is now gated by actual
+  post-rebuild selective traversal rather than inferred from occupancy or
+  growth alone.

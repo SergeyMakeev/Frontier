@@ -1345,14 +1345,15 @@ emit its whole terminal range.
 
 ```cpp
 enum class TlasQuality : uint8_t {
-    Morton,
+    SpatialBins,
     Median,
     BinnedSAH,
 };
 ```
 
-- `Morton` performs one spatial sort and contiguous wide grouping; it is the
-  least expensive and loosest build.
+- `SpatialBins` recursively partitions the longest centroid axis into wide
+  equal-width bins using linear count/scatter passes. Small or severely skewed
+  ranges use a median fallback.
 - `Median` recursively splits the longest axis at the median.
 - `BinnedSAH` uses a binned surface-area heuristic and normally gives the best
   traversal quality.
@@ -1374,7 +1375,7 @@ struct SpatialDatabaseConfig {
 
 - `context` supplies callbacks and is copied into the database.
 - `tlasQuality` selects initial-build and explicit-`optimize()` quality;
-  `refreshTlas()` always builds Morton topology.
+  `refreshTlas()` builds SpatialBins topology.
 - `tlasTraversalCost` and `tlasIntersectCost` are the Binned-SAH cost terms;
   increasing intersection cost favors deeper, tighter trees.
 - `tlasCountDrift` is the population-change fraction at which
@@ -1837,7 +1838,7 @@ void optimize();
 
 Both methods consume pending bounds and instance motion and establish a fresh
 population/area drift baseline without advancing `frame()` or collection age.
-`refreshTlas()` uses the linear Morton builder, clears incremental maintenance,
+`refreshTlas()` uses the SpatialBins builder, clears incremental maintenance,
 and preserves dense slots, physical instance order, layout version, and
 mapping version. `optimize()` uses `SpatialDatabaseConfig::tlasQuality`,
 compacts dead dense slots, and restores physical query-record order to TLAS

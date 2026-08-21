@@ -227,7 +227,7 @@ TEST(Tlas, FirstPopulationAfterAnEmptyPublicationBuildsAtConfiguredQuality)
 #endif
 }
 
-TEST(Tlas, RefreshRebuildsExactMortonTopologyWithoutChangingDenseLayout)
+TEST(Tlas, RefreshRebuildsExactSpatialTopologyWithoutChangingDenseLayout)
 {
     SpatialDatabaseConfig config;
     config.tlasQuality = TlasQuality::BinnedSAH;
@@ -271,7 +271,7 @@ TEST(Tlas, RefreshRebuildsExactMortonTopologyWithoutChangingDenseLayout)
                 500.0f, 0.001f);
 #ifdef FRONTIER_DEBUG_TOOLS
     const TlasDebugSummary summary = database.debugTlasSummary();
-    EXPECT_EQ(summary.activeQuality, TlasQuality::Morton);
+    EXPECT_EQ(summary.activeQuality, TlasQuality::SpatialBins);
     EXPECT_EQ(summary.configuredQuality, TlasQuality::BinnedSAH);
     EXPECT_EQ(summary.rebuildBaselineInstances,
               TestAccess::liveInstanceSlots(database));
@@ -289,7 +289,7 @@ TEST(Tlas, EveryQualityTierReturnsTheSameVisibleSet)
     constexpr uint32_t count = 1200;
     std::vector<UserPayload> reference;
     std::vector<size_t> nodeCounts;
-    for (const TlasQuality quality : {TlasQuality::Morton,
+    for (const TlasQuality quality : {TlasQuality::SpatialBins,
                                       TlasQuality::Median,
                                       TlasQuality::BinnedSAH})
     {
@@ -318,6 +318,43 @@ TEST(Tlas, EveryQualityTierReturnsTheSameVisibleSet)
     ASSERT_EQ(nodeCounts.size(), 3u);
     EXPECT_LT(nodeCounts[0], nodeCounts[1]);
 }
+
+#ifdef FRONTIER_DEBUG_TOOLS
+TEST(Tlas, SpatialRefreshDoesNotCreateCitySpanningNearLeafBounds)
+{
+    constexpr uint32_t side = 100;
+    constexpr uint32_t count = side * side;
+    SpatialDatabase database;
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        InstanceDesc desc;
+        desc.pos = float4::point(
+            float(int(i % side) - int(side / 2)) * 3.0f,
+            float(int(i / side) - int(side / 2)) * 3.0f, 0.0f);
+        database.instantiate(node(2000 + i, 0.0f, box(0.5f)), desc);
+    }
+    database.applyUpdates(0);
+    database.refreshTlas();
+
+    const TlasDebugSummary summary = database.debugTlasSummary();
+    ASSERT_EQ(summary.activeQuality, TlasQuality::SpatialBins);
+    ASSERT_GT(summary.maxDepth, 2u);
+    const uint32_t depth = summary.maxDepth - 1;
+    std::vector<TlasDebugBox> boxes(count + summary.activeNodes);
+    const size_t total = database.debugTlasBoxes(depth, boxes);
+    ASSERT_LE(total, boxes.size());
+
+    size_t internalCount = 0;
+    for (size_t i = 0; i < total; ++i)
+    {
+        if (boxes[i].kind != TlasDebugBoxKind::Internal) continue;
+        ++internalCount;
+        const float4 extent = boxes[i].bounds.extent();
+        EXPECT_LT(std::max(extent.x, extent.y), 100.0f);
+    }
+    EXPECT_GT(internalCount, 0u);
+}
+#endif
 
 TEST(Tlas, CoincidentCentroidsStillBuildACompleteTree)
 {

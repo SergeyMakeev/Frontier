@@ -926,8 +926,9 @@ BENCHMARK(BM_TlasIncrementalMaintenance)
 
 // Isolate the two explicit full-topology choices after a distributed motion
 // batch. Motion is staged once before measurement so this reports the rebuild:
-// method 0 is the Morton refresh that preserves dense layout; method 1 is the
-// configured binned-SAH rebuild plus compaction and traversal-order rewrite.
+// method 0 is the linear spatial-bin refresh that preserves dense layout;
+// method 1 is the configured binned-SAH rebuild plus compaction and
+// traversal-order rewrite.
 static void BM_TlasTopologyRebuild(benchmark::State& state)
 {
     const uint32_t count = uint32_t(state.range(0));
@@ -974,6 +975,58 @@ BENCHMARK(BM_TlasTopologyRebuild)
     ->Args({10000, 0})->Args({10000, 1})
     ->ArgNames({"instances", "optimize"})
     ->UseRealTime()
+    ->Unit(benchmark::kMicrosecond);
+
+// Regression gate for rebuild quality, not merely rebuild latency. Start from
+// the same configured SAH topology and moved population, perform one explicit
+// rebuild, then time a selective close-camera query. A cheap rebuild that
+// creates overlapping boxes is visible here as recurring traversal cost.
+static void BM_TlasPostRebuildSelection(benchmark::State& state)
+{
+    constexpr uint32_t count = 10000;
+    constexpr uint32_t side = 100;
+    const bool optimize = state.range(0) != 0;
+    SpatialDatabaseConfig config;
+    config.tlasQuality = TlasQuality::BinnedSAH;
+    SpatialDatabase world(config);
+    std::vector<InstanceHandle> movers;
+    movers.reserve(count / 10);
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        InstanceDesc desc;
+        desc.pos = float4::point(
+            float(int(i % side) - int(side / 2)) * 3.0f,
+            float(int(i / side) - int(side / 2)) * 3.0f, 0.0f);
+        const InstanceHandle handle = world.instantiate(
+            node(1000 + i, 0.0f, box(0.5f)), desc);
+        if (i % 10 == 0) movers.push_back(handle);
+    }
+    world.applyUpdates(0);
+    world.optimize();
+    SpatialDatabase::MotionGroup motion(movers);
+    world.translateInstances(motion, float4::vec(0.75f, 0.25f, 0.0f));
+    if (optimize)
+        world.optimize();
+    else
+        world.refreshTlas();
+
+    const Camera camera = cameraAt(-50.0f);
+    SpatialQuery query;
+    query.setReuseEnabled(false);
+    FrontierResultView result;
+    for (auto _ : state)
+    {
+        result = query.selectFrontier(world, camera, {});
+        consume(result);
+    }
+    state.counters["entries"] = double(result.size());
+    state.counters["tlas_nodes"] =
+        double(TestAccess::tlasNodeCount(world));
+}
+
+BENCHMARK(BM_TlasPostRebuildSelection)
+    ->Args({0})->Args({1})
+    ->ArgNames({"optimize"})
     ->Unit(benchmark::kMicrosecond);
 
 // End-to-end dynamic-frame cost: move a distributed subset of TLAS roots,
@@ -1235,10 +1288,10 @@ static void BM_TlasQualitySelection(benchmark::State& state)
 }
 
 BENCHMARK(BM_TlasQualitySelection)
-    ->Args({int64_t(TlasQuality::Morton), 0})
+    ->Args({int64_t(TlasQuality::SpatialBins), 0})
     ->Args({int64_t(TlasQuality::Median), 0})
     ->Args({int64_t(TlasQuality::BinnedSAH), 0})
-    ->Args({int64_t(TlasQuality::Morton), 1})
+    ->Args({int64_t(TlasQuality::SpatialBins), 1})
     ->Args({int64_t(TlasQuality::Median), 1})
     ->Args({int64_t(TlasQuality::BinnedSAH), 1})
     ->ArgNames({"quality", "close_camera"})

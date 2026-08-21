@@ -208,7 +208,7 @@ constraints.
 | `SpatialQuery::RecCold` | 16 B | Slab allocation and output offsets, fetched only on misses/rebuilds. |
 | `RenderFrontierRun` | 12 B | Slab begin/count plus one instance id for a cached render run. |
 | `TerminalRenderRun` | 16 B on 64-bit | Payload pointer/count plus one packed instance/error word. |
-| `MortonItem` | 12 B | Two halves of a 63-bit Morton key plus instance id; avoids normal pair padding. |
+| Shared TLAS level scratch | 4 B/live root | Spatial-bin scatter during rebuild; retained exact-refit postorder between rebuilds. |
 
 Top-level public instance ids are stable. The database separately maps stable
 handle ids to dense physical ids, so `optimize()` can reorder and compact all
@@ -466,7 +466,8 @@ Several thresholds are measurements encoded in the implementation:
 - Sparse overlays start at 64 wide blocks and promote after more than 1/16 of
   blocks are patched.
 - Large motion switches to exact full refit at one quarter of TLAS leaves.
-- The Morton radix path uses comparison sort below 1,024 items.
+- SpatialBins uses Median packing at 64 or fewer items and when one bin would
+  retain more than seven eighths of a range.
 - Cache slab compaction runs when abandoned capacity exceeds half of used
   capacity.
 
@@ -630,9 +631,9 @@ definitions, and readiness bits survive the removal of placements.
 
 ### 9.1 Build tiers
 
-The configured quality tier is `Morton`, `Median`, or 16-bin `BinnedSAH`.
+The configured quality tier is `SpatialBins`, `Median`, or 16-bin `BinnedSAH`.
 Initial builds and explicit `optimize()` calls use the configured tier.
-`refreshTlas()` always uses the linear Morton builder and preserves the current
+`refreshTlas()` uses the SpatialBins builder and preserves the current
 dense instance layout.
 
 The quality builder recursively produces a `kWide`-way tree using
@@ -641,16 +642,16 @@ degenerate SAH choice falls back to a longest-axis median so progress is
 guaranteed. Ranges of at most `kWide * kWide` are packed explicitly into full
 leaf groups, avoiding an underfilled final internal level.
 
-The Morton builder:
+The SpatialBins builder:
 
-- quantizes centroids to 21 bits per axis and interleaves a 63-bit key;
-- stores each item in 12 bytes rather than a padded key/id pair;
-- uses stable LSD radix passes of 11 bits, keeping the 2,048-entry histogram in
-  L1;
-- skips digit passes with no key variation;
-- uses `std::sort` for fewer than 1,024 items;
-- groups consecutive `kWide` instances into leaves and then groups nodes
-  bottom-up in streaming passes.
+- finds the longest centroid axis for each large range;
+- counts instances into `kWide` equal-width spatial bins;
+- scatters dense instance ids into the retained 32-bit scratch stream, then
+  swaps source/destination roles for the child level without copying back;
+- recurses only into non-empty bins;
+- uses Median packing for ranges up to `kWide * kWide` and as a bounded
+  fallback when one spatial bin would contain more than seven eighths of a
+  range.
 
 ### 9.2 Incremental structural edits
 
@@ -713,7 +714,7 @@ camera by the offset. A later differential edit materializes it in one pass.
 ### 9.4 Explicit topology rebuilds
 
 `refreshTlas()` consumes exact current instance bounds, rebuilds all TLAS nodes
-with Morton ordering, clears loose flags and the incremental repair queue, and
+with linear-pass spatial bins, clears loose flags and the incremental repair queue, and
 establishes fresh population and area baselines. It does not compact dead dense
 slots, permute any per-instance stream, or increment the instance layout and
 mapping epochs. Existing `MotionGroup` and `RigidMotionGroup` dense mappings
@@ -721,7 +722,7 @@ therefore remain valid.
 
 `optimize()` performs the configured-quality rebuild and then compacts and
 spatially reorders dense storage. It is the appropriate choice when dead-slot
-reclamation or the tighter traversal quality of Median/BinnedSAH justifies the
+reclamation or a configured Median/BinnedSAH topology justifies the
 additional safe-point cost.
 
 ### 9.5 Physical reordering

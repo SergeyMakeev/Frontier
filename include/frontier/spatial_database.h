@@ -1115,7 +1115,7 @@ private:
 
 enum class TlasQuality : uint8_t
 {
-    Morton,     // one sort, contiguous groups of kWide — cheapest, loosest
+    SpatialBins, // linear-pass longest-axis spatial bins; fast and tight
     Median,     // recursive longest-axis median split
     BinnedSAH,  // binned surface-area-heuristic split; best traversal cost
 };
@@ -1146,7 +1146,7 @@ struct TlasDebugSummary
     float areaGrowthRatio = 0.0f;
     bool buildRequired = false;
     bool topologyRebuildRecommended = false;
-    TlasQuality activeQuality = TlasQuality::Morton;
+    TlasQuality activeQuality = TlasQuality::SpatialBins;
     TlasQuality configuredQuality = TlasQuality::BinnedSAH;
 };
 
@@ -1180,7 +1180,7 @@ struct SpatialDatabaseConfig
     FrontierContext context{};
 
     // Quality tier of the top-level BVH. Initial builds and explicit
-    // optimize() calls use this tier. refreshTlas() always uses Morton.
+    // optimize() calls use this tier. refreshTlas() uses SpatialBins.
     TlasQuality tlasQuality = TlasQuality::BinnedSAH;
 
     // SAH cost constants (BinnedSAH only): cost of visiting a node vs testing
@@ -1467,8 +1467,8 @@ public:
     // SpatialQuery selection using this snapshot has completed.
     UpdateReport applyUpdates(uint32_t maintenanceNodeBudget);
 
-    // Rebuild the TLAS from exact current instance bounds with the linear
-    // Morton builder. Unlike optimize(), this does not compact dead dense
+    // Rebuild the TLAS from exact current instance bounds with the linear-pass
+    // SpatialBins builder. Unlike optimize(), this does not compact dead dense
     // slots or reorder instance and SpatialQuery-record storage, so cached
     // MotionGroup physical mappings remain valid. It clears accumulated
     // topology drift and incremental-maintenance state. This is still a full
@@ -2433,7 +2433,10 @@ private:
 
     bool tlasRebuildRecommended() const;
     float tlasAreaGrowthRatio() const;
-    void tlasRebuild(bool reorderInstances, bool useConfiguredQuality);
+    void tlasRebuild(bool reorderInstances, TlasQuality quality);
+    int32_t tlasBuildSpatialBinsRange(std::vector<uint32_t>& items,
+                                      std::vector<uint32_t>& scratch,
+                                      int lo, int hi, int32_t parent);
     int32_t tlasBuildRange(std::vector<uint32_t>& items, int lo, int hi, int32_t parent);
     int  tlasSplit(std::vector<uint32_t>& items, int lo, int hi);
     void tlasQuery(const Camera& view, float minPix,
@@ -2627,7 +2630,7 @@ private:
     std::vector<int32_t>  tlasFreeNodes_;           // nodes emptied by removal
     uint32_t              tlasLeafCount_ = 0;
     uint32_t              tlasBuildCount_ = 0;     // leaves at last topology build
-    TlasQuality           tlasBuiltQuality_ = TlasQuality::Morton;
+    TlasQuality           tlasBuiltQuality_ = TlasQuality::SpatialBins;
     double                tlasBaseArea_ = 0.0;     // lane area at last build
     double                tlasCurrentArea_ = 0.0;  // current stored lane area
     std::deque<uint32_t>  tlasRepairQueue_;
@@ -2664,34 +2667,10 @@ private:
     };
     static_assert(sizeof(TlasItem) == 4, "TLAS stack item must stay 4 bytes");
 
-    // A normal {uint64 key, uint32 id} pair has 4 bytes of tail padding. Two
-    // word halves retain the full 63-bit key with a 12-byte stride in both
-    // radix-sort buffers.
-    struct MortonItem
-    {
-        uint32_t keyLo = 0;
-        uint32_t keyHi = 0;
-        InstanceId instance = 0;
-
-        MortonItem() = default;
-        MortonItem(uint64_t key, InstanceId id)
-            : keyLo(uint32_t(key)), keyHi(uint32_t(key >> 32)), instance(id)
-        {}
-        uint64_t key() const { return uint64_t(keyLo) | (uint64_t(keyHi) << 32); }
-        bool operator<(const MortonItem& other) const
-        {
-            const uint64_t a = key(), b = other.key();
-            return a < b || (a == b && instance < other.instance);
-        }
-    };
-    static_assert(sizeof(MortonItem) == 12, "Morton sort item must stay 12 bytes");
-
-    std::vector<MortonItem> tlasKeys_;
-    std::vector<MortonItem> tlasKeysTmp_;
-    // Build and publication are mutually exclusive. Between rebuilds these
-    // existing scratch buffers retain exact-refit postorder and pending moved
-    // dense ids, avoiding extra SpatialDatabase fields or allocations.
-    std::vector<int32_t>                       tlasLevelTmp_;
+    // Build and publication are mutually exclusive. The first stream holds
+    // the SpatialBins scatter during rebuilds and the retained exact-refit
+    // postorder between them; the second holds build/pending dense ids.
+    std::vector<uint32_t>                      tlasLevelTmp_;
     std::vector<uint32_t>                      tlasItemsTmp_;
     // Cold and last: adding the optional refined plan must not move any of the
     // long-established hot scene streams above it.

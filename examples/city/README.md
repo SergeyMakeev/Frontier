@@ -45,7 +45,7 @@ configures a finite or unlimited node-repair budget for each `applyUpdates`
 call and three explicit topology-rebuild strategies: **Manual only**,
 unconditional **Periodic**, and **When recommended**. The two scheduled
 strategies use a configurable 0.25-to-60-second interval and can call either
-`refreshTlas()` (Morton topology, dense layout preserved) or `optimize()`
+`refreshTlas()` (SpatialBins topology, dense layout preserved) or `optimize()`
 (configured quality, compaction, and spatial reordering). Recommendation-gated
 mode checks the latest `UpdateReport` at that cadence. **Refresh TLAS now** and
 **Optimize now** remain available under every strategy. The UI tracks timing
