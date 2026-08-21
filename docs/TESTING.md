@@ -28,7 +28,8 @@ The suite contains:
   public contract tests;
 - exact current/ideal frontier tests for shared readiness, mounted coverage,
   both current-cut policies, query reuse, masks, and contribution culling;
-- TLAS lifecycle, motion-group, copy-on-write bounds, collection, and cache
+- TLAS lifecycle, explicit incremental-maintenance budgets, advisory quality
+  recommendations, motion-group, copy-on-write bounds, collection, and cache
   invalidation tests, including sparse-to-dense bounds-overlay promotion;
 - deterministic randomized TLAS churn checked against a live-instance model;
 - deterministic randomized node-readiness transitions checked against an
@@ -114,7 +115,9 @@ end-to-end public workflows with eight- and four-byte payload words: assembly
 versus flattening, raw and cached selection, mixed-readiness cut policy,
 shared readiness fanout, serialized registration, TLAS scale, instance
 lifecycle, mount lifecycle and retention, stable motion groups, and bounds
-overrides. It also measures complete move/publish/select frames and translated
+overrides. A dedicated TLAS case compares zero, finite, and larger maintenance
+budgets while reporting repair throughput, queue depth, and area growth. It
+also measures complete move/publish/select frames and translated
 cameras at zero, sub-unit, and large per-frame steps while reporting the
 resulting reuse/walk ratio. The realistic city cases add a continuously unique
 camera trajectory, 100 rotating/moving cars, 1,000 pedestrians, 100,000 total

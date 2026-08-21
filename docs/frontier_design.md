@@ -129,12 +129,15 @@ escape.
 
 ## 9. TLAS contracts
 
-The TLAS stores exact world bounds and maximum root error for live instances.
-It supports incremental insertion, removal, and grow-only refit. Population
-drift, edit count, and accumulated ancestor-area growth schedule repair. Exact
-leaf changes alone do not schedule a rebuild.
-`optimize()` performs explicit compaction and a quality rebuild while retaining
-public instance ids.
+The TLAS stores conservative world bounds, contribution maxima, and layer-mask
+summaries for live instances; exact instance state remains in the dense
+instance arrays. It supports incremental insertion, removal, and grow-only
+motion publication. Changed leaves enter a deduplicated repair queue;
+`applyUpdates(maintenanceNodeBudget)` tightens at most that many nodes and
+propagates shrinkage by queuing parents. Unprocessed nodes remain conservative.
+Population drift, edit count, and current lane-area growth only set an
+optimization recommendation. `optimize()` performs explicit compaction and a
+quality rebuild while retaining public instance ids.
 
 Flat TLAS roots have specialized emission paths and never touch mounted-state
 streams. Hierarchical roots may terminate directly before a local camera
@@ -191,7 +194,7 @@ after all placements are gone.
 | node readiness change | placements of one definition and ancestor paths until stable |
 | submit bound change | O(1) |
 | flush bound change | O(ancestor depth) until contained |
-| insert/remove/move instance | O(TLAS depth), excluding scheduled rebuild |
+| insert/remove/move instance | O(TLAS depth), plus caller-budgeted repair |
 | selection | output-sensitive TLAS plus surviving hierarchy work |
 | cache hit | O(recorded output plus dependency validation) |
 

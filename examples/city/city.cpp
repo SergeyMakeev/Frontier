@@ -464,7 +464,8 @@ public:
                 updateActors(simulationTime_);
             }
         }
-        database_.applyUpdates();
+        lastUpdateReport_ = database_.applyUpdates(
+            uint32_t(std::max(tlasMaintenanceBudget_, 0)));
         stageEnd = bx::getHPCounter();
         performance.simulationMs = milliseconds(stageStart, stageEnd);
 
@@ -942,8 +943,8 @@ private:
         tlasHealth_ = database_.debugTlasSummary();
         tlasHealthValid_ = true;
         nextTlasHealthSampleTime_ =
-            tlasHealth_.rebuildPending ? cameraTime_
-                                       : cameraTime_ + 0.25f;
+            tlasHealth_.buildRequired ? cameraTime_
+                                      : cameraTime_ + 0.25f;
         tlasDebugDepth_ = std::clamp(
             tlasDebugDepth_, 0, int(tlasHealth_.maxDepth));
     }
@@ -992,9 +993,19 @@ private:
                            std::max(areaLimit, 1.0e-6f),
                        0.0f, 1.0f),
             ImVec2(-1.0f, 6.0f), "");
-        if (tlasHealth_.rebuildPending)
+        ImGui::Text("Maintenance queue %u nodes",
+                    tlasHealth_.maintenanceNodesPending);
+        ImGui::Text("Last maintenance %u processed | %u pending",
+                    lastUpdateReport_.maintenanceNodesProcessed,
+                    lastUpdateReport_.maintenanceNodesPending);
+        ImGui::SliderInt("Repair nodes / frame", &tlasMaintenanceBudget_,
+                         0, 4096);
+        if (tlasHealth_.buildRequired)
             ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.20f, 1.0f),
-                               "TLAS update/rebuild pending");
+                               "TLAS correctness build required");
+        else if (tlasHealth_.optimizeRecommended)
+            ImGui::TextColored(ImVec4(1.0f, 0.78f, 0.20f, 1.0f),
+                               "TLAS optimize recommended");
 
         ImGui::Separator();
         ImGui::Text("Spatial visualizations");
@@ -1974,7 +1985,7 @@ private:
 
         resetWholeSceneMotionGroup();
 
-        database_.applyUpdates();
+        database_.applyUpdates(0);
         database_.optimize();
     }
 
@@ -2618,6 +2629,8 @@ private:
     bool showSceneStats_ = false;
     bool showPerformance_ = false;
     bool showSceneHierarchy_ = false;
+    int tlasMaintenanceBudget_ = 256;
+    UpdateReport lastUpdateReport_{};
 #ifdef FRONTIER_DEBUG_TOOLS
     bool showTlasHealth_ = false;
     bool showQueryCache_ = false;

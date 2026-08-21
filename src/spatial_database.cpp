@@ -38,6 +38,12 @@ inline float surfaceArea(const AABB& b)
     return 2.0f * (e.x * e.y + e.y * e.z + e.z * e.x);
 }
 
+inline bool sameBounds(const AABB& a, const AABB& b)
+{
+    return a.mn.x == b.mn.x && a.mn.y == b.mn.y && a.mn.z == b.mn.z &&
+           a.mx.x == b.mx.x && a.mx.y == b.mx.y && a.mx.z == b.mx.z;
+}
+
 // A view-independent upper bound for an instance's projected diameter. The
 // full AABB diagonal is intentionally conservative for every camera angle.
 // Unlike geometric error, this measures whether the instance itself can still
@@ -1564,7 +1570,6 @@ InstanceHandle SpatialDatabase::addTlasRootInstance(
             instanceFlatSlots_[id] = kInvalidIndex;
     }
     tlasInsert(id);
-    markTlasStructuralChange();
     return InstanceHandle{handle, inst.generation};
 }
 
@@ -1628,23 +1633,26 @@ void SpatialDatabase::MotionGroup::reset(
     physicalOrderValid_ = false;
 }
 
-// Structural change policy: quality rebuilds are reserved for real population
-// drift — database assembly, level load, mass despawn. Under steady churn
-// (spawn/despawn at roughly constant population) the instance count barely
-// moves, so nothing is forced here at all: the edit is applied incrementally
-// and tlasEditFraction decides when the accumulated quality loss is worth a
-// rebuild. Only a real change in population size forces one immediately, and
-// then it takes the quality tier because it is rare and long-lived.
-void SpatialDatabase::markTlasStructuralChange()
+// Current quality is advisory. Population, edit, and stored-area drift remain
+// queryable after every publication; only optimize() acts on the recommendation.
+float SpatialDatabase::tlasAreaGrowthRatio() const
+{
+    if (!(tlasBaseArea_ > 0.0)) return 0.0f;
+    return float(std::max(0.0, tlasCurrentArea_ - tlasBaseArea_) /
+                 tlasBaseArea_);
+}
+
+bool SpatialDatabase::tlasOptimizationRecommended() const
 {
     const uint64_t alive = liveInstances_.size();
     const uint64_t drift = alive > tlasQualityCount_ ? alive - tlasQualityCount_
                                                      : tlasQualityCount_ - alive;
-    if (float(drift) > float(tlasQualityCount_) * config_.tlasCountDrift)
-    {
-        tlasDirty_ = true;
-        tlasQualityBuild_ = true;
-    }
+    const bool countDrift =
+        float(drift) > float(tlasQualityCount_) * config_.tlasCountDrift;
+    const bool editDrift =
+        float(tlasEdits_) > float(tlasLeafCount_) * config_.tlasEditFraction;
+    return countDrift || editDrift ||
+           tlasAreaGrowthRatio() > config_.tlasAreaDrift;
 }
 
 void SpatialDatabase::removeInstance(InstanceHandle ref)
@@ -1687,7 +1695,6 @@ void SpatialDatabase::removeInstance(InstanceHandle ref)
     instanceDenseToHandle_[id] = kInvalidInstanceId;
     freeInstanceHandles_.push_back(ref.id);
     freeInstances_.push_back(id);
-    markTlasStructuralChange();
 
     tlasRootPayloads_[id] = 0;
 }
@@ -1915,7 +1922,7 @@ void SpatialDatabase::moveInstances(MotionGroup& group,
     // A complete population translated by one common delta can keep the TLAS
     // byte-for-byte unchanged. Validate the whole batch before mutating so
     // contract failures and a differential fallback remain transactional.
-    if (!tlasDirty_ && !group.physicalOrder_.empty() &&
+    if (!tlasBuildRequired_ && !group.physicalOrder_.empty() &&
         group.physicalOrder_.size() == liveInstances_.size())
     {
         const MotionGroup::Slot first = group.physicalOrder_[0];
@@ -2430,8 +2437,9 @@ void SpatialDatabase::setNodeBounds(InstanceHandle ref, NodeHandle h,
     pendingMoves_.push_back({localBounds, h, ref.id, ref.generation});
 }
 
-void SpatialDatabase::applyUpdates()
+UpdateReport SpatialDatabase::applyUpdates(uint32_t maintenanceNodeBudget)
 {
+    UpdateReport report;
     ++frame_;
     flushBounds();
     // Publish the final instance boxes after all local-bound edits in this
@@ -2439,12 +2447,20 @@ void SpatialDatabase::applyUpdates()
     // can then rebuild exact TLAS lanes once instead of immediately growing
     // stale pre-deformation bounds and touching the same ancestors again.
     flushInstanceMoves();
-    if (tlasDirty_)
+    if (tlasBuildRequired_)
     {
         const bool firstSpatialization =
             !instanceLayoutSpatialized_ && !liveInstances_.empty();
+        if (firstSpatialization) tlasQualityBuild_ = true;
         tlasRebuild(firstSpatialization);
+        report.requiredBuildPerformed = true;
     }
+    report.maintenanceNodesProcessed = repairTlas(maintenanceNodeBudget);
+    report.maintenanceNodesPending =
+        uint32_t(std::min<size_t>(tlasRepairQueue_.size(), UINT32_MAX));
+    report.areaGrowthRatio = tlasAreaGrowthRatio();
+    report.optimizeRecommended = tlasOptimizationRecommended();
+    return report;
 }
 
 void SpatialDatabase::optimize()
@@ -2453,7 +2469,7 @@ void SpatialDatabase::optimize()
     // intermediate refit of the old topology is necessary.
     tlasItemsTmp_.clear();
     flushBounds();
-    tlasDirty_ = true;
+    tlasBuildRequired_ = true;
     tlasQualityBuild_ = true;
     tlasRebuild(true);
 }
@@ -2637,17 +2653,84 @@ AABB SpatialDatabase::nodeBounds(InstanceHandle ref, NodeHandle h)
 // top-level BVH
 // ============================================================================
 
-void SpatialDatabase::tlasNoteGrowth(float addedArea)
+void SpatialDatabase::tlasAdjustCurrentArea(double delta)
 {
-    tlasGrownArea_ += addedArea;
-    // Cost drift: a population that stays constant while everything moves
-    // never trips the count-drift trigger, but grow-only refit bloats the
-    // lanes all the same. Watching the added area catches exactly that case.
-    if (tlasBaseArea_ > 0.0f && tlasGrownArea_ > tlasBaseArea_ * config_.tlasAreaDrift)
+    tlasCurrentArea_ = std::max(0.0, tlasCurrentArea_ + delta);
+}
+
+void SpatialDatabase::queueTlasRepair(uint32_t node)
+{
+    if (node >= tlasNodes_.size()) return;
+    if (tlasRepairQueued_.size() < tlasNodes_.size())
+        tlasRepairQueued_.resize(tlasNodes_.size(), 0);
+    if (tlasRepairQueued_[node]) return;
+    tlasRepairQueued_[node] = 1;
+    tlasRepairQueue_.push_back(node);
+}
+
+bool SpatialDatabase::repairTlasNode(uint32_t nodeIndex)
+{
+    if (nodeIndex >= tlasNodes_.size()) return false;
+    TlasNode& node = tlasNodes_[nodeIndex];
+    if (node.validLanes() == 0) return false;
+    TlasMeta& meta = tlasMeta_[nodeIndex];
+    bool changed = false;
+    uint32_t lanes = node.validLanes();
+    while (lanes)
     {
-        tlasDirty_ = true;
-        tlasQualityBuild_ = true;
+        const uint32_t lane = uint32_t(std::countr_zero(lanes));
+        lanes &= lanes - 1;
+        const int32_t child = node.child[lane];
+        AABB exact;
+        float contribution = 0.0f;
+        uint32_t layerMask = 0;
+        if (child < 0)
+        {
+            const InstanceId dense = InstanceId(~child);
+            FRONTIER_ASSERT(dense < instances_.size() &&
+                                instances_[dense].alive(),
+                            "TLAS leaf references a dead instance");
+            const Instance& instance = instances_[dense];
+            exact = instance.worldBox;
+            contribution = contributionDiameter(exact);
+            layerMask = instance.mask;
+            instanceTlasLoose_[dense] = 0;
+        }
+        else
+        {
+            exact = tlasNodeExtent(uint32_t(child), contribution, layerMask);
+        }
+
+        const AABB old = node.bounds.lane(lane);
+        if (!sameBounds(old, exact) ||
+            meta.maxContribution.v[lane] != contribution ||
+            meta.laneMask[lane] != layerMask)
+        {
+            tlasAdjustCurrentArea(double(surfaceArea(exact)) -
+                                  double(surfaceArea(old)));
+            node.bounds.setLane(lane, exact);
+            meta.maxContribution.v[lane] = contribution;
+            meta.laneMask[lane] = layerMask;
+            changed = true;
+        }
     }
+    if (changed && node.parent >= 0)
+        queueTlasRepair(uint32_t(node.parent));
+    return changed;
+}
+
+uint32_t SpatialDatabase::repairTlas(uint32_t nodeBudget)
+{
+    uint32_t processed = 0;
+    while (processed < nodeBudget && !tlasRepairQueue_.empty())
+    {
+        const uint32_t node = tlasRepairQueue_.front();
+        tlasRepairQueue_.pop_front();
+        if (node < tlasRepairQueued_.size()) tlasRepairQueued_[node] = 0;
+        repairTlasNode(node);
+        ++processed;
+    }
+    return processed;
 }
 
 // Grow-only propagation up the parent chain, shared by motion refit and by
@@ -2734,6 +2817,7 @@ int32_t SpatialDatabase::tlasAllocNode()
     const int32_t idx = int32_t(tlasNodes_.size());
     TlasNode& n = tlasNodes_.emplace_back();
     TlasMeta& meta = tlasMeta_.emplace_back();
+    tlasRepairQueued_.push_back(0);
     n.bounds = WideBounds::allEmpty();
     meta.maxContribution = float8::splat(0.0f);
     n.parent = -1;
@@ -2746,13 +2830,12 @@ int32_t SpatialDatabase::tlasAllocNode()
 }
 
 // Incremental edits trade a little tree quality for O(depth) instead of a full
-// rebuild. This is what bounds how much of that accumulates.
+// rebuild. The counter makes that accumulated quality drift observable to the
+// caller without scheduling work here.
 void SpatialDatabase::tlasNoteEdit()
 {
     tlasLevelTmp_.clear();
     ++tlasEdits_;
-    if (float(tlasEdits_) > float(tlasLeafCount_) * config_.tlasEditFraction)
-        tlasDirty_ = true;
 }
 
 // Descend to the leaf whose lane box grows least, then either take a free lane
@@ -2763,12 +2846,12 @@ void SpatialDatabase::tlasNoteEdit()
 // that was just built full.
 void SpatialDatabase::tlasInsert(InstanceId id)
 {
-    if (tlasDirty_) return;   // the pending rebuild will enumerate this instance
+    if (tlasBuildRequired_) return;   // the pending build will enumerate this instance
     materializeTlasGlobalOffset();
     Instance& inst = instances_[id];
     if (tlasRoot_ < 0)
     {
-        tlasDirty_ = true;    // no tree yet; let a build make the first one
+        tlasBuildRequired_ = true;    // no tree yet; let a build make the first one
         return;
     }
 
@@ -2798,6 +2881,7 @@ void SpatialDatabase::tlasInsert(InstanceId id)
 
     const uint32_t full = (1u << kWide) - 1;
     uint32_t host = cur;
+    double areaDelta = 0.0;
     if (tlasNodes_[cur].validLanes() == full)
     {
         // Split. The new node replaces `cur` wherever `cur` was referenced, and
@@ -2814,6 +2898,7 @@ void SpatialDatabase::tlasInsert(InstanceId id)
 
         m.parent = l0.parent;
         m.bounds.setLane(0, childBox);
+        areaDelta += surfaceArea(childBox);
         mMeta.maxContribution.v[0] = childContribution;
         m.child[0] = int32_t(cur);
         mMeta.laneMask[0] = childMask;
@@ -2839,6 +2924,7 @@ void SpatialDatabase::tlasInsert(InstanceId id)
     TlasMeta& hMeta = tlasMeta_[host];
     const uint32_t lane = uint32_t(std::countr_zero(~h.validMask & full));
     h.bounds.setLane(lane, inst.worldBox);
+    areaDelta += surfaceArea(inst.worldBox);
     const float contribution = contributionDiameter(inst.worldBox);
     hMeta.maxContribution.v[lane] = contribution;
     h.child[lane] = ~int32_t(id);
@@ -2847,8 +2933,8 @@ void SpatialDatabase::tlasInsert(InstanceId id)
     inst.setTlasPlacement(host, lane);
     ++tlasLeafCount_;
 
-    tlasNoteGrowth(
-        tlasGrowUp(host, inst.worldBox, contribution, inst.mask));
+    areaDelta += tlasGrowUp(host, inst.worldBox, contribution, inst.mask);
+    tlasAdjustCurrentArea(areaDelta);
     tlasNoteEdit();
 }
 
@@ -2857,7 +2943,7 @@ void SpatialDatabase::tlasInsert(InstanceId id)
 // than its contents costs a little traversal and nothing else.
 void SpatialDatabase::tlasRemove(InstanceId id)
 {
-    if (tlasDirty_) return;
+    if (tlasBuildRequired_) return;
     Instance& inst = instances_[id];
     if (inst.tlasNode() == kInvalidInstanceId) return;
 
@@ -2867,10 +2953,12 @@ void SpatialDatabase::tlasRemove(InstanceId id)
         !(tlasNodes_[nodeIdx].validMask & (1u << lane)) ||
         tlasNodes_[nodeIdx].child[lane] != ~int32_t(id))
     {
-        tlasDirty_ = true;   // bookkeeping disagrees; rebuild rather than guess
+        tlasBuildRequired_ = true;   // bookkeeping disagrees; rebuild rather than guess
         return;
     }
 
+    tlasAdjustCurrentArea(-double(surfaceArea(
+        tlasNodes_[nodeIdx].bounds.lane(lane))));
     tlasNodes_[nodeIdx].clearLane(lane);
     inst.clearTlasPlacement();
     if (tlasLeafCount_) --tlasLeafCount_;
@@ -2888,6 +2976,7 @@ void SpatialDatabase::tlasRemove(InstanceId id)
         for (uint32_t l = 0; l < kWide; ++l)
             if ((p.validMask & (1u << l)) && p.child[l] == int32_t(nodeIdx))
             {
+                tlasAdjustCurrentArea(-double(surfaceArea(p.bounds.lane(l))));
                 p.clearLane(l);
                 break;
             }
@@ -2895,16 +2984,20 @@ void SpatialDatabase::tlasRemove(InstanceId id)
         nodeIdx = uint32_t(parent);
     }
 
+    if (tlasNodes_[nodeIdx].validLanes() != 0 &&
+        tlasNodes_[nodeIdx].parent >= 0)
+        queueTlasRepair(uint32_t(tlasNodes_[nodeIdx].parent));
+
     tlasNoteEdit();
 }
 
 void SpatialDatabase::tlasOnInstanceMoved(InstanceId id)
 {
-    if (tlasDirty_) return;
+    if (tlasBuildRequired_) return;
     Instance& inst = instances_[id];
     if (inst.tlasNode() == kInvalidInstanceId)
     {
-        tlasDirty_ = true;
+        tlasBuildRequired_ = true;
         return;
     }
 
@@ -2923,14 +3016,12 @@ void SpatialDatabase::tlasOnInstanceMoved(InstanceId id)
         meta.maxContribution.v[lane] >= contribution;
     if (envelopeAlreadyCovers)
     {
-        if (oldLeafBounds.mn.x != inst.worldBox.mn.x ||
-            oldLeafBounds.mn.y != inst.worldBox.mn.y ||
-            oldLeafBounds.mn.z != inst.worldBox.mn.z ||
-            oldLeafBounds.mx.x != inst.worldBox.mx.x ||
-            oldLeafBounds.mx.y != inst.worldBox.mx.y ||
-            oldLeafBounds.mx.z != inst.worldBox.mx.z ||
+        if (!sameBounds(oldLeafBounds, inst.worldBox) ||
             meta.maxContribution.v[lane] != contribution)
+        {
             instanceTlasLoose_[id] = 1;
+            queueTlasRepair(nodeIdx);
+        }
         return;
     }
 
@@ -2940,17 +3031,20 @@ void SpatialDatabase::tlasOnInstanceMoved(InstanceId id)
     meta.maxContribution.v[lane] =
         std::max(meta.maxContribution.v[lane], contribution);
     instanceTlasLoose_[id] = 1;
+    queueTlasRepair(nodeIdx);
 
     const float added =
         tlasGrowUp(nodeIdx, envelope, contribution, inst.mask);
 
-    tlasNoteGrowth(added);
+    tlasAdjustCurrentArea(
+        double(surfaceArea(envelope)) - double(surfaceArea(oldLeafBounds)) +
+        double(added));
 }
 
 void SpatialDatabase::flushInstanceMoves()
 {
     if (tlasItemsTmp_.empty()) return;
-    if (tlasDirty_)
+    if (tlasBuildRequired_)
     {
         tlasItemsTmp_.clear();
         return;
@@ -3008,7 +3102,7 @@ void SpatialDatabase::tlasRefitAllExact()
         }
     }
 
-    float exactArea = 0.0f;
+    double exactArea = 0.0;
     for (const int32_t signedNodeIndex : tlasLevelTmp_)
     {
         const uint32_t nodeIndex = uint32_t(signedNodeIndex);
@@ -3040,17 +3134,13 @@ void SpatialDatabase::tlasRefitAllExact()
             node.bounds.setLane(lane, bounds);
             meta.maxContribution.v[lane] = maxContribution;
             meta.laneMask[lane] = layerMask;
-            exactArea += surfaceArea(bounds);
+            exactArea += double(surfaceArea(bounds));
         }
     }
 
-    tlasGrownArea_ = std::max(0.0f, exactArea - tlasBaseArea_);
-    if (tlasBaseArea_ > 0.0f &&
-        tlasGrownArea_ > tlasBaseArea_ * config_.tlasAreaDrift)
-    {
-        tlasDirty_ = true;
-        tlasQualityBuild_ = true;
-    }
+    tlasCurrentArea_ = exactArea;
+    tlasRepairQueue_.clear();
+    std::fill(tlasRepairQueued_.begin(), tlasRepairQueued_.end(), uint8_t(0));
 }
 
 // 21 bits per axis -> 63-bit Morton key.
@@ -3451,13 +3541,9 @@ void SpatialDatabase::reorderInstancesByTlas()
     if (++instanceMappingVersion_ == 0) ++instanceMappingVersion_;
 }
 
-// Two-tier rebuild policy:
-//  - structural rebuilds (add/remove) take the quality path: rare,
-//    long-lived, quality matters (contribution culling leans on tight
-//    contribution/bounds lanes);
-//  - motion rebuilds (area threshold) take the Morton path: one sort plus
-//    contiguous groups of kWide per level, ~5x faster to build while keeping
-//    grow-only ancestor bloat bounded.
+// Build the required initial/recovery topology or the quality topology
+// explicitly requested by optimize(). Routine motion and quality drift never
+// reach this path implicitly.
 void SpatialDatabase::tlasRebuild(bool reorderInstances)
 {
     // Rebuild enumerates instance bounds, so first bring a deferred uniform
@@ -3467,10 +3553,12 @@ void SpatialDatabase::tlasRebuild(bool reorderInstances)
     tlasMeta_.clear();
     tlasLevelTmp_.clear();
     tlasFreeNodes_.clear();
+    tlasRepairQueue_.clear();
+    tlasRepairQueued_.clear();
     tlasRoot_ = -1;
     tlasEdits_ = 0;
-    tlasGrownArea_ = 0.0f;
-    tlasDirty_ = false;
+    tlasCurrentArea_ = 0.0;
+    tlasBuildRequired_ = false;
     for (const InstanceId dense : liveInstances_)
         instanceTlasLoose_[dense] = 0;
 
@@ -3591,13 +3679,14 @@ void SpatialDatabase::tlasRebuild(bool reorderInstances)
 
     if (reorderInstances) reorderInstancesByTlas();
 
-    // Baseline for the area-drift trigger: the total lane area this build
-    // started from. Motion is allowed to add a configured fraction of it
-    // before the tree is considered bloated enough to rebuild.
-    tlasBaseArea_ = 0.0f;
+    // The current stored-lane area is updated incrementally as bounds grow or
+    // tighten. This build establishes the comparison baseline.
+    tlasCurrentArea_ = 0.0;
     for (const TlasNode& n : tlasNodes_)
         for (uint32_t l = 0; l < kWide; ++l)
-            if (n.validMask & (1u << l)) tlasBaseArea_ += surfaceArea(n.bounds.lane(l));
+            if (n.validMask & (1u << l))
+                tlasCurrentArea_ += double(surfaceArea(n.bounds.lane(l)));
+    tlasBaseArea_ = tlasCurrentArea_;
     tlasItemsTmp_.clear();
     tlasLevelTmp_.clear();
 }
@@ -3608,9 +3697,9 @@ void SpatialDatabase::tlasQueryImpl(const Camera& view, float minPix,
                           std::vector<TlasItem>& stack) const
 {
     outVisible.clear();
-    FRONTIER_CHECK(!tlasDirty_ && pendingMoves_.empty() &&
+    FRONTIER_CHECK(!tlasBuildRequired_ && pendingMoves_.empty() &&
                        tlasItemsTmp_.empty(),
-                   "SpatialQuery::selectFrontier: call applyUpdates() after "
+                   "SpatialQuery::selectFrontier: call applyUpdates(budget) after "
                    "database changes");
     if (tlasRoot_ < 0) return;
 
@@ -3748,9 +3837,9 @@ void SpatialDatabase::consumeMountUsage(SpatialQuery& query)
 
 bool SpatialDatabase::tlasRootContainsPopulation(const Camera& view) const
 {
-    FRONTIER_CHECK(!tlasDirty_ && pendingMoves_.empty() &&
+    FRONTIER_CHECK(!tlasBuildRequired_ && pendingMoves_.empty() &&
                        tlasItemsTmp_.empty(),
-                   "SpatialQuery::selectFrontier: call applyUpdates() after "
+                   "SpatialQuery::selectFrontier: call applyUpdates(budget) after "
                    "database changes");
     if (tlasRoot_ < 0) return true;
 
@@ -3879,23 +3968,27 @@ TlasDebugSummary SpatialDatabase::debugTlasSummary() const
         tlasNodes_.capacity() * sizeof(TlasNode) +
         tlasMeta_.capacity() * sizeof(TlasMeta) +
         tlasFreeNodes_.capacity() * sizeof(int32_t) +
-        instanceTlasLoose_.capacity() * sizeof(uint8_t);
+        instanceTlasLoose_.capacity() * sizeof(uint8_t) +
+        tlasRepairQueued_.capacity() * sizeof(uint8_t) +
+        tlasRepairQueue_.size() * sizeof(uint32_t);
     summary.allocatedNodes = uint32_t(tlasNodes_.size());
     summary.freeNodes = uint32_t(tlasFreeNodes_.size());
     summary.instanceCount = uint32_t(liveInstances_.size());
     summary.editsSinceRebuild = tlasEdits_;
     summary.qualityBaselineInstances = tlasQualityCount_;
-    summary.areaGrowthRatio =
-        tlasBaseArea_ > 0.0f ? tlasGrownArea_ / tlasBaseArea_ : 0.0f;
-    summary.rebuildPending = tlasDirty_ || !pendingMoves_.empty() ||
-                             !tlasItemsTmp_.empty();
+    summary.maintenanceNodesPending =
+        uint32_t(std::min<size_t>(tlasRepairQueue_.size(), UINT32_MAX));
+    summary.areaGrowthRatio = tlasAreaGrowthRatio();
+    summary.buildRequired = tlasBuildRequired_;
+    summary.optimizeRecommended = tlasOptimizationRecommended();
     summary.configuredQuality = config_.tlasQuality;
 
     for (const InstanceId dense : liveInstances_)
         if (dense < instanceTlasLoose_.size() && instanceTlasLoose_[dense])
             ++summary.looseInstanceCount;
 
-    if (summary.rebuildPending || tlasRoot_ < 0)
+    if (summary.buildRequired || !pendingMoves_.empty() ||
+        !tlasItemsTmp_.empty() || tlasRoot_ < 0)
         return summary;
 
     uint64_t validLanes = 0;
@@ -3934,7 +4027,7 @@ TlasDebugSummary SpatialDatabase::debugTlasSummary() const
 size_t SpatialDatabase::debugTlasBoxes(
     uint32_t depth, std::span<TlasDebugBox> output) const
 {
-    if (tlasDirty_ || !pendingMoves_.empty() || !tlasItemsTmp_.empty() ||
+    if (tlasBuildRequired_ || !pendingMoves_.empty() || !tlasItemsTmp_.empty() ||
         tlasRoot_ < 0)
         return 0;
 
@@ -4007,7 +4100,7 @@ size_t SpatialDatabase::debugTlasBoxes(
 size_t SpatialDatabase::debugLooseInstanceBounds(
     std::span<LooseInstanceDebugBounds> output) const
 {
-    if (tlasDirty_ || !pendingMoves_.empty() || !tlasItemsTmp_.empty())
+    if (tlasBuildRequired_ || !pendingMoves_.empty() || !tlasItemsTmp_.empty())
         return 0;
 
     const auto worldBounds = [this](const AABB& bounds)

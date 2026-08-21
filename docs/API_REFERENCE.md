@@ -1170,7 +1170,7 @@ void selectFrontier(const SpatialDatabase& database,
 ```
 
 - **Parameters:** `database` must expose a snapshot published by
-  `applyUpdates()`; `camera` is raw input and is damped internally; `params`
+  `applyUpdates(budget)`; `camera` is raw input and is damped internally; `params`
   controls refinement, contribution culling, and current-cut fallback policy.
   The final overload argument selects query-owned, caller-fixed, or
   caller-owned output.
@@ -1285,7 +1285,7 @@ The contract is intentionally narrower than `SpatialQuery`:
 - definitions must contain no nested mount points and every terminal node must
   have zero geometric error;
 - selected instances must not have copy-on-write bound deformation;
-- the caller must publish changes with `applyUpdates()` first.
+- the caller must publish changes with `applyUpdates(budget)` first.
 
 Violations are contract errors; the query does not silently fall back to a
 proxy because that would change max-detail semantics. TLAS-only roots remain
@@ -1373,15 +1373,16 @@ struct SpatialDatabaseConfig {
 ```
 
 - `context` supplies callbacks and is copied into the database.
-- `tlasQuality` selects initial and promoted rebuild quality.
+- `tlasQuality` selects initial-build and explicit-`optimize()` quality.
 - `tlasTraversalCost` and `tlasIntersectCost` are the Binned-SAH cost terms;
   increasing intersection cost favors deeper, tighter trees.
-- `tlasCountDrift` is the population-change fraction that promotes a quality
-  rebuild.
-- `tlasAreaDrift` is the allowed grow-only refit area relative to the last
-  quality build.
-- `tlasEditFraction` bounds accumulated incremental spawn/removal edits before
-  rebuild.
+- `tlasCountDrift` is the population-change fraction at which
+  `UpdateReport::optimizeRecommended` becomes true.
+- `tlasAreaDrift` is the allowed current TLAS lane area growth relative to the
+  last TLAS build before optimization is recommended. Incremental
+  maintenance reduces this ratio as it tightens lanes.
+- `tlasEditFraction` is the accumulated incremental spawn/removal fraction at
+  which optimization is recommended.
 - `parallelInstanceThreshold` is the minimum visible-instance count for
   uncached parallel selection. Zero disables it; `context.workerCount` must
   also exceed one.
@@ -1391,6 +1392,10 @@ and drift values. When `parallelInstanceThreshold` is non-zero and
 `workerCount > 1`, `context.parallelFor` must be non-null. Internal parallel
 selection is blocking and concatenates worker output in instance order, so
 serial and parallel cuts are identical.
+
+The three drift thresholds are advisory. They never cause an implicit quality
+rebuild during publication; only the application decides when to call
+`optimize()`.
 
 ## 10. `SpatialDatabase`
 
@@ -1503,7 +1508,7 @@ void moveInstance(InstanceHandle instance, const Transform& transform);
   translation and angular displacement consume affected query records' exact
   distance margins, while scale changes invalidate those records. Public
   handles remain valid. Exact instance state changes during submission; TLAS
-  maintenance is coalesced and becomes queryable after `applyUpdates()`.
+  maintenance is coalesced and becomes queryable after `applyUpdates(budget)`.
 - **Stale behavior:** no-op.
 - **Contract:** position and scale are finite, with positive scale and finite
   reciprocal. The transformed root bound and error must remain representable
@@ -1771,7 +1776,8 @@ void flushBounds();
 
 Applies queued bounds edits immediately in submission order. The edited node
 is set exactly; ancestor propagation is grow-only. This is normally implicit
-in `applyUpdates()` and is exposed for tools or immediate readback.
+in `applyUpdates(maintenanceNodeBudget)` and is exposed for tools or immediate
+readback.
 
 ```cpp
 AABB nodeBounds(InstanceHandle instance, NodeHandle node);
@@ -1788,14 +1794,40 @@ or render transform.
 ### Publication and maintenance
 
 ```cpp
-void applyUpdates();
+inline constexpr uint32_t kUnlimitedTlasMaintenance = UINT32_MAX;
+
+struct UpdateReport {
+    uint32_t maintenanceNodesProcessed = 0;
+    uint32_t maintenanceNodesPending = 0;
+    float areaGrowthRatio = 0.0f;
+    bool optimizeRecommended = false;
+    bool requiredBuildPerformed = false;
+};
+
+UpdateReport applyUpdates(uint32_t maintenanceNodeBudget);
 ```
 
-Flushes node bounds, coalesces pending instance motion, performs any scheduled
-TLAS refit or rebuild, publishes the state for a group of read-only selections,
-and increments `frame()`. Call once before each selection group, even when the
-writer made no scene edits, if collection age should advance. No mutation or
-collection may overlap selections using the published snapshot.
+Flushes node bounds, coalesces pending instance motion, repairs at most the
+specified number of queued TLAS nodes, publishes the state for a group of
+read-only selections, and increments `frame()`. Every interruption point is
+safe: unprocessed nodes retain conservative grown bounds, which can reduce
+culling efficiency but cannot hide a visible instance.
+
+- Pass `0` to pay no optional tightening cost in this update.
+- Pass a finite node count to spread repair work predictably across updates.
+- Pass `kUnlimitedTlasMaintenance` to drain all currently queued repair work.
+
+`maintenanceNodesProcessed` is the exact work charged to this call and
+`maintenanceNodesPending` is the queue size after it. `areaGrowthRatio`
+measures current stored lane area above the last TLAS build.
+`optimizeRecommended` applies the configured population, edit, and area drift
+thresholds; it is advice, not a scheduled action. `requiredBuildPerformed` is
+true only for a correctness-required initial or defensive build. Optional
+maintenance never rebuilds topology.
+
+Call once before each selection group, even when the writer made no scene
+edits, if collection age should advance. No mutation or collection may overlap
+selections using the published snapshot.
 
 ```cpp
 void optimize();
@@ -1849,7 +1881,7 @@ size_t instanceOrientationStateBytes() const;
 ```
 
 - `mountedSubtreeCount()` returns the number of live mounted placements.
-- `frame()` returns the latest `applyUpdates()` epoch.
+- `frame()` returns the latest `applyUpdates(budget)` epoch.
 - `overlayCount()` returns live copy-on-write bounds overlay count.
 - `overlayBytes()` returns retained overlay storage bytes.
 - `subtreeInstanceStateBytes()` returns retained placement records,
@@ -1872,7 +1904,9 @@ size_t SpatialDatabase::debugLooseInstanceBounds(
     std::span<LooseInstanceDebugBounds> output) const;
 ```
 
-The summaries read existing scalar state. `debugTlasSummary()` walks the live
+The summaries read existing scalar state. `debugTlasSummary()` reports the
+same pending-maintenance, current area growth, required-build, and optimization
+recommendation state as publication. It also walks the live
 TLAS to calculate depth and occupancy. The span methods allocate nothing,
 write at most `output.size()` records, and return the complete matching count
 so the caller can detect truncation. `debugTlasBoxes()` returns a complete cut
@@ -1888,7 +1922,7 @@ snapshot; their work is performed only when explicitly requested.
 
 1. One writer performs registration, assembly, movement, readiness changes,
    bounds, maintenance, or collection.
-2. The writer calls `applyUpdates()`.
+2. The writer calls `applyUpdates(maintenanceNodeBudget)`.
 3. Any number of readers call `selectFrontier()` concurrently using distinct
    `SpatialQuery` and output objects.
 4. All readers join before the next database mutation.

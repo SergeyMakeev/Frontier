@@ -145,9 +145,9 @@ TerminalRenderView TerminalRenderQuery::select(
     impl_->runs.clear();
     impl_->leafCount = 0;
 
-    FRONTIER_CHECK(!database.tlasDirty_ && database.pendingMoves_.empty() &&
+    FRONTIER_CHECK(!database.tlasBuildRequired_ && database.pendingMoves_.empty() &&
                        database.tlasItemsTmp_.empty(),
-                   "TerminalRenderQuery::select: call applyUpdates() after "
+                   "TerminalRenderQuery::select: call applyUpdates(budget) after "
                    "database changes");
     if (database.tlasRoot_ < 0 && batches.empty())
         return {{}, 0};

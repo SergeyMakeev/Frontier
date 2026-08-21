@@ -165,17 +165,31 @@ the existing query epoch.
 
 ## TLAS maintenance
 
-Initial and quality builds use the configured `BinnedSAH`, `Median`, or `Morton`
-tier. Incremental insertion descends by least bound growth and splits a full
-leaf. Removal invalidates a lane. Instance motion updates exact dense instance
-state immediately but defers TLAS writes to `applyUpdates()`. A cohort smaller
-than one quarter of the TLAS population uses conservative grow-only leaf and
-ancestor propagation. At or above that threshold, publication streams the
-complete TLAS once in retained bottom-up order, copies exact leaf state from
-the dense instance array, recomputes interior lanes, and clears loose-leaf
-flags. This trades scattered mover-to-root walks for sequential O(TLAS nodes)
-work and shrinks old swept envelopes at the same time. Population drift, edit
-fraction, and added surface area still schedule quality rebuilds.
+Initial builds and explicit `optimize()` calls use the configured `BinnedSAH`,
+`Median`, or `Morton` tier. Incremental insertion descends by least bound
+growth and splits a full leaf. Removal invalidates a lane. Instance motion
+updates exact dense instance state immediately but defers TLAS writes to
+`applyUpdates(maintenanceNodeBudget)`.
+
+A cohort smaller than one quarter of the TLAS population uses conservative
+grow-only leaf and ancestor propagation. Each changed leaf is queued once for
+optional tightening. One maintenance unit recomputes one queued node from its
+exact instance lanes or conservative child extents. If the node shrinks, its
+parent is queued, so a finite node budget naturally spreads repair toward the
+root across later updates. A zero budget leaves the conservative envelopes in
+place; `kUnlimitedTlasMaintenance` drains the queue. Every partial result is a
+valid broadphase.
+
+At or above the quarter-population threshold, publication streams the complete
+TLAS once in retained bottom-up order, copies exact leaf state from the dense
+instance array, recomputes interior lanes, and clears the repair queue. This
+mandatory publication strategy trades scattered mover-to-root writes for
+sequential O(TLAS nodes) work. It is separate from the caller-budgeted repair
+queue.
+
+Population drift, edit fraction, and current lane-area growth set
+`UpdateReport::optimizeRecommended`; they never schedule an implicit topology
+rebuild. `optimize()` is the sole application-requested quality repair.
 
 The large-batch path reuses mutually exclusive build scratch: one 32-bit array
 holds pending dense instance ids and the temporary DFS stack, while another
@@ -226,8 +240,9 @@ then depends on camera rotation. Uncached selection can split visible instance
 runs across the host's blocking `parallelFor`; workers own all temporary output
 and are concatenated deterministically.
 
-`SpatialDatabase::applyUpdates()` is the writer/read barrier. It flushes bound
-edits, performs scheduled TLAS maintenance, and advances the collection epoch.
+`SpatialDatabase::applyUpdates(maintenanceNodeBudget)` is the writer/read
+barrier. It flushes bound edits, publishes motion, performs up to the requested
+amount of optional TLAS tightening, and advances the collection epoch.
 After publication, distinct queries may read concurrently until the next write.
 
 ## Memory and performance checkpoints

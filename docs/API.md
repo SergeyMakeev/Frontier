@@ -125,7 +125,7 @@ InstanceHandle rock = database.instantiate(
         .mask = ~0u,
     });
 
-database.applyUpdates();
+database.applyUpdates(256);
 
 SpatialQuery query;
 Camera camera = makeLookAtCamera(cameraPosition, cameraTarget);
@@ -464,7 +464,7 @@ reciprocal because traversal transforms the camera into placement-local space.
 Mutations become queryable at an update barrier:
 
 ```cpp
-database.applyUpdates();
+database.applyUpdates(256);
 
 SpatialQuery mainView;
 mainView.setHalfLife(3.0f); // optional view-local LOD damping
@@ -830,7 +830,8 @@ Frontier distinguishes three kinds of movement.
 
 `moveInstance()` changes the translation, uniform scale, and planar yaw of the
 permanent root and everything mounted below it. Exact instance state changes at
-submission time; the TLAS snapshot is published by the next `applyUpdates()`:
+submission time; the TLAS snapshot is published by the next
+`applyUpdates(maintenanceNodeBudget)`:
 
 ```cpp
 database.moveInstance(carInstance, InstanceTransform{
@@ -888,6 +889,13 @@ addition, or rebuild materializes that offset transparently. Subsets update
 their exact instance transforms. At publication, cohorts below one quarter of
 the TLAS population reuse grow-only swept leaf envelopes; larger cohorts
 replace scattered per-mover ancestor walks with one exact bottom-up TLAS refit.
+Every loose small-cohort leaf is queued for optional tightening. The maintenance
+budget passed to `applyUpdates(maintenanceNodeBudget)` repairs queued nodes and
+propagates shrinkage toward the root over later calls. Unprocessed nodes remain
+conservative and queryable. Dense-motion exact refit remains a publication
+strategy because it
+is cheaper than many scattered grow paths; it is not an optional topology
+rebuild and does not consume the maintenance budget.
 
 Here **dense order** means Frontier's compact internal instance-slot order. It
 may change during `optimize()`. Public `InstanceHandle` identity remains stable,
@@ -963,7 +971,7 @@ local bound for the affected top-level instance:
 database.setNodeBounds(carInstance, movingDoorNode,
                        animatedDoorBoundsInDefinitionSpace);
 
-// Optional immediate tool/readback barrier; applyUpdates() also flushes.
+// Optional immediate tool/readback barrier; applyUpdates(budget) also flushes.
 database.flushBounds();
 AABB effective = database.nodeBounds(carInstance, movingDoorNode);
 ```
@@ -995,7 +1003,7 @@ contributes retention feedback only when enabled:
 SpatialQuery streamingView;
 streamingView.setMountUsageEnabled(true);
 
-database.applyUpdates();
+database.applyUpdates(256);
 streamingView.selectFrontier(database, camera, params);
 
 CollectResult collected = database.collect(
@@ -1028,7 +1036,7 @@ registered bytes.
 
 1. one writer performs registration, assembly, motion, readiness changes, and
    collection;
-2. the writer calls `applyUpdates()`;
+2. the writer calls `applyUpdates(maintenanceNodeBudget)`;
 3. any number of readers select concurrently, each with a distinct
    `SpatialQuery`;
 4. all reads finish before the next write.
@@ -1037,7 +1045,9 @@ registered bytes.
 // Single-writer phase.
 applyStreamingCompletions(database);
 applySimulationMotion(database);
-database.applyUpdates();
+UpdateReport update = database.applyUpdates(256);
+if (update.optimizeRecommended)
+    scheduleOptimizeAtAnApplicationChosenSafePoint();
 
 // Read-only phase. Each task owns a different query.
 runConcurrently(
@@ -1053,17 +1063,26 @@ A `SpatialQuery` is mutable and cannot be used concurrently, even against the
 same database. It binds to the first database it reads; `reset()` releases that
 binding and clears damping/reuse history while retaining allocations.
 
-Call `applyUpdates()` once per publication group even if no content changed; it
-also advances the epoch used by collection aging. `optimize()` is a heavier
-safe-point operation that flushes bounds, compacts dead dense instance slots,
-and performs a quality TLAS rebuild. Public handles and `FrontierEntry` instance
-ids remain stable.
+Call `applyUpdates(budget)` once per publication group even if no content
+changed; it also advances the epoch used by collection aging. The budget is the
+maximum number of queued TLAS nodes whose conservative bounds may be tightened
+in that call. Zero publishes without optional tightening. A finite value spreads
+maintenance across frames, and `kUnlimitedTlasMaintenance` drains the queue.
+The returned `UpdateReport` contains processed and pending node counts, current
+area growth, whether optimization is recommended, and whether a correctness-
+required build occurred.
+
+`applyUpdates(maintenanceNodeBudget)` never performs an optional topology
+rebuild. Population drift, incremental edit count, and stored-area growth only set
+`optimizeRecommended`. `optimize()` is the explicit heavier safe-point operation
+that flushes bounds, compacts dead dense instance slots, and performs a quality
+TLAS rebuild. Public handles and `FrontierEntry` instance ids remain stable.
 
 ## 12. Configure allocation, TLAS quality, and parallel selection
 
 `FrontierContext` supplies aligned allocation for serialized subtrees and an
 optional blocking `parallelFor` callback. `SpatialDatabaseConfig` selects TLAS
-quality and maintenance thresholds.
+build quality and optimization-recommendation thresholds.
 
 ```cpp
 FrontierContext context{
@@ -1090,8 +1109,8 @@ SpatialDatabase database(config);
 
 `BinnedSAH` uses a binned surface-area heuristic to build a tighter TLAS at a
 higher rebuild cost. `Morton` is the cheapest, loosest build and `Median` is the
-middle option. The drift thresholds decide when inexpensive incremental edits
-have degraded the current TLAS enough to rebuild it.
+middle option. The drift thresholds decide when `UpdateReport` recommends an
+explicit `optimize()`; they never cause an implicit quality rebuild.
 
 `parallelFor` must block until all requested tasks finish. Internal parallel
 selection is used only for uncached queries, above the configured visible
@@ -1224,7 +1243,7 @@ void expandHouses(FrontierCutView ideal)
     }
 }
 
-database.applyUpdates();
+database.applyUpdates(256);
 FrontierResultView cut = cityQuery.selectFrontier(database, camera, params);
 requestReadiness(cut.idealOnly);
 expandHouses(cut.ideal());
@@ -1272,7 +1291,7 @@ void applyCompletions()
         // A stale parent simply returns an invalid placement.
     }
 
-    database.applyUpdates();
+database.applyUpdates(256);
 }
 ```
 
@@ -1308,7 +1327,7 @@ void frame(std::span<const float4> vehiclePositions)
     database.moveInstances(vehicles, vehiclePositions, 1.0f);
     for (const AnimatedBound& edit : animatedBounds)
         database.setNodeBounds(edit.instance, edit.node, edit.localBounds);
-    database.applyUpdates();
+database.applyUpdates(256);
 
     // Concurrent read phase.
     FrontierResult mainResult;

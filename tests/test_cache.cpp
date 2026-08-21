@@ -19,7 +19,7 @@ TEST(QueryCache, ReusesStableFrontiers)
                                  float(i / 16) * 4.0f);
         instantiateFor(database, subtree, box(), 64.0f, desc);
     }
-    database.applyUpdates();
+    database.applyUpdates(0);
     SpatialQuery query;
     (void)query.selectFrontier(database, cameraAt(-100), {});
     EXPECT_GT(query.walked(), 0u);
@@ -53,7 +53,7 @@ TEST(QueryCache, AngularMotionMatchesUncachedSelection)
     const InstanceHandle instance = instantiateFor(
         database, subtree, box(12.0f), 64.0f);
     TestAccess::markAllNodesReady(database);
-    database.applyUpdates();
+    database.applyUpdates(0);
 
     SpatialQuery cached;
     SpatialQuery reference;
@@ -67,7 +67,7 @@ TEST(QueryCache, AngularMotionMatchesUncachedSelection)
             instance,
             InstanceTransform{float4::point(0.0f, 0.0f, 0.0f), 1.0f,
                               yawRotation(angle)});
-        database.applyUpdates();
+        database.applyUpdates(0);
         const std::vector<UserPayload> actual = payloads(
             database, cached.selectFrontier(database, camera, {}), false);
         const std::vector<UserPayload> expected = payloads(
@@ -93,7 +93,7 @@ TEST(QueryCache, RetainsWholeInternalResultButStillFillsExternalSinks)
         if (i == 0) moved = instance;
     }
     TestAccess::markAllNodesReady(database);
-    database.applyUpdates();
+    database.applyUpdates(0);
 
     SpatialQuery query;
     const Camera camera = cameraAt(-1000.0f);
@@ -107,7 +107,7 @@ TEST(QueryCache, RetainsWholeInternalResultButStillFillsExternalSinks)
 
     database.moveInstance(
         moved, Transform{float4::point(0.0f, 0.25f, 0.0f), 1.0f});
-    database.applyUpdates();
+    database.applyUpdates(0);
     const FrontierResultView patched =
         query.selectFrontier(database, camera, {});
     EXPECT_EQ(patched.shared.data(), retained);
@@ -133,7 +133,7 @@ TEST(QueryCache, MountedStateMutationInvalidatesRecordedCut)
     SpatialDatabase database;
     SubtreeHandle subtree = database.registerSubtree(makeLodSubtree());
     instantiateFor(database, subtree, box(5.0f));
-    database.applyUpdates();
+    database.applyUpdates(0);
 
     SpatialQuery query;
     SelectionParams params;
@@ -144,7 +144,7 @@ TEST(QueryCache, MountedStateMutationInvalidatesRecordedCut)
     ASSERT_GT(query.reused(), 0u);
 
     database.markNodeReady(handleOf(database, 11));
-    database.applyUpdates();
+    database.applyUpdates(0);
     (void)query.selectFrontier(database, camera, params);
     EXPECT_GT(query.walked(), 0u);
 }
@@ -155,7 +155,7 @@ TEST(QueryCache, RecurringViewMemoReturnsExactCutsAndTracksSceneVersions)
     const SubtreeHandle subtree =
         database.registerSubtree(makeLodSubtree());
     instantiateFor(database, subtree, box(5.0f));
-    database.applyUpdates();
+    database.applyUpdates(0);
 
     const Camera nearView = cameraAt(-8.0f);
     const Camera farView = cameraAt(-1000.0f);
@@ -180,7 +180,7 @@ TEST(QueryCache, RecurringViewMemoReturnsExactCutsAndTracksSceneVersions)
 
     database.markNodeReady(handleOf(database, 11));
     database.markNodeReady(handleOf(database, 12));
-    database.applyUpdates();
+    database.applyUpdates(0);
     const FrontierResultView updated =
         query.selectFrontier(database, nearView, {});
     EXPECT_EQ(payloads(database, updated, false),
@@ -193,7 +193,7 @@ TEST(QueryCache, QueriesOwnIndependentDampingAndReuseState)
     const SubtreeHandle subtree =
         database.registerSubtree(makeLeafSubtree(2));
     instantiateFor(database, subtree, box(), 4.0f);
-    database.applyUpdates();
+    database.applyUpdates(0);
     SpatialQuery mainView(4.0f);
     SpatialQuery shadowView(0.0f);
 
@@ -227,7 +227,7 @@ TEST(QueryCache, TlasOnlyObjectsBypassEntryCaching)
     constexpr uint32_t count = 64;
     for (uint32_t i = 0; i < count; ++i)
         database.instantiate(node(1000 + i, 0.0f, box()));
-    database.applyUpdates();
+    database.applyUpdates(0);
 
     SpatialQuery query;
     ASSERT_TRUE(query.reuseEnabled());

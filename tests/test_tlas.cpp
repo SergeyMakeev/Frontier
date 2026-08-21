@@ -19,7 +19,7 @@ TEST(Tlas, ManySingleNodesNeedNoBlasAllocation)
                                  float(i / 20) * 4.0f);
         database.instantiate(node(1000 + i, 0.0f, box()), desc);
     }
-    database.applyUpdates();
+    database.applyUpdates(0);
     EXPECT_EQ(TestAccess::liveInstanceSlots(database), count);
     EXPECT_EQ(database.subtreeCount(), 0u);
     EXPECT_EQ(database.mountedSubtreeCount(), 0u);
@@ -41,7 +41,7 @@ TEST(Tlas, InstanceHandlesSurviveOptimize)
 
     database.moveInstance(handles[1],
                           Transform{float4::point(500, 0, 0), 1.0f});
-    database.applyUpdates();
+    database.applyUpdates(0);
     EXPECT_NEAR(TestAccess::instanceBounds(database, handles[1]).center().x,
                 500.0f, 0.001f);
     EXPECT_TRUE(TestAccess::instanceBounds(database, handles[0]).isEmpty());
@@ -118,10 +118,10 @@ TEST(Tlas, DebugToolsExposeHealthAndDepthBoxes)
                                        float(i / 10) * 4.0f);
         database.instantiate(node(1000 + i, 0.0f, box()), desc);
     }
-    database.applyUpdates();
+    database.applyUpdates(0);
 
     const TlasDebugSummary summary = database.debugTlasSummary();
-    EXPECT_FALSE(summary.rebuildPending);
+    EXPECT_FALSE(summary.buildRequired);
     EXPECT_EQ(summary.instanceCount, count);
     EXPECT_EQ(summary.instanceLaneCount, count);
     EXPECT_GT(summary.activeNodes, 1u);
@@ -160,9 +160,71 @@ TEST(Tlas, StaleInstanceHandleCannotMoveReusedSlot)
 
     database.moveInstance(stale,
                           Transform{float4::point(100, 0, 0), 1.0f});
-    database.applyUpdates();
+    database.applyUpdates(0);
     EXPECT_NEAR(TestAccess::instanceBounds(database, live).center().x,
                 0.0f, 0.001f);
+}
+
+TEST(Tlas, QualityDriftIsAdvisoryUntilOptimizeIsExplicit)
+{
+    SpatialDatabaseConfig config;
+    config.tlasCountDrift = 0.0f;
+    config.tlasEditFraction = 0.0f;
+    config.tlasAreaDrift = 1000.0f;
+    SpatialDatabase database(config);
+    for (uint32_t i = 0; i < 16; ++i)
+    {
+        InstanceDesc desc;
+        desc.pos = float4::point(float(i) * 4.0f, 0.0f, 0.0f);
+        database.instantiate(node(100 + i, 0.0f, box()), desc);
+    }
+    EXPECT_TRUE(database.applyUpdates(0).requiredBuildPerformed);
+
+    database.instantiate(
+        node(999, 0.0f, box()),
+        InstanceDesc{.pos = float4::point(80.0f, 0.0f, 0.0f)});
+    const UpdateReport report = database.applyUpdates(0);
+    EXPECT_FALSE(report.requiredBuildPerformed);
+    EXPECT_TRUE(report.optimizeRecommended);
+
+    SpatialQuery query;
+    EXPECT_EQ(query.selectFrontier(database, cameraAt(-1000.0f), {}).size(),
+              17u);
+#ifdef FRONTIER_DEBUG_TOOLS
+    const TlasDebugSummary before = database.debugTlasSummary();
+    EXPECT_FALSE(before.buildRequired);
+    EXPECT_TRUE(before.optimizeRecommended);
+#endif
+
+    database.optimize();
+#ifdef FRONTIER_DEBUG_TOOLS
+    const TlasDebugSummary after = database.debugTlasSummary();
+    EXPECT_FALSE(after.buildRequired);
+    EXPECT_FALSE(after.optimizeRecommended);
+#endif
+}
+
+TEST(Tlas, FirstPopulationAfterAnEmptyPublicationBuildsAtConfiguredQuality)
+{
+    SpatialDatabaseConfig config;
+    config.tlasCountDrift = 0.0f;
+    config.tlasEditFraction = 1000.0f;
+    config.tlasAreaDrift = 1000.0f;
+    SpatialDatabase database(config);
+    EXPECT_TRUE(database.applyUpdates(0).requiredBuildPerformed);
+
+    for (uint32_t i = 0; i < 16; ++i)
+    {
+        InstanceDesc desc;
+        desc.pos = float4::point(float(i) * 4.0f, 0.0f, 0.0f);
+        database.instantiate(node(300 + i, 0.0f, box()), desc);
+    }
+    const UpdateReport report = database.applyUpdates(0);
+    EXPECT_TRUE(report.requiredBuildPerformed);
+    EXPECT_FALSE(report.optimizeRecommended);
+#ifdef FRONTIER_DEBUG_TOOLS
+    EXPECT_EQ(database.debugTlasSummary().qualityBaselineInstances, 16u);
+#endif
 }
 
 TEST(Tlas, EveryQualityTierReturnsTheSameVisibleSet)

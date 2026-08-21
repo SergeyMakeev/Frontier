@@ -252,7 +252,7 @@ TEST(Contracts, InvalidConfigurationAndSelectionInputsAreRejected)
 
     SpatialDatabase database;
     database.instantiate(node(1, 0.0f, box()));
-    database.applyUpdates();
+    database.applyUpdates(0);
     SpatialQuery query;
 
     SelectionParams params;
@@ -315,7 +315,7 @@ TEST(Contracts, FixedOutputReportsOverflow)
     SpatialDatabase database;
     for (uint32_t i = 0; i < 8; ++i)
         database.instantiate(node(i + 1, 0.0f, box()));
-    database.applyUpdates();
+    database.applyUpdates(0);
 
     std::array<FrontierEntry, 3> shared{};
     FrontierResultSink sink{Sink<FrontierEntry>{shared},
@@ -409,7 +409,7 @@ TEST(Contracts, OwningFrontierResultsRemainSelfContainedAfterCopyAndMove)
     SpatialDatabase database;
     database.instantiate(node(1, 0.0f, box()));
     database.instantiate(node(2, 0.0f, box()));
-    database.applyUpdates();
+    database.applyUpdates(0);
 
     SpatialQuery query;
     FrontierResult original;
@@ -445,7 +445,7 @@ TEST(Contracts, MovedSpatialQueryRetainsItsBindingAndAllocations)
     const SubtreeHandle subtree =
         database.registerSubtree(makeLeafSubtree(2));
     instantiateFor(database, subtree, box(), 64.0f);
-    database.applyUpdates();
+    database.applyUpdates(0);
     const Camera camera = cameraAt(-100.0f);
 
     SpatialQuery source;
@@ -468,7 +468,7 @@ TEST(Contracts, SelectionStatisticsMatchTheBuildMode)
 {
     SpatialDatabase database;
     database.instantiate(node(1, 0.0f, box()));
-    database.applyUpdates();
+    database.applyUpdates(0);
     SpatialQuery query;
     query.setReuseEnabled(false);
     (void)query.selectFrontier(database, cameraAt(), {});

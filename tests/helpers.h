@@ -270,7 +270,7 @@ inline FrontierResultView select(SpatialDatabase& database, SpatialQuery& query,
                                  const Camera& camera,
                                  SelectionParams params = {})
 {
-    database.applyUpdates();
+    database.applyUpdates(0);
     return query.selectFrontier(database, camera, params);
 }
 

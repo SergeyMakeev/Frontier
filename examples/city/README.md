@@ -53,9 +53,9 @@ unaccounted, and total-frame time. Each timer also reports the minimum, maximum,
 and average over its visible rolling window. Draw, primitive, and transient-
 buffer counters remain alongside the timing charts. **Scene hierarchy** is a live
 ImGui tree of each reusable Frontier topology with current/ideal selected-entry
-counts. **TLAS
-health** reports topology occupancy, depth, motion-area growth, rebuild state,
-and storage, and controls complete depth-cut TLAS AABB rendering plus loose-
+counts. **TLAS health** reports topology occupancy, depth, motion-area growth,
+the incremental repair queue, optimization advice, and storage. It controls the
+per-frame repair-node budget, complete depth-cut TLAS AABB rendering, and loose-
 motion envelope comparison. **Query cache** reports reuse rate, record/slab
 storage, garbage, cache state, travel, and hit-rate history. The TLAS and
 loose-bound visualizations are also independently available from the

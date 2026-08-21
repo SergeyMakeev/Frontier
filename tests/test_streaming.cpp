@@ -64,7 +64,7 @@ TEST(Streaming, QueryOwnsOptionalRetentionFeedback)
     EXPECT_EQ(kept.unmountedSubtrees, 0u);
     EXPECT_EQ(database.mountedSubtreeCount(), 1u);
 
-    database.applyUpdates();
+    database.applyUpdates(0);
     CollectResult collected = database.collect(0, 1);
     EXPECT_EQ(collected.unmountedSubtrees, 1u);
     EXPECT_EQ(database.mountedSubtreeCount(), 0u);
@@ -109,7 +109,7 @@ TEST(Streaming, ResetMountUsageDropsUnconsumedRetentionFeedback)
     (void)select(database, query, cameraAt(-8),
                  SelectionParams{.threshold = 1.0f});
     query.resetMountUsage();
-    database.applyUpdates();
+    database.applyUpdates(0);
 
     const CollectResult result = database.collect(query, 0, 1);
     EXPECT_EQ(result.unmountedSubtrees, 1u);
@@ -128,8 +128,8 @@ TEST(Streaming, CollectionDoesNotChangeSharedDefinitionNodeReadiness)
     const NodeHandle stale =
         TestAccess::nodeAt(database, firstPlacement, 1);
     database.markNodeReady(stale);
-    database.applyUpdates();
-    database.applyUpdates();
+    database.applyUpdates(0);
+    database.applyUpdates(0);
 
     CollectResult result = database.collect(0, 1);
     ASSERT_EQ(result.unmountedSubtrees, 1u);

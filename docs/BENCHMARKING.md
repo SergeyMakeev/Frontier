@@ -42,6 +42,11 @@ library's macro-based public payload customization.
   for streaming and collapse decisions.
 - `BM_MotionGroupSteady` measures repeated rigid translation through a stable
   `MotionGroup` and the explicit `translateInstances()` path.
+- `BM_TlasIncrementalMaintenance` moves 100 actors in a 10,000-instance scene
+  and measures motion plus publication with maintenance budgets of 0, 16, 64,
+  and 256 nodes. Counters report nodes processed and pending per call plus the
+  average TLAS area-growth ratio, exposing both the steady per-frame charge and
+  repair throughput.
 - `BM_MovingObjectsSelectionScale` moves a distributed 10% or 100% of a
   mounted 1,000/10,000-root forest, publishes the update, and selects the next
   frontier through the same rigid-translation API. Counters separate roots

@@ -493,7 +493,7 @@ TEST(Frontier, RenderQueryTracksCachedRebuildsAndApiSwitches)
 {
     Scene scene;
     TestAccess::markAllNodesReady(scene.database);
-    scene.database.applyUpdates();
+    scene.database.applyUpdates(0);
     SpatialQuery query;
     SpatialQuery referenceQuery;
     const Camera camera = cameraAt(-8.0f);
@@ -574,7 +574,7 @@ TEST(Frontier, RenderAsUnitCoarsensOnlyDescendantFrustumCulling)
 {
     Scene scene;
     TestAccess::markAllNodesReady(scene.database);
-    scene.database.applyUpdates();
+    scene.database.applyUpdates(0);
     const Camera camera = cameraAt(-8.0f);
     SpatialQuery exactQuery;
     exactQuery.setReuseEnabled(false);
@@ -587,7 +587,7 @@ TEST(Frontier, RenderAsUnitCoarsensOnlyDescendantFrustumCulling)
         InstanceTransform transform;
         transform.pos = float4::point(boundaryX, 0.0f, 0.0f);
         scene.database.moveInstance(scene.instance, transform);
-        scene.database.applyUpdates();
+    scene.database.applyUpdates(0);
         exactPayloads = payloads(
             scene.database,
             exactQuery.selectFrontier(scene.database, camera, {}), false);
@@ -676,8 +676,8 @@ TEST(Frontier, FullyRefinedBoundaryTraversalMatchesTheGeneralWalker)
         transform.pos = float4::point(float(step) * 0.125f, 0.0f, 0.0f);
         fastDatabase.moveInstance(fastInstance, transform);
         referenceDatabase.moveInstance(referenceInstance, transform);
-        fastDatabase.applyUpdates();
-        referenceDatabase.applyUpdates();
+        fastDatabase.applyUpdates(0);
+        referenceDatabase.applyUpdates(0);
 
         const std::vector<UserPayload> fast = payloads(
             fastDatabase,
@@ -721,7 +721,7 @@ TEST(Frontier, TerminalRenderRangesMatchTheFullyRefinedCurrentCut)
         InstanceTransform transform;
         transform.pos = float4::point(float(step) * 0.125f, 0.0f, 0.0f);
         database.moveInstance(instance, transform);
-        database.applyUpdates();
+        database.applyUpdates(0);
 
         std::vector<UserPayload> reference = payloads(
             database,
@@ -770,7 +770,7 @@ TEST(Frontier, TerminalActorBatchMatchesMountedYawedInstance)
     TestAccess::markAllNodesReady(mountedDatabase);
     TestAccess::markAllNodesReady(batchDatabase);
     mountedDatabase.optimize();
-    batchDatabase.applyUpdates();
+    batchDatabase.applyUpdates(0);
 
     std::array<float4, 1> positions{desc.pos};
     std::array<YawRotation, 1> yaws{desc.yaw};
@@ -815,7 +815,7 @@ TEST(Frontier, TerminalActorBatchMatchesMountedYawedInstance)
         transform.yaw = desc.yaw;
         positions[0] = transform.pos;
         mountedDatabase.moveInstance(instance, transform);
-        mountedDatabase.applyUpdates();
+        mountedDatabase.applyUpdates(0);
         exact = payloads(
             mountedDatabase,
             mountedQuery.selectFrontier(mountedDatabase, camera, {}), false);
@@ -847,7 +847,7 @@ TEST(Frontier, TerminalActorClustersMatchUngroupedPlacementStream)
     const SubtreeHandle definition = database.registerSubtree(
         makeFullyRefinedReferenceSubtree(0.0f));
     TestAccess::markAllNodesReady(database);
-    database.applyUpdates();
+        database.applyUpdates(0);
 
     std::array<float4, 6> positions{
         float4::point(-18.0f, 0.0f, -2.0f),
@@ -939,7 +939,7 @@ TEST(Frontier, TerminalRenderRejectsNonzeroTerminalError)
         makeFullyRefinedReferenceSubtree(1.0f));
     instantiateFor(database, subtree, box(5.0f), 64.0f);
     TestAccess::markAllNodesReady(database);
-    database.applyUpdates();
+    database.applyUpdates(0);
 
     TerminalRenderQuery query;
     EXPECT_THROW(query.select(database, cameraAt(-8.0f)), std::logic_error);

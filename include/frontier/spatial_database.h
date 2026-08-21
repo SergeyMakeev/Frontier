@@ -11,7 +11,7 @@
 // SubtreeHandle names registered bytes; SubtreeInstanceHandle names one
 // mounted placement; and InstanceHandle names one permanent TLAS root.
 //
-// SpatialDatabase updates are single-writer. applyUpdates() publishes a stable snapshot;
+// SpatialDatabase updates are single-writer. applyUpdates(budget) publishes a stable snapshot;
 // SpatialQuery::selectFrontier then reads only that snapshot and may run concurrently when
 // each call has its own SpatialQuery and outputs. LOD damping, frontier reuse, query scratch,
 // and optional selection statistics live in the SpatialQuery, never as mutable
@@ -20,6 +20,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <iterator>
 #include <memory>
 #include <span>
@@ -902,7 +903,7 @@ public:
     void setMountUsageEnabled(bool enabled);
     void resetMountUsage();
 
-    // Query a snapshot published by SpatialDatabase::applyUpdates(). The SpatialQuery
+    // Query a snapshot published by SpatialDatabase::applyUpdates(budget). The SpatialQuery
     // is mutable and must not be used concurrently; any number of distinct queries
     // may read the same const SpatialDatabase concurrently. A query binds to the
     // first database it reads, and reset() releases that binding.
@@ -1140,9 +1141,11 @@ struct TlasDebugSummary
     uint32_t maxDepth = 0;
     uint32_t editsSinceRebuild = 0;
     uint32_t qualityBaselineInstances = 0;
+    uint32_t maintenanceNodesPending = 0;
     float averageLaneOccupancy = 0.0f;
     float areaGrowthRatio = 0.0f;
-    bool rebuildPending = false;
+    bool buildRequired = false;
+    bool optimizeRecommended = false;
     TlasQuality configuredQuality = TlasQuality::BinnedSAH;
 };
 
@@ -1175,9 +1178,8 @@ struct SpatialDatabaseConfig
     // and anything referenced by `user` must remain valid for its lifetime.
     FrontierContext context{};
 
-    // Quality tier of the top-level BVH. Initial builds, large population
-    // drift, and area-drift repair use this tier. Escape/edit-budget repairs
-    // use the cheaper Morton path unless another trigger promotes the build.
+    // Quality tier of the top-level BVH. Initial builds and explicit
+    // optimize() calls use this tier.
     TlasQuality tlasQuality = TlasQuality::BinnedSAH;
 
     // SAH cost constants (BinnedSAH only): cost of visiting a node vs testing
@@ -1185,21 +1187,23 @@ struct SpatialDatabaseConfig
     float tlasTraversalCost = 1.0f;
     float tlasIntersectCost = 1.0f;
 
-    // Fraction of the instance population that must appear or disappear
-    // before the next rebuild is promoted to the quality tier.
+    // Fraction of the quality-build population that may appear or disappear
+    // before optimize() is recommended. This never triggers an implicit
+    // rebuild during applyUpdates(budget).
     float tlasCountDrift = 0.2f;
 
-    // Fraction of the top-level BVH's original lane area that motion may add
-    // through grow-only refit before a quality rebuild is forced. Catches the
-    // bloat that a steady population hides from tlasCountDrift.
+    // Fraction of the top-level BVH's most recent build area that current
+    // stored lanes may add before optimize() is recommended. Incremental
+    // maintenance reduces the measured growth as it tightens lanes. This
+    // never triggers an implicit
+    // rebuild during applyUpdates(budget).
     float tlasAreaDrift = 0.5f;
 
     // Fraction of the population that may be spawned or removed INCREMENTALLY
-    // before the tree is rebuilt. An incremental insert descends to the leaf
+    // before optimize() is recommended. An incremental insert descends to the leaf
     // whose box grows least and either takes a free lane or splits the leaf,
     // which deepens that subtree by one; a removal invalidates a lane and
-    // leaves its box loose. Both are O(depth) and both cost a little quality,
-    // so this bounds how much of it accumulates.
+    // leaves its box loose. Both are O(depth) and preserve correctness.
     float tlasEditFraction = 0.05f;
 
     // Minimum number of visible instances before an uncached SpatialQuery fans
@@ -1210,6 +1214,17 @@ struct SpatialDatabaseConfig
     // SpatialDatabase and writes only per-worker buffers, which are concatenated in
     // instance order, so parallel and serial selection are bit-identical.
     uint32_t parallelInstanceThreshold = 0;
+};
+
+inline constexpr uint32_t kUnlimitedTlasMaintenance = UINT32_MAX;
+
+struct UpdateReport
+{
+    uint32_t maintenanceNodesProcessed = 0;
+    uint32_t maintenanceNodesPending = 0;
+    float areaGrowthRatio = 0.0f;
+    bool optimizeRecommended = false;
+    bool requiredBuildPerformed = false;
 };
 
 class SpatialDatabase
@@ -1316,8 +1331,8 @@ public:
 
     void removeInstance(InstanceHandle instance); // no-op if stale
     // Update exact instance state now and coalesce TLAS maintenance until the
-    // next applyUpdates(). Small cohorts retain swept grow-only envelopes;
-    // large cohorts publish one exact bottom-up TLAS refit.
+    // next applyUpdates(budget). Small cohorts retain swept grow-only
+    // envelopes; large cohorts publish one exact bottom-up TLAS refit.
     void moveInstance(InstanceHandle instance,
                       const InstanceTransform& transform);
     // Opt into instance-granular culling for render-native queries. The TLAS
@@ -1404,8 +1419,9 @@ public:
     // ---- motion --------------------------------------------------------------
     // Record new local-space bounds for one node OF ONE INSTANCE: a bounds
     // check and a queue push. Call it as often as needed; the refit runs
-    // LAZILY, so the tree is guaranteed up to date after applyUpdates() (or an
-    // explicit flushBounds() for tools and tests). A node moved many times
+    // LAZILY, so the tree is guaranteed conservative after
+    // applyUpdates(budget) (or an explicit flushBounds() for tools and tests).
+    // A node moved many times
     // between update barriers ends at
     // exactly the last submitted box; the repeat applications hit hot cache
     // lines and early-out at the already-grown parent, so they cost a fraction
@@ -1438,18 +1454,22 @@ public:
     // one, the shared authored bounds otherwise. Flushes pending moves first.
     AABB nodeBounds(InstanceHandle instance, NodeHandle node);
 
-    // Publish queued node-bound and instance-motion changes, perform scheduled
-    // TLAS maintenance, and prepare a stable read-only selection snapshot.
+    // Publish queued node-bound and instance-motion changes, repair at most
+    // maintenanceNodeBudget queued TLAS nodes, and prepare a stable read-only
+    // selection snapshot. A zero budget retains conservative grown bounds;
+    // kUnlimitedTlasMaintenance drains the repair queue. Optional maintenance
+    // never performs a topology rebuild: the returned report tells the caller
+    // when optimize() is recommended.
     // Call once before a group of selections, even when no database contents
     // changed; it also advances the epoch used by collection aging.
     // No SpatialDatabase mutation (including collect) may overlap or occur before every
     // SpatialQuery selection using this snapshot has completed.
-    void applyUpdates();
+    UpdateReport applyUpdates(uint32_t maintenanceNodeBudget);
 
     // Force a full quality TLAS rebuild, compact dead dense slots, and restore
     // physical instance/SpatialQuery-record order to TLAS traversal order. Public
     // InstanceHandles and FrontierEntry::instance() ids remain stable. This is
-    // intentionally heavier than applyUpdates(): call it at an occasional
+    // intentionally heavier than applyUpdates(budget): call it at an occasional
     // synchronization point after disruptive database changes (level transition,
     // teleport, loading screen), not as routine per-frame maintenance. It
     // consumes pending bounds and instance-motion edits but does not advance
@@ -2400,7 +2420,8 @@ private:
     InstanceHandle addTlasRootInstance(const NodeDesc& root,
                                        const InstanceDesc& desc);
 
-    void markTlasStructuralChange();
+    bool tlasOptimizationRecommended() const;
+    float tlasAreaGrowthRatio() const;
     void tlasRebuild(bool reorderInstances);
     int32_t tlasBuildRange(std::vector<uint32_t>& items, int lo, int hi, int32_t parent);
     int  tlasSplit(std::vector<uint32_t>& items, int lo, int hi);
@@ -2413,7 +2434,10 @@ private:
                        std::vector<VisibleItem>& outVisible,
                        std::vector<TlasItem>& stack) const;
     void tlasOnInstanceMoved(InstanceId id);
-    void tlasNoteGrowth(float addedArea);
+    void tlasAdjustCurrentArea(double delta);
+    void queueTlasRepair(uint32_t node);
+    uint32_t repairTlas(uint32_t nodeBudget);
+    bool repairTlasNode(uint32_t node);
     void flushInstanceMoves();
     void tlasRefitAllExact();
 
@@ -2587,14 +2611,16 @@ private:
     // common base space until a differential edit materializes the offset.
     float4                tlasGlobalOffset_{};
     int32_t               tlasRoot_ = -1;
-    bool                  tlasDirty_ = true;
+    bool                  tlasBuildRequired_ = true;
     bool                  tlasQualityBuild_ = true;   // quality tier vs Morton
     uint32_t              tlasEdits_ = 0;           // incremental inserts + removes
     std::vector<int32_t>  tlasFreeNodes_;           // nodes emptied by removal
     uint32_t              tlasLeafCount_ = 0;
     uint32_t              tlasQualityCount_ = 0;   // leaves at last quality build
-    float                 tlasBaseArea_ = 0.0f;    // lane area at last quality build
-    float                 tlasGrownArea_ = 0.0f;   // area added by grow-only refit
+    double                tlasBaseArea_ = 0.0;     // lane area at last build
+    double                tlasCurrentArea_ = 0.0;  // current stored lane area
+    std::deque<uint32_t>  tlasRepairQueue_;
+    std::vector<uint8_t>  tlasRepairQueued_;
 
     uint32_t lruHead_ = kInvalidIndex, lruTail_ = kInvalidIndex;
     uint32_t frame_ = 0;

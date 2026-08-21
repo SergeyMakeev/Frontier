@@ -54,9 +54,11 @@ The most important implementation facts are:
 - The view-returning API can reuse the entire already-materialized answer
   without probing per-instance records. A separate two-entry exact-view memo
   handles recurring undamped views.
-- Mutation is single-writer and deferred to `applyUpdates()`. Small motion uses
-  grow-only propagation; large motion streams one exact bottom-up refit; a
-  rigid translation of the whole population is represented by one offset.
+- Mutation is single-writer and published by
+  `applyUpdates(maintenanceNodeBudget)`. Small motion grows conservative
+  envelopes and enters a bounded repair queue; large motion streams one exact
+  bottom-up refit; a rigid translation of the whole population is represented
+  by one offset.
 - Hot/cold splitting and packed records are deliberate. Several `static_assert`
   size checks are performance contracts, not cosmetic assertions.
 
@@ -101,9 +103,10 @@ The intended lifecycle is:
 
 1. A single writer creates/removes instances, mounts/unmounts definitions,
    publishes readiness, submits transforms, or queues deformed bounds.
-2. `SpatialDatabase::applyUpdates()` flushes bound overlays and instance
-   motion, repairs or rebuilds the TLAS as needed, and publishes a stable
-   snapshot.
+2. `SpatialDatabase::applyUpdates(maintenanceNodeBudget)` flushes bound
+   overlays and instance motion, tightens at most the requested number of TLAS
+   nodes, and publishes a stable snapshot. Remaining grown bounds stay
+   conservative.
 3. Any number of readers select concurrently from that snapshot, but every
    reader has its own `SpatialQuery` or `TerminalRenderQuery`.
 4. The caller consumes the returned query-owned views.
@@ -628,9 +631,7 @@ definitions, and readiness bits survive the removal of placements.
 ### 9.1 Build tiers
 
 The configured quality tier is `Morton`, `Median`, or 16-bin `BinnedSAH`.
-Initial builds, population-drift rebuilds, area-drift rebuilds, and explicit
-quality repairs use the configured tier. Edit-budget and defensive escape
-repairs use Morton unless another trigger promotes the same rebuild.
+Initial builds and explicit `optimize()` calls use the configured tier.
 
 The quality builder recursively produces a `kWide`-way tree using
 `log2(kWide)` binary splits per node. SAH scans 16 bins on all three axes; a
@@ -657,27 +658,37 @@ that leaf in its parent and adopts the old leaf plus the new instance. This
 always succeeds without scanning upward for a free lane.
 
 Removal clears the instance lane and unlinks newly empty nodes. It deliberately
-leaves ancestor boxes loose. `tlasEditFraction` bounds accumulated quality
-loss; `tlasCountDrift` promotes a rebuild only for real population drift, so
-steady spawn/despawn churn can remain incremental.
+leaves ancestor boxes loose and queues their repair. `tlasEditFraction` and
+`tlasCountDrift` decide when publication recommends `optimize()`; steady
+spawn/despawn churn remains incremental until the application accepts that
+recommendation.
 
 ### 9.3 Motion publication
 
 Exact instance transforms and bounds change at submission time, but TLAS writes
-are coalesced until `applyUpdates()`.
+are coalesced until `applyUpdates(maintenanceNodeBudget)`.
 
 For a small cohort, each leaf retains a grow-only motion envelope. If the exact
 new box is already inside, no TLAS memory is written. Otherwise the leaf and
 ancestors grow until the first ancestor already containing the new box,
-maximum contribution, and layer mask. Added lane area is accumulated; crossing
-`tlasAreaDrift` schedules a quality rebuild.
+maximum contribution, and layer mask. Crossing `tlasAreaDrift` makes
+`UpdateReport::optimizeRecommended` true.
+
+Each changed leaf enters a deduplicated FIFO repair queue. One optional
+maintenance unit recomputes one node from exact instance lanes or conservative
+child extents. If the bounds change, its parent enters the queue. Passing zero
+does no optional tightening, a finite node count spreads the work across
+updates, and `kUnlimitedTlasMaintenance` drains the queue. The current lane
+area is adjusted as nodes tighten, so the area recommendation can clear without
+a rebuild. At every partial point the TLAS remains a conservative broadphase.
 
 At one quarter of the population, scattered leaf/ancestor traffic is more
 expensive than streaming the tree. `tlasRefitAllExact()` retains a bottom-up
 node order until topology changes, copies exact dense instance state into leaf
-lanes, recomputes interiors sequentially, and clears loose flags. The pending
-instance-id vector and retained postorder reuse build scratch that is mutually
-exclusive with publication.
+lanes, recomputes interiors sequentially, clears loose flags, and empties the
+repair queue. This dense publication path is independent of the optional node
+budget. The pending instance-id vector and retained postorder reuse build
+scratch that is mutually exclusive with publication.
 
 Repeated identical transforms exit before changing cache or TLAS state.
 Stable-scale translation updates an exact AABB by adding delta rather than
@@ -1052,7 +1063,7 @@ The nominal costs are:
 | Readiness change | Placements of one definition plus changed ancestor paths |
 | Submit bound change | O(1) queue append |
 | Flush bound change | O(changed ancestor depth), stopping at containment |
-| Incremental TLAS insert/remove | O(TLAS depth), excluding scheduled repair |
+| Incremental TLAS insert/remove | O(TLAS depth), plus explicitly budgeted repair |
 | Selection | Output-sensitive TLAS plus surviving hierarchy work |
 | Per-instance cache hit | O(recorded output + at most two dependency checks) |
 | Whole retained answer | O(1) after the visible stream has been proven or compared; validating a boundary-visible stream still costs its TLAS query/comparison |

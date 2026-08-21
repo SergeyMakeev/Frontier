@@ -114,7 +114,7 @@ TEST(Torture, RandomizedTlasChurnMatchesTheLiveInstanceModel)
     const auto verify = [&](uint32_t step)
     {
         camera.viewMask = 1u << rng.bounded(3);
-        database.applyUpdates();
+        database.applyUpdates(0);
 
         std::vector<UserPayload> expected;
         for (const Record& record : records)
@@ -308,7 +308,7 @@ TEST(Torture, ParallelAndSerialSelectionAreBitIdentical)
         database.instantiate(node(1000 + i, float(i % 5), box(0.5f)),
                              desc);
     }
-    database.applyUpdates();
+    database.applyUpdates(0);
 
     Camera camera = cameraAt(-1000.0f);
     camera.viewMask = 0x3;
@@ -338,7 +338,7 @@ TEST(Torture, IndependentQueriesReadOnePublishedSnapshotConcurrently)
                                  float(int(i / 24) - 4) * 2.0f, 0.0f);
         database.instantiate(node(1000 + i, 0.0f, box(0.5f)), desc);
     }
-    database.applyUpdates();
+    database.applyUpdates(0);
     const Camera camera = cameraAt(-1000.0f);
     std::atomic<bool> valid{true};
 

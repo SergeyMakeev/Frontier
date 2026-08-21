@@ -15,7 +15,7 @@ TEST(Motion, MovesTlasOwnedNodeWithoutSubtreeState)
         database.instantiate(node(7, 0.0f, box(1.0f)));
     database.moveInstance(
         instance, Transform{float4::point(100, 2, 3), 2.0f});
-    database.applyUpdates();
+    database.applyUpdates(0);
 
     const AABB world = TestAccess::instanceBounds(database, instance);
     EXPECT_TRUE(world.contains(box(2.0f, float4::point(100, 2, 3))));
@@ -111,12 +111,12 @@ TEST(Motion, LargeMotionBatchPublishesOneExactTlasRefit)
             200.0f - float(i % 8) * 5.0f, float(i & 1u),
             -100.0f + float(i / 8) * 6.0f);
     }
-    database.applyUpdates();
+    database.applyUpdates(0);
     database.optimize();
 
     SpatialDatabase::MotionGroup group(handles);
     database.moveInstances(group, transforms);
-    database.applyUpdates();
+    database.applyUpdates(0);
 
     for (const InstanceHandle handle : handles)
     {
@@ -197,7 +197,7 @@ TEST(Motion, RigidMotionGroupStreamsYawInvariantActors)
         YawRotation{0.0f, 1.0f}, YawRotation{-1.0f, 0.0f}};
 
     database.moveRigidInstances(group, positions, yaws);
-    database.applyUpdates();
+    database.applyUpdates(0);
 
     const AABB firstBounds = TestAccess::instanceBounds(database, first);
     const AABB secondBounds = TestAccess::instanceBounds(database, second);
@@ -227,7 +227,7 @@ TEST(Motion, RigidMotionGroupFallsBackForOrientedBounds)
     const std::array<YawRotation, 1> yaws{YawRotation{0.0f, 1.0f}};
 
     database.moveRigidInstances(group, positions, yaws);
-    database.applyUpdates();
+    database.applyUpdates(0);
 
     const AABB bounds = TestAccess::instanceBounds(database, instance);
     EXPECT_FLOAT_EQ(bounds.mn.x, 7.0f);
@@ -362,7 +362,7 @@ TEST(Motion, MotionGroupIgnoresStaleHandles)
     std::array<float4, 2> positions{
         float4::point(100, 0, 0), float4::point(20, 0, 0)};
     database.moveInstances(group, positions);
-    database.applyUpdates();
+    database.applyUpdates(0);
 
     const AABB moved = TestAccess::instanceBounds(database, b);
     EXPECT_NEAR(moved.center().x, 20.0f, 0.001f);
@@ -387,7 +387,7 @@ TEST(Motion, CachedMotionGroupRefreshesBeforeDenseSlotReuse)
     const std::array<float4, 2> secondPositions{
         float4::point(100, 0, 0), float4::point(30, 0, 0)};
     database.moveInstances(group, secondPositions);
-    database.applyUpdates();
+    database.applyUpdates(0);
 
     EXPECT_NEAR(TestAccess::instanceBounds(database, survivor).center().x,
                 30.0f, 0.001f);
@@ -409,7 +409,7 @@ TEST(Motion, MotionGroupDuplicateHandlesUseTheFinalCallerPosition)
         float4::point(30, 0, 0)};
 
     database.moveInstances(group, positions);
-    database.applyUpdates();
+    database.applyUpdates(0);
     EXPECT_NEAR(TestAccess::instanceBounds(database, instance).center().x,
                 30.0f, 0.001f);
 }
@@ -434,7 +434,7 @@ TEST(Motion, MotionGroupResetReplacesTheCallerCohort)
     const std::array<float4, 1> secondPosition{
         float4::point(20, 0, 0)};
     database.moveInstances(group, secondPosition);
-    database.applyUpdates();
+    database.applyUpdates(0);
 
     EXPECT_NEAR(TestAccess::instanceBounds(database, first).center().x,
                 10.0f, 0.001f);
@@ -450,12 +450,12 @@ TEST(Motion, RigidPopulationTranslationMaterializesBeforeDifferentialEdits)
     const InstanceHandle second = database.instantiate(
         node(2, 0.0f, box()),
         InstanceDesc{.pos = float4::point(10, 0, 0)});
-    database.applyUpdates();
+    database.applyUpdates(0);
 
     const std::array<InstanceHandle, 2> handles{first, second};
     SpatialDatabase::MotionGroup all(handles);
     database.translateInstances(all, float4::vec(100, 0, 0));
-    database.applyUpdates();
+    database.applyUpdates(0);
 
     EXPECT_NEAR(TestAccess::instanceBounds(database, first).center().x,
                 100.0f, 0.001f);
@@ -467,7 +467,7 @@ TEST(Motion, RigidPopulationTranslationMaterializesBeforeDifferentialEdits)
     const InstanceHandle added = database.instantiate(
         node(3, 0.0f, box()),
         InstanceDesc{.pos = float4::point(7, 0, 0)});
-    database.applyUpdates();
+    database.applyUpdates(0);
 
     EXPECT_NEAR(TestAccess::instanceBounds(database, first).center().x,
                 200.0f, 0.001f);
@@ -485,7 +485,7 @@ TEST(Motion, SweptTlasLeafRetestsItsExactCurrentBounds)
     database.instantiate(
         node(2, 0.0f, box()),
         InstanceDesc{.pos = float4::point(3, 0, 0)});
-    database.applyUpdates();
+    database.applyUpdates(0);
 
     const std::array<InstanceHandle, 1> handles{moving};
     SpatialDatabase::MotionGroup group(handles);
@@ -511,7 +511,7 @@ TEST(Motion, ContributionCullRetestsExactBoundsAfterScaleChanges)
         desc.pos = float4::point(float(i + 1) * 4.0f, 0.0f, 0.0f);
         database.instantiate(node(2 + i, 0.0f, box(0.1f)), desc);
     }
-    database.applyUpdates();
+    database.applyUpdates(0);
 
     SpatialQuery query;
     SelectionParams params;
@@ -522,7 +522,7 @@ TEST(Motion, ContributionCullRetestsExactBoundsAfterScaleChanges)
 
     database.moveInstance(
         scaled, Transform{float4::point(0.0f, 0.0f, 0.0f), 0.01f});
-    database.applyUpdates();
+    database.applyUpdates(0);
     EXPECT_TRUE(query.selectFrontier(database, camera, params).empty());
 
 #ifdef FRONTIER_DEBUG_TOOLS
@@ -538,9 +538,90 @@ TEST(Motion, ContributionCullRetestsExactBoundsAfterScaleChanges)
 
     database.moveInstance(
         scaled, Transform{float4::point(0.0f, 0.0f, 0.0f), 1.0f});
-    database.applyUpdates();
+    database.applyUpdates(0);
     EXPECT_EQ(payloads(database, query.selectFrontier(database, camera, params)),
               (std::vector<UserPayload>{1}));
+}
+
+TEST(Motion, ApplyUpdatesRepairsOnlyTheExplicitNodeBudget)
+{
+    SpatialDatabaseConfig config;
+    config.tlasAreaDrift = 1000.0f;
+    config.tlasCountDrift = 1000.0f;
+    config.tlasEditFraction = 1000.0f;
+    SpatialDatabase database(config);
+    std::vector<InstanceHandle> handles;
+    for (uint32_t i = 0; i < 32; ++i)
+    {
+        InstanceDesc desc;
+        desc.pos = float4::point(float(i % 8) * 4.0f, 0.0f,
+                                 float(i / 8) * 4.0f);
+        handles.push_back(database.instantiate(
+            node(1000 + i, 0.0f, box()), desc));
+    }
+    EXPECT_TRUE(database.applyUpdates(0).requiredBuildPerformed);
+
+    const InstanceHandle moving = handles.front();
+    database.moveInstance(
+        moving, Transform{float4::point(1000.0f, 0.0f, 0.0f), 1.0f});
+    const UpdateReport deferred = database.applyUpdates(0);
+    EXPECT_EQ(deferred.maintenanceNodesProcessed, 0u);
+    EXPECT_EQ(deferred.maintenanceNodesPending, 1u);
+    EXPECT_FALSE(deferred.requiredBuildPerformed);
+    EXPECT_TRUE(TestAccess::tlasLeafIsLoose(database, moving));
+    EXPECT_TRUE(TestAccess::tlasLeafBounds(database, moving).contains(
+        TestAccess::instanceBounds(database, moving)));
+
+    const UpdateReport oneNode = database.applyUpdates(1);
+    EXPECT_EQ(oneNode.maintenanceNodesProcessed, 1u);
+    EXPECT_GT(oneNode.maintenanceNodesPending, 0u);
+    EXPECT_FALSE(TestAccess::tlasLeafIsLoose(database, moving));
+    const AABB exact = TestAccess::instanceBounds(database, moving);
+    const AABB leaf = TestAccess::tlasLeafBounds(database, moving);
+    EXPECT_FLOAT_EQ(leaf.mn.x, exact.mn.x);
+    EXPECT_FLOAT_EQ(leaf.mx.x, exact.mx.x);
+
+    const UpdateReport drained =
+        database.applyUpdates(kUnlimitedTlasMaintenance);
+    EXPECT_GT(drained.maintenanceNodesProcessed, 0u);
+    EXPECT_EQ(drained.maintenanceNodesPending, 0u);
+}
+
+TEST(Motion, TighteningReducesCurrentAreaWithoutImplicitRebuild)
+{
+    SpatialDatabaseConfig config;
+    config.tlasAreaDrift = 0.0f;
+    config.tlasCountDrift = 1000.0f;
+    config.tlasEditFraction = 1000.0f;
+    SpatialDatabase database(config);
+    std::vector<InstanceHandle> handles;
+    for (uint32_t i = 0; i < 32; ++i)
+    {
+        InstanceDesc desc;
+        desc.pos = float4::point(float(i % 8) * 4.0f, 0.0f,
+                                 float(i / 8) * 4.0f);
+        handles.push_back(database.instantiate(
+            node(2000 + i, 0.0f, box()), desc));
+    }
+    database.applyUpdates(0);
+
+    const InstanceHandle moving = handles.front();
+    database.moveInstance(
+        moving, Transform{float4::point(1000.0f, 0.0f, 0.0f), 1.0f});
+    const UpdateReport grown = database.applyUpdates(0);
+    EXPECT_FALSE(grown.requiredBuildPerformed);
+    EXPECT_TRUE(grown.optimizeRecommended);
+    EXPECT_GT(grown.areaGrowthRatio, 0.0f);
+
+    database.moveInstance(
+        moving, Transform{float4::point(0.0f, 0.0f, 0.0f), 1.0f});
+    database.applyUpdates(0);
+    const UpdateReport repaired =
+        database.applyUpdates(kUnlimitedTlasMaintenance);
+    EXPECT_FALSE(repaired.requiredBuildPerformed);
+    EXPECT_EQ(repaired.maintenanceNodesPending, 0u);
+    EXPECT_NEAR(repaired.areaGrowthRatio, 0.0f, 1.0e-6f);
+    EXPECT_FALSE(repaired.optimizeRecommended);
 }
 
 TEST(Motion, RejectsInvalidTransformsWithoutCorruptingTlas)

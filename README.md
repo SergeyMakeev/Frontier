@@ -99,7 +99,7 @@ const InstanceHandle cityInstance = world.instantiate(NodeDesc{
     .bounds = cityBounds,
 });
 world.mountSubtree(cityInstance.rootNode(), city);
-world.applyUpdates();
+world.applyUpdates(0);
 
 SpatialQuery query;
 const Camera camera = currentCamera(); // application function
@@ -123,7 +123,7 @@ for (const FrontierEntry& entry : cut.ideal()) {
                                Transform{rightHousePosition, 1.0f});
     }
 }
-world.applyUpdates(); // publish the newly mounted houses
+world.applyUpdates(0); // publish without optional TLAS tightening
 ```
 
 Builder `NodeId` values are authoring-local and are never converted to runtime
@@ -182,9 +182,14 @@ are contract errors routed through `FRONTIER_FATAL`.
 
 ## Query lifecycle
 
-`SpatialDatabase` is single-writer. Apply mutations, call `applyUpdates()`, then
-run any number of concurrent reads with distinct `SpatialQuery` objects. All
-reads must finish before the next mutation or collection.
+`SpatialDatabase` is single-writer. Apply mutations, call
+`applyUpdates(maintenanceNodeBudget)`, then run any number of concurrent reads
+with distinct `SpatialQuery` objects. All reads must finish before the next
+mutation or collection. A zero budget publishes conservative grown TLAS bounds
+without tightening; finite budgets spread tightening across frames, and
+`kUnlimitedTlasMaintenance` drains all pending tightening work. The returned
+`UpdateReport` reports remaining work and recommends an explicit `optimize()`
+when topology quality has drifted far enough.
 
 Each query owns damping, reuse records, scratch, output, optional instrumented
 statistics, and optional mount-retention feedback. Enable the latter with

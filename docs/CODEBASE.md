@@ -118,8 +118,9 @@ of the same definition share its readiness/coverage storage.
 The database uses an explicit publish boundary:
 
 1. The single writer performs instance, mount, readiness, or bound mutations.
-2. `applyUpdates()` flushes copy-on-write bounds, publishes motion, maintains
-   the TLAS, and advances the snapshot epoch.
+2. `applyUpdates(maintenanceNodeBudget)` flushes copy-on-write bounds,
+   publishes motion, tightens at most that many queued TLAS nodes, and advances
+   the snapshot epoch. Work left in the queue remains conservative and safe.
 3. Any number of readers select concurrently, each with a distinct query
    object.
 4. The application consumes or submits the returned views.
@@ -154,10 +155,18 @@ leaf. Boundary branches continue through exact wide traversal.
 
 ## Motion and TLAS publication
 
-Small motion cohorts use conservative grow-only TLAS propagation. When the
-pending cohort reaches one quarter of the TLAS population, `applyUpdates()`
-streams the retained TLAS postorder once, copies exact dense leaf state, and
-recomputes interior bounds sequentially.
+Small motion cohorts use conservative grow-only TLAS propagation and queue
+changed leaves for incremental tightening. A maintenance unit recomputes one
+node; shrinkage queues its parent. A zero budget keeps the grown envelopes,
+finite budgets distribute repair over updates, and
+`kUnlimitedTlasMaintenance` drains the queue. Population, edit, and area drift
+are reported as `optimizeRecommended`; they never trigger an optional rebuild
+inside publication.
+
+When the pending motion cohort reaches one quarter of the TLAS population,
+publication streams the retained TLAS postorder once, copies exact dense leaf
+state, and recomputes interior bounds sequentially. This is a publication
+strategy for a dense update, independent of the optional maintenance budget.
 
 `RigidMotionGroup` caches a caller-to-dense mapping for stable top-level
 cohorts whose authored bounds are yaw-invariant. Separate contiguous position
