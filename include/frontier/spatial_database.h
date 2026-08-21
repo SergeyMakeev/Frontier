@@ -1140,12 +1140,13 @@ struct TlasDebugSummary
     uint32_t instanceLaneCount = 0;
     uint32_t maxDepth = 0;
     uint32_t editsSinceRebuild = 0;
-    uint32_t qualityBaselineInstances = 0;
+    uint32_t rebuildBaselineInstances = 0;
     uint32_t maintenanceNodesPending = 0;
     float averageLaneOccupancy = 0.0f;
     float areaGrowthRatio = 0.0f;
     bool buildRequired = false;
-    bool optimizeRecommended = false;
+    bool topologyRebuildRecommended = false;
+    TlasQuality activeQuality = TlasQuality::Morton;
     TlasQuality configuredQuality = TlasQuality::BinnedSAH;
 };
 
@@ -1179,7 +1180,7 @@ struct SpatialDatabaseConfig
     FrontierContext context{};
 
     // Quality tier of the top-level BVH. Initial builds and explicit
-    // optimize() calls use this tier.
+    // optimize() calls use this tier. refreshTlas() always uses Morton.
     TlasQuality tlasQuality = TlasQuality::BinnedSAH;
 
     // SAH cost constants (BinnedSAH only): cost of visiting a node vs testing
@@ -1187,23 +1188,23 @@ struct SpatialDatabaseConfig
     float tlasTraversalCost = 1.0f;
     float tlasIntersectCost = 1.0f;
 
-    // Fraction of the quality-build population that may appear or disappear
-    // before optimize() is recommended. This never triggers an implicit
-    // rebuild during applyUpdates(budget).
+    // Fraction of the most recent rebuild population that may appear or
+    // disappear before a topology rebuild is recommended. This never triggers
+    // an implicit rebuild during applyUpdates(budget).
     float tlasCountDrift = 0.2f;
 
     // Fraction of the top-level BVH's most recent build area that current
-    // stored lanes may add before optimize() is recommended. Incremental
-    // maintenance reduces the measured growth as it tightens lanes. This
-    // never triggers an implicit
-    // rebuild during applyUpdates(budget).
+    // stored lanes may add before a topology rebuild is recommended.
+    // Incremental maintenance reduces the measured growth as it tightens
+    // lanes. This never triggers an implicit rebuild during
+    // applyUpdates(budget).
     float tlasAreaDrift = 0.5f;
 
     // Fraction of the population that may be spawned or removed INCREMENTALLY
-    // before optimize() is recommended. An incremental insert descends to the leaf
-    // whose box grows least and either takes a free lane or splits the leaf,
-    // which deepens that subtree by one; a removal invalidates a lane and
-    // leaves its box loose. Both are O(depth) and preserve correctness.
+    // before a topology rebuild is recommended. An incremental insert descends
+    // to the leaf whose box grows least and either takes a free lane or splits
+    // the leaf, which deepens that subtree by one; a removal invalidates a lane
+    // and leaves its box loose. Both are O(depth) and preserve correctness.
     float tlasEditFraction = 0.05f;
 
     // Minimum number of visible instances before an uncached SpatialQuery fans
@@ -1223,7 +1224,7 @@ struct UpdateReport
     uint32_t maintenanceNodesProcessed = 0;
     uint32_t maintenanceNodesPending = 0;
     float areaGrowthRatio = 0.0f;
-    bool optimizeRecommended = false;
+    bool topologyRebuildRecommended = false;
     bool requiredBuildPerformed = false;
 };
 
@@ -1459,12 +1460,22 @@ public:
     // selection snapshot. A zero budget retains conservative grown bounds;
     // kUnlimitedTlasMaintenance drains the repair queue. Optional maintenance
     // never performs a topology rebuild: the returned report tells the caller
-    // when optimize() is recommended.
+    // when refreshTlas() or optimize() is recommended.
     // Call once before a group of selections, even when no database contents
     // changed; it also advances the epoch used by collection aging.
     // No SpatialDatabase mutation (including collect) may overlap or occur before every
     // SpatialQuery selection using this snapshot has completed.
     UpdateReport applyUpdates(uint32_t maintenanceNodeBudget);
+
+    // Rebuild the TLAS from exact current instance bounds with the linear
+    // Morton builder. Unlike optimize(), this does not compact dead dense
+    // slots or reorder instance and SpatialQuery-record storage, so cached
+    // MotionGroup physical mappings remain valid. It clears accumulated
+    // topology drift and incremental-maintenance state. This is still a full
+    // O(instance count) topology rebuild, intended as the lower-cost runtime
+    // alternative to optimize(). Pending bounds and motion edits are consumed;
+    // collection age is not advanced.
+    void refreshTlas();
 
     // Force a full quality TLAS rebuild, compact dead dense slots, and restore
     // physical instance/SpatialQuery-record order to TLAS traversal order. Public
@@ -2420,9 +2431,9 @@ private:
     InstanceHandle addTlasRootInstance(const NodeDesc& root,
                                        const InstanceDesc& desc);
 
-    bool tlasOptimizationRecommended() const;
+    bool tlasRebuildRecommended() const;
     float tlasAreaGrowthRatio() const;
-    void tlasRebuild(bool reorderInstances);
+    void tlasRebuild(bool reorderInstances, bool useConfiguredQuality);
     int32_t tlasBuildRange(std::vector<uint32_t>& items, int lo, int hi, int32_t parent);
     int  tlasSplit(std::vector<uint32_t>& items, int lo, int hi);
     void tlasQuery(const Camera& view, float minPix,
@@ -2612,11 +2623,11 @@ private:
     float4                tlasGlobalOffset_{};
     int32_t               tlasRoot_ = -1;
     bool                  tlasBuildRequired_ = true;
-    bool                  tlasQualityBuild_ = true;   // quality tier vs Morton
     uint32_t              tlasEdits_ = 0;           // incremental inserts + removes
     std::vector<int32_t>  tlasFreeNodes_;           // nodes emptied by removal
     uint32_t              tlasLeafCount_ = 0;
-    uint32_t              tlasQualityCount_ = 0;   // leaves at last quality build
+    uint32_t              tlasBuildCount_ = 0;     // leaves at last topology build
+    TlasQuality           tlasBuiltQuality_ = TlasQuality::Morton;
     double                tlasBaseArea_ = 0.0;     // lane area at last build
     double                tlasCurrentArea_ = 0.0;  // current stored lane area
     std::deque<uint32_t>  tlasRepairQueue_;

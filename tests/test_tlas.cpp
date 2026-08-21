@@ -165,7 +165,7 @@ TEST(Tlas, StaleInstanceHandleCannotMoveReusedSlot)
                 0.0f, 0.001f);
 }
 
-TEST(Tlas, QualityDriftIsAdvisoryUntilOptimizeIsExplicit)
+TEST(Tlas, TopologyDriftIsAdvisoryUntilARebuildIsExplicit)
 {
     SpatialDatabaseConfig config;
     config.tlasCountDrift = 0.0f;
@@ -185,7 +185,7 @@ TEST(Tlas, QualityDriftIsAdvisoryUntilOptimizeIsExplicit)
         InstanceDesc{.pos = float4::point(80.0f, 0.0f, 0.0f)});
     const UpdateReport report = database.applyUpdates(0);
     EXPECT_FALSE(report.requiredBuildPerformed);
-    EXPECT_TRUE(report.optimizeRecommended);
+    EXPECT_TRUE(report.topologyRebuildRecommended);
 
     SpatialQuery query;
     EXPECT_EQ(query.selectFrontier(database, cameraAt(-1000.0f), {}).size(),
@@ -193,14 +193,14 @@ TEST(Tlas, QualityDriftIsAdvisoryUntilOptimizeIsExplicit)
 #ifdef FRONTIER_DEBUG_TOOLS
     const TlasDebugSummary before = database.debugTlasSummary();
     EXPECT_FALSE(before.buildRequired);
-    EXPECT_TRUE(before.optimizeRecommended);
+    EXPECT_TRUE(before.topologyRebuildRecommended);
 #endif
 
     database.optimize();
 #ifdef FRONTIER_DEBUG_TOOLS
     const TlasDebugSummary after = database.debugTlasSummary();
     EXPECT_FALSE(after.buildRequired);
-    EXPECT_FALSE(after.optimizeRecommended);
+    EXPECT_FALSE(after.topologyRebuildRecommended);
 #endif
 }
 
@@ -221,10 +221,67 @@ TEST(Tlas, FirstPopulationAfterAnEmptyPublicationBuildsAtConfiguredQuality)
     }
     const UpdateReport report = database.applyUpdates(0);
     EXPECT_TRUE(report.requiredBuildPerformed);
-    EXPECT_FALSE(report.optimizeRecommended);
+    EXPECT_FALSE(report.topologyRebuildRecommended);
 #ifdef FRONTIER_DEBUG_TOOLS
-    EXPECT_EQ(database.debugTlasSummary().qualityBaselineInstances, 16u);
+    EXPECT_EQ(database.debugTlasSummary().rebuildBaselineInstances, 16u);
 #endif
+}
+
+TEST(Tlas, RefreshRebuildsExactMortonTopologyWithoutChangingDenseLayout)
+{
+    SpatialDatabaseConfig config;
+    config.tlasQuality = TlasQuality::BinnedSAH;
+    config.tlasCountDrift = 0.0f;
+    config.tlasEditFraction = 0.0f;
+    config.tlasAreaDrift = 0.0f;
+    SpatialDatabase database(config);
+
+    std::vector<InstanceHandle> handles;
+    for (uint32_t i = 0; i < 64; ++i)
+    {
+        InstanceDesc desc;
+        desc.pos = float4::point(float(i) * 3.0f, 0.0f, 0.0f);
+        handles.push_back(database.instantiate(node(500 + i, 0.0f, box()),
+                                               desc));
+    }
+    database.applyUpdates(0);
+    for (uint32_t i = 0; i < 64; i += 3)
+        database.removeInstance(handles[i]);
+    ASSERT_TRUE(database.applyUpdates(0).topologyRebuildRecommended);
+    database.moveInstance(handles[1],
+                          Transform{float4::point(500.0f, 0.0f, 0.0f), 1.0f});
+
+    const size_t allocatedBefore = TestAccess::allocatedInstanceSlots(database);
+    const uint32_t layoutBefore = TestAccess::instanceLayoutVersion(database);
+    const uint32_t mappingBefore = TestAccess::instanceMappingVersion(database);
+    const uint32_t frameBefore = database.frame();
+    const InstanceId denseBefore = TestAccess::denseInstanceId(database,
+                                                                handles[1]);
+
+    database.refreshTlas();
+
+    EXPECT_EQ(TestAccess::allocatedInstanceSlots(database), allocatedBefore);
+    EXPECT_GT(allocatedBefore, TestAccess::liveInstanceSlots(database));
+    EXPECT_EQ(TestAccess::instanceLayoutVersion(database), layoutBefore);
+    EXPECT_EQ(TestAccess::instanceMappingVersion(database), mappingBefore);
+    EXPECT_EQ(database.frame(), frameBefore);
+    EXPECT_EQ(TestAccess::denseInstanceId(database, handles[1]), denseBefore);
+    EXPECT_TRUE(TestAccess::instanceBounds(database, handles[0]).isEmpty());
+    EXPECT_NEAR(TestAccess::tlasLeafBounds(database, handles[1]).center().x,
+                500.0f, 0.001f);
+#ifdef FRONTIER_DEBUG_TOOLS
+    const TlasDebugSummary summary = database.debugTlasSummary();
+    EXPECT_EQ(summary.activeQuality, TlasQuality::Morton);
+    EXPECT_EQ(summary.configuredQuality, TlasQuality::BinnedSAH);
+    EXPECT_EQ(summary.rebuildBaselineInstances,
+              TestAccess::liveInstanceSlots(database));
+    EXPECT_EQ(summary.maintenanceNodesPending, 0u);
+    EXPECT_FALSE(summary.topologyRebuildRecommended);
+#endif
+
+    SpatialQuery query;
+    EXPECT_EQ(query.selectFrontier(database, cameraAt(-1000.0f), {}).size(),
+              TestAccess::liveInstanceSlots(database));
 }
 
 TEST(Tlas, EveryQualityTierReturnsTheSameVisibleSet)

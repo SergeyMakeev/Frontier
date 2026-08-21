@@ -140,6 +140,23 @@ struct SpatialDatabase::TestAccess
     {
         return database.liveInstances_.size();
     }
+    static size_t allocatedInstanceSlots(const SpatialDatabase& database)
+    {
+        return database.instances_.size();
+    }
+    static uint32_t instanceLayoutVersion(const SpatialDatabase& database)
+    {
+        return database.instanceLayoutVersion_;
+    }
+    static uint32_t instanceMappingVersion(const SpatialDatabase& database)
+    {
+        return database.instanceMappingVersion_;
+    }
+    static InstanceId denseInstanceId(const SpatialDatabase& database,
+                                      InstanceHandle handle)
+    {
+        return database.denseInstanceId(handle);
+    }
 
     static bool overlayIsSparse(SpatialDatabase& database,
                                 InstanceHandle owner, NodeHandle node)

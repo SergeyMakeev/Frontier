@@ -166,10 +166,11 @@ the existing query epoch.
 ## TLAS maintenance
 
 Initial builds and explicit `optimize()` calls use the configured `BinnedSAH`,
-`Median`, or `Morton` tier. Incremental insertion descends by least bound
-growth and splits a full leaf. Removal invalidates a lane. Instance motion
-updates exact dense instance state immediately but defers TLAS writes to
-`applyUpdates(maintenanceNodeBudget)`.
+`Median`, or `Morton` tier. `refreshTlas()` uses the linear Morton builder and
+does not change dense instance layout. Incremental insertion descends by least
+bound growth and splits a full leaf. Removal invalidates a lane. Instance
+motion updates exact dense instance state immediately but defers TLAS writes
+to `applyUpdates(maintenanceNodeBudget)`.
 
 A cohort smaller than one quarter of the TLAS population uses conservative
 grow-only leaf and ancestor propagation. Each changed leaf is queued once for
@@ -188,8 +189,10 @@ sequential O(TLAS nodes) work. It is separate from the caller-budgeted repair
 queue.
 
 Population drift, edit fraction, and current lane-area growth set
-`UpdateReport::optimizeRecommended`; they never schedule an implicit topology
-rebuild. `optimize()` is the sole application-requested quality repair.
+`UpdateReport::topologyRebuildRecommended`; they never schedule an implicit
+topology rebuild. The application chooses `refreshTlas()` for an exact Morton
+refresh that preserves dense layout, or `optimize()` for configured-quality
+rebuild plus compaction and spatial reordering.
 
 The large-batch path reuses mutually exclusive build scratch: one 32-bit array
 holds pending dense instance ids and the temporary DFS stack, while another

@@ -1046,8 +1046,8 @@ registered bytes.
 applyStreamingCompletions(database);
 applySimulationMotion(database);
 UpdateReport update = database.applyUpdates(256);
-if (update.optimizeRecommended)
-    scheduleOptimizeAtAnApplicationChosenSafePoint();
+if (update.topologyRebuildRecommended)
+    scheduleTlasRebuildAtAnApplicationChosenSafePoint();
 
 // Read-only phase. Each task owns a different query.
 runConcurrently(
@@ -1069,14 +1069,23 @@ maximum number of queued TLAS nodes whose conservative bounds may be tightened
 in that call. Zero publishes without optional tightening. A finite value spreads
 maintenance across frames, and `kUnlimitedTlasMaintenance` drains the queue.
 The returned `UpdateReport` contains processed and pending node counts, current
-area growth, whether optimization is recommended, and whether a correctness-
-required build occurred.
+area growth, whether a topology rebuild is recommended, and whether a
+correctness-required build occurred.
 
 `applyUpdates(maintenanceNodeBudget)` never performs an optional topology
 rebuild. Population drift, incremental edit count, and stored-area growth only set
-`optimizeRecommended`. `optimize()` is the explicit heavier safe-point operation
-that flushes bounds, compacts dead dense instance slots, and performs a quality
-TLAS rebuild. Public handles and `FrontierEntry` instance ids remain stable.
+`topologyRebuildRecommended`. The application can answer that advice with one
+of two explicit safe-point operations:
+
+- `refreshTlas()` flushes pending state and rebuilds exact TLAS topology with
+  the linear Morton builder. It leaves dead dense slots and physical instance
+  order untouched, so cached `MotionGroup` mappings remain valid.
+- `optimize()` flushes pending state, compacts dead dense instance slots,
+  spatially reorders instance/query-record storage, and rebuilds with the
+  configured quality tier.
+
+Neither operation advances collection age. Public handles and
+`FrontierEntry` instance ids remain stable.
 
 ## 12. Configure allocation, TLAS quality, and parallel selection
 
@@ -1110,7 +1119,10 @@ SpatialDatabase database(config);
 `BinnedSAH` uses a binned surface-area heuristic to build a tighter TLAS at a
 higher rebuild cost. `Morton` is the cheapest, loosest build and `Median` is the
 middle option. The drift thresholds decide when `UpdateReport` recommends an
-explicit `optimize()`; they never cause an implicit quality rebuild.
+explicit topology rebuild; they never cause one implicitly. Use
+`refreshTlas()` for a lower-cost Morton refresh during ordinary simulation and
+`optimize()` when compaction or the configured higher-quality topology is worth
+the extra cost.
 
 `parallelFor` must block until all requested tasks finish. Internal parallel
 selection is used only for uncached queries, above the configured visible

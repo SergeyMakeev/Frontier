@@ -1633,8 +1633,9 @@ void SpatialDatabase::MotionGroup::reset(
     physicalOrderValid_ = false;
 }
 
-// Current quality is advisory. Population, edit, and stored-area drift remain
-// queryable after every publication; only optimize() acts on the recommendation.
+// Current topology drift is advisory. Population, edit, and stored-area drift
+// remain queryable after every publication; only an explicit refreshTlas() or
+// optimize() acts on the recommendation.
 float SpatialDatabase::tlasAreaGrowthRatio() const
 {
     if (!(tlasBaseArea_ > 0.0)) return 0.0f;
@@ -1642,13 +1643,13 @@ float SpatialDatabase::tlasAreaGrowthRatio() const
                  tlasBaseArea_);
 }
 
-bool SpatialDatabase::tlasOptimizationRecommended() const
+bool SpatialDatabase::tlasRebuildRecommended() const
 {
     const uint64_t alive = liveInstances_.size();
-    const uint64_t drift = alive > tlasQualityCount_ ? alive - tlasQualityCount_
-                                                     : tlasQualityCount_ - alive;
+    const uint64_t drift = alive > tlasBuildCount_ ? alive - tlasBuildCount_
+                                                   : tlasBuildCount_ - alive;
     const bool countDrift =
-        float(drift) > float(tlasQualityCount_) * config_.tlasCountDrift;
+        float(drift) > float(tlasBuildCount_) * config_.tlasCountDrift;
     const bool editDrift =
         float(tlasEdits_) > float(tlasLeafCount_) * config_.tlasEditFraction;
     return countDrift || editDrift ||
@@ -2451,16 +2452,26 @@ UpdateReport SpatialDatabase::applyUpdates(uint32_t maintenanceNodeBudget)
     {
         const bool firstSpatialization =
             !instanceLayoutSpatialized_ && !liveInstances_.empty();
-        if (firstSpatialization) tlasQualityBuild_ = true;
-        tlasRebuild(firstSpatialization);
+        tlasRebuild(firstSpatialization, firstSpatialization);
         report.requiredBuildPerformed = true;
     }
     report.maintenanceNodesProcessed = repairTlas(maintenanceNodeBudget);
     report.maintenanceNodesPending =
         uint32_t(std::min<size_t>(tlasRepairQueue_.size(), UINT32_MAX));
     report.areaGrowthRatio = tlasAreaGrowthRatio();
-    report.optimizeRecommended = tlasOptimizationRecommended();
+    report.topologyRebuildRecommended = tlasRebuildRecommended();
     return report;
+}
+
+void SpatialDatabase::refreshTlas()
+{
+    // The rebuild consumes exact Instance records directly. Discarding the
+    // pending old-topology lane list avoids paying for a refit that will be
+    // thrown away immediately.
+    tlasItemsTmp_.clear();
+    tlasBuildRequired_ = true;
+    flushBounds();
+    tlasRebuild(false, false);
 }
 
 void SpatialDatabase::optimize()
@@ -2468,10 +2479,9 @@ void SpatialDatabase::optimize()
     // The rebuild below consumes the exact Instance records directly, so no
     // intermediate refit of the old topology is necessary.
     tlasItemsTmp_.clear();
-    flushBounds();
     tlasBuildRequired_ = true;
-    tlasQualityBuild_ = true;
-    tlasRebuild(true);
+    flushBounds();
+    tlasRebuild(true, true);
 }
 
 void SpatialDatabase::flushBounds()
@@ -3541,10 +3551,11 @@ void SpatialDatabase::reorderInstancesByTlas()
     if (++instanceMappingVersion_ == 0) ++instanceMappingVersion_;
 }
 
-// Build the required initial/recovery topology or the quality topology
-// explicitly requested by optimize(). Routine motion and quality drift never
-// reach this path implicitly.
-void SpatialDatabase::tlasRebuild(bool reorderInstances)
+// Build the required initial/recovery topology or a topology explicitly
+// requested by refreshTlas()/optimize(). Routine motion and topology drift
+// never reach this path implicitly.
+void SpatialDatabase::tlasRebuild(bool reorderInstances,
+                                  bool useConfiguredQuality)
 {
     // Rebuild enumerates instance bounds, so first bring a deferred uniform
     // translation into those records and the old TLAS nodes.
@@ -3562,10 +3573,10 @@ void SpatialDatabase::tlasRebuild(bool reorderInstances)
     for (const InstanceId dense : liveInstances_)
         instanceTlasLoose_[dense] = 0;
 
-    const bool promoted = tlasQualityBuild_;
-    const bool quality =
-        promoted && config_.tlasQuality != TlasQuality::Morton;
-    tlasQualityBuild_ = false;
+    tlasBuiltQuality_ = useConfiguredQuality
+                            ? config_.tlasQuality
+                            : TlasQuality::Morton;
+    const bool quality = tlasBuiltQuality_ != TlasQuality::Morton;
 
     if (quality)
     {
@@ -3673,9 +3684,9 @@ void SpatialDatabase::tlasRebuild(bool reorderInstances)
         }
     }
 
-    // Morton is itself the selected quality tier when configured explicitly.
-    // Record its population baseline just like median/SAH promoted builds.
-    if (promoted) tlasQualityCount_ = tlasLeafCount_;
+    // Every exact topology rebuild establishes a fresh population baseline,
+    // whether it used the configured quality tier or the Morton fast path.
+    tlasBuildCount_ = tlasLeafCount_;
 
     if (reorderInstances) reorderInstancesByTlas();
 
@@ -3975,12 +3986,13 @@ TlasDebugSummary SpatialDatabase::debugTlasSummary() const
     summary.freeNodes = uint32_t(tlasFreeNodes_.size());
     summary.instanceCount = uint32_t(liveInstances_.size());
     summary.editsSinceRebuild = tlasEdits_;
-    summary.qualityBaselineInstances = tlasQualityCount_;
+    summary.rebuildBaselineInstances = tlasBuildCount_;
     summary.maintenanceNodesPending =
         uint32_t(std::min<size_t>(tlasRepairQueue_.size(), UINT32_MAX));
     summary.areaGrowthRatio = tlasAreaGrowthRatio();
     summary.buildRequired = tlasBuildRequired_;
-    summary.optimizeRecommended = tlasOptimizationRecommended();
+    summary.topologyRebuildRecommended = tlasRebuildRecommended();
+    summary.activeQuality = tlasBuiltQuality_;
     summary.configuredQuality = config_.tlasQuality;
 
     for (const InstanceId dense : liveInstances_)

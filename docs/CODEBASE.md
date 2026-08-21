@@ -160,8 +160,10 @@ changed leaves for incremental tightening. A maintenance unit recomputes one
 node; shrinkage queues its parent. A zero budget keeps the grown envelopes,
 finite budgets distribute repair over updates, and
 `kUnlimitedTlasMaintenance` drains the queue. Population, edit, and area drift
-are reported as `optimizeRecommended`; they never trigger an optional rebuild
-inside publication.
+are reported as `topologyRebuildRecommended`; they never trigger an optional
+rebuild inside publication. `refreshTlas()` rebuilds exact Morton topology
+without changing dense layout. `optimize()` additionally compacts and
+spatially reorders storage and uses the configured quality tier.
 
 When the pending motion cohort reaches one quarter of the TLAS population,
 publication streams the retained TLAS postorder once, copies exact dense leaf

@@ -924,6 +924,58 @@ BENCHMARK(BM_TlasIncrementalMaintenance)
     ->ArgNames({"instances", "moving", "repair_nodes"})
     ->Unit(benchmark::kMicrosecond);
 
+// Isolate the two explicit full-topology choices after a distributed motion
+// batch. Motion is staged once before measurement so this reports the rebuild:
+// method 0 is the Morton refresh that preserves dense layout; method 1 is the
+// configured binned-SAH rebuild plus compaction and traversal-order rewrite.
+static void BM_TlasTopologyRebuild(benchmark::State& state)
+{
+    const uint32_t count = uint32_t(state.range(0));
+    const bool optimize = state.range(1) != 0;
+    SpatialDatabaseConfig config;
+    config.tlasQuality = TlasQuality::BinnedSAH;
+    SpatialDatabase world(config);
+    std::vector<InstanceHandle> movers;
+    movers.reserve(std::max(1u, count / 10u));
+    const uint32_t side =
+        uint32_t(std::ceil(std::sqrt(double(count))));
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        InstanceDesc desc;
+        desc.pos = float4::point(float(i % side) * 2.0f, 0.0f,
+                                 float(i / side) * 2.0f);
+        const InstanceHandle handle = world.instantiate(
+            node(1000 + i, 0.0f, box(0.5f)), desc);
+        const uint32_t movingCount = std::max(1u, count / 10u);
+        if (movers.size() < movingCount &&
+            (uint64_t(i) * movingCount) / count == movers.size())
+            movers.push_back(handle);
+    }
+    world.applyUpdates(0);
+    world.optimize();
+    SpatialDatabase::MotionGroup motion(movers);
+    world.translateInstances(motion, float4::vec(0.0f, 0.25f, 0.0f));
+
+    for (auto _ : state)
+    {
+        if (optimize)
+            world.optimize();
+        else
+            world.refreshTlas();
+        benchmark::ClobberMemory();
+    }
+    state.counters["moving"] = double(movers.size());
+    state.counters["tlas_nodes"] = double(TestAccess::tlasNodeCount(world));
+    state.SetItemsProcessed(state.iterations() * int64_t(count));
+}
+
+BENCHMARK(BM_TlasTopologyRebuild)
+    ->Args({1191, 0})->Args({1191, 1})
+    ->Args({10000, 0})->Args({10000, 1})
+    ->ArgNames({"instances", "optimize"})
+    ->UseRealTime()
+    ->Unit(benchmark::kMicrosecond);
+
 // End-to-end dynamic-frame cost: move a distributed subset of TLAS roots,
 // publish the exact leaf changes, then select a mounted hierarchy. Static
 // roots remain eligible for exact-cut reuse while moved roots are invalidated

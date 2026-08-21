@@ -14,6 +14,7 @@ They are not current performance or integration documentation.
 - [Round 7](PERFORMANCE_OPTIMIZATION_2026_ROUND7.md)
 - [Round 8](PERFORMANCE_OPTIMIZATION_2026_ROUND8.md)
 - [Round 9](PERFORMANCE_OPTIMIZATION_2026_ROUND9.md)
+- [Round 10](PERFORMANCE_OPTIMIZATION_2026_ROUND10.md)
 
 For current absolute measurements, use the
 [current performance report](../../PERFORMANCE.md).

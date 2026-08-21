@@ -47,6 +47,11 @@ library's macro-based public payload customization.
   and 256 nodes. Counters report nodes processed and pending per call plus the
   average TLAS area-growth ratio, exposing both the steady per-frame charge and
   repair throughput.
+- `BM_TlasTopologyRebuild` compares `refreshTlas()` with `optimize()` after a
+  distributed 10% motion batch at 1,191 roots (the live-city population) and
+  10,000 roots. Motion submission is outside the timed interval. Method zero is
+  the exact Morton rebuild that preserves dense layout; method one is the
+  configured Binned-SAH rebuild plus compaction and physical reordering.
 - `BM_MovingObjectsSelectionScale` moves a distributed 10% or 100% of a
   mounted 1,000/10,000-root forest, publishes the update, and selects the next
   frontier through the same rigid-translation API. Counters separate roots

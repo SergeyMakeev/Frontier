@@ -632,6 +632,8 @@ definitions, and readiness bits survive the removal of placements.
 
 The configured quality tier is `Morton`, `Median`, or 16-bin `BinnedSAH`.
 Initial builds and explicit `optimize()` calls use the configured tier.
+`refreshTlas()` always uses the linear Morton builder and preserves the current
+dense instance layout.
 
 The quality builder recursively produces a `kWide`-way tree using
 `log2(kWide)` binary splits per node. SAH scans 16 bins on all three axes; a
@@ -659,9 +661,9 @@ always succeeds without scanning upward for a free lane.
 
 Removal clears the instance lane and unlinks newly empty nodes. It deliberately
 leaves ancestor boxes loose and queues their repair. `tlasEditFraction` and
-`tlasCountDrift` decide when publication recommends `optimize()`; steady
+`tlasCountDrift` decide when publication recommends a topology rebuild; steady
 spawn/despawn churn remains incremental until the application accepts that
-recommendation.
+recommendation with `refreshTlas()` or `optimize()`.
 
 ### 9.3 Motion publication
 
@@ -672,7 +674,7 @@ For a small cohort, each leaf retains a grow-only motion envelope. If the exact
 new box is already inside, no TLAS memory is written. Otherwise the leaf and
 ancestors grow until the first ancestor already containing the new box,
 maximum contribution, and layer mask. Crossing `tlasAreaDrift` makes
-`UpdateReport::optimizeRecommended` true.
+`UpdateReport::topologyRebuildRecommended` true.
 
 Each changed leaf enters a deduplicated FIFO repair queue. One optional
 maintenance unit recomputes one node from exact instance lanes or conservative
@@ -708,7 +710,21 @@ database leaves all instance and TLAS bytes in a common base space and updates
 `tlasGlobalOffset_` plus travel/version scalars. Selection transforms the
 camera by the offset. A later differential edit materializes it in one pass.
 
-### 9.4 Physical reordering
+### 9.4 Explicit topology rebuilds
+
+`refreshTlas()` consumes exact current instance bounds, rebuilds all TLAS nodes
+with Morton ordering, clears loose flags and the incremental repair queue, and
+establishes fresh population and area baselines. It does not compact dead dense
+slots, permute any per-instance stream, or increment the instance layout and
+mapping epochs. Existing `MotionGroup` and `RigidMotionGroup` dense mappings
+therefore remain valid.
+
+`optimize()` performs the configured-quality rebuild and then compacts and
+spatially reorders dense storage. It is the appropriate choice when dead-slot
+reclamation or the tighter traversal quality of Median/BinnedSAH justifies the
+additional safe-point cost.
+
+### 9.5 Physical reordering
 
 The first spatial build and explicit `optimize()` reorder dense database
 instance streams into TLAS traversal order. A query detects the layout-version

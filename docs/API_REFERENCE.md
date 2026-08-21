@@ -1373,16 +1373,17 @@ struct SpatialDatabaseConfig {
 ```
 
 - `context` supplies callbacks and is copied into the database.
-- `tlasQuality` selects initial-build and explicit-`optimize()` quality.
+- `tlasQuality` selects initial-build and explicit-`optimize()` quality;
+  `refreshTlas()` always builds Morton topology.
 - `tlasTraversalCost` and `tlasIntersectCost` are the Binned-SAH cost terms;
   increasing intersection cost favors deeper, tighter trees.
 - `tlasCountDrift` is the population-change fraction at which
-  `UpdateReport::optimizeRecommended` becomes true.
+  `UpdateReport::topologyRebuildRecommended` becomes true.
 - `tlasAreaDrift` is the allowed current TLAS lane area growth relative to the
-  last TLAS build before optimization is recommended. Incremental
+  last TLAS build before a topology rebuild is recommended. Incremental
   maintenance reduces this ratio as it tightens lanes.
 - `tlasEditFraction` is the accumulated incremental spawn/removal fraction at
-  which optimization is recommended.
+  which a topology rebuild is recommended.
 - `parallelInstanceThreshold` is the minimum visible-instance count for
   uncached parallel selection. Zero disables it; `context.workerCount` must
   also exceed one.
@@ -1393,9 +1394,9 @@ and drift values. When `parallelInstanceThreshold` is non-zero and
 selection is blocking and concatenates worker output in instance order, so
 serial and parallel cuts are identical.
 
-The three drift thresholds are advisory. They never cause an implicit quality
+The three drift thresholds are advisory. They never cause an implicit topology
 rebuild during publication; only the application decides when to call
-`optimize()`.
+`refreshTlas()` or `optimize()`.
 
 ## 10. `SpatialDatabase`
 
@@ -1800,7 +1801,7 @@ struct UpdateReport {
     uint32_t maintenanceNodesProcessed = 0;
     uint32_t maintenanceNodesPending = 0;
     float areaGrowthRatio = 0.0f;
-    bool optimizeRecommended = false;
+    bool topologyRebuildRecommended = false;
     bool requiredBuildPerformed = false;
 };
 
@@ -1820,25 +1821,28 @@ culling efficiency but cannot hide a visible instance.
 `maintenanceNodesProcessed` is the exact work charged to this call and
 `maintenanceNodesPending` is the queue size after it. `areaGrowthRatio`
 measures current stored lane area above the last TLAS build.
-`optimizeRecommended` applies the configured population, edit, and area drift
-thresholds; it is advice, not a scheduled action. `requiredBuildPerformed` is
-true only for a correctness-required initial or defensive build. Optional
-maintenance never rebuilds topology.
+`topologyRebuildRecommended` applies the configured population, edit, and area
+drift thresholds; it is advice, not a scheduled action.
+`requiredBuildPerformed` is true only for a correctness-required initial or
+defensive build. Optional maintenance never rebuilds topology.
 
 Call once before each selection group, even when the writer made no scene
 edits, if collection age should advance. No mutation or collection may overlap
 selections using the published snapshot.
 
 ```cpp
+void refreshTlas();
 void optimize();
 ```
 
-Consumes pending bounds and instance motion, forces a quality-tier TLAS
-rebuild, compacts dead dense instance slots, and restores physical query-record
-order. Public `InstanceHandle` values, root `NodeHandle` values, and
-`FrontierEntry::instance()` ids remain stable. This is a heavy
-synchronization-point operation and does not advance `frame()` or collection
-age.
+Both methods consume pending bounds and instance motion and establish a fresh
+population/area drift baseline without advancing `frame()` or collection age.
+`refreshTlas()` uses the linear Morton builder, clears incremental maintenance,
+and preserves dense slots, physical instance order, layout version, and
+mapping version. `optimize()` uses `SpatialDatabaseConfig::tlasQuality`,
+compacts dead dense slots, and restores physical query-record order to TLAS
+traversal order. Public `InstanceHandle` values, root `NodeHandle` values, and
+`FrontierEntry::instance()` ids remain stable in either case.
 
 ### Mounted-placement collection
 
@@ -1905,8 +1909,9 @@ size_t SpatialDatabase::debugLooseInstanceBounds(
 ```
 
 The summaries read existing scalar state. `debugTlasSummary()` reports the
-same pending-maintenance, current area growth, required-build, and optimization
-recommendation state as publication. It also walks the live
+same pending-maintenance, current area growth, required-build, and topology-
+rebuild recommendation state as publication. It includes the active and
+configured quality tiers plus the population at the last rebuild, and walks the live
 TLAS to calculate depth and occupancy. The span methods allocate nothing,
 write at most `output.size()` records, and return the complete matching count
 so the caller can detect truncation. `debugTlasBoxes()` returns a complete cut

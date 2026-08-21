@@ -610,7 +610,7 @@ TEST(Motion, TighteningReducesCurrentAreaWithoutImplicitRebuild)
         moving, Transform{float4::point(1000.0f, 0.0f, 0.0f), 1.0f});
     const UpdateReport grown = database.applyUpdates(0);
     EXPECT_FALSE(grown.requiredBuildPerformed);
-    EXPECT_TRUE(grown.optimizeRecommended);
+    EXPECT_TRUE(grown.topologyRebuildRecommended);
     EXPECT_GT(grown.areaGrowthRatio, 0.0f);
 
     database.moveInstance(
@@ -621,7 +621,7 @@ TEST(Motion, TighteningReducesCurrentAreaWithoutImplicitRebuild)
     EXPECT_FALSE(repaired.requiredBuildPerformed);
     EXPECT_EQ(repaired.maintenanceNodesPending, 0u);
     EXPECT_NEAR(repaired.areaGrowthRatio, 0.0f, 1.0e-6f);
-    EXPECT_FALSE(repaired.optimizeRecommended);
+    EXPECT_FALSE(repaired.topologyRebuildRecommended);
 }
 
 TEST(Motion, RejectsInvalidTransformsWithoutCorruptingTlas)

@@ -188,8 +188,10 @@ with distinct `SpatialQuery` objects. All reads must finish before the next
 mutation or collection. A zero budget publishes conservative grown TLAS bounds
 without tightening; finite budgets spread tightening across frames, and
 `kUnlimitedTlasMaintenance` drains all pending tightening work. The returned
-`UpdateReport` reports remaining work and recommends an explicit `optimize()`
-when topology quality has drifted far enough.
+`UpdateReport` reports remaining work and recommends an explicit topology
+rebuild when quality has drifted far enough. `refreshTlas()` performs the fast
+exact Morton rebuild without changing dense instance layout; `optimize()` uses
+the configured quality tier and also compacts and spatially reorders storage.
 
 Each query owns damping, reuse records, scratch, output, optional instrumented
 statistics, and optional mount-retention feedback. Enable the latter with

@@ -42,14 +42,15 @@ coherent rigid motion and deliberately forces the more expensive all-object
 motion case; stopping it restores the authored city layout. Simulation freeze
 also pauses this stress animation. The separate **TLAS maintenance** window
 configures a finite or unlimited node-repair budget for each `applyUpdates`
-call and three explicit optimization strategies: **Manual only**,
+call and three explicit topology-rebuild strategies: **Manual only**,
 unconditional **Periodic**, and **When recommended**. The two scheduled
-strategies use a configurable 0.25-to-60-second interval;
-recommendation-gated mode checks the latest `UpdateReport` at that cadence and
-skips `optimize()` unless Frontier advises it. **Optimize now** remains
-available under every strategy. The UI counts recommendation checks and
-skipped rebuilds so the policies can be compared. The sample defaults to
-**When recommended** with a two-second check interval.
+strategies use a configurable 0.25-to-60-second interval and can call either
+`refreshTlas()` (Morton topology, dense layout preserved) or `optimize()`
+(configured quality, compaction, and spatial reordering). Recommendation-gated
+mode checks the latest `UpdateReport` at that cadence. **Refresh TLAS now** and
+**Optimize now** remain available under every strategy. The UI tracks timing
+and call counts for both methods so they can be compared. The sample defaults
+to **When recommended**, `refreshTlas()`, and a two-second check interval.
 Wireframe can also be toggled directly from the top-bar
 **Rendering** menu and composes with hierarchy tinting. **Scene stats** contains
 entity, cut, streaming, cache, simulation, and camera status.
@@ -57,15 +58,15 @@ entity, cut, streaming, cache, simulation, and camera status.
 motion/database work, and resource publication first. bgfx timing and backend
 counters follow, with UI, camera, and diagnostic overhead last. Every timer has
 its own rolling raw-sample chart covering roughly 5-10 seconds, including
-Frontier selection, motion submission, `applyUpdates`, `optimize`, resource
+Frontier selection, motion submission, `applyUpdates`, TLAS rebuild, resource
 publication, bgfx submit/render/GPU/wait, UI, camera, accounting, unaccounted,
 and total-frame time. Each timer also reports the minimum, maximum, and average
 over its visible rolling window. Draw, primitive, and transient-buffer counters
 remain alongside the timing charts. **Scene hierarchy** is a live
 ImGui tree of each reusable Frontier topology with current/ideal selected-entry
 counts. **TLAS health** reports topology occupancy, depth, motion-area growth,
-the incremental repair queue, active maintenance/optimization policy,
-optimization advice, and storage. It controls complete depth-cut TLAS AABB
+the incremental repair queue, active/configured build quality, rebuild policy,
+topology-rebuild advice, and storage. It controls complete depth-cut TLAS AABB
 rendering and loose-motion envelope comparison. **Query cache** reports reuse
 rate, record/slab storage, garbage, cache state, travel, and hit-rate history. The TLAS and
 loose-bound visualizations are also independently available from the
