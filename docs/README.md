@@ -36,7 +36,8 @@ the current integration contract.
 
 ## Design proposals
 
-- [Frontier gap computation API](proposals/FRONTIER_GAP_API.md): proposed
-  policy-free `SpatialQuery::computeFrontierGap()` building block for bounded
-  streaming decisions between the current and ideal cuts. This API is not yet
-  implemented and is not part of the current contract.
+- [Frontier refinement computation API](proposals/FRONTIER_REFINEMENT_API.md):
+  proposed current-only selection result and policy-free
+  `SpatialQuery::computeFrontierRefinement()` building block for bounded or
+  exhaustive streaming analysis. This API is not yet implemented and is not
+  part of the current contract.
