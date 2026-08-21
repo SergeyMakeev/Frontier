@@ -847,10 +847,13 @@ private:
                     lastUpdateReport_.areaGrowthRatio * 100.0f);
         if (lastUpdateReport_.requiredBuildPerformed)
             ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.20f, 1.0f),
-                               "Correctness-required build performed");
-        if (lastUpdateReport_.optimizeRecommended)
+                               "TLAS health: correctness build performed");
+        else if (lastUpdateReport_.optimizeRecommended)
             ImGui::TextColored(ImVec4(1.0f, 0.78f, 0.20f, 1.0f),
-                               "Optimize recommended");
+                               "TLAS health: optimization recommended");
+        else
+            ImGui::TextColored(ImVec4(0.35f, 0.85f, 0.45f, 1.0f),
+                               "TLAS health: OK; optimization not needed");
 
         ImGui::Text("optimize");
         ImGui::Separator();
@@ -1227,10 +1230,13 @@ private:
                     optimizeStrategyName(optimizeStrategy_));
         if (tlasHealth_.buildRequired)
             ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.20f, 1.0f),
-                               "TLAS correctness build required");
+                               "TLAS health: correctness build required");
         else if (tlasHealth_.optimizeRecommended)
             ImGui::TextColored(ImVec4(1.0f, 0.78f, 0.20f, 1.0f),
-                               "TLAS optimize recommended");
+                               "TLAS health: optimization recommended");
+        else
+            ImGui::TextColored(ImVec4(0.35f, 0.85f, 0.45f, 1.0f),
+                               "TLAS health: OK; optimization not needed");
 
         ImGui::Separator();
         ImGui::Text("Spatial visualizations");
