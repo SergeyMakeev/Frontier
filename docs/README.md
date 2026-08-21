@@ -33,3 +33,10 @@ the historical records.
 designs, old APIs, optimization experiments, rejected prototypes, and
 before/after measurements. They are engineering records and are not part of
 the current integration contract.
+
+## Design proposals
+
+- [Frontier gap computation API](proposals/FRONTIER_GAP_API.md): proposed
+  policy-free `SpatialQuery::computeFrontierGap()` building block for bounded
+  streaming decisions between the current and ideal cuts. This API is not yet
+  implemented and is not part of the current contract.
