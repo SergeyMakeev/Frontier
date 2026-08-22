@@ -20,9 +20,16 @@ pedestrian path curving around their trunks.
 The scene deliberately uses no external meshes or textures. Each reusable
 Frontier subtree has reusable LOD cuts; skyscrapers use a deliberately deeper
 five-level hierarchy. Selected payloads dispatch simple bgfx debug-draw
-geometry. A bounded refinement query looks three levels below the current cut;
-the sample publishes complete sibling groups within its per-frame resource
-budget, so readiness changes always enable a valid frontier transition.
+geometry. Every representation has application-side virtual size metadata: a
+skyscraper fallback costs 0.5 MiB, while its three max-detail leaf resources
+total 10 MiB. Sizes apply to reusable representation resources, so every
+placement of a registered definition shares the same residency. Only the five
+coarsest fallback resources start resident.
+`computeFrontierRefinement()` analyzes the complete ideal cut each frame, while
+the streaming simulator requests only immediate complete-child groups. Groups
+become ready atomically after the configured latency, so Frontier advances the
+current renderable cut toward the ideal without ever exposing a partial sibling
+transition.
 
 The UI is split into independent, movable ImGui windows so diagnostics do not
 cover one another. The global **Debug windows** menu in the top bar toggles
@@ -52,11 +59,20 @@ mode checks the latest `UpdateReport` at that cadence. **Refresh TLAS now** and
 **Optimize now** remain available under every strategy. The UI tracks timing
 and call counts for both methods so they can be compared. The sample defaults
 to **When recommended**, `refreshTlas()`, and a two-second check interval.
+The separate **Virtual streaming** window controls the virtual memory budget,
+load latency, unload delay, and maximum concurrent group loads. It reports
+resident, loading, current-cut, and ideal-cut memory; current-to-ideal frontier
+convergence with a rolling history and elapsed completion time; budget or
+transition stalls; representation residency; and a rolling virtual load/unload
+log. **Reset to coarsest residency** makes all
+non-fallback representations unavailable again. Replacing the house generation
+also unloads the previous style's virtual resources before the new style is
+streamed.
 Wireframe can also be toggled directly from the top-bar
 **Rendering** menu and composes with hierarchy tinting. **Scene stats** contains
 entity, cut, streaming, cache, simulation, and camera status.
 **Performance** reports timings in microseconds and puts Frontier selection,
-motion/database work, and resource publication first. bgfx timing and backend
+motion/database work, and virtual streaming first. bgfx timing and backend
 counters follow, with UI, camera, and diagnostic overhead last. Every timer has
 its own rolling raw-sample chart covering roughly 5-10 seconds, including
 Frontier selection, motion submission, `applyUpdates`, TLAS rebuild, resource
