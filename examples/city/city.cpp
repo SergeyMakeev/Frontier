@@ -2898,7 +2898,7 @@ private:
     float smoothedFps_ = 60.0f;
     float simulationTime_ = 0.0f;
     float cameraTime_ = 0.0f;
-    float lodThreshold_ = 3.0f;
+    float lodThreshold_ = 0.75f;
     float contributionCullPixels_ = 0.75f;
     bool freezeSimulation_ = false;
     bool animateWholeScene_ = false;
