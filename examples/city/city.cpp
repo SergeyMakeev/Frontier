@@ -16,7 +16,10 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <iterator>
+#include <limits>
 #include <string>
 #include <utility>
 #include <vector>
@@ -75,13 +78,42 @@ enum class Payload : UserPayload
 constexpr size_t kPayloadSlotCount =
     static_cast<size_t>(Payload::TowerCrown) + 1;
 constexpr size_t kHouseDetailResourceCount = 3;
-constexpr size_t kStreamingResourceSlotCount =
+constexpr size_t kTowerDetailResourceCount =
+    size_t(Payload::TowerCrown) - size_t(Payload::TowerDistrict) + 1;
+constexpr uint16_t kHeroTowerInstancesPerAsset = 3;
+constexpr size_t kTowerBlocksPerDistrict = 6;
+constexpr size_t kTowerInstanceCount =
+    kTowerBlocksPerDistrict * kDistrictCount;
+constexpr size_t kHeroTowerAssetCount =
+    (kTowerInstanceCount + kHeroTowerInstancesPerAsset - 1) /
+    kHeroTowerInstancesPerAsset;
+constexpr size_t kHeroTowerResourceBase =
     kPayloadSlotCount + kHouseDetailResourceCount;
-static_assert(kStreamingResourceSlotCount <= 64,
-              "virtual streaming resource mask must fit in 64 bits");
+constexpr size_t kStreamingResourceSlotCount =
+    kHeroTowerResourceBase +
+    kHeroTowerAssetCount * kTowerDetailResourceCount;
+constexpr size_t kMaxStreamingResidencyGroupSize = 3;
 constexpr size_t kStreamingLogCapacity = 96;
 constexpr size_t kStreamingConvergenceHistorySize = 300;
 constexpr float kStreamingConvergenceSampleInterval = 1.0f / 30.0f;
+constexpr float kHeroPressureTestBudgetMiB = 85.0f;
+constexpr float kHeroOrbitCenterX = -12.0f;
+constexpr float kHeroOrbitCenterZ = -12.0f;
+constexpr float kHeroOrbitTargetHeight = 20.0f;
+constexpr float kHeroOrbitCameraHeight = 27.0f;
+constexpr float kHeroOrbitRadius = 58.0f;
+constexpr float kHeroOrbitAngularSpeed = 0.035f;
+constexpr float kHeroOrbitLookaheadSeconds = 6.0f;
+constexpr float kHeroOrbitWarmupSeconds = 20.0f;
+constexpr float kHeroOrbitTestSeconds = 180.0f;
+// TowerTop has 0.9 m geometric error versus a roughly 46 m facade, so a
+// 3-pixel top error corresponds to a skyscraper around 150 pixels tall.
+constexpr float kHeroOrbitDominantFallbackErrorPixels = 3.0f;
+constexpr uint32_t kHeroOrbitMaxRapidReloads = 1;
+constexpr float kHeroOrbitRapidReloadWindowSeconds = 5.0f;
+constexpr float kStreamingReplacementMinimumGain = 1.05f;
+constexpr float kStreamingCurrentReplacementMinimumGain = 1.30f;
+constexpr float kStreamingCurrentMinimumResidencySeconds = 15.0f;
 constexpr size_t kPerformanceHistorySize = 300;
 constexpr float kPerformanceHistorySampleInterval = 1.0f / 60.0f;
 
@@ -105,6 +137,35 @@ struct RepresentationInfo
     bool coarsest = false;
 };
 
+struct StreamingErrorStats
+{
+    uint32_t count = 0;
+    float minimum = std::numeric_limits<float>::max();
+    float maximum = 0.0f;
+    double total = 0.0;
+
+    void reset()
+    {
+        count = 0;
+        minimum = std::numeric_limits<float>::max();
+        maximum = 0.0f;
+        total = 0.0;
+    }
+
+    void add(float screenError)
+    {
+        ++count;
+        minimum = std::min(minimum, screenError);
+        maximum = std::max(maximum, screenError);
+        total += screenError;
+    }
+
+    float average() const
+    {
+        return count != 0 ? float(total / double(count)) : 0.0f;
+    }
+};
+
 struct VirtualResource
 {
     Payload payload = Payload::HouseTop;
@@ -113,6 +174,20 @@ struct VirtualResource
     NodeHandle representative{};
     float byteSizeMiB = 0.0f;
     float lastDemandTime = 0.0f;
+    float residentSince = 0.0f;
+    StreamingErrorStats currentErrors;
+    StreamingErrorStats currentBenefitErrors;
+    StreamingErrorStats idealErrors;
+    StreamingErrorStats transitionErrors;
+    StreamingErrorStats prefetchErrors;
+    StreamingErrorStats residentBenefitErrors;
+    float importanceScore = 0.0f;
+    float scorePerMiB = 0.0f;
+    std::string decision = "not evaluated";
+    std::string lastAction = "never loaded";
+    std::array<size_t, kMaxStreamingResidencyGroupSize> residencyGroup{};
+    uint16_t heroAsset = UINT16_MAX;
+    uint8_t residencyGroupCount = 0;
     bool pinned = false;
 };
 
@@ -121,13 +196,16 @@ struct PendingStreamingGroup
     std::vector<size_t> resources;
     float readyAt = 0.0f;
     float byteSizeMiB = 0.0f;
+    float scorePerMiB = 0.0f;
     uint64_t serial = 0;
 };
 
 struct StreamingCandidateGroup
 {
-    uint64_t resourceMask = 0;
-    uint8_t priority = 0;
+    std::vector<size_t> resources;
+    float importanceScore = 0.0f;
+    float scorePerMiB = 0.0f;
+    bool qualityFloor = false;
 };
 
 struct StreamingLogEntry
@@ -174,6 +252,12 @@ enum class RebuildMethod : uint8_t
     Optimize,
 };
 
+enum class StreamingCutStrategy : uint8_t
+{
+    QualityPerByte,
+    RetainReadyDetail,
+};
+
 enum class EntityKind : uint8_t
 {
     House,
@@ -193,6 +277,7 @@ struct Entity
     uint32_t color = 0xffffffff;
     EntityKind kind = EntityKind::House;
     HouseStyle houseStyle = HouseStyle::HouseA;
+    uint16_t heroAsset = UINT16_MAX;
 };
 
 struct CarPath
@@ -420,6 +505,12 @@ bool isHouseDetailPayload(Payload payload)
     return payload >= Payload::HouseCoarse && payload <= Payload::HouseRoof;
 }
 
+bool isTowerDetailPayload(Payload payload)
+{
+    return payload >= Payload::TowerDistrict &&
+           payload <= Payload::TowerCrown;
+}
+
 const char* streamingStateName(StreamingResourceState state)
 {
     switch (state)
@@ -476,15 +567,50 @@ class DynamicCity final : public entry::AppI
 {
 public:
     DynamicCity(const char* name, const char* description, const char* url)
-        : entry::AppI(name, description, url), query_(4.0f)
+        : entry::AppI(name, description, url), query_(4.0f),
+          streamingLookaheadQuery_(4.0f)
     {}
 
-    void init(int32_t, const char* const*, uint32_t width,
+    void init(int32_t argc, const char* const* argv, uint32_t width,
               uint32_t height) override
     {
+        for (int32_t index = 1; index < argc; ++index)
+        {
+            if (std::strcmp(argv[index], "--streaming-self-test") == 0)
+            {
+                streamingSelfTest_ = true;
+            }
+            else if (std::strcmp(argv[index],
+                                 "--streaming-dynamic-self-test") == 0 ||
+                     std::strcmp(argv[index],
+                                 "--streaming-orbit-self-test") == 0)
+            {
+                streamingSelfTest_ = true;
+            }
+            else if (std::strncmp(argv[index],
+                                  "--streaming-test-camera-time=", 29) == 0)
+            {
+                streamingTestCameraTime_ =
+                    std::strtof(argv[index] + 29, nullptr);
+            }
+            else if (std::strncmp(argv[index],
+                                  "--streaming-test-budget=", 24) == 0)
+            {
+                streamingTestBudgetMiB_ =
+                    std::strtof(argv[index] + 24, nullptr);
+            }
+            else if (std::strncmp(
+                         argv[index],
+                         "--streaming-test-viewport-height=", 33) == 0)
+            {
+                streamingTestViewportHeight_ =
+                    std::strtof(argv[index] + 33, nullptr);
+            }
+        }
         width_ = width;
         height_ = height;
-        reset_ = BGFX_RESET_VSYNC | BGFX_RESET_MSAA_X4;
+        reset_ = BGFX_RESET_MSAA_X4 |
+                 (streamingSelfTest_ ? 0 : BGFX_RESET_VSYNC);
         debug_ = BGFX_DEBUG_NONE;
 
         bgfx::Init init;
@@ -513,6 +639,8 @@ public:
         createRoofGeometry();
         createScene();
         initializeVirtualStreaming();
+        if (streamingSelfTest_)
+            startHeroPressureScenario();
         previousCounter_ = bx::getHPCounter();
     }
 
@@ -524,7 +652,7 @@ public:
         imguiDestroy();
         ddShutdown();
         bgfx::shutdown();
-        return 0;
+        return streamingSelfTestExitCode_;
     }
 
     bool update() override
@@ -534,8 +662,12 @@ public:
 
         const int64_t now = bx::getHPCounter();
         const double frequency = double(bx::getHPFrequency());
-        const float deltaTime = std::clamp(
-            float(double(now - previousCounter_) / frequency), 1.0e-4f, 0.1f);
+        const float deltaTime = streamingSelfTest_
+                                    ? 0.1f
+                                    : std::clamp(
+                                          float(double(now - previousCounter_) /
+                                                frequency),
+                                          1.0e-4f, 0.1f);
         previousCounter_ = now;
         smoothedFps_ += ((1.0f / deltaTime) - smoothedFps_) * 0.05f;
 
@@ -570,13 +702,41 @@ public:
         stageStart = stageEnd;
         if (streamingResetRequested_)
         {
-            resetVirtualStreaming();
+            if (virtualStreamingEnabled_)
+                resetVirtualStreaming();
+            else
+                makeAllVirtualResourcesResident(false);
             streamingResetRequested_ = false;
+        }
+        if (heroPressureScenarioRequested_)
+        {
+            startHeroPressureScenario();
+            heroPressureScenarioRequested_ = false;
         }
         if (houseReplacementPending_)
         {
             replaceHouses(pendingHouseStyle_);
             houseReplacementPending_ = false;
+            if (!virtualStreamingEnabled_)
+                makeAllVirtualResourcesResident(false);
+        }
+        if (virtualStreamingToggleRequested_)
+        {
+            virtualStreamingToggleRequested_ = false;
+            virtualStreamingEnabled_ = !virtualStreamingEnabled_;
+            streamingPaused_ = false;
+            if (virtualStreamingEnabled_)
+            {
+                resetVirtualStreaming();
+                appendStreamingLog(
+                    ImVec4(0.50f, 0.85f, 1.0f, 1.0f),
+                    "VIRTUAL STREAMING enabled: reset to coarsest residency");
+            }
+            else
+            {
+                heroPressureScenarioActive_ = false;
+                makeAllVirtualResourcesResident(true);
+            }
         }
         if (restoreSceneAfterStress_)
         {
@@ -678,6 +838,14 @@ public:
         CameraPose automaticPose;
         updateAutomaticCamera(cameraTime_, automaticPose.position,
                               automaticPose.target);
+        if (heroPressureScenarioActive_)
+        {
+            const float orbitTime =
+                streamingTime_ - heroPressureScenarioStartTime_ +
+                heroPressureOrbitPhaseOffset_;
+            updateHeroPressureOrbitCamera(
+                orbitTime, automaticPose.position, automaticPose.target);
+        }
         if (seedFreeCamera_)
         {
             seedFreeCameraFrom(automaticPose.position, automaticPose.target);
@@ -712,10 +880,33 @@ public:
         const SelectionParams selection{
             .threshold = lodThreshold_,
             .minPix = contributionCullPixels_,
-            .currentCutPolicy = CurrentCutPolicy::PreferReadyDescendants,
+            .currentCutPolicy =
+                !virtualStreamingEnabled_ ||
+                        streamingCutStrategy_ ==
+                            StreamingCutStrategy::QualityPerByte
+                    ? CurrentCutPolicy::PreferReadyAncestors
+                    : CurrentCutPolicy::PreferReadyDescendants,
         };
         const FrontierResultView frontier =
             query_.selectFrontier(database_, frontierCamera, selection);
+        FrontierResultView prefetchFrontier{};
+        if (heroPressureScenarioActive_)
+        {
+            float4 prefetchPosition;
+            float4 prefetchTarget;
+            const float prefetchTime =
+                streamingTime_ - heroPressureScenarioStartTime_ +
+                heroPressureOrbitPhaseOffset_ +
+                kHeroOrbitLookaheadSeconds;
+            updateHeroPressureOrbitCamera(
+                prefetchTime, prefetchPosition, prefetchTarget);
+            prefetchFrontier = streamingLookaheadQuery_.selectFrontier(
+                database_,
+                makeFrontierCamera(
+                    makeCameraPose(prefetchPosition, prefetchTarget)),
+                selection);
+        }
+        observeHeroPressureFrontier(frontier);
         stageEnd = bx::getHPCounter();
         performance.selectionMs = milliseconds(stageStart, stageEnd);
 
@@ -734,7 +925,8 @@ public:
         performance.renderMs = milliseconds(stageStart, stageEnd);
 
         stageStart = stageEnd;
-        updateVirtualStreaming(frontier, deltaTime);
+        updateVirtualStreaming(frontier, prefetchFrontier, deltaTime);
+        updateHeroPressureScenario();
         stageEnd = bx::getHPCounter();
         performance.streamingMs = milliseconds(stageStart, stageEnd);
 
@@ -745,7 +937,7 @@ public:
         performance.totalMs = milliseconds(now, stageEnd);
         captureBgfxPerformance(performance);
         recordPerformance(performance, deltaTime);
-        return true;
+        return !streamingSelfTestFinished_;
     }
 
 private:
@@ -917,6 +1109,7 @@ private:
                     seedFreeCamera_ = true;
                 freeCamera_ = requestedFreeCamera;
                 query_.reset();
+                streamingLookaheadQuery_.reset();
             }
         }
 
@@ -937,6 +1130,7 @@ private:
             {
                 frozenCull_.valid = false;
                 query_.reset();
+                streamingLookaheadQuery_.reset();
             }
         }
         if (freezeCullCamera_)
@@ -1094,9 +1288,9 @@ private:
 
     void drawVirtualStreamingUi()
     {
-        ImGui::SetNextWindowPos(ImVec2(808.0f, 36.0f),
+        ImGui::SetNextWindowPos(ImVec2(520.0f, 36.0f),
                                 ImGuiCond_FirstUseEver);
-        ImGui::SetNextWindowSize(ImVec2(480.0f, 620.0f),
+        ImGui::SetNextWindowSize(ImVec2(760.0f, 680.0f),
                                  ImGuiCond_FirstUseEver);
         if (!ImGui::Begin("Virtual streaming", &showVirtualStreaming_))
         {
@@ -1110,8 +1304,77 @@ private:
             "eviction without loading real files. Sizes are per reusable "
             "representation resource, shared by all of its placements.");
         ImGui::Separator();
+        if (ImGui::Button(virtualStreamingEnabled_
+                              ? "Turn off virtual streaming"
+                              : "Turn on virtual streaming"))
+            virtualStreamingToggleRequested_ = true;
+        ImGui::SameLine();
+        ImGui::TextColored(
+            virtualStreamingEnabled_
+                ? ImVec4(0.35f, 0.85f, 0.45f, 1.0f)
+                : ImVec4(0.35f, 0.72f, 1.0f, 1.0f),
+            "Virtual streaming: %s",
+            virtualStreamingEnabled_ ? "ON" : "OFF - everything resident");
+        if (!virtualStreamingEnabled_)
+        {
+            ImGui::TextWrapped(
+                "All active representation resources are immediately ready. "
+                "The memory budget, latency, and eviction policy are ignored "
+                "until virtual streaming is turned on again.");
+        }
+        int cutStrategy = int(streamingCutStrategy_);
+        const char* cutStrategies[] = {
+            "Quality per byte (coarsen)",
+            "Retain ready detail (sticky)",
+        };
+        if (ImGui::Combo("Residency cut strategy", &cutStrategy,
+                         cutStrategies, int(std::size(cutStrategies))))
+        {
+            streamingCutStrategy_ = StreamingCutStrategy(cutStrategy);
+            query_.reset();
+            streamingLookaheadQuery_.reset();
+            appendStreamingLog(
+                ImVec4(0.50f, 0.85f, 1.0f, 1.0f),
+                streamingCutStrategy_ == StreamingCutStrategy::QualityPerByte
+                    ? "POLICY quality-per-byte: threshold target or ready "
+                      "ancestor; over-detail may be reclaimed"
+                    : "POLICY sticky detail: prefer complete ready "
+                      "descendants");
+        }
+        if (streamingCutStrategy_ == StreamingCutStrategy::QualityPerByte)
+        {
+            ImGui::TextWrapped(
+                "Quality-per-byte uses PreferReadyAncestors. A previously "
+                "loaded descendant cannot override the camera's coarser LOD "
+                "target, so stale over-detail leaves the current cut and can "
+                "fund a more valuable refinement elsewhere.");
+        }
+        else
+        {
+            ImGui::TextWrapped(
+                "Sticky detail uses PreferReadyDescendants for comparison. "
+                "It preserves a complete ready descendant cover, which can "
+                "retain over-detail and starve higher-value loads under a "
+                "tight budget.");
+        }
         ImGui::SliderFloat("Memory budget (MiB)",
-                           &virtualMemoryBudgetMiB_, 0.5f, 128.0f, "%.1f");
+                           &virtualMemoryBudgetMiB_, 0.5f, 512.0f, "%.1f");
+        const float detailedHeroChildrenMiB =
+            representationInfo(Payload::TowerBase).byteSizeMiB +
+            representationInfo(Payload::TowerShaft).byteSizeMiB +
+            representationInfo(Payload::TowerCrown).byteSizeMiB;
+        const float oneHeroTransitionBudgetMiB =
+            virtualPinnedMiB() +
+            representationInfo(Payload::TowerFine).byteSizeMiB +
+            detailedHeroChildrenMiB;
+        if (ImGui::Button("Set one-hero transition budget"))
+            virtualMemoryBudgetMiB_ = oneHeroTransitionBudgetMiB;
+        ImGui::SameLine();
+        ImGui::TextDisabled("%.2f MiB", oneHeroTransitionBudgetMiB);
+        ImGui::TextWrapped(
+            "The one-hero preset covers pinned fallbacks plus one 5 MiB "
+            "fine parent and its complete 10 MiB detailed child group. "
+            "Other representations still compete for the same budget.");
         ImGui::SliderFloat("Load latency (seconds)",
                            &streamingLatencySeconds_, 0.0f, 5.0f, "%.2f");
         ImGui::SliderFloat("Unload delay (seconds)",
@@ -1125,6 +1388,97 @@ private:
         ImGui::SameLine();
         if (ImGui::Button("Clear log"))
             streamingLog_.clear();
+
+        ImGui::Text("Regression scenario");
+        ImGui::Separator();
+        if (!heroPressureScenarioActive_)
+        {
+            if (ImGui::Button("Start close skyscraper orbit test"))
+                heroPressureScenarioRequested_ = true;
+        }
+        else if (ImGui::Button("Stop hero pressure test"))
+        {
+            heroPressureScenarioActive_ = false;
+            heroPressureScenarioPassed_ = false;
+            heroPressureScenarioFinished_ = true;
+        }
+        ImGui::TextWrapped(
+            "Slowly orbits the captured central skyscraper at close range "
+            "while the simulation runs normally. It resets residency, applies "
+            "an 85 MiB budget, and fails if the focal, screen-dominant hero "
+            "or any other >150 px-tall hero drops to its pinned fallback after "
+            "a 20 second warm-up. It also rejects rapid unload/reload loops.");
+        if (heroPressureScenarioActive_)
+        {
+            const float elapsed =
+                streamingTime_ - heroPressureScenarioStartTime_;
+            ImGui::TextColored(
+                ImVec4(1.0f, 0.78f, 0.20f, 1.0f),
+                "RUNNING %.1f / %.0f s | %u resource-state transitions",
+                elapsed, kHeroOrbitTestSeconds,
+                heroPressureScenarioTransitions_);
+            ImGui::Text("Focal LOD: %s | fallback frames after warm-up: %u",
+                        towerLodName(heroPressureLastFocalRank_),
+                        heroPressureFocalFallbackFrames_);
+            ImGui::Text(
+                "All dominant heroes: fallback frames %u | max at once %u",
+                heroPressureDominantFallbackFrames_,
+                heroPressureMaxDominantFallbacks_);
+            ImGui::Text(
+                "Rapid reloads: %u total | worst resource %u / %u",
+                heroPressureRapidReloads_,
+                heroPressureMaxResourceRapidReloads_,
+                kHeroOrbitMaxRapidReloads);
+            ImGui::Text("Worst per-resource state transitions: %u",
+                        heroPressureMaxResourceTransitions_);
+        }
+        else if (heroPressureScenarioFinished_)
+        {
+            const char* resultText =
+                "PASS: dominant heroes retained streamed LODs";
+            if (!heroPressureScenarioPassed_)
+            {
+                if (!heroPressureScenarioWithinBudget_)
+                    resultText = "FAIL: committed memory exceeded budget";
+                else if (heroPressureFocalObservedFrames_ == 0)
+                    resultText = "FAIL: focal hero was never observed";
+                else if (heroPressureFocalFallbackFrames_ != 0 ||
+                         heroPressureDominantFallbackFrames_ != 0)
+                    resultText =
+                        "FAIL: screen-dominant hero reached fallback";
+                else if (heroPressureMaxResourceRapidReloads_ >
+                         kHeroOrbitMaxRapidReloads)
+                    resultText = "FAIL: repeated rapid resource reload loop";
+                else
+                    resultText = "FAIL: regression invariant failed";
+            }
+            ImGui::TextColored(
+                heroPressureScenarioPassed_
+                    ? ImVec4(0.35f, 0.85f, 0.45f, 1.0f)
+                    : ImVec4(1.0f, 0.35f, 0.25f, 1.0f),
+                "%s after %.1f s | %u transitions | loads +%llu | "
+                "unloads +%llu | demotions +%llu",
+                resultText,
+                heroPressureScenarioElapsed_,
+                heroPressureScenarioTransitions_,
+                static_cast<unsigned long long>(
+                    heroPressureScenarioLoads_),
+                static_cast<unsigned long long>(
+                    heroPressureScenarioUnloads_),
+                static_cast<unsigned long long>(
+                    heroPressureScenarioDemotions_));
+            ImGui::Text(
+                "Dominant fallback frames: %u | focal fallback frames: %u",
+                heroPressureDominantFallbackFrames_,
+                heroPressureFocalFallbackFrames_);
+            ImGui::Text(
+                "Rapid reloads: %u total | worst resource %u / %u",
+                heroPressureRapidReloads_,
+                heroPressureMaxResourceRapidReloads_,
+                kHeroOrbitMaxRapidReloads);
+            ImGui::Text("Worst per-resource state transitions: %u",
+                        heroPressureMaxResourceTransitions_);
+        }
 
         ImGui::Text("Memory");
         ImGui::Separator();
@@ -1142,6 +1496,11 @@ private:
             ImVec2(-1.0f, 8.0f), "");
         ImGui::Text("Current cut %.2f MiB | ideal %.2f MiB",
                     currentFrontierMemoryMiB_, idealFrontierMemoryMiB_);
+        ImGui::Text("Protected ready fallback chains %.2f MiB",
+                    protectedFallbackMemoryMiB_);
+        ImGui::Text("Outside active target: %u resources | %.2f MiB",
+                    lastReclaimableResourceCount_,
+                    lastReclaimableResidentMiB_);
 
         ImGui::Text("Convergence");
         ImGui::Separator();
@@ -1182,7 +1541,17 @@ private:
                     lastRefinementGroups_, lastRefinementEntries_,
                     refinementPlanComplete_ ? "complete plan"
                                             : "bounded plan");
-        if (!streamingPlanValid_)
+        if (heroPressureScenarioActive_)
+            ImGui::Text("6 s camera look-ahead: %u entries | %u groups",
+                        lastPrefetchEntryCount_, lastPrefetchGroupCount_);
+        if (!virtualStreamingEnabled_)
+        {
+            ImGui::TextColored(
+                ImVec4(0.35f, 0.72f, 1.0f, 1.0f),
+                "Status: virtual streaming disabled; all active resources "
+                "resident");
+        }
+        else if (!streamingPlanValid_)
         {
             ImGui::TextColored(ImVec4(0.65f, 0.70f, 0.78f, 1.0f),
                                "Status: waiting for first refinement plan");
@@ -1220,33 +1589,174 @@ private:
         ImGui::Text("Active loads %u / %d | budget-blocked groups %u",
                     uint32_t(pendingStreamingGroups_.size()),
                     maxConcurrentStreamingLoads_, lastBudgetBlockedGroups_);
+        ImGui::Text("Admission rejects: capacity %u | insufficient gain %u",
+                    lastCapacityBlockedGroups_, lastValueBlockedGroups_);
         ImGui::Text("Completed %llu resources | evicted %llu",
                     static_cast<unsigned long long>(streamingLoadsCompleted_),
                     static_cast<unsigned long long>(streamingUnloads_));
+        ImGui::Text("Quality demotions to ready ancestors: %llu",
+                    static_cast<unsigned long long>(
+                        streamingQualityDemotions_));
 
         if (ImGui::TreeNode("Representation residency"))
         {
             ImGui::TextDisabled(
-                "Skyscraper max-detail leaves total 10.0 MiB");
-            for (const VirtualResource& resource : virtualResources_)
+                "%u hero skyscraper assets | <= %u instances each | "
+                "10.0 MiB max-detail leaves per hero",
+                uint32_t(kHeroTowerAssetCount),
+                uint32_t(kHeroTowerInstancesPerAsset));
+            ImGui::TextWrapped(
+                "Score estimates visual benefit: current-cut demand is 4x, "
+                "the immediate refinement is 3x, predicted camera demand is "
+                "1.5x, and ideal-endpoint demand is 1x. Each role contributes "
+                "instances x (0.65 avg + 0.35 "
+                "max screen error) / LOD threshold. Complete groups load by "
+                "score/MiB; the group membership reported by refinement is "
+                "retained for atomic pressure eviction. The lowest-value "
+                "complete group in the safest demand class goes first.");
+            ImGui::TextWrapped(
+                "A resident representation keeps the parent-error benefit "
+                "recorded when it was admitted. Rescoring it with its own "
+                "smaller child error would create load/evict oscillation.");
+            ImGui::TextWrapped(
+                "Replacement is transactional: the simulator first plans a "
+                "complete victim set without changing residency. It commits "
+                "only when the full request fits and its total visual value "
+                "exceeds unused cache victims by at least 5%, or current-cut "
+                "victims by at least 30%. Score/MiB orders the choices; total "
+                "value and the stronger visible-cut hysteresis prevent "
+                "granularity and role-change churn.");
+            ImGui::TextWrapped(
+                "In quality-per-byte mode, a requested group may demote a "
+                "lower-score current group after safer victims are exhausted. "
+                "Ordinary replacements protect and charge the full ready "
+                "ancestor chain, so coarsening proceeds one available level "
+                "at a time instead of jumping directly to the pinned "
+                "fallback.");
+            ImGui::TextWrapped(
+                "Minimum visible quality is enforced before scalar scoring: "
+                "a screen-dominant hero's district representation is loaded "
+                "first and cannot be selected as a victim. This quality-floor "
+                "request may displace lower-priority cache, refinement, or "
+                "fallback-chain resources; remaining bytes are still assigned "
+                "by score/MiB.");
+            ImGui::TextWrapped(
+                "Refinement rows use the projected error of the parent that "
+                "the representation replaces; terminal child error is often "
+                "zero and does not measure the benefit of loading it.");
+            ImGui::TextDisabled(
+                "Data columns: instance count | min / avg / max screen "
+                "error or eliminated parent error (px)");
+
+            std::array<size_t, kStreamingResourceSlotCount> resourceOrder{};
+            for (size_t index = 0; index < resourceOrder.size(); ++index)
+                resourceOrder[index] = index;
+            std::stable_sort(
+                resourceOrder.begin(), resourceOrder.end(),
+                [this](size_t lhs, size_t rhs)
+                {
+                    const VirtualResource& left = virtualResources_[lhs];
+                    const VirtualResource& right = virtualResources_[rhs];
+                    if (left.scorePerMiB != right.scorePerMiB)
+                        return left.scorePerMiB > right.scorePerMiB;
+                    if (left.importanceScore != right.importanceScore)
+                        return left.importanceScore > right.importanceScore;
+                    return lhs < rhs;
+                });
+
+            constexpr ImGuiTableFlags tableFlags =
+                ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
+                ImGuiTableFlags_Resizable | ImGuiTableFlags_Reorderable |
+                ImGuiTableFlags_Hideable | ImGuiTableFlags_ScrollX |
+                ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingFixedFit;
+            if (ImGui::BeginTable("##representation-residency", 12,
+                                  tableFlags, ImVec2(-1.0f, 270.0f),
+                                  2040.0f))
             {
-                if (resource.byteSizeMiB <= 0.0f)
-                    continue;
-                char name[96];
-                virtualResourceName(resource, name, sizeof(name));
-                const ImVec4 color = resource.pinned
-                                         ? ImVec4(0.50f, 0.85f, 1.0f, 1.0f)
-                                     : resource.state ==
-                                               StreamingResourceState::Resident
-                                         ? ImVec4(0.35f, 0.85f, 0.45f, 1.0f)
-                                     : resource.state ==
-                                               StreamingResourceState::Loading
-                                         ? ImVec4(1.0f, 0.78f, 0.20f, 1.0f)
-                                         : ImVec4(0.58f, 0.58f, 0.62f, 1.0f);
-                ImGui::TextColored(color, "%s: %.3f MiB | %s%s",
-                                   name, resource.byteSizeMiB,
-                                   streamingStateName(resource.state),
-                                   resource.pinned ? " (pinned)" : "");
+                ImGui::TableSetupScrollFreeze(2, 1);
+                ImGui::TableSetupColumn("Rank", 0, 42.0f);
+                ImGui::TableSetupColumn("Representation", 0, 205.0f);
+                ImGui::TableSetupColumn("State", 0, 90.0f);
+                ImGui::TableSetupColumn("Current node", 0, 190.0f);
+                ImGui::TableSetupColumn("Current benefit (4x)", 0, 190.0f);
+                ImGui::TableSetupColumn("Next (3x)", 0, 190.0f);
+                ImGui::TableSetupColumn("Look-ahead (1.5x)", 0, 190.0f);
+                ImGui::TableSetupColumn("Ideal (1x)", 0, 190.0f);
+                ImGui::TableSetupColumn("Bytes", 0, 105.0f);
+                ImGui::TableSetupColumn("Score", 0, 82.0f);
+                ImGui::TableSetupColumn("Score/MiB", 0, 92.0f);
+                ImGui::TableSetupColumn("Policy / last action", 0, 350.0f);
+                ImGui::TableHeadersRow();
+
+                uint32_t rank = 0;
+                for (size_t slot : resourceOrder)
+                {
+                    const VirtualResource& resource = virtualResources_[slot];
+                    if (resource.byteSizeMiB <= 0.0f)
+                        continue;
+                    ++rank;
+                    char name[96];
+                    virtualResourceName(resource, name, sizeof(name));
+                    const ImVec4 color =
+                        resource.pinned
+                            ? ImVec4(0.50f, 0.85f, 1.0f, 1.0f)
+                        : resource.state == StreamingResourceState::Resident
+                            ? ImVec4(0.35f, 0.85f, 0.45f, 1.0f)
+                        : resource.state == StreamingResourceState::Loading
+                            ? ImVec4(1.0f, 0.78f, 0.20f, 1.0f)
+                            : ImVec4(0.58f, 0.58f, 0.62f, 1.0f);
+                    const uint64_t bytes = uint64_t(
+                        resource.byteSizeMiB * 1024.0f * 1024.0f + 0.5f);
+
+                    ImGui::TableNextRow();
+                    ImGui::TableSetColumnIndex(0);
+                    ImGui::Text("%u", rank);
+                    ImGui::TableSetColumnIndex(1);
+                    ImGui::TextColored(color, "%s", name);
+                    ImGui::TableSetColumnIndex(2);
+                    ImGui::TextColored(
+                        color, "%s%s", streamingStateName(resource.state),
+                        resource.pinned ? " (pinned)" : "");
+                    const auto drawRole = [](const StreamingErrorStats& errors)
+                    {
+                        if (errors.count == 0)
+                        {
+                            ImGui::TextDisabled("0 | -- / -- / --");
+                            return;
+                        }
+                        ImGui::Text("%u | %.2f / %.2f / %.2f", errors.count,
+                                    errors.minimum, errors.average(),
+                                    errors.maximum);
+                    };
+                    ImGui::TableSetColumnIndex(3);
+                    drawRole(resource.currentErrors);
+                    ImGui::TableSetColumnIndex(4);
+                    drawRole(resource.currentBenefitErrors);
+                    ImGui::TableSetColumnIndex(5);
+                    drawRole(resource.transitionErrors);
+                    ImGui::TableSetColumnIndex(6);
+                    drawRole(resource.prefetchErrors);
+                    ImGui::TableSetColumnIndex(7);
+                    drawRole(resource.idealErrors);
+                    ImGui::TableSetColumnIndex(8);
+                    ImGui::Text("%llu B",
+                                static_cast<unsigned long long>(bytes));
+                    ImGui::TableSetColumnIndex(9);
+                    if (resource.pinned)
+                        ImGui::Text("INF");
+                    else
+                        ImGui::Text("%.1f", resource.importanceScore);
+                    ImGui::TableSetColumnIndex(10);
+                    if (resource.pinned)
+                        ImGui::Text("INF");
+                    else
+                        ImGui::Text("%.1f", resource.scorePerMiB);
+                    ImGui::TableSetColumnIndex(11);
+                    ImGui::TextWrapped("%s | last: %s",
+                                       resource.decision.c_str(),
+                                       resource.lastAction.c_str());
+                }
+                ImGui::EndTable();
             }
             ImGui::TreePop();
         }
@@ -1979,10 +2489,14 @@ private:
 
     Camera makeFrontierCamera(const CameraPose& pose) const
     {
+        const float pixelHeight =
+            streamingSelfTest_ && streamingTestViewportHeight_ > 0.0f
+                ? streamingTestViewportHeight_
+                : float(height_);
         return makePerspectiveCamera(
             pose.position, pose.target - pose.position,
             float4::vec(0.0f, 1.0f, 0.0f), 58.0f * kPi / 180.0f,
-            cameraAspect(), float(height_), 0.25f, kCameraFarPlane);
+            cameraAspect(), pixelHeight, 0.25f, kCameraFarPlane);
     }
 
     void seedFreeCameraFrom(float4 position, float4 target)
@@ -2007,6 +2521,7 @@ private:
         frozenCull_.camera = makeFrontierCamera(pose);
         frozenCull_.valid = true;
         query_.reset();
+        streamingLookaheadQuery_.reset();
     }
 
     static float milliseconds(int64_t begin, int64_t end)
@@ -2253,6 +2768,93 @@ private:
         entities_[handle.id] = entity;
     }
 
+    void rememberStreamingRepresentatives(
+        SubtreeInstanceHandle mounted, const Entity& entity)
+    {
+        if (!mounted.valid())
+            return;
+        const auto mountedNode = [mounted](uint32_t packedIndex)
+        {
+            return NodeHandle{mounted.slot, packedIndex,
+                              mounted.generation};
+        };
+        const auto remember = [this, &mountedNode](size_t slot,
+                                                   uint32_t packedIndex,
+                                                   Payload expectedPayload)
+        {
+            if (slot < virtualResources_.size())
+            {
+                const NodeHandle handle = mountedNode(packedIndex);
+                if (database_.tryGetPayload(handle) !=
+                    UserPayload(expectedPayload))
+                {
+                    FRONTIER_ASSERT(
+                        false,
+                        "city streaming representative index mismatch");
+                    return;
+                }
+                virtualResources_[slot].representative = handle;
+            }
+        };
+
+        // These sample definitions are authored in traversal order, so their
+        // public mounted handles plus packed indices provide stable readiness
+        // handles even before a camera query has visited the representation.
+        switch (entity.kind)
+        {
+        case EntityKind::House:
+        {
+            const size_t base = entity.houseStyle == HouseStyle::HouseA
+                                    ? size_t(Payload::HouseCoarse)
+                                    : kPayloadSlotCount;
+            for (size_t detail = 0; detail < kHouseDetailResourceCount;
+                 ++detail)
+                remember(
+                    base + detail, uint32_t(detail + 1),
+                    static_cast<Payload>(size_t(Payload::HouseCoarse) +
+                                         detail));
+            break;
+        }
+        case EntityKind::Tower:
+            if (entity.heroAsset < kHeroTowerAssetCount)
+            {
+                const size_t base =
+                    kHeroTowerResourceBase +
+                    size_t(entity.heroAsset) * kTowerDetailResourceCount;
+                for (size_t detail = 0;
+                     detail < kTowerDetailResourceCount; ++detail)
+                    remember(
+                        base + detail, uint32_t(detail + 1),
+                        static_cast<Payload>(
+                            size_t(Payload::TowerDistrict) + detail));
+            }
+            break;
+        case EntityKind::Tree:
+            remember(size_t(Payload::TreeCoarse), 1,
+                     Payload::TreeCoarse);
+            remember(size_t(Payload::TreeTrunk), 2,
+                     Payload::TreeTrunk);
+            remember(size_t(Payload::TreeCrown), 3,
+                     Payload::TreeCrown);
+            break;
+        case EntityKind::Car:
+            remember(size_t(Payload::CarCoarse), 1,
+                     Payload::CarCoarse);
+            remember(size_t(Payload::CarBody), 2, Payload::CarBody);
+            remember(size_t(Payload::CarCabin), 3,
+                     Payload::CarCabin);
+            break;
+        case EntityKind::Pedestrian:
+            remember(size_t(Payload::PedestrianCoarse), 1,
+                     Payload::PedestrianCoarse);
+            remember(size_t(Payload::PedestrianBody), 2,
+                     Payload::PedestrianBody);
+            remember(size_t(Payload::PedestrianHead), 3,
+                     Payload::PedestrianHead);
+            break;
+        }
+    }
+
     InstanceHandle instantiateActor(Payload fallback, float error,
                                     const AABB& localBounds,
                                     const Entity& entity,
@@ -2270,7 +2872,9 @@ private:
             .yaw = yawRotation(placed.yaw),
         };
         const InstanceHandle handle = database_.instantiate(root, placement);
-        database_.mountSubtree(handle.rootNode(), definition);
+        const SubtreeInstanceHandle mounted =
+            database_.mountSubtree(handle.rootNode(), definition);
+        rememberStreamingRepresentatives(mounted, placed);
         rememberEntity(handle, placed);
         return handle;
     }
@@ -2364,6 +2968,7 @@ private:
             updateWholeSceneWave(simulationTime_,
                                  kWorstCaseWaveAmplitude);
         query_.reset();
+        streamingLookaheadQuery_.reset();
     }
 
     void createScene()
@@ -2376,8 +2981,11 @@ private:
         const SubtreeHandle pedestrianDefinition =
             createPedestrianDefinition();
         const SubtreeHandle treeDefinition = createTreeDefinition();
-        const SubtreeHandle towerDefinition = createTowerDefinition();
+        std::array<SubtreeHandle, kHeroTowerAssetCount> towerDefinitions{};
+        for (SubtreeHandle& definition : towerDefinitions)
+            definition = createTowerDefinition();
         uint32_t random = 0x5eed1234u;
+        size_t towerIndex = 0;
 
         const AABB treeBounds =
             bounds(-1.9f, 0.0f, -1.9f, 1.9f, 6.7f, 1.9f);
@@ -2407,18 +3015,25 @@ private:
                     kBlockSpacing;
                 if (isTowerBlock(x, z))
                 {
+                    const uint16_t heroAsset = uint16_t(
+                        towerIndex % kHeroTowerAssetCount);
                     Entity tower;
                     tower.kind = EntityKind::Tower;
+                    tower.heroAsset = heroAsset;
                     tower.position = float4::point(centerX, 0.0f, centerZ);
                     tower.scale = 0.82f + random01(random) * 0.28f;
                     tower.yaw = float((x + z) & 1) * kPi * 0.5f;
+                    uint32_t heroRandom =
+                        0x71f15eadu ^
+                        (uint32_t(heroAsset) * 0x9e3779b9u);
                     tower.color = abgr(
-                        uint8_t(105 + random01(random) * 55),
-                        uint8_t(125 + random01(random) * 60),
-                        uint8_t(145 + random01(random) * 65));
+                        uint8_t(105 + random01(heroRandom) * 55),
+                        uint8_t(125 + random01(heroRandom) * 60),
+                        uint8_t(145 + random01(heroRandom) * 65));
                     towerHandles_.push_back(instantiateActor(
                         Payload::TowerTop, 0.90f, towerBounds,
-                        tower, towerDefinition));
+                        tower, towerDefinitions[heroAsset]));
+                    ++towerIndex;
                     ++towerCount_;
                 }
                 else
@@ -2460,6 +3075,8 @@ private:
                 }
             }
         }
+        FRONTIER_ASSERT(towerIndex == kTowerInstanceCount,
+                        "unexpected hero skyscraper instance count");
 
         const AABB carBounds =
             bounds(-2.3f, 0.0f, -2.3f, 2.3f, 2.3f, 2.3f);
@@ -2649,6 +3266,21 @@ private:
         target = float4::point(std::sin(time * 0.035f) * targetTravel,
                                10.0f,
                                std::cos(time * 0.031f) * targetTravel);
+    }
+
+    void updateHeroPressureOrbitCamera(float time, float4& position,
+                                       float4& target) const
+    {
+        // This starts at the same close southern view used in the supplied
+        // regression image, then takes almost three minutes to circle the
+        // focal skyscraper once.
+        const float angle = -kPi * 0.5f + time * kHeroOrbitAngularSpeed;
+        position = float4::point(
+            kHeroOrbitCenterX + std::cos(angle) * kHeroOrbitRadius,
+            kHeroOrbitCameraHeight,
+            kHeroOrbitCenterZ + std::sin(angle) * kHeroOrbitRadius);
+        target = float4::point(kHeroOrbitCenterX, kHeroOrbitTargetHeight,
+                               kHeroOrbitCenterZ);
     }
 
     void drawWorld(DebugDrawEncoder& encoder)
@@ -3133,6 +3765,19 @@ private:
 
     size_t virtualResourceSlot(Payload payload, InstanceId instance) const
     {
+        if (isTowerDetailPayload(payload))
+        {
+            if (instance < entities_.size() &&
+                entities_[instance].kind == EntityKind::Tower &&
+                entities_[instance].heroAsset < kHeroTowerAssetCount)
+            {
+                return kHeroTowerResourceBase +
+                       size_t(entities_[instance].heroAsset) *
+                           kTowerDetailResourceCount +
+                       size_t(payload) - size_t(Payload::TowerDistrict);
+            }
+            return kStreamingResourceSlotCount;
+        }
         if (isHouseDetailPayload(payload) &&
             instance < entities_.size() &&
             entities_[instance].kind == EntityKind::House &&
@@ -3142,6 +3787,71 @@ private:
                    size_t(payload) - size_t(Payload::HouseCoarse);
         }
         return size_t(payload);
+    }
+
+    size_t towerDistrictResourceSlot(InstanceId instance) const
+    {
+        if (instance >= entities_.size() ||
+            entities_[instance].kind != EntityKind::Tower ||
+            entities_[instance].heroAsset >= kHeroTowerAssetCount)
+            return kStreamingResourceSlotCount;
+        return kHeroTowerResourceBase +
+               size_t(entities_[instance].heroAsset) *
+                   kTowerDetailResourceCount;
+    }
+
+    void markStreamingFallbackAncestors(
+        size_t slot,
+        std::array<bool, kStreamingResourceSlotCount>& fallbackDemand) const
+    {
+        if (slot >= virtualResources_.size())
+            return;
+        const VirtualResource& resource = virtualResources_[slot];
+        const Payload payload = resource.payload;
+        if (isTowerDetailPayload(payload) &&
+            resource.heroAsset < kHeroTowerAssetCount)
+        {
+            const size_t detail =
+                size_t(payload) - size_t(Payload::TowerDistrict);
+            // Base/shaft/crown share Fine as their immediate parent. Retain
+            // the full District -> Fine chain so every pressure demotion has
+            // a ready next-coarser representation.
+            const size_t ancestorCount =
+                std::min(detail, size_t(Payload::TowerFine) -
+                                     size_t(Payload::TowerDistrict) + 1);
+            const size_t heroBase =
+                kHeroTowerResourceBase +
+                size_t(resource.heroAsset) * kTowerDetailResourceCount;
+            for (size_t ancestor = 0; ancestor < ancestorCount; ++ancestor)
+                fallbackDemand[heroBase + ancestor] = true;
+            return;
+        }
+
+        size_t coarseSlot = kStreamingResourceSlotCount;
+        switch (payload)
+        {
+        case Payload::HouseBody:
+        case Payload::HouseRoof:
+            coarseSlot = resource.houseStyle == HouseStyle::HouseB
+                             ? kPayloadSlotCount
+                             : size_t(Payload::HouseCoarse);
+            break;
+        case Payload::CarBody:
+        case Payload::CarCabin:
+            coarseSlot = size_t(Payload::CarCoarse);
+            break;
+        case Payload::PedestrianBody:
+        case Payload::PedestrianHead:
+            coarseSlot = size_t(Payload::PedestrianCoarse);
+            break;
+        case Payload::TreeTrunk:
+        case Payload::TreeCrown:
+            coarseSlot = size_t(Payload::TreeCoarse);
+            break;
+        default: break;
+        }
+        if (coarseSlot < fallbackDemand.size())
+            fallbackDemand[coarseSlot] = true;
     }
 
     void virtualResourceName(const VirtualResource& resource, char* output,
@@ -3155,9 +3865,93 @@ private:
                               ? "House A"
                               : "House B");
         }
+        else if (isTowerDetailPayload(resource.payload) &&
+                 resource.heroAsset != UINT16_MAX)
+        {
+            std::snprintf(output, outputSize, "Hero %02u / %s",
+                          uint32_t(resource.heroAsset) + 1, info.name);
+        }
         else
         {
             std::snprintf(output, outputSize, "%s", info.name);
+        }
+    }
+
+    size_t streamingResidencyGroup(
+        size_t slot,
+        std::array<size_t, kMaxStreamingResidencyGroupSize>& group) const
+    {
+        const VirtualResource& resource = virtualResources_[slot];
+        if (resource.residencyGroupCount == 0)
+        {
+            group[0] = slot;
+            return 1;
+        }
+        group = resource.residencyGroup;
+        return resource.residencyGroupCount;
+    }
+
+    float streamingRoleScore(const StreamingErrorStats& errors,
+                             float roleWeight) const
+    {
+        if (errors.count == 0)
+            return 0.0f;
+        const float weightedError =
+            errors.average() * 0.65f + errors.maximum * 0.35f;
+        const float normalizedError = std::max(
+            weightedError / std::max(lodThreshold_, 0.01f), 0.05f);
+        return roleWeight * float(errors.count) * normalizedError;
+    }
+
+    static StreamingErrorStats rebaseStreamingErrorCount(
+        const StreamingErrorStats& source, uint32_t count)
+    {
+        if (source.count == 0 || count == 0)
+            return {};
+        StreamingErrorStats result = source;
+        result.count = count;
+        result.total = double(source.average()) * double(count);
+        return result;
+    }
+
+    void finalizeVirtualResourceScores()
+    {
+        for (VirtualResource& resource : virtualResources_)
+        {
+            if (resource.byteSizeMiB <= 0.0f)
+                continue;
+            if (resource.pinned)
+            {
+                resource.importanceScore =
+                    std::numeric_limits<float>::infinity();
+                resource.scorePerMiB =
+                    std::numeric_limits<float>::infinity();
+                resource.decision = "keep: pinned coarsest fallback";
+                continue;
+            }
+
+            resource.importanceScore =
+                streamingRoleScore(resource.currentBenefitErrors, 4.0f) +
+                streamingRoleScore(resource.transitionErrors, 3.0f) +
+                streamingRoleScore(resource.prefetchErrors, 1.5f) +
+                streamingRoleScore(resource.idealErrors, 1.0f);
+            resource.scorePerMiB =
+                resource.importanceScore /
+                std::max(resource.byteSizeMiB, 0.001f);
+            if (resource.state == StreamingResourceState::Loading)
+                resource.decision = "keep: load already in flight";
+            else if (resource.currentErrors.count != 0)
+                resource.decision = "keep: used by current frontier";
+            else if (resource.transitionErrors.count != 0)
+                resource.decision = "candidate: immediate refinement";
+            else if (resource.prefetchErrors.count != 0)
+                resource.decision = "candidate: predicted camera demand";
+            else if (resource.idealErrors.count != 0)
+                resource.decision = "candidate: ideal endpoint";
+            else if (resource.state == StreamingResourceState::Resident)
+                resource.decision = "evictable: outside current plan";
+            else
+                resource.decision = "unloaded: outside current plan";
         }
     }
 
@@ -3167,6 +3961,15 @@ private:
             streamingLog_.erase(streamingLog_.begin());
         streamingLog_.push_back(
             StreamingLogEntry{streamingTime_, color, std::move(message)});
+    }
+
+    float virtualPinnedMiB() const
+    {
+        float result = 0.0f;
+        for (const VirtualResource& resource : virtualResources_)
+            if (resource.pinned)
+                result += resource.byteSizeMiB;
+        return result;
     }
 
     float virtualResidentMiB() const
@@ -3192,6 +3995,8 @@ private:
         for (size_t slot = 1; slot < kPayloadSlotCount; ++slot)
         {
             const Payload payload = static_cast<Payload>(slot);
+            if (isTowerDetailPayload(payload))
+                continue;
             const RepresentationInfo info = representationInfo(payload);
             VirtualResource& resource = virtualResources_[slot];
             resource.payload = payload;
@@ -3201,6 +4006,8 @@ private:
             resource.state = info.coarsest
                                  ? StreamingResourceState::Resident
                                  : StreamingResourceState::Unloaded;
+            resource.lastAction = info.coarsest ? "resident at startup"
+                                                : "never loaded";
         }
         for (size_t index = 0; index < kHouseDetailResourceCount; ++index)
         {
@@ -3212,11 +4019,35 @@ private:
             resource.payload = payload;
             resource.houseStyle = HouseStyle::HouseB;
             resource.byteSizeMiB = info.byteSizeMiB;
+            resource.lastAction = "never loaded";
+        }
+        for (size_t hero = 0; hero < kHeroTowerAssetCount; ++hero)
+        {
+            for (size_t detail = 0; detail < kTowerDetailResourceCount;
+                 ++detail)
+            {
+                const Payload payload = static_cast<Payload>(
+                    size_t(Payload::TowerDistrict) + detail);
+                const RepresentationInfo info = representationInfo(payload);
+                VirtualResource& resource = virtualResources_[
+                    kHeroTowerResourceBase +
+                    hero * kTowerDetailResourceCount + detail];
+                resource.payload = payload;
+                resource.heroAsset = uint16_t(hero);
+                resource.byteSizeMiB = info.byteSizeMiB;
+                resource.lastAction = "never loaded";
+            }
         }
         char message[160];
         std::snprintf(message, sizeof(message),
                       "Initialized %.3f MiB of pinned coarsest resources",
                       virtualResidentMiB());
+        appendStreamingLog(ImVec4(0.50f, 0.85f, 1.0f, 1.0f), message);
+        std::snprintf(
+            message, sizeof(message),
+            "%u independent hero skyscraper assets, at most %u instances each",
+            uint32_t(kHeroTowerAssetCount),
+            uint32_t(kHeroTowerInstancesPerAsset));
         appendStreamingLog(ImVec4(0.50f, 0.85f, 1.0f, 1.0f), message);
     }
 
@@ -3229,13 +4060,20 @@ private:
         if (resource.representative.valid())
             database_.markNodeUnavailable(resource.representative);
         resource.state = StreamingResourceState::Unloaded;
+        resource.residentSince = 0.0f;
+        resource.residentBenefitErrors.reset();
+        resource.decision = std::string("evicted: ") + reason;
+        resource.lastAction = std::string("unloaded: ") + reason;
         ++streamingUnloads_;
+        if (heroPressureScenarioActive_)
+            heroPressureLastUnloadTime_[slot] = streamingTime_;
 
         char name[96];
-        char message[192];
+        char message[240];
         virtualResourceName(resource, name, sizeof(name));
-        std::snprintf(message, sizeof(message), "UNLOAD %s (%.3f MiB, %s)",
-                      name, resource.byteSizeMiB, reason);
+        std::snprintf(message, sizeof(message),
+                      "UNLOAD %s (%.3f MiB, score %.1f/MiB, %s)", name,
+                      resource.byteSizeMiB, resource.scorePerMiB, reason);
         appendStreamingLog(ImVec4(1.0f, 0.48f, 0.25f, 1.0f), message);
     }
 
@@ -3247,16 +4085,88 @@ private:
         {
             VirtualResource& resource = virtualResources_[slot];
             if (resource.state == StreamingResourceState::Loading)
+            {
                 resource.state = StreamingResourceState::Unloaded;
+                resource.residentBenefitErrors.reset();
+                resource.decision =
+                    std::string("canceled: ") + reason;
+                resource.lastAction =
+                    std::string("load canceled: ") + reason;
+            }
         }
-        char message[160];
+        char message[192];
         std::snprintf(message, sizeof(message),
-                      "CANCEL load group #%llu (%.3f MiB, %s)",
+                      "CANCEL load group #%llu (%.3f MiB, score %.1f/MiB, %s)",
                       static_cast<unsigned long long>(group.serial),
-                      group.byteSizeMiB, reason);
+                      group.byteSizeMiB, group.scorePerMiB, reason);
         appendStreamingLog(ImVec4(0.75f, 0.62f, 0.35f, 1.0f), message);
         pendingStreamingGroups_.erase(
             pendingStreamingGroups_.begin() + groupIndex);
+    }
+
+    void makeAllVirtualResourcesResident(bool announce)
+    {
+        while (!pendingStreamingGroups_.empty())
+            cancelPendingStreamingGroup(
+                pendingStreamingGroups_.size() - 1,
+                "virtual streaming disabled");
+
+        uint32_t activeResources = 0;
+        for (VirtualResource& resource : virtualResources_)
+        {
+            if (resource.byteSizeMiB <= 0.0f)
+                continue;
+            const bool activeHouseResource =
+                !isHouseDetailPayload(resource.payload) ||
+                resource.houseStyle == activeHouseStyle_;
+            const bool active = resource.pinned || activeHouseResource;
+            if (!active)
+            {
+                if (resource.representative.valid() &&
+                    database_.isNodeReady(resource.representative))
+                    database_.markNodeUnavailable(resource.representative);
+                resource.state = StreamingResourceState::Unloaded;
+                resource.residentSince = 0.0f;
+                resource.residentBenefitErrors.reset();
+                resource.decision = "inactive house style";
+                resource.lastAction =
+                    "unloaded: inactive house style";
+                continue;
+            }
+
+            ++activeResources;
+            if (resource.representative.valid() &&
+                !database_.isNodeReady(resource.representative))
+                database_.markNodeReady(resource.representative);
+            resource.state = StreamingResourceState::Resident;
+            resource.residentSince = streamingTime_;
+            resource.residentBenefitErrors.reset();
+            resource.decision =
+                "resident: virtual streaming disabled";
+            resource.lastAction =
+                "resident immediately: virtual streaming disabled";
+        }
+
+        query_.reset();
+        streamingLookaheadQuery_.reset();
+        currentFrontierMemoryMiB_ = virtualResidentMiB();
+        idealFrontierMemoryMiB_ = currentFrontierMemoryMiB_;
+        protectedFallbackMemoryMiB_ = 0.0f;
+        lastBudgetBlockedGroups_ = 0;
+        lastCapacityBlockedGroups_ = 0;
+        lastValueBlockedGroups_ = 0;
+        minimumBlockedCommitMiB_ = 0.0f;
+        if (announce)
+        {
+            char message[192];
+            std::snprintf(
+                message, sizeof(message),
+                "VIRTUAL STREAMING disabled: %u active resources resident "
+                "immediately (%.2f MiB)",
+                activeResources, virtualResidentMiB());
+            appendStreamingLog(ImVec4(0.35f, 0.72f, 1.0f, 1.0f),
+                               message);
+        }
     }
 
     void unloadHouseResources(HouseStyle style)
@@ -3291,12 +4201,18 @@ private:
             unloadVirtualResource(slot, "reset to coarsest");
         lastRefinementGroups_ = 0;
         lastRefinementEntries_ = 0;
+        lastPrefetchGroupCount_ = 0;
+        lastPrefetchEntryCount_ = 0;
         lastIdealEntryCount_ = 0;
         lastConvergedEntryCount_ = 0;
         currentFrontierMemoryMiB_ = virtualResidentMiB();
         idealFrontierMemoryMiB_ = virtualResidentMiB();
         lastBudgetBlockedGroups_ = 0;
+        lastCapacityBlockedGroups_ = 0;
+        lastValueBlockedGroups_ = 0;
         minimumBlockedCommitMiB_ = 0.0f;
+        lastReclaimableResourceCount_ = 0;
+        lastReclaimableResidentMiB_ = 0.0f;
         streamingPlanValid_ = false;
         streamingConvergenceHistory_.fill(0.0f);
         streamingConvergenceHistoryCursor_ = 0;
@@ -3305,8 +4221,396 @@ private:
         streamingConvergenceActive_ = false;
         lastStreamingConvergenceSeconds_ = 0.0f;
         query_.reset();
+        streamingLookaheadQuery_.reset();
         appendStreamingLog(ImVec4(0.50f, 0.85f, 1.0f, 1.0f),
                            "RESET complete: only coarsest resources resident");
+    }
+
+    uint32_t residentHeroFineCount() const
+    {
+        uint32_t result = 0;
+        for (const VirtualResource& resource : virtualResources_)
+            if (resource.payload == Payload::TowerFine &&
+                resource.heroAsset != UINT16_MAX &&
+                resource.state == StreamingResourceState::Resident)
+                ++result;
+        return result;
+    }
+
+    static int towerLodRank(Payload payload)
+    {
+        switch (payload)
+        {
+        case Payload::TowerTop: return 0;
+        case Payload::TowerDistrict: return 1;
+        case Payload::TowerCoarse: return 2;
+        case Payload::TowerMedium: return 3;
+        case Payload::TowerFine: return 4;
+        case Payload::TowerBase:
+        case Payload::TowerShaft:
+        case Payload::TowerCrown: return 5;
+        default: return -1;
+        }
+    }
+
+    static const char* towerLodName(int rank)
+    {
+        constexpr const char* names[] = {
+            "fallback", "district", "coarse", "medium", "fine", "detail",
+        };
+        return rank >= 0 && rank < int(std::size(names))
+                   ? names[rank]
+                   : "not visible";
+    }
+
+    void observeHeroPressureFrontier(const FrontierResultView& frontier)
+    {
+        if (!heroPressureScenarioActive_ ||
+            heroPressureFocalInstance_ == kInvalidInstanceId)
+            return;
+
+        int focalRank = -1;
+        float focalError = 0.0f;
+        uint32_t dominantFallbacks = 0;
+        float worstDominantFallbackError = 0.0f;
+        InstanceId worstDominantFallbackInstance = kInvalidInstanceId;
+        for (const FrontierEntry& entry : frontier)
+        {
+            const UserPayload rawPayload =
+                database_.tryGetPayload(entry.nodeHandle);
+            if (rawPayload == kInvalidPayload ||
+                rawPayload >= UserPayload(kPayloadSlotCount))
+                continue;
+            const Payload payload = Payload(rawPayload);
+            const int rank = towerLodRank(payload);
+            if (rank < 0)
+                continue;
+            const float error = entry.approximateError(lodThreshold_);
+            if (entry.instance() == heroPressureFocalInstance_)
+            {
+                focalRank = std::max(focalRank, rank);
+                focalError = std::max(focalError, error);
+            }
+            if (payload == Payload::TowerTop &&
+                error >= kHeroOrbitDominantFallbackErrorPixels)
+            {
+                ++dominantFallbacks;
+                if (error > worstDominantFallbackError)
+                {
+                    worstDominantFallbackError = error;
+                    worstDominantFallbackInstance = entry.instance();
+                }
+            }
+        }
+
+        const float elapsed =
+            streamingTime_ - heroPressureScenarioStartTime_;
+        if (focalRank >= 0)
+            ++heroPressureFocalObservedFrames_;
+        if (elapsed >= kHeroOrbitWarmupSeconds && focalRank == 0)
+        {
+            ++heroPressureFocalFallbackFrames_;
+            heroPressureWorstFallbackError_ = std::max(
+                heroPressureWorstFallbackError_, focalError);
+            if (heroPressureFirstFallbackTime_ < 0.0f)
+                heroPressureFirstFallbackTime_ = elapsed;
+        }
+        if (elapsed >= kHeroOrbitWarmupSeconds && dominantFallbacks != 0)
+        {
+            ++heroPressureDominantFallbackFrames_;
+            heroPressureMaxDominantFallbacks_ = std::max(
+                heroPressureMaxDominantFallbacks_, dominantFallbacks);
+            heroPressureWorstDominantFallbackError_ = std::max(
+                heroPressureWorstDominantFallbackError_,
+                worstDominantFallbackError);
+            if (heroPressureFirstDominantFallbackTime_ < 0.0f)
+                heroPressureFirstDominantFallbackTime_ = elapsed;
+        }
+
+        if (streamingSelfTest_ &&
+            dominantFallbacks != heroPressureLastDominantFallbacks_ &&
+            elapsed >= kHeroOrbitWarmupSeconds)
+        {
+            uint32_t hero = UINT32_MAX;
+            if (worstDominantFallbackInstance < entities_.size())
+                hero = entities_[worstDominantFallbackInstance].heroAsset;
+            std::printf(
+                "FRONTIER_STREAMING_SELF_TEST DOMINANT_FALLBACK t=%.2f "
+                "count=%u worstError=%.2fpx instance=%u hero=%u\n",
+                elapsed, dominantFallbacks, worstDominantFallbackError,
+                worstDominantFallbackInstance,
+                hero != UINT32_MAX ? hero + 1 : 0);
+            if (hero != UINT32_MAX && hero < kHeroTowerAssetCount &&
+                dominantFallbacks != 0)
+            {
+                const size_t heroBase =
+                    kHeroTowerResourceBase +
+                    size_t(hero) * kTowerDetailResourceCount;
+                for (size_t detail = 0;
+                     detail < kTowerDetailResourceCount; ++detail)
+                {
+                    const VirtualResource& resource =
+                        virtualResources_[heroBase + detail];
+                    char name[96];
+                    virtualResourceName(resource, name, sizeof(name));
+                    std::printf(
+                        "FRONTIER_STREAMING_SELF_TEST HERO_STATE "
+                        "resource=\"%s\" state=%s score=%.2f/MiB "
+                        "current=%u transition=%u prefetch=%u ideal=%u "
+                        "decision=\"%s\"\n",
+                        name, streamingStateName(resource.state),
+                        resource.scorePerMiB,
+                        resource.currentErrors.count,
+                        resource.transitionErrors.count,
+                        resource.prefetchErrors.count,
+                        resource.idealErrors.count,
+                        resource.decision.c_str());
+                }
+            }
+            std::fflush(stdout);
+        }
+        heroPressureLastDominantFallbacks_ = dominantFallbacks;
+
+        if (focalRank != heroPressureLastFocalRank_)
+        {
+            if (streamingSelfTest_)
+            {
+                std::printf(
+                    "FRONTIER_STREAMING_SELF_TEST FOCAL_LOD t=%.2f "
+                    "lod=%s error=%.2fpx committed=%.2f/%.2fMiB\n",
+                    elapsed, towerLodName(focalRank), focalError,
+                    virtualResidentMiB() + virtualLoadingMiB(),
+                    virtualMemoryBudgetMiB_);
+                std::fflush(stdout);
+            }
+            heroPressureLastFocalRank_ = focalRank;
+        }
+    }
+
+    void startHeroPressureScenario()
+    {
+        if (animateWholeScene_)
+        {
+            animateWholeScene_ = false;
+            updateWholeSceneWave(simulationTime_, 0.0f);
+        }
+        restoreSceneAfterStress_ = false;
+        freezeSimulation_ = false;
+        virtualStreamingEnabled_ = true;
+        streamingPaused_ = false;
+        streamingCutStrategy_ = StreamingCutStrategy::QualityPerByte;
+        virtualMemoryBudgetMiB_ = streamingSelfTest_
+                                      ? streamingTestBudgetMiB_
+                                      : kHeroPressureTestBudgetMiB;
+        streamingLatencySeconds_ = 0.65f;
+        streamingUnloadDelaySeconds_ = 2.0f;
+        maxConcurrentStreamingLoads_ = 3;
+        streamingLog_.clear();
+        resetVirtualStreaming();
+
+        heroPressureOrbitPhaseOffset_ =
+            std::max(streamingTestCameraTime_, 0.0f);
+        float4 position;
+        float4 target;
+        updateHeroPressureOrbitCamera(heroPressureOrbitPhaseOffset_, position,
+                                      target);
+        freeCamera_ = false;
+        freezeCullCamera_ = false;
+        frozenCull_.valid = false;
+
+        heroPressureFocalInstance_ = kInvalidInstanceId;
+        float closestFocalDistanceSquared =
+            std::numeric_limits<float>::infinity();
+        for (InstanceHandle handle : towerHandles_)
+        {
+            const Entity& tower = entities_[handle.id];
+            const float dx = tower.position.x - kHeroOrbitCenterX;
+            const float dz = tower.position.z - kHeroOrbitCenterZ;
+            const float distanceSquared = dx * dx + dz * dz;
+            if (distanceSquared < closestFocalDistanceSquared)
+            {
+                closestFocalDistanceSquared = distanceSquared;
+                heroPressureFocalInstance_ = handle.id;
+            }
+        }
+
+        for (size_t slot = 0; slot < virtualResources_.size(); ++slot)
+        {
+            heroPressureScenarioStates_[slot] =
+                virtualResources_[slot].state;
+            heroPressureScenarioResourceTransitions_[slot] = 0;
+            heroPressureScenarioResourceRapidReloads_[slot] = 0;
+            heroPressureLastUnloadTime_[slot] =
+                -std::numeric_limits<float>::infinity();
+        }
+        heroPressureScenarioStartTime_ = streamingTime_;
+        heroPressureScenarioTransitions_ = 0;
+        heroPressureScenarioStartLoads_ = streamingLoadsCompleted_;
+        heroPressureScenarioStartUnloads_ = streamingUnloads_;
+        heroPressureScenarioStartDemotions_ = streamingQualityDemotions_;
+        heroPressureScenarioLoads_ = 0;
+        heroPressureScenarioUnloads_ = 0;
+        heroPressureScenarioDemotions_ = 0;
+        heroPressureScenarioElapsed_ = 0.0f;
+        heroPressureScenarioFineHeroes_ = 0;
+        heroPressureFocalObservedFrames_ = 0;
+        heroPressureFocalFallbackFrames_ = 0;
+        heroPressureWorstFallbackError_ = 0.0f;
+        heroPressureFirstFallbackTime_ = -1.0f;
+        heroPressureLastFocalRank_ = -2;
+        heroPressureDominantFallbackFrames_ = 0;
+        heroPressureMaxDominantFallbacks_ = 0;
+        heroPressureLastDominantFallbacks_ = 0;
+        heroPressureMaxResourceTransitions_ = 0;
+        heroPressureRapidReloads_ = 0;
+        heroPressureMaxResourceRapidReloads_ = 0;
+        heroPressureWorstDominantFallbackError_ = 0.0f;
+        heroPressureFirstDominantFallbackTime_ = -1.0f;
+        heroPressureScenarioActive_ = true;
+        heroPressureScenarioFinished_ = false;
+        heroPressureScenarioPassed_ = false;
+        heroPressureScenarioWithinBudget_ = true;
+        showVirtualStreaming_ = !streamingSelfTest_;
+        char startMessage[192];
+        std::snprintf(
+            startMessage, sizeof(startMessage),
+            "TEST start: close focal-skyscraper orbit with moving actors, "
+            "%.2f MiB quality-per-byte budget",
+            virtualMemoryBudgetMiB_);
+        appendStreamingLog(ImVec4(0.50f, 0.85f, 1.0f, 1.0f), startMessage);
+        if (streamingSelfTest_)
+        {
+            std::printf(
+                "FRONTIER_STREAMING_SELF_TEST START budget=%.2fMiB "
+                "actors=moving orbit=(%.1f,%.1f,%.1f)->"
+                "(%.1f,%.1f,%.1f) focal_instance=%u\n",
+                virtualMemoryBudgetMiB_,
+                position.x, position.y, position.z,
+                target.x, target.y, target.z,
+                heroPressureFocalInstance_);
+            std::fflush(stdout);
+        }
+    }
+
+    void finishHeroPressureScenario(bool passed)
+    {
+        heroPressureScenarioActive_ = false;
+        heroPressureScenarioFinished_ = true;
+        heroPressureScenarioPassed_ = passed;
+        heroPressureScenarioElapsed_ =
+            streamingTime_ - heroPressureScenarioStartTime_;
+        heroPressureScenarioLoads_ =
+            streamingLoadsCompleted_ - heroPressureScenarioStartLoads_;
+        heroPressureScenarioUnloads_ =
+            streamingUnloads_ - heroPressureScenarioStartUnloads_;
+        heroPressureScenarioDemotions_ =
+            streamingQualityDemotions_ -
+            heroPressureScenarioStartDemotions_;
+        heroPressureScenarioFineHeroes_ = residentHeroFineCount();
+
+        char message[256];
+        std::snprintf(
+            message, sizeof(message),
+            "TEST %s after %.1f s: %u transitions, %u fine heroes, "
+            "%.2f/%.2f MiB, dominant fallback frames %u",
+            passed ? "PASS" : "FAIL",
+            heroPressureScenarioElapsed_, heroPressureScenarioTransitions_,
+            heroPressureScenarioFineHeroes_,
+            virtualResidentMiB() + virtualLoadingMiB(),
+            virtualMemoryBudgetMiB_,
+            heroPressureDominantFallbackFrames_);
+        appendStreamingLog(
+            passed ? ImVec4(0.35f, 0.85f, 0.45f, 1.0f)
+                   : ImVec4(1.0f, 0.35f, 0.25f, 1.0f),
+            message);
+        std::printf(
+            "FRONTIER_STREAMING_SELF_TEST %s elapsed=%.1fs transitions=%u "
+            "loads=%llu unloads=%llu demotions=%llu fineHeroes=%u "
+            "committed=%.2fMiB budget=%.2fMiB blocked=%u "
+            "capacityRejected=%u valueRejected=%u focalFallbackFrames=%u "
+            "firstFallback=%.2fs worstFallbackError=%.2fpx "
+            "dominantFallbackFrames=%u maxDominantFallbacks=%u "
+            "firstDominantFallback=%.2fs worstDominantError=%.2fpx "
+            "rapidReloads=%u maxResourceRapidReloads=%u "
+            "maxResourceTransitions=%u\n",
+            passed ? "PASS" : "FAIL", heroPressureScenarioElapsed_,
+            heroPressureScenarioTransitions_,
+            static_cast<unsigned long long>(heroPressureScenarioLoads_),
+            static_cast<unsigned long long>(heroPressureScenarioUnloads_),
+            static_cast<unsigned long long>(heroPressureScenarioDemotions_),
+            heroPressureScenarioFineHeroes_,
+            virtualResidentMiB() + virtualLoadingMiB(),
+            virtualMemoryBudgetMiB_, lastBudgetBlockedGroups_,
+            lastCapacityBlockedGroups_, lastValueBlockedGroups_,
+            heroPressureFocalFallbackFrames_,
+            heroPressureFirstFallbackTime_,
+            heroPressureWorstFallbackError_,
+            heroPressureDominantFallbackFrames_,
+            heroPressureMaxDominantFallbacks_,
+            heroPressureFirstDominantFallbackTime_,
+            heroPressureWorstDominantFallbackError_,
+            heroPressureRapidReloads_,
+            heroPressureMaxResourceRapidReloads_,
+            heroPressureMaxResourceTransitions_);
+        for (size_t slot = 0; slot < virtualResources_.size(); ++slot)
+        {
+            const uint32_t transitions =
+                heroPressureScenarioResourceTransitions_[slot];
+            if (transitions < (passed ? 5u : 3u))
+                continue;
+            const VirtualResource& resource = virtualResources_[slot];
+            char name[96];
+            virtualResourceName(resource, name, sizeof(name));
+            std::printf(
+                "FRONTIER_STREAMING_SELF_TEST %s resource=\"%s\" "
+                "transitions=%u rapidReloads=%u state=%s score=%.1f/MiB "
+                "action=\"%s\"\n",
+                passed ? "SETTLING" : "CHURN", name, transitions,
+                heroPressureScenarioResourceRapidReloads_[slot],
+                streamingStateName(resource.state), resource.scorePerMiB,
+                resource.lastAction.c_str());
+        }
+        std::fflush(stdout);
+        if (streamingSelfTest_)
+        {
+            streamingSelfTestExitCode_ = passed ? 0 : 1;
+            streamingSelfTestFinished_ = true;
+        }
+    }
+
+    void updateHeroPressureScenario()
+    {
+        if (!heroPressureScenarioActive_)
+            return;
+        for (size_t slot = 0; slot < virtualResources_.size(); ++slot)
+        {
+            const StreamingResourceState state = virtualResources_[slot].state;
+            if (heroPressureScenarioStates_[slot] == state)
+                continue;
+            heroPressureScenarioStates_[slot] = state;
+            ++heroPressureScenarioTransitions_;
+            ++heroPressureScenarioResourceTransitions_[slot];
+            heroPressureMaxResourceTransitions_ = std::max(
+                heroPressureMaxResourceTransitions_,
+                heroPressureScenarioResourceTransitions_[slot]);
+        }
+
+        const float elapsed =
+            streamingTime_ - heroPressureScenarioStartTime_;
+        const float committed = virtualResidentMiB() + virtualLoadingMiB();
+        const bool withinBudget =
+            committed <= virtualMemoryBudgetMiB_ + 0.001f;
+        if (elapsed >= kHeroOrbitTestSeconds)
+        {
+            heroPressureScenarioWithinBudget_ = withinBudget;
+            const bool passed =
+                withinBudget && heroPressureFocalObservedFrames_ != 0 &&
+                heroPressureFocalFallbackFrames_ == 0 &&
+                heroPressureDominantFallbackFrames_ == 0 &&
+                heroPressureMaxResourceRapidReloads_ <=
+                    kHeroOrbitMaxRapidReloads;
+            finishHeroPressureScenario(passed);
+        }
     }
 
     void completePendingStreamingGroups()
@@ -3336,22 +4640,32 @@ private:
                     database_.markNodeReady(resource.representative);
                     resource.state = StreamingResourceState::Resident;
                     resource.lastDemandTime = streamingTime_;
+                    resource.residentSince = streamingTime_;
+                    resource.decision = "keep: load completed";
+                    resource.lastAction = "load completed";
                     ++completed;
                     ++streamingLoadsCompleted_;
                 }
                 else
                 {
                     resource.state = StreamingResourceState::Unloaded;
+                    resource.residentBenefitErrors.reset();
+                    resource.decision =
+                        "unloaded: stale representative handle";
+                    resource.lastAction =
+                        "load completion skipped: stale handle";
                     ++stale;
                 }
             }
 
-            char message[192];
+            char message[224];
             std::snprintf(
                 message, sizeof(message),
-                "LOAD complete group #%llu: %u resources, %.3f MiB%s",
+                "LOAD complete group #%llu: %u resources, %.3f MiB, "
+                "score %.1f/MiB%s",
                 static_cast<unsigned long long>(group.serial), completed,
-                group.byteSizeMiB, stale != 0 ? " (stale handles skipped)" : "");
+                group.byteSizeMiB, group.scorePerMiB,
+                stale != 0 ? " (stale handles skipped)" : "");
             appendStreamingLog(
                 stale == 0 ? ImVec4(0.35f, 0.85f, 0.45f, 1.0f)
                            : ImVec4(1.0f, 0.55f, 0.20f, 1.0f),
@@ -3399,10 +4713,83 @@ private:
     }
 
     void updateVirtualStreaming(const FrontierResultView& frontier,
+                                const FrontierResultView& prefetchFrontier,
                                 float deltaTime)
     {
         if (!streamingPaused_)
             streamingTime_ += deltaTime;
+
+        if (!virtualStreamingEnabled_)
+        {
+            std::array<bool, kStreamingResourceSlotCount> currentDemand{};
+            for (VirtualResource& resource : virtualResources_)
+            {
+                resource.currentErrors.reset();
+                resource.currentBenefitErrors.reset();
+                resource.idealErrors.reset();
+                resource.transitionErrors.reset();
+                resource.prefetchErrors.reset();
+                resource.importanceScore =
+                    resource.pinned
+                        ? std::numeric_limits<float>::infinity()
+                        : 0.0f;
+                resource.scorePerMiB = resource.importanceScore;
+                if (resource.state == StreamingResourceState::Resident)
+                    resource.decision =
+                        "resident: virtual streaming disabled";
+            }
+            for (const FrontierEntry& entry : frontier)
+            {
+                const UserPayload rawPayload =
+                    database_.tryGetPayload(entry.nodeHandle);
+                if (rawPayload == kInvalidPayload ||
+                    rawPayload >= UserPayload(kPayloadSlotCount))
+                    continue;
+                const size_t slot = virtualResourceSlot(
+                    Payload(rawPayload), entry.instance());
+                if (slot >= virtualResources_.size())
+                    continue;
+                VirtualResource& resource = virtualResources_[slot];
+                currentDemand[slot] = true;
+                const float error =
+                    entry.approximateError(lodThreshold_);
+                resource.currentErrors.add(error);
+                resource.currentBenefitErrors.add(error);
+                resource.idealErrors.add(error);
+            }
+
+            currentFrontierMemoryMiB_ = 0.0f;
+            lastReclaimableResourceCount_ = 0;
+            lastReclaimableResidentMiB_ = 0.0f;
+            for (size_t slot = 0; slot < virtualResources_.size(); ++slot)
+            {
+                const VirtualResource& resource = virtualResources_[slot];
+                if (resource.pinned || currentDemand[slot])
+                    currentFrontierMemoryMiB_ += resource.byteSizeMiB;
+                if (!resource.pinned && !currentDemand[slot] &&
+                    resource.state == StreamingResourceState::Resident)
+                {
+                    ++lastReclaimableResourceCount_;
+                    lastReclaimableResidentMiB_ += resource.byteSizeMiB;
+                }
+            }
+            idealFrontierMemoryMiB_ = currentFrontierMemoryMiB_;
+            protectedFallbackMemoryMiB_ = 0.0f;
+            lastRefinementGroups_ = 0;
+            lastRefinementEntries_ = 0;
+            lastPrefetchGroupCount_ = 0;
+            lastPrefetchEntryCount_ = 0;
+            lastIdealEntryCount_ = uint32_t(frontier.size());
+            lastConvergedEntryCount_ = lastIdealEntryCount_;
+            lastBudgetBlockedGroups_ = 0;
+            lastCapacityBlockedGroups_ = 0;
+            lastValueBlockedGroups_ = 0;
+            minimumBlockedCommitMiB_ = 0.0f;
+            streamingPlanValid_ = true;
+            refinementPlanComplete_ = true;
+            recordStreamingConvergence(deltaTime);
+            return;
+        }
 
         const FrontierRefinementView refinement =
             query_.computeFrontierRefinement(
@@ -3415,6 +4802,25 @@ private:
         std::array<bool, kStreamingResourceSlotCount> currentDemand{};
         std::array<bool, kStreamingResourceSlotCount> idealDemand{};
         std::array<bool, kStreamingResourceSlotCount> transitionDemand{};
+        std::array<bool, kStreamingResourceSlotCount> fallbackDemand{};
+        std::array<bool, kStreamingResourceSlotCount> prefetchDemand{};
+        // This is a lexicographic quality constraint, not another score
+        // weight. A screen-dominant hero must retain (or acquire) at least
+        // its first streamed representation before spare bytes are spent on
+        // fine detail elsewhere.
+        std::array<bool, kStreamingResourceSlotCount> qualityFloorDemand{};
+        for (VirtualResource& resource : virtualResources_)
+        {
+            resource.currentErrors.reset();
+            resource.currentBenefitErrors.reset();
+            resource.idealErrors.reset();
+            resource.transitionErrors.reset();
+            resource.prefetchErrors.reset();
+            resource.importanceScore = 0.0f;
+            resource.scorePerMiB = 0.0f;
+            resource.decision = "not demanded by current plan";
+        }
+
         std::vector<uint64_t> refinementParents;
         refinementParents.reserve(refinement.groupCount());
         for (uint32_t group = 0; group < refinement.groupCount(); ++group)
@@ -3440,8 +4846,63 @@ private:
                 return kStreamingResourceSlotCount;
             const size_t slot = virtualResourceSlot(
                 Payload(rawPayload), entry.instance());
+            if (slot >= virtualResources_.size())
+                return kStreamingResourceSlotCount;
             virtualResources_[slot].representative = entry.nodeHandle;
             return slot;
+        };
+
+        const float refinementThreshold = refinement.threshold();
+        struct NodeInstanceError
+        {
+            uint64_t node = 0;
+            InstanceId instance = kInvalidInstanceId;
+            float error = 0.0f;
+        };
+        std::vector<NodeInstanceError> nodeErrors;
+        nodeErrors.reserve(frontier.size() + refinement.entries().size());
+        const auto appendNodeError =
+            [&nodeErrors, refinementThreshold](const FrontierEntry& entry)
+        {
+            const uint64_t key =
+                (uint64_t(entry.nodeHandle.hi) << 32) |
+                uint64_t(entry.nodeHandle.lo);
+            nodeErrors.push_back(
+                {key, entry.instance(),
+                 entry.approximateError(refinementThreshold)});
+        };
+        for (const FrontierEntry& entry : frontier)
+            appendNodeError(entry);
+        for (const FrontierEntry& entry : refinement.entries())
+            appendNodeError(entry);
+        std::sort(nodeErrors.begin(), nodeErrors.end(),
+                  [](const NodeInstanceError& lhs,
+                     const NodeInstanceError& rhs)
+                  {
+                      if (lhs.node != rhs.node)
+                          return lhs.node < rhs.node;
+                      return lhs.instance < rhs.instance;
+                  });
+        const auto nodeScreenError =
+            [&nodeErrors, refinementThreshold](NodeHandle node,
+                                                InstanceId instance)
+        {
+            const uint64_t key =
+                (uint64_t(node.hi) << 32) | uint64_t(node.lo);
+            const auto found = std::lower_bound(
+                nodeErrors.begin(), nodeErrors.end(),
+                std::pair<uint64_t, InstanceId>{key, instance},
+                [](const NodeInstanceError& item,
+                   const std::pair<uint64_t, InstanceId>& value)
+                {
+                    return item.node != value.first
+                               ? item.node < value.first
+                               : item.instance < value.second;
+                });
+            return found != nodeErrors.end() && found->node == key &&
+                           found->instance == instance
+                       ? found->error
+                       : refinementThreshold;
         };
 
         lastIdealEntryCount_ = 0;
@@ -3452,22 +4913,34 @@ private:
             if (slot == kStreamingResourceSlotCount)
                 continue;
             currentDemand[slot] = true;
+            const float screenError =
+                entry.approximateError(refinementThreshold);
+            virtualResources_[slot].currentErrors.add(screenError);
+            const UserPayload rawPayload =
+                database_.tryGetPayload(entry.nodeHandle);
+            if (rawPayload == UserPayload(Payload::TowerTop) &&
+                screenError >= kHeroOrbitDominantFallbackErrorPixels)
+            {
+                const size_t districtSlot =
+                    towerDistrictResourceSlot(entry.instance());
+                if (districtSlot < qualityFloorDemand.size())
+                    qualityFloorDemand[districtSlot] = true;
+            }
+            else if (rawPayload == UserPayload(Payload::TowerDistrict) &&
+                     screenError * (0.90f / 0.70f) >=
+                         kHeroOrbitDominantFallbackErrorPixels)
+            {
+                const size_t districtSlot =
+                    towerDistrictResourceSlot(entry.instance());
+                if (districtSlot < qualityFloorDemand.size())
+                    qualityFloorDemand[districtSlot] = true;
+            }
             if (!isRefinementParent(entry.nodeHandle))
             {
                 idealDemand[slot] = true;
+                virtualResources_[slot].idealErrors.add(screenError);
                 ++lastIdealEntryCount_;
                 ++lastConvergedEntryCount_;
-            }
-        }
-        for (const FrontierEntry& entry : refinement.entries())
-        {
-            const size_t slot = resourceForEntry(entry);
-            if (slot == kStreamingResourceSlotCount)
-                continue;
-            if (!isRefinementParent(entry.nodeHandle))
-            {
-                idealDemand[slot] = true;
-                ++lastIdealEntryCount_;
             }
         }
 
@@ -3475,38 +4948,237 @@ private:
         for (uint32_t groupIndex = 0;
              groupIndex < refinement.groupCount(); ++groupIndex)
         {
-            if (refinement.depth(groupIndex) != 1)
-                continue;
-            uint64_t mask = 0;
-            uint8_t priority = 0;
+            const bool immediate = refinement.depth(groupIndex) == 1;
+            std::vector<size_t> groupResources;
             for (const FrontierEntry& entry : refinement.children(groupIndex))
+            {
+                const float parentError = nodeScreenError(
+                    refinement.parent(groupIndex), entry.instance());
+                const size_t slot = resourceForEntry(entry);
+                if (slot == kStreamingResourceSlotCount)
+                    continue;
+                if (!isRefinementParent(entry.nodeHandle))
+                {
+                    idealDemand[slot] = true;
+                    virtualResources_[slot].idealErrors.add(parentError);
+                    ++lastIdealEntryCount_;
+                }
+                if (immediate)
+                {
+                    groupResources.push_back(slot);
+                    transitionDemand[slot] = true;
+                    virtualResources_[slot].transitionErrors.add(parentError);
+                }
+            }
+            if (!immediate || groupResources.empty())
+                continue;
+            std::sort(groupResources.begin(), groupResources.end());
+            groupResources.erase(
+                std::unique(groupResources.begin(), groupResources.end()),
+                groupResources.end());
+            if (groupResources.size() > kMaxStreamingResidencyGroupSize)
+                continue;
+            for (size_t slot : groupResources)
+            {
+                VirtualResource& resource = virtualResources_[slot];
+                resource.residencyGroupCount =
+                    uint8_t(groupResources.size());
+                std::copy(groupResources.begin(), groupResources.end(),
+                          resource.residencyGroup.begin());
+            }
+            const auto found = std::find_if(
+                candidates.begin(), candidates.end(),
+                [&groupResources](const StreamingCandidateGroup& candidate)
+                { return candidate.resources == groupResources; });
+            if (found == candidates.end())
+                candidates.push_back({std::move(groupResources)});
+        }
+
+        lastPrefetchEntryCount_ = uint32_t(prefetchFrontier.size());
+        lastPrefetchGroupCount_ = 0;
+        if (!prefetchFrontier.empty())
+        {
+            const FrontierRefinementView prefetchRefinement =
+                streamingLookaheadQuery_.computeFrontierRefinement(
+                    database_, prefetchFrontier,
+                    SpatialQuery::UnlimitedDepth);
+            lastPrefetchGroupCount_ =
+                uint32_t(prefetchRefinement.groupCount());
+            const float prefetchThreshold = prefetchRefinement.threshold();
+            std::vector<NodeInstanceError> prefetchNodeErrors;
+            prefetchNodeErrors.reserve(
+                prefetchFrontier.size() +
+                prefetchRefinement.entries().size());
+            const auto appendPrefetchError =
+                [&prefetchNodeErrors, prefetchThreshold](
+                    const FrontierEntry& entry)
+            {
+                const uint64_t key =
+                    (uint64_t(entry.nodeHandle.hi) << 32) |
+                    uint64_t(entry.nodeHandle.lo);
+                prefetchNodeErrors.push_back(
+                    {key, entry.instance(),
+                     entry.approximateError(prefetchThreshold)});
+            };
+            for (const FrontierEntry& entry : prefetchFrontier)
+                appendPrefetchError(entry);
+            for (const FrontierEntry& entry : prefetchRefinement.entries())
+                appendPrefetchError(entry);
+            std::sort(
+                prefetchNodeErrors.begin(), prefetchNodeErrors.end(),
+                [](const NodeInstanceError& lhs,
+                   const NodeInstanceError& rhs)
+                {
+                    if (lhs.node != rhs.node)
+                        return lhs.node < rhs.node;
+                    return lhs.instance < rhs.instance;
+                });
+            const auto prefetchNodeScreenError =
+                [&prefetchNodeErrors, prefetchThreshold](
+                    NodeHandle node, InstanceId instance)
+            {
+                const uint64_t key =
+                    (uint64_t(node.hi) << 32) | uint64_t(node.lo);
+                const auto found = std::lower_bound(
+                    prefetchNodeErrors.begin(), prefetchNodeErrors.end(),
+                    std::pair<uint64_t, InstanceId>{key, instance},
+                    [](const NodeInstanceError& item,
+                       const std::pair<uint64_t, InstanceId>& value)
+                    {
+                        return item.node != value.first
+                                   ? item.node < value.first
+                                   : item.instance < value.second;
+                    });
+                return found != prefetchNodeErrors.end() &&
+                               found->node == key &&
+                               found->instance == instance
+                           ? found->error
+                           : prefetchThreshold;
+            };
+
+            for (const FrontierEntry& entry : prefetchFrontier)
             {
                 const size_t slot = resourceForEntry(entry);
                 if (slot == kStreamingResourceSlotCount)
                     continue;
-                mask |= uint64_t(1) << slot;
-                transitionDemand[slot] = true;
-                priority = std::max(priority, entry.errorCode());
+                prefetchDemand[slot] = true;
+                const float screenError =
+                    entry.approximateError(prefetchThreshold);
+                virtualResources_[slot].prefetchErrors.add(screenError);
+                const UserPayload rawPayload =
+                    database_.tryGetPayload(entry.nodeHandle);
+                if (rawPayload == UserPayload(Payload::TowerTop) &&
+                    screenError >= kHeroOrbitDominantFallbackErrorPixels)
+                {
+                    const size_t districtSlot =
+                        towerDistrictResourceSlot(entry.instance());
+                    if (districtSlot < qualityFloorDemand.size())
+                        qualityFloorDemand[districtSlot] = true;
+                }
+                else if (
+                    rawPayload == UserPayload(Payload::TowerDistrict) &&
+                    screenError * (0.90f / 0.70f) >=
+                        kHeroOrbitDominantFallbackErrorPixels)
+                {
+                    const size_t districtSlot =
+                        towerDistrictResourceSlot(entry.instance());
+                    if (districtSlot < qualityFloorDemand.size())
+                        qualityFloorDemand[districtSlot] = true;
+                }
             }
-            if (mask == 0)
+            for (uint32_t groupIndex = 0;
+                 groupIndex < prefetchRefinement.groupCount(); ++groupIndex)
+            {
+                if (prefetchRefinement.depth(groupIndex) != 1)
+                    continue;
+                std::vector<size_t> groupResources;
+                for (const FrontierEntry& entry :
+                     prefetchRefinement.children(groupIndex))
+                {
+                    const size_t slot = resourceForEntry(entry);
+                    if (slot == kStreamingResourceSlotCount)
+                        continue;
+                    const float parentError = prefetchNodeScreenError(
+                        prefetchRefinement.parent(groupIndex),
+                        entry.instance());
+                    groupResources.push_back(slot);
+                    prefetchDemand[slot] = true;
+                    virtualResources_[slot].prefetchErrors.add(parentError);
+                }
+                std::sort(groupResources.begin(), groupResources.end());
+                groupResources.erase(
+                    std::unique(groupResources.begin(),
+                                groupResources.end()),
+                    groupResources.end());
+                if (groupResources.empty() ||
+                    groupResources.size() >
+                        kMaxStreamingResidencyGroupSize)
+                    continue;
+                for (size_t slot : groupResources)
+                {
+                    VirtualResource& resource = virtualResources_[slot];
+                    resource.residencyGroupCount =
+                        uint8_t(groupResources.size());
+                    std::copy(groupResources.begin(), groupResources.end(),
+                              resource.residencyGroup.begin());
+                }
+                const auto found = std::find_if(
+                    candidates.begin(), candidates.end(),
+                    [&groupResources](
+                        const StreamingCandidateGroup& candidate)
+                    { return candidate.resources == groupResources; });
+                if (found == candidates.end())
+                    candidates.push_back({std::move(groupResources)});
+            }
+        }
+
+        for (size_t slot = 0; slot < currentDemand.size(); ++slot)
+            if (currentDemand[slot] || prefetchDemand[slot])
+                markStreamingFallbackAncestors(slot, fallbackDemand);
+
+        for (VirtualResource& resource : virtualResources_)
+        {
+            if (resource.currentErrors.count == 0)
                 continue;
-            const auto found = std::find_if(
-                candidates.begin(), candidates.end(),
-                [mask](const StreamingCandidateGroup& candidate)
-                { return candidate.resourceMask == mask; });
-            if (found == candidates.end())
-                candidates.push_back({mask, priority});
-            else
-                found->priority = std::max(found->priority, priority);
+            const StreamingErrorStats& benefitSource =
+                resource.residentBenefitErrors.count != 0
+                    ? resource.residentBenefitErrors
+                    : resource.currentErrors;
+            resource.currentBenefitErrors = rebaseStreamingErrorCount(
+                benefitSource, resource.currentErrors.count);
+        }
+
+        finalizeVirtualResourceScores();
+        for (StreamingCandidateGroup& candidate : candidates)
+        {
+            float byteSizeMiB = 0.0f;
+            for (size_t slot : candidate.resources)
+            {
+                candidate.importanceScore +=
+                    virtualResources_[slot].importanceScore;
+                byteSizeMiB += virtualResources_[slot].byteSizeMiB;
+                candidate.qualityFloor |= qualityFloorDemand[slot];
+            }
+            candidate.scorePerMiB =
+                candidate.importanceScore / std::max(byteSizeMiB, 0.001f);
         }
         std::stable_sort(
             candidates.begin(), candidates.end(),
             [](const StreamingCandidateGroup& lhs,
                const StreamingCandidateGroup& rhs)
-            { return lhs.priority > rhs.priority; });
+            {
+                if (lhs.qualityFloor != rhs.qualityFloor)
+                    return lhs.qualityFloor;
+                if (lhs.scorePerMiB != rhs.scorePerMiB)
+                    return lhs.scorePerMiB > rhs.scorePerMiB;
+                return lhs.importanceScore > rhs.importanceScore;
+            });
 
         currentFrontierMemoryMiB_ = 0.0f;
         idealFrontierMemoryMiB_ = 0.0f;
+        protectedFallbackMemoryMiB_ = 0.0f;
+        lastReclaimableResourceCount_ = 0;
+        lastReclaimableResidentMiB_ = 0.0f;
         for (size_t slot = 0; slot < virtualResources_.size(); ++slot)
         {
             VirtualResource& resource = virtualResources_[slot];
@@ -3514,9 +5186,27 @@ private:
                 currentFrontierMemoryMiB_ += resource.byteSizeMiB;
             if (resource.pinned || idealDemand[slot])
                 idealFrontierMemoryMiB_ += resource.byteSizeMiB;
+            if (!resource.pinned && fallbackDemand[slot] &&
+                resource.state == StreamingResourceState::Resident)
+            {
+                protectedFallbackMemoryMiB_ += resource.byteSizeMiB;
+                if (!currentDemand[slot] && !transitionDemand[slot])
+                    resource.decision =
+                        "keep: ready fallback chain for current cut";
+            }
+            if (!resource.pinned && qualityFloorDemand[slot] &&
+                resource.state == StreamingResourceState::Resident)
+                resource.decision =
+                    "keep: minimum quality for screen-dominant hero";
             if (resource.pinned || currentDemand[slot] || idealDemand[slot] ||
-                transitionDemand[slot])
+                transitionDemand[slot] || prefetchDemand[slot] ||
+                fallbackDemand[slot])
                 resource.lastDemandTime = streamingTime_;
+            else if (resource.state == StreamingResourceState::Resident)
+            {
+                ++lastReclaimableResourceCount_;
+                lastReclaimableResidentMiB_ += resource.byteSizeMiB;
+            }
         }
 
         recordStreamingConvergence(deltaTime);
@@ -3524,12 +5214,68 @@ private:
         if (streamingPaused_)
             return;
 
+        struct ResidentGroup
+        {
+            std::array<size_t, kMaxStreamingResidencyGroupSize> resources{};
+            size_t count = 0;
+            float byteSizeMiB = 0.0f;
+            float importanceScore = 0.0f;
+            float scorePerMiB = 0.0f;
+            bool current = false;
+            bool transition = false;
+            bool fallback = false;
+            bool qualityFloor = false;
+            bool currentResidencyYoung = false;
+        };
+        const auto residentGroupFor =
+            [&](size_t seed)
+            {
+                ResidentGroup result;
+                std::array<size_t, kMaxStreamingResidencyGroupSize>
+                    topologyGroup{};
+                const size_t topologyCount =
+                    streamingResidencyGroup(seed, topologyGroup);
+                for (size_t index = 0; index < topologyCount; ++index)
+                {
+                    const size_t slot = topologyGroup[index];
+                    const VirtualResource& resource = virtualResources_[slot];
+                    if (resource.pinned ||
+                        resource.state != StreamingResourceState::Resident)
+                        continue;
+                    result.resources[result.count++] = slot;
+                    result.byteSizeMiB += resource.byteSizeMiB;
+                    result.importanceScore += resource.importanceScore;
+                    result.current |= currentDemand[slot];
+                    result.transition |= transitionDemand[slot];
+                    result.fallback |= fallbackDemand[slot];
+                    result.qualityFloor |= qualityFloorDemand[slot];
+                    result.currentResidencyYoung |=
+                        currentDemand[slot] &&
+                        streamingTime_ - resource.residentSince <
+                            kStreamingCurrentMinimumResidencySeconds;
+                }
+                result.scorePerMiB =
+                    result.importanceScore /
+                    std::max(result.byteSizeMiB, 0.001f);
+                return result;
+            };
+        const auto unloadResidentGroup =
+            [&](const ResidentGroup& group, const char* reason,
+                bool qualityDemotion)
+            {
+                if (qualityDemotion)
+                    ++streamingQualityDemotions_;
+                for (size_t index = 0; index < group.count; ++index)
+                    unloadVirtualResource(group.resources[index], reason);
+            };
+
         for (size_t group = pendingStreamingGroups_.size(); group-- > 0;)
         {
             bool stillDemanded = false;
             for (size_t slot : pendingStreamingGroups_[group].resources)
                 stillDemanded |= currentDemand[slot] || idealDemand[slot] ||
-                                 transitionDemand[slot];
+                                 transitionDemand[slot] ||
+                                 prefetchDemand[slot];
             if (!stillDemanded)
                 cancelPendingStreamingGroup(group, "no longer in ideal plan");
         }
@@ -3538,40 +5284,60 @@ private:
                    virtualMemoryBudgetMiB_ &&
                !pendingStreamingGroups_.empty())
         {
-            cancelPendingStreamingGroup(
-                pendingStreamingGroups_.size() - 1,
-                "memory budget reduced");
+            size_t cancellationGroup = 0;
+            for (size_t group = 1; group < pendingStreamingGroups_.size();
+                 ++group)
+            {
+                if (pendingStreamingGroups_[group].scorePerMiB <
+                    pendingStreamingGroups_[cancellationGroup].scorePerMiB)
+                    cancellationGroup = group;
+            }
+            cancelPendingStreamingGroup(cancellationGroup,
+                                        "memory budget reduced");
         }
 
         while (virtualResidentMiB() > virtualMemoryBudgetMiB_)
         {
-            size_t evictionSlot = virtualResources_.size();
+            ResidentGroup evictionGroup;
             int bestClass = 3;
+            float lowestScorePerMiB =
+                std::numeric_limits<float>::infinity();
             float largestMiB = 0.0f;
             for (size_t slot = 0; slot < virtualResources_.size(); ++slot)
             {
-                const VirtualResource& resource = virtualResources_[slot];
-                if (resource.pinned ||
-                    resource.state != StreamingResourceState::Resident)
+                const ResidentGroup group = residentGroupFor(slot);
+                if (group.count == 0 || group.fallback ||
+                    group.qualityFloor)
                     continue;
-                const int evictionClass = !currentDemand[slot] &&
-                                                  !transitionDemand[slot]
+                const int evictionClass = !group.current &&
+                                                  !group.transition
                                               ? 0
-                                          : !currentDemand[slot]
+                                          : !group.current
                                               ? 1
                                               : 2;
                 if (evictionClass < bestClass ||
                     (evictionClass == bestClass &&
-                     resource.byteSizeMiB > largestMiB))
+                     (group.scorePerMiB < lowestScorePerMiB ||
+                      (group.scorePerMiB == lowestScorePerMiB &&
+                       group.byteSizeMiB > largestMiB))))
                 {
-                    evictionSlot = slot;
+                    evictionGroup = group;
                     bestClass = evictionClass;
-                    largestMiB = resource.byteSizeMiB;
+                    lowestScorePerMiB = group.scorePerMiB;
+                    largestMiB = group.byteSizeMiB;
                 }
             }
-            if (evictionSlot == virtualResources_.size())
+            if (evictionGroup.count == 0)
                 break;
-            unloadVirtualResource(evictionSlot, "memory budget reduced");
+            if (evictionGroup.current)
+                unloadResidentGroup(
+                    evictionGroup,
+                    "memory budget reduced; coarsen complete group to ready "
+                    "ancestor",
+                    true);
+            else
+                unloadResidentGroup(evictionGroup,
+                                    "memory budget reduced", false);
         }
 
         completePendingStreamingGroups();
@@ -3580,7 +5346,9 @@ private:
         {
             const VirtualResource& resource = virtualResources_[slot];
             const bool demanded = resource.pinned || currentDemand[slot] ||
-                                  idealDemand[slot] || transitionDemand[slot];
+                                  idealDemand[slot] || transitionDemand[slot] ||
+                                  prefetchDemand[slot] ||
+                                  fallbackDemand[slot];
             if (!demanded &&
                 resource.state == StreamingResourceState::Resident &&
                 streamingTime_ - resource.lastDemandTime >=
@@ -3589,79 +5357,228 @@ private:
         }
 
         lastBudgetBlockedGroups_ = 0;
+        lastCapacityBlockedGroups_ = 0;
+        lastValueBlockedGroups_ = 0;
         minimumBlockedCommitMiB_ = 0.0f;
         for (const StreamingCandidateGroup& candidate : candidates)
         {
-            if (pendingStreamingGroups_.size() >=
-                size_t(maxConcurrentStreamingLoads_))
-                break;
-
-            uint64_t missingMask = 0;
-            float missingMiB = 0.0f;
-            for (size_t slot = 0; slot < virtualResources_.size(); ++slot)
+            std::string candidateNames;
+            float candidateMiB = 0.0f;
+            for (size_t slot : candidate.resources)
             {
-                if ((candidate.resourceMask & (uint64_t(1) << slot)) == 0)
-                    continue;
+                char name[96];
+                virtualResourceName(virtualResources_[slot], name,
+                                    sizeof(name));
+                if (!candidateNames.empty())
+                    candidateNames += ", ";
+                candidateNames += name;
+                candidateMiB += virtualResources_[slot].byteSizeMiB;
+            }
+            std::vector<size_t> missingResources;
+            float missingMiB = 0.0f;
+            for (size_t slot : candidate.resources)
+            {
                 const VirtualResource& resource = virtualResources_[slot];
                 if (resource.state == StreamingResourceState::Unloaded)
                 {
-                    missingMask |= uint64_t(1) << slot;
+                    missingResources.push_back(slot);
                     missingMiB += resource.byteSizeMiB;
                 }
             }
-            if (missingMask == 0)
+            if (missingResources.empty())
                 continue;
-
-            float committedMiB = virtualResidentMiB() + virtualLoadingMiB();
-            while (committedMiB + missingMiB > virtualMemoryBudgetMiB_)
+            if (pendingStreamingGroups_.size() >=
+                size_t(maxConcurrentStreamingLoads_))
             {
-                size_t oldestSlot = virtualResources_.size();
-                float oldestDemand = streamingTime_ + 1.0f;
-                for (size_t slot = 0; slot < virtualResources_.size(); ++slot)
-                {
-                    const VirtualResource& resource = virtualResources_[slot];
-                    const bool demanded = resource.pinned ||
-                                          currentDemand[slot] ||
-                                          transitionDemand[slot];
-                    if (!demanded &&
-                        resource.state == StreamingResourceState::Resident &&
-                        resource.lastDemandTime < oldestDemand)
-                    {
-                        oldestSlot = slot;
-                        oldestDemand = resource.lastDemandTime;
-                    }
-                }
-                if (oldestSlot == virtualResources_.size())
-                    break;
-                unloadVirtualResource(oldestSlot, "memory budget pressure");
-                committedMiB = virtualResidentMiB() + virtualLoadingMiB();
+                for (size_t slot : missingResources)
+                    virtualResources_[slot].decision =
+                        "queued: concurrent load-group limit";
+                continue;
             }
 
-            committedMiB = virtualResidentMiB() + virtualLoadingMiB();
-            if (committedMiB + missingMiB > virtualMemoryBudgetMiB_)
+            const float committedMiB =
+                virtualResidentMiB() + virtualLoadingMiB();
+            float plannedCommittedMiB = committedMiB;
+            float plannedVictimImportance = 0.0f;
+            bool plannedCurrentDemotion = false;
+            std::vector<ResidentGroup> evictionPlan;
+            std::array<bool, kStreamingResourceSlotCount> plannedVictims{};
+            while (plannedCommittedMiB + missingMiB >
+                   virtualMemoryBudgetMiB_)
+            {
+                ResidentGroup evictionGroup;
+                int bestEvictionClass = 2;
+                float lowestScorePerMiB =
+                    std::numeric_limits<float>::infinity();
+                float largestMiB = 0.0f;
+                for (size_t slot = 0; slot < virtualResources_.size(); ++slot)
+                {
+                    const ResidentGroup group = residentGroupFor(slot);
+                    bool alreadyPlanned = false;
+                    for (size_t index = 0; index < group.count; ++index)
+                        alreadyPlanned |=
+                            plannedVictims[group.resources[index]];
+                    if (group.count == 0 || alreadyPlanned ||
+                        group.qualityFloor ||
+                        (!candidate.qualityFloor && group.transition) ||
+                        (!candidate.qualityFloor && group.fallback) ||
+                        (!candidate.qualityFloor &&
+                         group.currentResidencyYoung) ||
+                        (!candidate.qualityFloor &&
+                         group.scorePerMiB >= candidate.scorePerMiB))
+                        continue;
+                    const bool demotableCurrent =
+                        group.current &&
+                        streamingCutStrategy_ ==
+                            StreamingCutStrategy::QualityPerByte;
+                    if (group.current && !demotableCurrent)
+                        continue;
+                    const int evictionClass = group.current ? 1 : 0;
+                    const bool betterTie =
+                        evictionGroup.count != 0 &&
+                        group.scorePerMiB == lowestScorePerMiB &&
+                        group.byteSizeMiB > largestMiB;
+                    if (evictionClass < bestEvictionClass ||
+                        (evictionClass == bestEvictionClass &&
+                         (group.scorePerMiB < lowestScorePerMiB ||
+                          betterTie)))
+                    {
+                        evictionGroup = group;
+                        bestEvictionClass = evictionClass;
+                        lowestScorePerMiB = group.scorePerMiB;
+                        largestMiB = group.byteSizeMiB;
+                    }
+                }
+                if (evictionGroup.count == 0)
+                    break;
+                for (size_t index = 0; index < evictionGroup.count; ++index)
+                    plannedVictims[evictionGroup.resources[index]] = true;
+                plannedCommittedMiB -= evictionGroup.byteSizeMiB;
+                plannedVictimImportance += evictionGroup.importanceScore;
+                plannedCurrentDemotion |= evictionGroup.current;
+                evictionPlan.push_back(evictionGroup);
+            }
+
+            const bool capacityFeasible =
+                plannedCommittedMiB + missingMiB <=
+                virtualMemoryBudgetMiB_ + 0.001f;
+            const float replacementMinimumGain =
+                plannedCurrentDemotion
+                    ? kStreamingCurrentReplacementMinimumGain
+                    : kStreamingReplacementMinimumGain;
+            const bool valueImproves =
+                candidate.qualityFloor || evictionPlan.empty() ||
+                candidate.importanceScore >=
+                    plannedVictimImportance *
+                        replacementMinimumGain;
+            if (!capacityFeasible || !valueImproves)
             {
                 ++lastBudgetBlockedGroups_;
+                if (!capacityFeasible)
+                    ++lastCapacityBlockedGroups_;
+                else
+                    ++lastValueBlockedGroups_;
                 const float required = committedMiB + missingMiB;
                 if (minimumBlockedCommitMiB_ == 0.0f)
                     minimumBlockedCommitMiB_ = required;
                 else
                     minimumBlockedCommitMiB_ =
                         std::min(minimumBlockedCommitMiB_, required);
+                char blockedReason[192];
+                if (!capacityFeasible)
+                {
+                    std::snprintf(
+                        blockedReason, sizeof(blockedReason),
+                        "blocked: complete %.2f MiB request cannot fit; "
+                        "%.2f MiB after eligible victims",
+                        missingMiB, plannedCommittedMiB + missingMiB);
+                }
+                else
+                {
+                    std::snprintf(
+                        blockedReason, sizeof(blockedReason),
+                        "blocked: request value %.2f does not exceed victim "
+                        "value %.2f by %.0f%%",
+                        candidate.importanceScore,
+                        plannedVictimImportance,
+                        (replacementMinimumGain - 1.0f) * 100.0f);
+                }
+                for (size_t slot : missingResources)
+                    virtualResources_[slot].decision = blockedReason;
                 continue;
+            }
+
+            if (streamingSelfTest_ && !evictionPlan.empty())
+            {
+                std::string victimNames;
+                float victimMiB = 0.0f;
+                for (const ResidentGroup& victimGroup : evictionPlan)
+                {
+                    victimMiB += victimGroup.byteSizeMiB;
+                    for (size_t index = 0; index < victimGroup.count; ++index)
+                    {
+                        const VirtualResource& victim =
+                            virtualResources_[victimGroup.resources[index]];
+                        char name[96];
+                        virtualResourceName(victim, name, sizeof(name));
+                        if (!victimNames.empty())
+                            victimNames += ", ";
+                        victimNames += name;
+                    }
+                }
+                std::printf(
+                    "FRONTIER_STREAMING_SELF_TEST EXCHANGE t=%.2f "
+                    "request=\"%s\" value=%.2f density=%.2f/MiB "
+                    "groupMiB=%.2f missingMiB=%.2f victims=\"%s\" "
+                    "value=%.2f MiB=%.2f\n",
+                    streamingTime_, candidateNames.c_str(),
+                    candidate.importanceScore, candidate.scorePerMiB,
+                    candidateMiB, missingMiB, victimNames.c_str(),
+                    plannedVictimImportance, victimMiB);
+            }
+            for (const ResidentGroup& evictionGroup : evictionPlan)
+            {
+                if (evictionGroup.current)
+                    unloadResidentGroup(
+                        evictionGroup,
+                        "quality-per-byte replacement; coarsen complete "
+                        "group to ready ancestor",
+                        true);
+                else
+                    unloadResidentGroup(
+                        evictionGroup,
+                        "lower group score/MiB than requested group", false);
             }
 
             PendingStreamingGroup group;
             group.readyAt = streamingTime_ + streamingLatencySeconds_;
             group.byteSizeMiB = missingMiB;
+            group.scorePerMiB = candidate.scorePerMiB;
             group.serial = ++streamingGroupSerial_;
             std::string names;
-            for (size_t slot = 0; slot < virtualResources_.size(); ++slot)
+            for (size_t slot : missingResources)
             {
-                if ((missingMask & (uint64_t(1) << slot)) == 0)
-                    continue;
                 VirtualResource& resource = virtualResources_[slot];
+                if (heroPressureScenarioActive_ &&
+                    std::isfinite(heroPressureLastUnloadTime_[slot]) &&
+                    streamingTime_ - heroPressureLastUnloadTime_[slot] <=
+                        kHeroOrbitRapidReloadWindowSeconds)
+                {
+                    ++heroPressureRapidReloads_;
+                    ++heroPressureScenarioResourceRapidReloads_[slot];
+                    heroPressureMaxResourceRapidReloads_ = std::max(
+                        heroPressureMaxResourceRapidReloads_,
+                        heroPressureScenarioResourceRapidReloads_[slot]);
+                }
                 resource.state = StreamingResourceState::Loading;
                 resource.lastDemandTime = streamingTime_;
+                resource.residentBenefitErrors = resource.transitionErrors;
+                char decision[128];
+                std::snprintf(decision, sizeof(decision),
+                              "loading: complete group score %.1f/MiB",
+                              candidate.scorePerMiB);
+                resource.decision = decision;
+                resource.lastAction = "load requested";
                 group.resources.push_back(slot);
                 char name[96];
                 virtualResourceName(resource, name, sizeof(name));
@@ -3672,9 +5589,11 @@ private:
             char message[320];
             std::snprintf(
                 message, sizeof(message),
-                "LOAD request group #%llu: %s (%.3f MiB, %.2f s)",
+                "LOAD request group #%llu: %s (%.3f MiB, score %.1f/MiB, "
+                "%.2f s)",
                 static_cast<unsigned long long>(group.serial), names.c_str(),
-                group.byteSizeMiB, streamingLatencySeconds_);
+                group.byteSizeMiB, candidate.scorePerMiB,
+                streamingLatencySeconds_);
             appendStreamingLog(ImVec4(1.0f, 0.78f, 0.20f, 1.0f), message);
             pendingStreamingGroups_.push_back(std::move(group));
         }
@@ -3685,6 +5604,7 @@ private:
 
     SpatialDatabase database_;
     SpatialQuery query_;
+    SpatialQuery streamingLookaheadQuery_;
     std::vector<Entity> entities_;
 
     std::array<SubtreeHandle, 2> houseDefinitions_{};
@@ -3746,6 +5666,8 @@ private:
     RebuildStrategy lastRebuildTrigger_ = RebuildStrategy::Manual;
     RebuildMethod scheduledRebuildMethod_ = RebuildMethod::RefreshTlas;
     RebuildMethod lastRebuildMethod_ = RebuildMethod::RefreshTlas;
+    StreamingCutStrategy streamingCutStrategy_ =
+        StreamingCutStrategy::QualityPerByte;
     float rebuildIntervalSeconds_ = 2.0f;
     float timeSinceRebuild_ = 0.0f;
     float lastRebuildMs_ = 0.0f;
@@ -3787,26 +5709,48 @@ private:
     uint32_t lastCurrentSize_ = 0;
     uint32_t lastRefinementGroups_ = 0;
     uint32_t lastRefinementEntries_ = 0;
+    uint32_t lastPrefetchGroupCount_ = 0;
+    uint32_t lastPrefetchEntryCount_ = 0;
     uint32_t lastIdealEntryCount_ = 0;
     uint32_t lastConvergedEntryCount_ = 0;
     uint32_t lastQueryReused_ = 0;
     uint32_t lastQueryWalked_ = 0;
     std::array<VirtualResource, kStreamingResourceSlotCount>
         virtualResources_{};
+    std::array<StreamingResourceState, kStreamingResourceSlotCount>
+        heroPressureScenarioStates_{};
+    std::array<uint32_t, kStreamingResourceSlotCount>
+        heroPressureScenarioResourceTransitions_{};
+    std::array<uint32_t, kStreamingResourceSlotCount>
+        heroPressureScenarioResourceRapidReloads_{};
+    std::array<float, kStreamingResourceSlotCount>
+        heroPressureLastUnloadTime_{};
     std::vector<PendingStreamingGroup> pendingStreamingGroups_;
     std::vector<StreamingLogEntry> streamingLog_;
-    float virtualMemoryBudgetMiB_ = 32.0f;
+    float virtualMemoryBudgetMiB_ = kHeroPressureTestBudgetMiB;
     float streamingLatencySeconds_ = 0.65f;
     float streamingUnloadDelaySeconds_ = 2.0f;
     float streamingTime_ = 0.0f;
     float currentFrontierMemoryMiB_ = 0.0f;
     float idealFrontierMemoryMiB_ = 0.0f;
+    float protectedFallbackMemoryMiB_ = 0.0f;
     float minimumBlockedCommitMiB_ = 0.0f;
     int maxConcurrentStreamingLoads_ = 3;
     uint32_t lastBudgetBlockedGroups_ = 0;
+    uint32_t lastCapacityBlockedGroups_ = 0;
+    uint32_t lastValueBlockedGroups_ = 0;
+    uint32_t lastReclaimableResourceCount_ = 0;
+    float lastReclaimableResidentMiB_ = 0.0f;
     uint64_t streamingGroupSerial_ = 0;
     uint64_t streamingLoadsCompleted_ = 0;
     uint64_t streamingUnloads_ = 0;
+    uint64_t streamingQualityDemotions_ = 0;
+    uint64_t heroPressureScenarioStartLoads_ = 0;
+    uint64_t heroPressureScenarioStartUnloads_ = 0;
+    uint64_t heroPressureScenarioStartDemotions_ = 0;
+    uint64_t heroPressureScenarioLoads_ = 0;
+    uint64_t heroPressureScenarioUnloads_ = 0;
+    uint64_t heroPressureScenarioDemotions_ = 0;
     std::array<float, kStreamingConvergenceHistorySize>
         streamingConvergenceHistory_{};
     size_t streamingConvergenceHistoryCursor_ = 0;
@@ -3816,9 +5760,41 @@ private:
     float lastStreamingConvergenceSeconds_ = 0.0f;
     bool streamingPaused_ = false;
     bool streamingResetRequested_ = false;
+    bool virtualStreamingEnabled_ = true;
+    bool virtualStreamingToggleRequested_ = false;
     bool streamingPlanValid_ = false;
     bool refinementPlanComplete_ = false;
     bool streamingConvergenceActive_ = false;
+    float heroPressureScenarioStartTime_ = 0.0f;
+    float heroPressureScenarioElapsed_ = 0.0f;
+    float heroPressureOrbitPhaseOffset_ = 0.0f;
+    float heroPressureWorstFallbackError_ = 0.0f;
+    float heroPressureFirstFallbackTime_ = -1.0f;
+    float heroPressureWorstDominantFallbackError_ = 0.0f;
+    float heroPressureFirstDominantFallbackTime_ = -1.0f;
+    float streamingTestCameraTime_ = 0.0f;
+    float streamingTestBudgetMiB_ = kHeroPressureTestBudgetMiB;
+    float streamingTestViewportHeight_ = 0.0f;
+    InstanceId heroPressureFocalInstance_ = kInvalidInstanceId;
+    uint32_t heroPressureScenarioTransitions_ = 0;
+    uint32_t heroPressureScenarioFineHeroes_ = 0;
+    uint32_t heroPressureFocalObservedFrames_ = 0;
+    uint32_t heroPressureFocalFallbackFrames_ = 0;
+    uint32_t heroPressureDominantFallbackFrames_ = 0;
+    uint32_t heroPressureMaxDominantFallbacks_ = 0;
+    uint32_t heroPressureLastDominantFallbacks_ = 0;
+    uint32_t heroPressureMaxResourceTransitions_ = 0;
+    uint32_t heroPressureRapidReloads_ = 0;
+    uint32_t heroPressureMaxResourceRapidReloads_ = 0;
+    int heroPressureLastFocalRank_ = -2;
+    bool heroPressureScenarioRequested_ = false;
+    bool heroPressureScenarioActive_ = false;
+    bool heroPressureScenarioFinished_ = false;
+    bool heroPressureScenarioPassed_ = false;
+    bool heroPressureScenarioWithinBudget_ = true;
+    bool streamingSelfTest_ = false;
+    bool streamingSelfTestFinished_ = false;
+    int streamingSelfTestExitCode_ = 0;
     std::array<uint32_t, kPayloadSlotCount> currentPayloadCounts_{};
     PerformanceSample performance_;
     std::array<std::array<float, kPerformanceHistorySize>,

@@ -60,14 +60,109 @@ mode checks the latest `UpdateReport` at that cadence. **Refresh TLAS now** and
 and call counts for both methods so they can be compared. The sample defaults
 to **When recommended**, `refreshTlas()`, and a two-second check interval.
 The separate **Virtual streaming** window controls the virtual memory budget,
-load latency, unload delay, and maximum concurrent group loads. It reports
+load latency, unload delay, maximum concurrent group loads, and the residency
+cut strategy. **Turn off virtual streaming** cancels simulated I/O and makes
+every representation resource used by the active scene immediately resident;
+the budget, latency, and eviction policy are ignored while it is off, giving a
+fully resident ideal-quality baseline. Refinement planning, scoring, admission,
+and eviction work are skipped in this mode, apart from lightweight current-cut
+UI accounting. Turning streaming on again resets
+residency to the pinned coarsest resources and resumes normal convergence.
+House A/B replacement also makes the new active style fully resident while
+streaming remains off. The simulator defaults to an 85 MiB budget and
+**Quality per byte**, which
+selects with
+`PreferReadyAncestors`: a resident descendant cannot override the camera's
+coarser threshold target, so over-detailed resources leave the current cut and
+become eviction candidates. **Retain ready detail** switches to
+`PreferReadyDescendants` to demonstrate the intentionally sticky alternative
+and why it can starve a more valuable load under pressure. The window reports
 resident, loading, current-cut, and ideal-cut memory; current-to-ideal frontier
-convergence with a rolling history and elapsed completion time; budget or
-transition stalls; representation residency; and a rolling virtual load/unload
-log. **Reset to coarsest residency** makes all
-non-fallback representations unavailable again. Replacing the house generation
-also unloads the previous style's virtual resources before the new style is
-streamed.
+convergence with a rolling history and elapsed completion time; memory outside
+the active quality target; budget or transition stalls; and a detailed
+representation-residency decision table.
+That table reports current-node/current-benefit/immediate-next/predicted-camera/
+ideal instance counts, min/average/max projected screen error, exact virtual bytes,
+visual-importance score, score-per-MiB, current policy decision, and the last
+load or eviction reason. A resident representation retains the parent-error
+benefit measured when its load was admitted. Valuing it later by only its own
+smaller post-refinement error would make its eviction priority collapse merely
+because it loaded, producing a coarse-to-fine streaming feedback loop.
+Refinement candidates use the parent error that loading the child group would
+eliminate, rather than a terminal child's usually-zero geometric error.
+The documented sample policy weights current-cut, immediate-next, six-second
+predicted-camera, and ideal demand at 4x, 3x, 1.5x, and 1x, then loads complete
+refinement groups by
+score-per-MiB and makes pressure eviction use those same complete sibling
+groups. This prevents the simulator from retaining an unusable partial
+refinement (for example a skyscraper base and crown without its shaft) and
+repeatedly reloading its missing member. Replacement is a two-phase transaction:
+the simulator plans the complete victim set without changing residency, then
+commits only if the request fits and its total visual value exceeds unused
+cache victims by at least 5%, or current-cut victims by at least 30%.
+Score-per-MiB orders candidates and victims; the total-value test handles
+indivisible-resource granularity. A request that cannot complete leaves every
+prospective victim untouched. Current-cut replacements also receive fifteen
+seconds of minimum residency to reject role-change feedback.
+Projected errors are keyed by both logical node and placement instance; this is
+essential for hero assets whose shared representation can be tiny in one
+placement and fill the screen in another. After resources outside the active
+target are exhausted, quality-per-byte mode may replace a lower-score current
+group with a higher-score requested group. Ordinary score-based replacements
+keep every selected representation's complete ready ancestor chain resident
+and charged to the same budget, so pressure coarsens it one available level at
+a time instead of jumping directly to the pinned fallback. A second Frontier
+query follows the known camera path
+six seconds ahead with a lower score weight, providing enough time for several
+sequential refinement loads before a skyscraper enters the close view.
+Before the scalar score is applied, the sample enforces a minimum-quality
+constraint for hero assets: if a skyscraper's pinned fallback would be at least
+three pixels of projected error (roughly a 150-pixel-tall facade), its 0.75 MiB
+district representation is a quality-floor request. These requests are ordered
+ahead of ordinary refinements, may displace lower-priority cached, transition,
+or fallback-chain data, and cannot themselves be selected as victims while the
+hero remains screen-dominant. The rest of the budget is still optimized by
+visual score per MiB. This lexicographic policy prevents a large visible tower
+from being sacrificed for fine detail elsewhere just because an indivisible
+10 MiB resource group has greater total score.
+The UI counts these quality demotions explicitly. A rolling virtual load/unload
+log includes the same score context. **Reset to coarsest residency**
+makes all non-fallback representations unavailable again. Replacing the house
+generation also unloads the previous style's virtual resources before the new
+style is streamed. The 54 skyscraper placements are divided among 18
+independent hero asset definitions, with exactly three instances per asset.
+Every hero has its own district-through-max-detail virtual resources and
+therefore competes independently for memory. **Set one-hero transition budget**
+selects the transient-safe budget for pinned fallbacks, one 5 MiB fine parent,
+and its complete 10 MiB detailed child group; other high-scoring scene
+resources still compete inside that same budget.
+The **Start close skyscraper orbit test** regression scenario uses the captured
+close view, then slowly orbits the central hero skyscraper for 180 simulated
+seconds while the normal simulation continues. It resets to coarsest residency,
+applies an 85 MiB budget, and records every virtual-resource state transition.
+After a 20-second warm-up it fails if the focal tower, or any other tower whose
+fallback error indicates an approximately 150-pixel-or-taller facade, reaches
+the pinned top representation. It separately detects a true feedback loop by
+counting unload-to-reload cycles that recur for the same resource within five
+seconds; ordinary load lifecycles across the full orbit are reported but do not
+fail the test. The same deterministic check can run without interactive input:
+
+```sh
+build-city/examples/city/frontier_city --streaming-orbit-self-test
+```
+
+`--streaming-test-camera-time=<seconds>` selects a starting phase on the orbit,
+`--streaming-test-budget=<MiB>` overrides the budget, and
+`--streaming-test-viewport-height=<pixels>` runs screen-error selection at a
+chosen pixel density without allocating a correspondingly large framebuffer.
+The older
+`--streaming-self-test` and `--streaming-dynamic-self-test` spellings remain
+aliases for this regression.
+
+The process exits nonzero on a dominant fallback, excess churn, or budget
+violation and prints focal LOD changes, dominant-fallback events, replacement
+transactions, and per-resource churn lines. Successful runs also print the
+highest-activity resources from the full orbit.
 Wireframe can also be toggled directly from the top-bar
 **Rendering** menu and composes with hierarchy tinting. **Scene stats** contains
 entity, cut, streaming, cache, simulation, and camera status.
