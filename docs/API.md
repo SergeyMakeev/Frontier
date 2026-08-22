@@ -84,11 +84,9 @@ above `SelectionParams::threshold`.
 
 A **frontier**, also called a **cut**, is the set selected by that process. No
 selected node is an ancestor of another, and together the selected nodes cover
-the visible scene. Frontier produces two cuts at once:
-
-- the **current cut** is hole-free and renderable with resources available now;
-- the **ideal cut** is what the currently mounted topology would select if all
-  of its nodes were render-ready.
+the visible scene. Selection produces the **current cut**, which is hole-free
+and renderable with resources available now. Streaming code can separately ask
+for a bounded forest of complete refinement groups below that cut.
 
 **Hole-free** means complete hierarchy coverage: every visible region represented
 by a selected parent remains represented either by that parent or by a complete
@@ -132,7 +130,7 @@ Camera camera = makeLookAtCamera(cameraPosition, cameraTarget);
 FrontierResultView cut = query.selectFrontier(
     database, camera, SelectionParams{.threshold = 4.0f});
 
-for (const FrontierEntry& entry : cut.current())
+for (const FrontierEntry& entry : cut)
     submitToRenderer(entry);
 ```
 
@@ -159,7 +157,7 @@ runtime.
 ```cpp
 SubtreeHandle houseDefinition = /* registered once */;
 
-NodeHandle firstHouseProxy  = /* discovered in an ideal frontier */;
+NodeHandle firstHouseProxy  = /* discovered in a frontier/refinement result */;
 NodeHandle secondHouseProxy = /* another placement's proxy */;
 
 SubtreeInstanceHandle firstHouse =
@@ -459,7 +457,7 @@ across nested placements. The supplied and accumulated transforms must remain
 finite and representable. A top-level mount scale must also have a finite
 reciprocal because traversal transforms the camera into placement-local space.
 
-## 7. Select the current and ideal frontiers
+## 7. Select the current frontier and inspect refinement
 
 Mutations become queryable at an update barrier:
 
@@ -509,19 +507,13 @@ bookmarks, and deterministic camera oscillation; any scene mutation or query
 parameter change falls back to ordinary exact selection automatically. The
 memoized output capacity is included in `SpatialQuery::bytes()`.
 
-`currentCutPolicy` controls how an unavailable ideal choice is replaced:
+`currentCutPolicy` controls how an unavailable threshold-target choice is replaced:
 
 - `PreferReadyDescendants` uses a complete ready descendant cut when one
   exists, falling back to a ready ancestor only when that cover is incomplete.
   This default normally preserves the most detail.
-- `PreferReadyAncestors` never searches below the unavailable ideal choice. It
+- `PreferReadyAncestors` never searches below the unavailable threshold target. It
   falls back upward, normally producing a smaller but coarser current cut.
-
-One traversal returns two logical cuts in three disjoint buckets:
-
-- `shared` belongs to both current and ideal cuts;
-- `currentOnly` contains ready fallbacks used only now;
-- `idealOnly` contains choices wanted if all known definition nodes were ready.
 
 ### Two current-cut policies
 
@@ -529,11 +521,12 @@ The following three diagrams show the same hierarchy and camera decision.
 Green nodes are ready, yellow nodes are unavailable, and the colored region
 marks the selected frontier.
 
-The ideal frontier is `D, H, I, J, F, G`. It is the desired LOD result, but it
+The threshold-directed target is `D, H, I, J, F, G`. It describes the choices
+an exhaustive refinement analysis would reach, but it
 cannot be rendered in this example because `H`, `I`, `J`, and `G` are not
 ready:
 
-![Ideal frontier containing unavailable nodes](images/cuts/ideal-cut.svg)
+![Threshold target containing unavailable nodes](images/cuts/threshold-target.svg)
 
 `PreferReadyAncestors` produces the compact current frontier `D, E, C`.
 Unavailable `H/I/J` retreat to their ready ancestor `E`; unavailable `G`
@@ -553,7 +546,7 @@ the ready ancestor `C` instead:
 Render the zero-copy current-cut view:
 
 ```cpp
-for (const FrontierEntry& entry : cut.current()) {
+for (const FrontierEntry& entry : cut) {
     if (UserPayload payload = database.tryGetPayload(entry.nodeHandle);
         payload != kInvalidPayload)
         submitPayload(payload, entry.instance());
@@ -565,24 +558,35 @@ interval. `tryGetPayload()` is stale-safe because applications may also retain
 node handles across writer phases; failure in the loop above would indicate
 that the threading contract was violated.
 
-Use the ideal-only delta for GPU demand. A ready sibling can still be in this
-bucket when a common ancestor covers the current cut, so retain the readiness
-test:
+Streaming analysis is explicit and bounded. This call looks three refinement
+transitions below current and stores at most 4096 candidate entries:
 
 ```cpp
-for (const FrontierEntry& entry : cut.idealOnly) {
-    if (UserPayload payload = database.tryGetPayload(entry.nodeHandle);
-        payload != kInvalidPayload &&
-        !database.isNodeReady(entry.nodeHandle))
-        requestPayload(entry.nodeHandle, payload);
+FrontierRefinementView refinement = mainView.computeFrontierRefinement(
+    database, cut, 3, 4096);
+
+for (uint32_t group = 0; group < refinement.groupCount(); ++group) {
+    NodeHandle parent = refinement.parent(group);
+    std::span<const FrontierEntry> children = refinement.children(group);
+    streamingPlanner.considerCompleteGroup(parent, children,
+                                            refinement.depth(group));
 }
 ```
 
-Topology demand is different: inspect the complete ideal cut because an
-unexpanded mountable proxy can be shared by both cuts:
+Every span is a complete visible immediate-child cover for its parent. Groups
+are ordered breadth-first, and depth 1 directly replaces a current entry. A
+planner may choose several levels to skip intermediate representations, but it
+must preserve the returned group boundary when reasoning about a hole-free
+transition. `maxNodes` is also group-atomic: a group that does not fit is not
+partially returned. Inspect `complete()`, `depthLimitReached()`, and
+`nodeLimitReached()` when the distinction matters.
+
+Topology demand starts with over-threshold mountable nodes in current. A
+lookahead planner should also inspect `refinement.entries()` for deeper
+mountable boundaries:
 
 ```cpp
-for (const FrontierEntry& entry : cut.ideal()) {
+for (const FrontierEntry& entry : cut) {
     if (!entry.overThreshold() ||
         database.hasMountedSubtree(entry.nodeHandle))
         continue;
@@ -594,14 +598,13 @@ for (const FrontierEntry& entry : cut.ideal()) {
 }
 ```
 
-`current()` iterates `shared` followed by `currentOnly`; `ideal()` iterates
-`shared` followed by `idealOnly`. Both are allocation-free forward ranges over
-the original spans. The individual buckets remain public for bulk submission
-and code that needs only the delta between the cuts.
-
 `FrontierResultView` points into its `SpatialQuery` and remains valid until that
 query's next selection, `reset()`, or destruction. Use `FrontierResult` for an
-owning copy or `FrontierResultSink` to write directly into fixed caller memory.
+owning copy or `Sink<FrontierEntry>` to write directly into fixed caller
+memory. `computeFrontierRefinement()` requires the complete view from that
+query's immediately preceding handle selection and an unchanged database
+snapshot. Its returned view is invalidated by the next selection, refinement
+call, or reset on the query.
 
 Each `FrontierEntry` carries a generation-stamped `NodeHandle`, an
 `InstanceId` stable for the lifetime of its top-level instance, and a
@@ -672,7 +675,7 @@ Optional clusters are immutable index ranges and must partition a spatially
 ordered position stream. With an empty `clusterBounds` span, selection computes
 each exact current union from actor transforms, so this safe default cannot
 become stale. A caller may instead provide one conservative AABB per cluster.
-That can be a lifetime motion envelope built once (ideal for actors constrained
+That can be a lifetime motion envelope built once (well suited to actors constrained
 to a road/cell), or a current snapshot published before `select()`. Every bound
 must contain every current member root; contract builds verify coverage. An
 outside cluster skips all members, a fully inside cluster emits each actor's
@@ -690,18 +693,26 @@ intentionally happen at different times.
 
 Suppose a building hierarchy is already mounted and therefore known to
 Frontier, but some wall meshes or materials are not in GPU memory yet. The
-current cut uses ready ancestors as fallbacks; `idealOnly` identifies choices
-that belong to the ideal cut but not the current cut. Start GPU demand there,
-without revisiting `shared` entries that are already usable in both cuts:
+current cut uses ready ancestors or complete ready descendant covers as
+fallbacks. Ask for a bounded decision horizon, then let application policy
+choose complete groups that fit its external resource budget:
 
 ```cpp
-for (const FrontierEntry& entry : cut.idealOnly) {
-    if (database.isNodeReady(entry.nodeHandle))
-        continue; // a ready sibling can still be ideal-only
+FrontierRefinementView refinement = query.computeFrontierRefinement(
+    database, cut, 4, 8192);
 
-    if (UserPayload payload = database.tryGetPayload(entry.nodeHandle);
-        payload != kInvalidPayload)
-        gpuStreamer.request(entry.nodeHandle, payload);
+for (uint32_t group = 0; group < refinement.groupCount(); ++group) {
+    const auto children = refinement.children(group);
+    if (!streamingPolicy.acceptWholeGroup(database, children))
+        continue;
+
+    for (const FrontierEntry& entry : children) {
+        if (database.isNodeReady(entry.nodeHandle))
+            continue;
+        if (UserPayload payload = database.tryGetPayload(entry.nodeHandle);
+            payload != kInvalidPayload)
+            gpuStreamer.request(entry.nodeHandle, payload);
+    }
 }
 
 // Applied later, during a writer phase after the upload finishes.
@@ -709,10 +720,11 @@ for (const GpuCompletion& completed : gpuStreamer.completed())
     database.markNodeReady(completed.node);
 ```
 
-The readiness test is still necessary. If one child is unavailable, the
-hole-free current cut may remain at a common ancestor; ready siblings below
-that ancestor then also appear in `idealOnly` even though they need no upload.
-No topology is mounted or unmounted in this example.
+The readiness test is still necessary: a complete candidate group may contain
+children that are already ready. The planner evaluates the siblings together
+because loading only an incomplete replacement cover cannot improve the
+hole-free current frontier. No topology is mounted or unmounted in this
+example.
 
 The reverse is equally important. A coarse building node may become unavailable
 after all of its wall descendants are ready. Because those walls form a
@@ -725,11 +737,11 @@ forces selection back to a ready ancestor.
 Now consider a planet-scale hierarchy. From orbit, the database needs only the
 planet, continent, and coarse terrain nodes. Individual city blocks, buildings,
 and walls do not need to be known at all. As the camera approaches the surface,
-an over-threshold mountable proxy in the ideal cut asks the application to load
-and mount its child definition:
+an over-threshold mountable proxy in the current cut asks the application to
+load and mount its child definition:
 
 ```cpp
-for (const FrontierEntry& entry : cut.ideal()) {
+for (const FrontierEntry& entry : cut) {
     const UserPayload payload = database.tryGetPayload(entry.nodeHandle);
     if (payload == kInvalidPayload)
         continue;
@@ -747,11 +759,11 @@ for (TopologyCompletion& completed : topologyStreamer.completed()) {
 }
 ```
 
-Topology demand inspects `ideal()`, not only `idealOnly`. Until the child is
-mounted, the known ideal frontier itself stops at the proxy; that proxy can be
-`shared` because it is also the best current representation. Its over-threshold
-error is what signals that more topology is wanted. The application's request
-queue should coalesce repeated requests while the child definition is loading.
+Until the child is mounted, known topology stops at the proxy. Its
+over-threshold error is what signals that more topology is wanted. A bounded
+refinement result can expose additional such boundaries within its lookahead
+horizon. The application's request queue should coalesce repeated requests
+while a child definition is loading.
 
 After mounting, the next selection can expose much finer nodes around the
 camera. Those nodes are commonly unready at first, so the first loop requests
@@ -1220,23 +1232,30 @@ InstanceHandle city = database.instantiate(
 database.mountSubtree(city.rootNode(), cityDefinition);
 ```
 
-The streaming loop discovers mountable proxies from the ideal frontier:
+The streaming loop discovers mountable proxies from current and evaluates
+resource demand as complete refinement groups:
 
 ```cpp
-void requestReadiness(std::span<const FrontierEntry> idealOnly)
+void requestReadiness(const FrontierRefinementView& refinement)
 {
-    for (const FrontierEntry& entry : idealOnly) {
-        if (database.isNodeReady(entry.nodeHandle))
+    for (uint32_t group = 0; group < refinement.groupCount(); ++group) {
+        const auto children = refinement.children(group);
+        if (!streamingPolicy.acceptWholeGroup(database, children))
             continue;
-        if (UserPayload payload = database.tryGetPayload(entry.nodeHandle);
-            payload != kInvalidPayload)
-            payloadStreamer.request(entry.nodeHandle, payload);
+
+        for (const FrontierEntry& entry : children) {
+            if (database.isNodeReady(entry.nodeHandle))
+                continue;
+            if (UserPayload payload = database.tryGetPayload(entry.nodeHandle);
+                payload != kInvalidPayload)
+                payloadStreamer.request(entry.nodeHandle, payload);
+        }
     }
 }
 
-void expandHouses(FrontierCutView ideal)
+void expandHouses(FrontierResultView current)
 {
-    for (const FrontierEntry& entry : ideal) {
+    for (const FrontierEntry& entry : current) {
         if (!entry.overThreshold() ||
             database.hasMountedSubtree(entry.nodeHandle))
             continue;
@@ -1258,8 +1277,10 @@ void expandHouses(FrontierCutView ideal)
 
 database.applyUpdates(256);
 FrontierResultView cut = cityQuery.selectFrontier(database, camera, params);
-requestReadiness(cut.idealOnly);
-expandHouses(cut.ideal());
+FrontierRefinementView refinement = cityQuery.computeFrontierRefinement(
+    database, cut, 3, 8192);
+requestReadiness(refinement);
+expandHouses(cut);
 ```
 
 The city can contain a million proxies without duplicating the house
@@ -1319,8 +1340,8 @@ for (UserPayload payload : payloadCache.unreferencedResources())
     evictFromGpu(payload);
 ```
 
-Topology can remain mounted so that the ideal cut continues to express future
-demand, or collection can remove cold leaf placements later.
+Topology can remain mounted so that later refinement calls continue to expose
+future demand, or collection can remove cold leaf placements later.
 
 ## 15. End-to-end example: moving multiview scene
 

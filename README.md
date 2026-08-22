@@ -14,11 +14,12 @@ acceleration structure (BLAS): it stores the reusable local hierarchy, while a
 mount supplies a placement below a renderable node. Frontier does not expose a
 `BLAS` type because definitions can be mounted recursively, and a one-node
 instance needs no lower hierarchy. A cut, or frontier, is the ancestor-free set
-of nodes selected to cover the visible scene. The current cut is renderable now
-and hole-free: it never replaces a parent until ready descendants cover every
-visible branch represented by that parent. The ideal cut assumes every node in
-currently mounted topology is ready. Here, hole-free describes logical
-hierarchy coverage; it does not guarantee crack-free mesh boundaries.
+of nodes selected to cover the visible scene. The selected cut is renderable
+now and hole-free: it never replaces a parent until ready descendants cover
+every visible branch represented by that parent. Applications that need to
+stream finer representations explicitly ask `SpatialQuery` for a bounded
+forest of complete refinement groups below that cut. Here, hole-free describes
+logical hierarchy coverage; it does not guarantee crack-free mesh boundaries.
 
 Readiness need not form an unbroken path from root to leaf. If an unavailable
 node has a complete ready descendant cut, Frontier renders those descendants
@@ -106,9 +107,9 @@ const Camera camera = currentCamera(); // application function
 FrontierResultView cut = query.selectFrontier(world, camera,
                                                SelectionParams{});
 
-// Mountable runtime nodes are discovered through the ideal frontier. The
+// Mountable runtime nodes are discovered through the current frontier. The
 // application payload maps each proxy to its child definition and placement.
-for (const FrontierEntry& entry : cut.ideal()) {
+for (const FrontierEntry& entry : cut) {
     if (!entry.overThreshold() ||
         world.hasMountedSubtree(entry.nodeHandle))
         continue;
@@ -124,16 +125,27 @@ for (const FrontierEntry& entry : cut.ideal()) {
     }
 }
 world.applyUpdates(0); // publish without optional TLAS tightening
+
+// Analyze a small decision horizon for content streaming. Each returned span
+// is a complete visible child cover for its existing parent NodeHandle.
+cut = query.selectFrontier(world, camera, SelectionParams{});
+FrontierRefinementView refinement =
+    query.computeFrontierRefinement(world, cut, 3, 1024);
+for (uint32_t group = 0; group < refinement.groupCount(); ++group) {
+    NodeHandle parent = refinement.parent(group);
+    std::span<const FrontierEntry> children = refinement.children(group);
+    enqueueWholeGroup(parent, children); // application policy
+}
 ```
 
 Builder `NodeId` values are authoring-local and are never converted to runtime
 handles. Nested mount points are deliberately discovered as `NodeHandle`
 values in frontier results, then retained while asynchronous loading runs.
 
-`cut.current()` is always a complete render frontier; it iterates `shared`
-followed by `currentOnly` without copying either bucket. `cut.ideal()` similarly
-iterates `shared` followed by `idealOnly`, the frontier the mounted topology
-would choose with every known node ready. Readiness means the renderer has every GPU resource
+`cut` is always a complete render frontier. Refinement analysis is opt-in and
+returns only complete visible immediate-child groups, in breadth-first depth
+order. `maxDepth` bounds lookahead, while `maxNodes` bounds candidate storage
+without ever truncating a group. Readiness means the renderer has every GPU resource
 needed to dispatch a node's payload. It belongs to a node in a registered
 definition and is shared by that node across every placement of the definition.
 Equal payload values in different nodes are independent; applications that use
@@ -240,7 +252,8 @@ An opt-in [bgfx city sample](examples/city/README.md) exercises Frontier in a
 visible, continuously changing 3-by-3 district scene: 2,088 reusable houses,
 54 deeply nested skyscrapers, 1,152 trees, 432 smoothly turning cars, 864
 moving pedestrians,
-per-frame rigid motion, current/ideal readiness, LOD selection, frustum
+per-frame rigid motion, readiness-driven LOD selection, bounded refinement
+analysis, frustum
 culling, automatic/free cameras, and ImGui controls for simulation freeze,
 hierarchy tinting, and a visualized frozen culling frustum.
 

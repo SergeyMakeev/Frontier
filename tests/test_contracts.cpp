@@ -317,14 +317,12 @@ TEST(Contracts, FixedOutputReportsOverflow)
         database.instantiate(node(i + 1, 0.0f, box()));
     database.applyUpdates(0);
 
-    std::array<FrontierEntry, 3> shared{};
-    FrontierResultSink sink{Sink<FrontierEntry>{shared},
-                            Sink<FrontierEntry>{{}},
-                            Sink<FrontierEntry>{{}}};
+    std::array<FrontierEntry, 3> storage{};
+    Sink<FrontierEntry> sink{storage};
     SpatialQuery query;
     query.selectFrontier(database, cameraAt(), {}, sink);
-    EXPECT_EQ(sink.shared.count(), shared.size());
-    EXPECT_EQ(sink.shared.dropped(), 5u);
+    EXPECT_EQ(sink.count(), storage.size());
+    EXPECT_EQ(sink.dropped(), 5u);
 }
 
 TEST(Contracts, FixedOutputGeneratedRangeReportsOverflow)
@@ -368,40 +366,22 @@ TEST(Contracts, EncodedFrontierErrorPreservesTheExactThresholdSide)
     }
 }
 
-TEST(Contracts, FrontierCutViewsJoinBucketsWithoutCopying)
+TEST(Contracts, FrontierResultViewIsOneContiguousCurrentCut)
 {
-    static_assert(std::forward_iterator<FrontierCutView::iterator>);
-
-    const std::array<FrontierEntry, 2> shared{
+    const std::array<FrontierEntry, 3> entries{
         FrontierEntry{{}, uint8_t(0), 1},
-        FrontierEntry{{}, uint8_t(0), 2}};
-    const std::array<FrontierEntry, 1> currentOnly{
+        FrontierEntry{{}, uint8_t(0), 2},
         FrontierEntry{{}, uint8_t(0), 3}};
-    const std::array<FrontierEntry, 2> idealOnly{
-        FrontierEntry{{}, uint8_t(0), 4},
-        FrontierEntry{{}, uint8_t(0), 5}};
-    const FrontierResultView result{shared, currentOnly, idealOnly};
+    const FrontierResultView result{entries};
 
-    const FrontierCutView current = result.current();
-    ASSERT_EQ(current.size(), 3u);
-    auto it = current.begin();
-    EXPECT_EQ(&*it++, &shared[0]);
-    EXPECT_EQ(&*it++, &shared[1]);
-    EXPECT_EQ(&*it++, &currentOnly[0]);
-    EXPECT_EQ(it, current.end());
-
-    std::vector<InstanceId> idealInstances;
-    for (const FrontierEntry& entry : result.ideal())
-        idealInstances.push_back(entry.instance());
-    EXPECT_EQ(idealInstances,
-              (std::vector<InstanceId>{1, 2, 4, 5}));
-
-    const FrontierResultView suffixOnly{{}, currentOnly, {}};
-    ASSERT_FALSE(suffixOnly.current().empty());
-    EXPECT_EQ(suffixOnly.current().begin()->instance(), 3u);
-    EXPECT_TRUE(FrontierResultView{}.current().empty());
-    EXPECT_EQ(FrontierResultView{}.ideal().begin(),
-              FrontierResultView{}.ideal().end());
+    ASSERT_EQ(result.size(), 3u);
+    EXPECT_EQ(result.entries.data(), entries.data());
+    auto it = result.begin();
+    EXPECT_EQ(&*it++, &entries[0]);
+    EXPECT_EQ(&*it++, &entries[1]);
+    EXPECT_EQ(&*it++, &entries[2]);
+    EXPECT_EQ(it, result.end());
+    EXPECT_TRUE(FrontierResultView{}.empty());
 }
 
 TEST(Contracts, OwningFrontierResultsRemainSelfContainedAfterCopyAndMove)
@@ -414,18 +394,18 @@ TEST(Contracts, OwningFrontierResultsRemainSelfContainedAfterCopyAndMove)
     SpatialQuery query;
     FrontierResult original;
     query.selectFrontier(database, cameraAt(), {}, original);
-    ASSERT_EQ(original.shared.size(), 2u);
+    ASSERT_EQ(original.entries.size(), 2u);
 
     FrontierResult copy = original;
     EXPECT_EQ(payloads(database, copy),
               (std::vector<UserPayload>{1, 2}));
-    EXPECT_NE(copy.shared.data(), original.shared.data());
+    EXPECT_NE(copy.entries.data(), original.entries.data());
 
     FrontierResult assigned;
     assigned = original;
     EXPECT_EQ(payloads(database, assigned),
               (std::vector<UserPayload>{1, 2}));
-    EXPECT_NE(assigned.shared.data(), original.shared.data());
+    EXPECT_NE(assigned.entries.data(), original.entries.data());
 
     FrontierResult moved = std::move(copy);
     EXPECT_TRUE(copy.empty());
@@ -453,14 +433,14 @@ TEST(Contracts, MovedSpatialQueryRetainsItsBindingAndAllocations)
     SpatialQuery moved(std::move(source));
     const FrontierResultView movedResult =
         moved.selectFrontier(database, camera, {});
-    EXPECT_EQ(movedResult.idealSize(), 1u);
+    EXPECT_EQ(movedResult.size(), 1u);
     EXPECT_EQ(moved.reused(), 1u);
 
     SpatialQuery assigned;
     assigned = std::move(moved);
     const FrontierResultView assignedResult =
         assigned.selectFrontier(database, camera, {});
-    EXPECT_EQ(assignedResult.idealSize(), 1u);
+    EXPECT_EQ(assignedResult.size(), 1u);
     EXPECT_EQ(assigned.reused(), 1u);
 }
 

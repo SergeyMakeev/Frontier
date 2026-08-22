@@ -263,8 +263,8 @@ TEST(Assembly, SingleNodeLivesOnlyInTlas)
 
     SpatialQuery query;
     const FrontierResultView cut = select(database, query, cameraAt());
-    ASSERT_EQ(cut.shared.size(), 1u);
+    ASSERT_EQ(cut.entries.size(), 1u);
     const UserPayload payload =
-        database.tryGetPayload(cut.shared[0].nodeHandle);
+        database.tryGetPayload(cut.entries[0].nodeHandle);
     EXPECT_EQ(payload, 42u);
 }

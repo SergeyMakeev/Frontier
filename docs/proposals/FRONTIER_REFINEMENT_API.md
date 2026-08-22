@@ -1,14 +1,14 @@
 # Frontier refinement computation API
 
-Status: proposed; not implemented.
+Status: implemented.
 
-This document defines a bounded, policy-free API for inspecting refinement
-opportunities below the current frontier produced by one `SpatialQuery`. It
-also proposes removing the materialized ideal frontier from the selection API.
+This document records the bounded, policy-free API for inspecting refinement
+opportunities below the current frontier produced by one `SpatialQuery`,
+including removal of the materialized ideal frontier from the selection API.
 
 ## 1. Motivation
 
-The current API computes two cuts during every selection:
+The previous API computed two cuts during every selection:
 
 ```text
 current = shared + currentOnly
@@ -79,7 +79,7 @@ explicit inputs. With one supplied cut, there is no longer a gap between two
 materialized endpoints.
 
 The operation starts at the current frontier and computes structurally valid
-ways to refine it. The proposed name is therefore:
+ways to refine it. The resulting name is therefore:
 
 ```cpp
 computeFrontierRefinement()
@@ -95,7 +95,7 @@ data without implying that Frontier chooses a streaming plan. Names such as
 
 ## 4. Goals
 
-The proposed design must:
+The design must:
 
 1. remove materialized ideal-cut output and work needed only to produce it
    from ordinary selection;
@@ -130,7 +130,7 @@ Ordinary `selectFrontier()` produces one ordered current frontier. The old
 three-bucket result exists only to share storage between current and ideal and
 is no longer needed.
 
-The proposed logical surface is:
+The implemented logical surface is:
 
 ```cpp
 struct FrontierResultView
@@ -296,9 +296,9 @@ current; a later bounded query then starts from the improved cut and usually
 has a smaller search space. With a stable view, feasible coverage groups, and
 sufficient resources, this is a convergent bounded-horizon process.
 
-## 8. Draft refinement API
+## 8. Refinement API
 
-Only two new public concepts are proposed:
+Only two new public concepts are introduced:
 
 - `FrontierRefinementView`, the non-owning result view;
 - `SpatialQuery::computeFrontierRefinement()`, the explicit computation.
@@ -437,9 +437,11 @@ without changing group semantics or enlarging every `FrontierEntry`.
 complete groups. A node at the depth boundary remains a valid intermediate
 choice even when finer eligible topology exists.
 
-`depthLimitReached()` is true when at least one eligible branch could continue
-beyond the returned horizon. It is false for an empty result when current
-already satisfies the retained refinement rule.
+`depthLimitReached()` is true when at least one over-threshold boundary entry
+has finer mounted topology. It is conservative because child visibility beyond
+the requested horizon is deliberately not evaluated merely to refine this
+diagnostic. It is false for an empty result when current already satisfies the
+retained refinement rule.
 
 ### 11.2 Node limit
 
@@ -463,6 +465,7 @@ need a hard work bound should supply both limits.
 - `current` is the complete result of the immediately preceding
   `selectFrontier()` call on the same `SpatialQuery`;
 - a fixed caller sink, if used, did not overflow;
+- the exact current-result storage and entry bytes remain unchanged;
 - `database` is the database to which the query is bound;
 - the database remains in the same published read interval as selection;
 - no database mutation overlaps selection or refinement computation;

@@ -20,8 +20,9 @@ pedestrian path curving around their trunks.
 The scene deliberately uses no external meshes or textures. Each reusable
 Frontier subtree has reusable LOD cuts; skyscrapers use a deliberately deeper
 five-level hierarchy. Selected payloads dispatch simple bgfx debug-draw
-geometry. Ideal-cut nodes become ready after first visibility to demonstrate
-Frontier's current/ideal readiness model.
+geometry. A bounded refinement query looks three levels below the current cut;
+the sample publishes complete sibling groups within its per-frame resource
+budget, so readiness changes always enable a valid frontier transition.
 
 The UI is split into independent, movable ImGui windows so diagnostics do not
 cover one another. The global **Debug windows** menu in the top bar toggles
@@ -63,7 +64,7 @@ publication, bgfx submit/render/GPU/wait, UI, camera, accounting, unaccounted,
 and total-frame time. Each timer also reports the minimum, maximum, and average
 over its visible rolling window. Draw, primitive, and transient-buffer counters
 remain alongside the timing charts. **Scene hierarchy** is a live
-ImGui tree of each reusable Frontier topology with current/ideal selected-entry
+ImGui tree of each reusable Frontier topology with current selected-entry
 counts. **TLAS health** reports topology occupancy, depth, motion-area growth,
 the incremental repair queue, active/configured build quality, rebuild policy,
 topology-rebuild advice, and storage. It controls complete depth-cut TLAS AABB

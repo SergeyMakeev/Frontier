@@ -307,7 +307,7 @@ TEST(Tlas, EveryQualityTierReturnsTheSameVisibleSet)
 
         SpatialQuery query;
         const std::vector<UserPayload> selected = payloads(
-            database, select(database, query, cameraAt(-1000.0f)), false);
+            database, select(database, query, cameraAt(-1000.0f)));
         nodeCounts.push_back(TestAccess::tlasNodeCount(database));
         ASSERT_EQ(selected.size(), count);
         if (reference.empty())
@@ -366,5 +366,5 @@ TEST(Tlas, CoincidentCentroidsStillBuildACompleteTree)
     SpatialQuery query;
     const FrontierResultView result =
         select(database, query, cameraAt(-1000.0f));
-    EXPECT_EQ(result.shared.size(), count);
+    EXPECT_EQ(result.entries.size(), count);
 }

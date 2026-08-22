@@ -26,8 +26,10 @@ The suite contains:
 - scalar, SIMD, frustum, screen-error, camera, and degenerate-math tests;
 - serialized-layout, builder-limit, allocator-ownership, stale-handle, and
   public contract tests;
-- exact current/ideal frontier tests for shared readiness, mounted coverage,
-  both current-cut policies, query reuse, masks, and contribution culling;
+- exact current-frontier tests for readiness, mounted coverage, both
+  current-cut policies, query reuse, masks, and contribution culling;
+- bounded and exhaustive refinement tests for breadth-first depth, complete
+  sibling groups, atomic node limits, mount boundaries, and stale context;
 - TLAS lifecycle, explicit incremental-maintenance budgets, advisory quality
   recommendations, motion-group, copy-on-write bounds, collection, and cache
   invalidation tests, including sparse-to-dense bounds-overlay promotion;

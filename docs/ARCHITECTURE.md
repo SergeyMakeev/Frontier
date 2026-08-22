@@ -90,9 +90,10 @@ is no hierarchy walk to save, so recording and copying one cached entry would
 only add work. Hierarchical roots either terminate in the TLAS or enqueue their
 first mounted placement.
 
-A `WorkItem` carries placement slot, effective wide bounds, current/ideal
-liveness, and narrowed frustum mask. One dispatch selects dense authored/COW
-bounds or sparse-overlay lookup for the whole subtree walk. `wideVisit()` tests
+A `WorkItem` carries placement slot, effective wide bounds, one implicit
+threshold-target bit, and a narrowed frustum mask. Every queued branch produces
+the current cover. One dispatch selects dense authored/COW bounds or
+sparse-overlay lookup for the whole subtree walk. `wideVisit()` tests
 up to `kWide` children (four or eight) together. Plain leaves emit immediately;
 other survivors go onto a compact DFS stack.
 
@@ -114,7 +115,7 @@ one-element range as the node-to-payload index, so the plan needs no duplicate
 node mapping stream.
 
 This is a separate archive member and a separate strict query type. The
-ordinary LOD/readiness walker and its flat three-bucket API are unchanged.
+ordinary LOD/readiness walker returns one current handle sequence.
 Scenes with streaming readiness, nested mounts, nonzero terminal error, or
 deformed bounds remain on `SpatialQuery`; the range path deliberately trades
 those capabilities for a compact max-detail representation.
@@ -140,28 +141,38 @@ spatially ordered actor storage, optional envelope memory, and a deliberately
 narrower cohort contract: consecutive external ids, constant bounds/scale/mask
 and one definition, no per-actor handles, streaming state, or deformed bounds.
 
-## Current and ideal coverage
+## Current coverage and the implicit target
 
 Registered definitions own readiness by node. Mounted nodes carry only derived
 coverage. A 4-byte
 per-placement summary makes a fully ready mounted tree a constant-time test;
-the lean traversal then emits only the shared bucket.
+the lean traversal then emits directly to the current sequence.
 
-For partial readiness, current/ideal liveness travels with the DFS item. An
-ideal proxy can be unavailable while a recursively complete ready descendant cut
-keeps the current traversal alive. Visibility-aware coverage checks ignore
-unseen missing branches without allowing a visible hole.
+For partial readiness, one internal threshold-target bit travels with the DFS
+item. A set bit continues LOD decisions toward the threshold; a clear bit means
+an unavailable target has already been reached and traversal stops at the
+nearest ready descendant cover. There is no second liveness bit or second
+result.
+Visibility-aware coverage checks ignore unseen missing branches without
+allowing a visible hole.
 
 That descendant-cover path implements
 `CurrentCutPolicy::PreferReadyDescendants`. Under
-`PreferReadyAncestors`, the single ideal traversal carries the nearest ready
+`PreferReadyAncestors`, the threshold-directed traversal carries the nearest ready
 ancestor candidate across both local children and mount boundaries. An
-unavailable ideal choice marks its candidate for fallback. A parent-first
-resolution pass selects the outermost marked candidates and partitions the
-recorded ideal entries into `shared` and `idealOnly`; it needs no speculative
-readiness walk. The compact candidate records are query scratch rather than
+unavailable target choice marks its candidate for fallback. A parent-first
+resolution pass selects the outermost marked candidates and emits one current
+cut; it needs no speculative readiness walk. The compact candidate records are query scratch rather than
 persistent per-node state, and changing policy invalidates cached cuts through
 the existing query epoch.
+
+`computeFrontierRefinement()` is a later, policy-free local walk. Query scratch
+retains the exact effective camera and selection parameters, plus provenance
+and database versions for the immediately preceding handle result. The walk
+starts at those current entries, carries placement transforms and error clamps
+across mounts, and commits complete visible immediate-child groups
+breadth-first. Depth and node-limit flags distinguish bounded results from an
+exhaustive threshold-directed closure.
 
 ## TLAS maintenance
 

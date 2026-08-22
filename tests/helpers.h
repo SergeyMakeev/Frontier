@@ -261,16 +261,52 @@ inline NodeHandle handleOf(SpatialDatabase& database, UserPayload payload)
 }
 
 inline std::vector<UserPayload> payloads(const SpatialDatabase& database,
-                                         const FrontierResultView& result,
-                                         bool ideal = true)
+                                         const FrontierResultView& result)
 {
     std::vector<UserPayload> output;
-    const FrontierCutView cut = ideal ? result.ideal() : result.current();
-    for (const FrontierEntry& entry : cut)
+    for (const FrontierEntry& entry : result)
     {
         const UserPayload payload = database.tryGetPayload(entry.nodeHandle);
         if (payload == kInvalidPayload)
             throw std::logic_error("stale frontier handle");
+        output.push_back(payload);
+    }
+    std::sort(output.begin(), output.end());
+    return output;
+}
+
+inline std::vector<UserPayload> refinedPayloads(
+    const SpatialDatabase& database, SpatialQuery& query,
+    FrontierResultView current,
+    uint32_t maxDepth = SpatialQuery::UnlimitedDepth,
+    uint32_t maxNodes = UINT32_MAX)
+{
+    const FrontierRefinementView refinement =
+        query.computeFrontierRefinement(database, current, maxDepth, maxNodes);
+    std::vector<FrontierEntry> terminal(current.begin(), current.end());
+    for (uint32_t group = 0; group < refinement.groupCount(); ++group)
+    {
+        const NodeHandle parent = refinement.parent(group);
+        const auto found = std::find_if(
+            terminal.begin(), terminal.end(), [&](const FrontierEntry& entry)
+            { return entry.nodeHandle == parent; });
+        if (found == terminal.end())
+            throw std::logic_error("refinement group parent is not terminal");
+        const size_t offset = size_t(found - terminal.begin());
+        terminal.erase(found);
+        const std::span<const FrontierEntry> children =
+            refinement.children(group);
+        terminal.insert(terminal.begin() + offset, children.begin(),
+                        children.end());
+    }
+
+    std::vector<UserPayload> output;
+    output.reserve(terminal.size());
+    for (const FrontierEntry& entry : terminal)
+    {
+        const UserPayload payload = database.tryGetPayload(entry.nodeHandle);
+        if (payload == kInvalidPayload)
+            throw std::logic_error("stale refinement handle");
         output.push_back(payload);
     }
     std::sort(output.begin(), output.end());

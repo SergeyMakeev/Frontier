@@ -24,12 +24,12 @@ pixelError = effectiveError * camera.k /
 refine = pixelError > params.threshold;
 ```
 
-The traversal returns two cuts at once:
-
-```text
-current = shared + currentOnly   // ready, hole-free renderable cover
-ideal   = shared + idealOnly     // desired cut if all known nodes were ready
-```
+The public traversal returns one ready, hole-free current cut. When streaming
+code needs lookahead, `computeFrontierRefinement()` performs a separate local
+walk below that cut and returns complete immediate-child groups. The ordinary
+selection walker still tracks an implicit threshold target internally where a
+current-cut readiness policy needs it, but it does not materialize a second
+public cut.
 
 The most important implementation facts are:
 
@@ -88,7 +88,7 @@ The important distinctions are:
 | TLAS root | The permanent renderable root of one top-level instance. It is always ready and is a valid fallback even when nothing is mounted. |
 | Plain leaf | A definition node with no local children and no mount point. It is terminal and needs no LOD decision below it. |
 | Mountable node | A local leaf that may acquire one mounted definition. It remains a renderable proxy when no child is mounted. |
-| Ideal cut | The geometric LOD choice assuming all known definition nodes are renderable. |
+| Threshold target | The geometric LOD stopping rule used while refining a ready current cover. It is traversal state, not a materialized result. |
 | Current cut | A ready, hole-free cover produced from the readiness actually published. |
 | Coverage | Derived state saying a node is ready itself or has a complete ready descendant cover. It is not the same as readiness. |
 | Fully ready | Every definition node and every mounted descendant below a placement is ready. |
@@ -193,7 +193,7 @@ constraints.
 | `NodeHandle` | 8 B | 20-bit mount slot, 20-bit node, 24-bit generation; a reserved slot encoding also carries TLAS roots. |
 | `FrontierEntry` | 12 B | Handle plus packed 24-bit stable instance id and 8-bit error code. |
 | `VisibleItem` / `TlasItem` | 4 B | 24-bit dense id or node plus six-bit plane mask. |
-| `NodeItem` | 8 B | Node index, pixel error, plane mask, current/ideal liveness. |
+| `NodeItem` | 8 B | Node index, pixel error, plane mask, and one implicit-target bit. |
 | `WorkItem` | 16 B | Wide-bounds base, packed mount/mask/liveness/stride state, optional sparse-overlay index. |
 | `TlasNode` | 128 B BVH4 / 256 B BVH8 | Wide bounds, child references, valid mask, parent; aligned to 64 bytes. |
 | `TlasMeta` | 32 B BVH4 / 64 B BVH8 | Cold maximum-contribution and layer-mask lanes. |
@@ -205,7 +205,7 @@ constraints.
 | `SubtreeInstanceRt` | 56 B | Cold placement ownership, coverage pointer, LRU, links, and definition-list state. |
 | Placement node state | 2 B/node | Covered bit, covered-child count, and—in shared state only—the authoritative ready bit. |
 | `SpatialQuery::Rec` | 32 B | The random-access per-instance cache-hit record. |
-| `SpatialQuery::RecCold` | 16 B | Slab allocation and output offsets, fetched only on misses/rebuilds. |
+| `SpatialQuery::RecCold` | 8 B | Slab allocation and current-output offset, fetched only on misses/rebuilds. |
 | `RenderFrontierRun` | 12 B | Slab begin/count plus one instance id for a cached render run. |
 | `TerminalRenderRun` | 16 B on 64-bit | Payload pointer/count plus one packed instance/error word. |
 | Shared TLAS level scratch | 4 B/live root | Spatial-bin scatter during rebuild; retained exact-refit postorder between rebuilds. |
@@ -250,7 +250,7 @@ visible = queryWideTlas(view, params.minPix, view.viewMask);
 
 for (VisibleItem item : visible) {
     if (canReuseExactInstanceCut(item)) {
-        appendRecordedBuckets(item.instance());
+        appendRecordedCurrentEntries(item.instance());
         continue;
     }
 
@@ -264,7 +264,7 @@ for (VisibleItem item : visible) {
 ```
 
 There are cached and uncached orchestration functions, but both call the same
-root and subtree walkers and produce the same three sequences.
+root and subtree walkers and produce the same current sequence.
 
 ### 5.1 Camera damping and the LOD test
 
@@ -337,13 +337,13 @@ envelope also wholly contains its exact box.
 
 `runTlasRootInstance()` first computes projected error for the permanent root.
 If the root is below threshold or no descendant definition is mounted, it
-emits the root into `shared` and stops. The TLAS root is always ready.
+emits the root into current and stops. The TLAS root is always ready.
 
 If refinement is required, the camera is transformed into instance-local
 space. Identity yaw and the globally absent orientation stream have their own
 branch-free path. The root placement then dispatches by readiness:
 
-- A fully-ready mounted tree uses `runSubtree<true>()` and emits only `shared`.
+- A fully-ready mounted tree uses `runSubtree<true>()` and emits directly to current.
 - A partially-ready tree uses the selected current-cut policy.
 
 ### 5.4 Wide subtree traversal
@@ -380,31 +380,23 @@ The plane mask is monotonic: planes are removed once a node is wholly inside
 them. A zero mask avoids all lower frustum work and is also the crucial proof
 for query reuse.
 
-### 5.5 Producing current and ideal cuts together
+### 5.5 Producing the current cut
 
-The three physical buckets avoid a per-entry current/ideal tag and avoid two
-independent traversals:
+The output sink contains one contiguous `FrontierEntry` sequence. Every queued
+branch contributes to the current cover; one private threshold-target bit says
+whether traversal should keep making LOD decisions or only seek the nearest
+ready descendant.
 
-```cpp
-void emit(entry, bool current, bool ideal) {
-    if (current && ideal) shared.push(entry);
-    else if (current)     currentOnly.push(entry);
-    else                  idealOnly.push(entry);
-}
-```
+For `PreferReadyDescendants`:
 
-For `PreferReadyDescendants`, each DFS item carries whether current and ideal
-are still live on that branch:
-
-- If an ideal node is below threshold and ready, it is shared.
-- If that ideal node is unavailable but its visible descendants have a
-  complete ready cover, it goes to `idealOnly` and a current-only traversal
-  continues below it until ready descendants are found.
-- If the requested refinement has no mounted definition, the mountable proxy
-  ends the ideal cut; no unknown topology is invented.
-- If visible descendants cannot cover an ideal refinement, the nearest ready
-  node already on the branch is emitted to `currentOnly` and only ideal
-  continues.
+- If a threshold-target node is ready, it is emitted to current.
+- If that node is unavailable but its visible descendants have a complete
+  ready cover, current traversal continues below it until those ready
+  descendants are found.
+- If requested refinement has no mounted definition, the mountable proxy ends
+  known topology; no unknown topology is invented.
+- If visible descendants cannot cover a target refinement, the nearest ready
+  node already on the branch is emitted as the current fallback.
 
 `visibleDescendantsCovered()` first consults propagated structural coverage.
 That is a constant-time success for the normal covered branch. If coverage is
@@ -415,16 +407,39 @@ coverage is definitive and no visibility walk is needed.
 For `PreferReadyAncestors`, the implementation avoids a speculative second
 readiness traversal:
 
-1. The ideal traversal carries the nearest ready ancestor candidate across
+1. The threshold-directed traversal carries the nearest ready ancestor candidate across
    local and mount boundaries.
-2. Every terminal ideal choice records its candidate and ready bit.
-3. An unavailable ideal choice marks its candidate as collapsed.
+2. Every terminal target choice records its candidate and ready bit.
+3. An unavailable target choice marks its candidate as collapsed.
 4. Candidates are allocated parent-first. One forward resolution pass
-   propagates the outermost collapse, emits each selected fallback once, and
-   partitions ideal entries into `shared` or `idealOnly`.
+   propagates the outermost collapse and emits each selected fallback once.
 
 The candidate vectors exist only for this policy. `NodeItem` and `WorkItem`
 remain unchanged for the default descendant policy.
+
+### 5.6 Computing refinement groups
+
+Handle selection retains the exact damped `Camera`, `SelectionParams`, current
+view provenance, and database mapping/content/spatial versions in
+`QueryScratch`. `computeFrontierRefinement()` validates those values before it
+walks; a different query, a stale current result, an intervening mutation, an
+overflowed fixed selection, or a render-native selection cannot supply its
+starting cut. A complete fixed selection and an owning result remain valid
+sources when passed back as the matching view.
+
+The analysis initializes one local work item per current entry, then performs
+a breadth-first walk. For each expandable over-threshold node it evaluates all
+visible immediate children using placed bounds, overlays, frustum masks,
+inherited error clamps, and the retained camera. A mounted definition's direct
+roots are the children of the mountable parent, so the existing parent
+`NodeHandle` remains the group id across that boundary.
+
+Parent, child-offset, depth, and entry buffers are committed only after the
+whole visible sibling cover fits `maxNodes`. Descendants are enqueued only
+after their group commits. This preserves complete groups at every limit and
+makes output depth order deterministic. `UnlimitedDepth` removes the depth
+horizon; it does not invent unmounted topology or coarsen a current node that
+is already finer than the implicit threshold target.
 
 ## 6. Fast-path inventory
 
@@ -438,7 +453,7 @@ The table below is a practical map of work that the implementation can skip.
 | Every flat root also has zero error | `runZeroErrorTlasFlatInstance()` | `Instance` fetch, distance, divide, and error encoding work. |
 | Root error is below threshold or has no mount | Emit TLAS root | Local camera transform and all definition traversal. |
 | Orientation stream is absent / yaw is identity | Translation-scale camera path | Yaw transform and cold orientation reads. |
-| Mounted tree is fully ready | `runSubtree<true>()` | Per-node readiness and current/ideal branch logic. |
+| Mounted tree is fully ready | `runSubtree<true>()` | Per-node readiness and implicit-target branch logic. |
 | All surviving lanes are plain zero-error leaves, or clamp is zero | `wideVisit()` block shortcut | Error-vector load, distance, reciprocal/sqrt, and scalar metadata reads. |
 | Definition direct roots are all leaves | Root-leaves-only path | General scalar DFS loop. |
 | Root-leaf placement is wholly inside | `emitMountedRootLeavesInside()` | Frustum tests and node stack. |
@@ -446,7 +461,7 @@ The table below is a practical map of work that the implementation can skip.
 | Eligible definition is guaranteed to refine every interior node | Fully-refined boundary path | All error decisions; wholly-inside branches bulk-generate preplanned terminal handles. |
 | Visible instance is wholly inside and its certificate is valid | Per-instance cache hit | Instance record fetch, local transform, mount resolution, and hierarchy walk. |
 | Visible stream and global certificate are unchanged | Retained whole-cut return | All per-instance record probes and output appends. |
-| Same visible stream, only some records miss, bucket counts stay fixed | In-place output patch | Complete output reconstruction. |
+| Same visible stream, only some records miss, entry counts stay fixed | In-place output patch | Complete output reconstruction. |
 | Exact undamped view recurs in a stable scene | Two-entry view memo | TLAS query, record checks, traversal, and answer reconstruction. |
 | Cached render API is used | `RenderFrontierRun` scatter/gather | Copying resolved payload/error leaves on hits and repeating instance id per leaf. |
 | Uncached visible count exceeds configured threshold | Per-worker contiguous ranges | Serial instance traversal while preserving deterministic output order. |
@@ -539,17 +554,19 @@ disable a coalesced hit and force the uncommon exact usage walk.
 ### 7.3 Record and slab layout
 
 `SpatialQuery::Rec` is exactly 32 hot bytes and is indexed by dense instance
-id. It contains only the hit-path certificate, a slab offset, compact bucket
-counts, and one dependency. Allocation capacity and old output offsets live in
-the 16-byte cold record.
+id. It contains only the hit-path certificate, a slab offset, a compact entry
+count, and one dependency. Allocation capacity and the current-output offset
+live in the 8-byte cold record.
 
-Three 10-bit bucket counts and a two-bit dependency count share one word. A
-dependency count of three is an escape marker whose low 30 bits index a sparse
-16-byte full-width count record. One dependency is inline; the second-dependency
-array is allocated only if a real cacheable cut needs it.
+The count word stores one 30-bit current-frontier count beside a two-bit
+dependency count. A dependency count of three is an escape marker whose low
+30 bits index a sparse 8-byte full-width count record. One dependency is inline;
+the second-dependency array is allocated only if a real cacheable cut needs it.
+The hot `Rec` remains 32 bytes while current-only selection halves both the
+cold record and the rare overflow record.
 
-Recorded entries for one instance are contiguous in `store_` as
-`shared/currentOnly/idealOnly`. A replacement reuses its old block if capacity
+Recorded current entries for one instance are contiguous in `store_`. A
+replacement reuses its old block if capacity
 fits. If it grows, the old block becomes garbage and a new block is bump
 allocated. Rare compaction copies live runs through a same-sized scratch slab;
 in-place compaction would be unsafe because record id order and allocation
@@ -569,9 +586,8 @@ match, the existing contiguous buffers are already the answer. Selection
 returns before reading the 32-byte records.
 
 When that global test fails but the visible sequence is unchanged, misses can
-patch old bucket ranges in place if their three counts did not change. One
-count change falls back to a deterministic rebuild from all per-instance slab
-runs.
+patch old entry ranges in place if their counts did not change. A count change
+falls back to a deterministic rebuild from all per-instance slab runs.
 
 A separate two-entry LRU memo recognizes bit-exact raw camera and parameter
 keys. It is enabled only for undamped, reuse-enabled, hierarchical queries with
@@ -913,7 +929,7 @@ end-to-end gate; do not infer a win from deleted instructions alone.
 ## 13. Determinism, concurrency, and stale safety
 
 Uncached parallel selection divides the visible array into contiguous worker
-ranges. Each worker owns stacks and three output buffers. Concatenating workers
+ranges. Each worker owns stacks and one output buffer. Concatenating workers
 in index order reproduces serial visible-instance order exactly, so serial and
 parallel cuts are bit-identical.
 
@@ -931,8 +947,8 @@ Debug. They are intentionally separate.
 
 ### Adding or changing a selection parameter
 
-- Decide whether it changes TLAS visibility, LOD decisions, current/ideal
-  membership, output encoding, or only metadata.
+- Decide whether it changes TLAS visibility, LOD decisions, current
+  membership, refinement analysis, output encoding, or only metadata.
 - Update cache epoch logic or add a certificate term. “The camera is the same”
   is not enough for per-instance reuse.
 - Update `sameMemoParams()` for the exact-view memo.
@@ -995,10 +1011,10 @@ Debug. They are intentionally separate.
 
 - The fully-refined and terminal plans are built to reproduce the ordinary
   LIFO traversal order. Update plan construction with the walker.
-- Update three-bucket counts, cache slab layout, output offsets, compaction,
-  bulk resolution, renderer mirrors, and tests.
-- Keep `FrontierCutView`'s two-span order: `shared` is always iterated before
-  the cut-specific bucket.
+- Update entry counts, cache slab layout, output offsets, compaction, bulk
+  resolution, renderer mirrors, refinement provenance, and tests.
+- Preserve the contiguous current order and complete-group refinement
+  boundaries.
 
 ## 15. Verification and performance workflow
 

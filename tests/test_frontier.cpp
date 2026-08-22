@@ -59,9 +59,9 @@ TEST(Frontier, PermanentRootCoversMissingMountedPayloads)
     const FrontierResultView cut =
         select(scene.database, query, cameraAt(-8.0f), params);
 
-    EXPECT_EQ(payloads(scene.database, cut, false),
+    EXPECT_EQ(payloads(scene.database, cut),
               (std::vector<UserPayload>{1}));
-    EXPECT_EQ(payloads(scene.database, cut, true),
+    EXPECT_EQ(refinedPayloads(scene.database, query, cut),
               (std::vector<UserPayload>{11, 12}));
 }
 
@@ -76,9 +76,9 @@ TEST(Frontier, ReadyLeavesBecomeCurrentCut)
     params.threshold = 1.0f;
     const FrontierResultView cut =
         select(scene.database, query, cameraAt(-8.0f), params);
-    EXPECT_EQ(payloads(scene.database, cut, false),
+    EXPECT_EQ(payloads(scene.database, cut),
               (std::vector<UserPayload>{11, 12}));
-    EXPECT_EQ(payloads(scene.database, cut, true),
+    EXPECT_EQ(refinedPayloads(scene.database, query, cut),
               (std::vector<UserPayload>{11, 12}));
 }
 
@@ -121,7 +121,7 @@ TEST(Frontier, EqualPayloadValuesDoNotCoupleDefinitionNodes)
     SelectionParams params;
     params.threshold = 1.0f;
     const FrontierResultView cut = select(database, query, cameraAt(-8), params);
-    EXPECT_EQ(payloads(database, cut, false),
+    EXPECT_EQ(payloads(database, cut),
               (std::vector<UserPayload>{77, 77}));
 }
 
@@ -152,12 +152,12 @@ TEST(Frontier, EqualPayloadValuesDoNotCoupleDefinitions)
     SpatialQuery query;
     SelectionParams params{.threshold = 1.0f};
     FrontierResultView cut = select(database, query, cameraAt(-8), params);
-    EXPECT_EQ(payloads(database, cut, false),
+    EXPECT_EQ(payloads(database, cut),
               (std::vector<UserPayload>{1, 77}));
 
     database.markNodeReady(secondNode);
     cut = select(database, query, cameraAt(-8), params);
-    EXPECT_EQ(payloads(database, cut, false),
+    EXPECT_EQ(payloads(database, cut),
               (std::vector<UserPayload>{77, 77}));
 }
 
@@ -184,13 +184,13 @@ TEST(Frontier, ReadinessAppliesToExistingAndFuturePlacements)
     SpatialQuery query;
     SelectionParams params{.threshold = 1.0f};
     FrontierResultView ready = select(database, query, cameraAt(-8), params);
-    EXPECT_EQ(payloads(database, ready, false),
+    EXPECT_EQ(payloads(database, ready),
               (std::vector<UserPayload>{55, 55}));
 
     database.markNodeUnavailable(secondNode);
     FrontierResultView unavailable =
         select(database, query, cameraAt(-8), params);
-    EXPECT_EQ(payloads(database, unavailable, false),
+    EXPECT_EQ(payloads(database, unavailable),
               (std::vector<UserPayload>{1, 2}));
 }
 
@@ -220,7 +220,7 @@ TEST(Frontier, NestedCoverageTracksSharedReadiness)
     const auto currentPayloads = [&]
     {
         return payloads(database,
-                        select(database, query, cameraAt(-8), params), false);
+                        select(database, query, cameraAt(-8), params));
     };
 
     EXPECT_EQ(currentPayloads(), (std::vector<UserPayload>{99}));
@@ -245,7 +245,7 @@ TEST(Frontier, CurrentCutPolicyChoosesAncestorOrDescendantFallback)
 
     // Matches docs/images/cuts: A is the permanent TLAS root and B..O are
     // definition nodes. High-error interior nodes refine at this camera; G
-    // is the unavailable ideal choice whose ready descendants distinguish the
+    // is the unavailable threshold-target choice whose ready descendants distinguish the
     // two current-cut policies.
     const auto b = builder.createNode(node(2, 64.0f, box(4.0f)));       // B
     builder.createNode(b, node(4, 0.0f, box(4.0f)));                    // D
@@ -277,9 +277,7 @@ TEST(Frontier, CurrentCutPolicyChoosesAncestorOrDescendantFallback)
     const Camera camera = cameraAt(-20.0f);
 
     FrontierResultView cut = select(database, query, camera, params);
-    EXPECT_EQ(payloads(database, cut, true),
-              (std::vector<UserPayload>{4, 6, 7, 8, 9, 10}));
-    EXPECT_EQ(payloads(database, cut, false),
+    EXPECT_EQ(payloads(database, cut),
               (std::vector<UserPayload>{4, 5, 6, 11, 13, 14, 15}));
 
     // Establish a cache hit before changing only the policy.
@@ -288,15 +286,15 @@ TEST(Frontier, CurrentCutPolicyChoosesAncestorOrDescendantFallback)
 
     params.currentCutPolicy = CurrentCutPolicy::PreferReadyAncestors;
     cut = select(database, query, camera, params);
-    EXPECT_EQ(payloads(database, cut, true),
+    EXPECT_EQ(refinedPayloads(database, query, cut),
               (std::vector<UserPayload>{4, 6, 7, 8, 9, 10}));
-    EXPECT_EQ(payloads(database, cut, false),
+    EXPECT_EQ(payloads(database, cut),
               (std::vector<UserPayload>{3, 4, 5}));
     EXPECT_EQ(query.walked(), 1u);
 
     params.currentCutPolicy = CurrentCutPolicy::PreferReadyDescendants;
     cut = select(database, query, camera, params);
-    EXPECT_EQ(payloads(database, cut, false),
+    EXPECT_EQ(payloads(database, cut),
               (std::vector<UserPayload>{4, 5, 6, 11, 13, 14, 15}));
     EXPECT_EQ(query.walked(), 1u);
 }
@@ -335,18 +333,18 @@ TEST(Frontier, AncestorPolicyTracksCandidatesAcrossMountedSubtrees)
     const Camera camera = cameraAt(-20.0f);
 
     FrontierResultView cut = select(database, query, camera, params);
-    EXPECT_EQ(payloads(database, cut, true),
+    EXPECT_EQ(refinedPayloads(database, query, cut),
               (std::vector<UserPayload>{21, 23}));
-    EXPECT_EQ(payloads(database, cut, false),
+    EXPECT_EQ(payloads(database, cut),
               (std::vector<UserPayload>{21, 22}));
 
-    // With G unavailable, its mounted ideal descendant must retreat to C.
+    // With G unavailable, its mounted target descendant must retreat to C.
     // C then replaces the ready sibling F as well.
     database.markNodeUnavailable(mountPoint);
     cut = select(database, query, camera, params);
-    EXPECT_EQ(payloads(database, cut, true),
+    EXPECT_EQ(refinedPayloads(database, query, cut),
               (std::vector<UserPayload>{21, 23}));
-    EXPECT_EQ(payloads(database, cut, false),
+    EXPECT_EQ(payloads(database, cut),
               (std::vector<UserPayload>{20}));
 }
 
@@ -382,7 +380,7 @@ TEST(Frontier, MountedCoverageStaysPlacementLocal)
     const auto currentPayloads = [&]
     {
         std::vector<UserPayload> result = payloads(
-            database, select(database, query, cameraAt(-8), params), false);
+            database, select(database, query, cameraAt(-8), params));
         std::sort(result.begin(), result.end());
         return result;
     };
@@ -426,12 +424,12 @@ TEST(Frontier, ReleasedDefinitionsDiscardReadiness)
     SpatialQuery query;
     SelectionParams params{.threshold = 1.0f};
     FrontierResultView cut = select(database, query, cameraAt(-8), params);
-    EXPECT_EQ(payloads(database, cut, false),
+    EXPECT_EQ(payloads(database, cut),
               (std::vector<UserPayload>{1}));
 
     database.markNodeReady(replacementNode);
     cut = select(database, query, cameraAt(-8), params);
-    EXPECT_EQ(payloads(database, cut, false),
+    EXPECT_EQ(payloads(database, cut),
               (std::vector<UserPayload>{66}));
 }
 
@@ -459,7 +457,7 @@ TEST(Frontier, BulkResolutionPreservesOrderMetadataAndStaleSafety)
         FrontierEntry{mountedNode, uint8_t(129), 4}};
     const std::array<FrontierEntry, 1> second{
         FrontierEntry{flatRoot.rootNode(), uint8_t(8), 5}};
-    const FrontierCutView cut{first, second};
+    const std::array<FrontierEntry, 3> cut{first[0], first[1], second[0]};
     std::array<ResolvedFrontierEntry, 3> output{};
 
     const std::span<ResolvedFrontierEntry> resolved =
@@ -502,9 +500,9 @@ TEST(Frontier, RenderQueryTracksCachedRebuildsAndApiSwitches)
     {
         const FrontierResultView handles =
             referenceQuery.selectFrontier(scene.database, view, {});
-        std::vector<ResolvedFrontierEntry> expected(handles.currentSize());
+        std::vector<ResolvedFrontierEntry> expected(handles.size());
         const std::span<ResolvedFrontierEntry> resolved =
-            scene.database.resolveFrontier(handles.current(), expected);
+            scene.database.resolveFrontier(handles.entries, expected);
         ASSERT_EQ(resolved.size(), expected.size());
 
         const RenderFrontierView render =
@@ -590,7 +588,7 @@ TEST(Frontier, RenderAsUnitCoarsensOnlyDescendantFrustumCulling)
     scene.database.applyUpdates(0);
         exactPayloads = payloads(
             scene.database,
-            exactQuery.selectFrontier(scene.database, camera, {}), false);
+            exactQuery.selectFrontier(scene.database, camera, {}));
         if (exactPayloads.size() == 1) break;
     }
     ASSERT_EQ(exactPayloads.size(), 1u)
@@ -636,8 +634,7 @@ TEST(Frontier, RenderAsUnitCoarsensOnlyDescendantFrustumCulling)
 
     // The normal handle API remains descendant-exact despite the render hint.
     EXPECT_EQ(payloads(scene.database,
-                       exactQuery.selectFrontier(scene.database, camera, {}),
-                       false),
+                       exactQuery.selectFrontier(scene.database, camera, {})),
               exactPayloads);
 
     // Policy changes invalidate the cached render record immediately.
@@ -681,11 +678,10 @@ TEST(Frontier, FullyRefinedBoundaryTraversalMatchesTheGeneralWalker)
 
         const std::vector<UserPayload> fast = payloads(
             fastDatabase,
-            fastQuery.selectFrontier(fastDatabase, camera, {}), false);
+            fastQuery.selectFrontier(fastDatabase, camera, {}));
         const std::vector<UserPayload> reference = payloads(
             referenceDatabase,
-            referenceQuery.selectFrontier(referenceDatabase, camera, {}),
-            false);
+            referenceQuery.selectFrontier(referenceDatabase, camera, {}));
         EXPECT_EQ(fast, reference);
         if (fast.empty() || fast.size() == 16) continue;
 
@@ -725,7 +721,7 @@ TEST(Frontier, TerminalRenderRangesMatchTheFullyRefinedCurrentCut)
 
         std::vector<UserPayload> reference = payloads(
             database,
-            referenceQuery.selectFrontier(database, camera, {}), false);
+            referenceQuery.selectFrontier(database, camera, {}));
         const TerminalRenderView terminal =
             terminalQuery.select(database, camera);
         std::vector<UserPayload> ranged;
@@ -818,7 +814,7 @@ TEST(Frontier, TerminalActorBatchMatchesMountedYawedInstance)
         mountedDatabase.applyUpdates(0);
         exact = payloads(
             mountedDatabase,
-            mountedQuery.selectFrontier(mountedDatabase, camera, {}), false);
+            mountedQuery.selectFrontier(mountedDatabase, camera, {}));
         std::sort(exact.begin(), exact.end());
         EXPECT_EQ(terminalPayloads(batchQuery, camera, false), exact);
         if (!exact.empty() && exact.size() != 16)

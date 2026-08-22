@@ -21,8 +21,9 @@ Frontier requires C++20.
   renderable node. The API does not expose a `BLAS` type because definitions
   can be mounted recursively and a one-node instance needs no lower hierarchy.
 - A **frontier** or **cut** is an ancestor-free set of renderable nodes that
-  covers the visible scene. The current cut uses resources available now; the
-  ideal cut assumes every node in currently mounted topology is ready.
+  covers the visible scene. Selection returns the current cut using resources
+  available now. Optional refinement analysis describes complete finer child
+  covers below it.
 - A **hole-free** current cut has complete logical hierarchy coverage: Frontier
   retains a parent until ready descendants cover every visible branch that the
   parent represented. This does not describe mesh seams or rasterization.
@@ -908,47 +909,23 @@ struct FrontierEntry {
 
 Size: 12 bytes.
 
-### Result buckets
+### Result views
 
 ```cpp
-class FrontierCutView {
-public:
-    class iterator; // forward iterator yielding const FrontierEntry&
-
-    FrontierCutView();
-    FrontierCutView(std::span<const FrontierEntry> first,
-                    std::span<const FrontierEntry> second);
-    iterator begin() const;
-    iterator end() const;
-    size_t size() const;
-    bool empty() const;
-};
-
 struct FrontierResultView {
-    std::span<const FrontierEntry> shared;
-    std::span<const FrontierEntry> currentOnly;
-    std::span<const FrontierEntry> idealOnly;
+    std::span<const FrontierEntry> entries;
 
-    FrontierCutView current() const;
-    FrontierCutView ideal() const;
-    size_t currentSize() const;
-    size_t idealSize() const;
+    auto begin() const;
+    auto end() const;
     size_t size() const;
     bool empty() const;
 };
 ```
 
-`current()` is a zero-allocation forward range that visits `shared` and then
-`currentOnly`. `ideal()` visits `shared` and then `idealOnly`. Neither range
-copies entries or makes the buckets contiguous; references point directly into
-the source spans. The individual spans remain available for bulk operations
-and delta-only processing.
-
-`currentSize()` and `idealSize()` report the corresponding logical range sizes.
-`size()` counts all three disjoint storage buckets. A view and any cut range or
-iterator obtained from it remain valid until the underlying result storage is
-invalidated. For a view returned by `SpatialQuery`, that means its next
-selection, `reset()`, move assignment, or destruction.
+The view is the ordered, contiguous current render frontier. It is directly
+iterable, and `entries` supports bulk operations. A query-owned view remains
+valid until that query's next selection, `reset()`, move assignment, or
+destruction.
 
 ```cpp
 class FrontierResult : public FrontierResultView {
@@ -961,9 +938,39 @@ public:
 };
 ```
 
-Owns all three buckets. Copy and move operations retarget the inherited spans
-to the destination's storage. Its spans remain valid until the result is
+Owns one current entry sequence. Copy and move operations retarget the
+inherited span to the destination's storage. Its span remains valid until the result is
 modified, assigned, moved from, or destroyed.
+
+### `FrontierRefinementView`
+
+```cpp
+class FrontierRefinementView {
+public:
+    size_t groupCount() const;
+    NodeHandle parent(uint32_t groupIndex) const;
+    std::span<const FrontierEntry> children(uint32_t groupIndex) const;
+    uint32_t depth(uint32_t groupIndex) const;
+    uint32_t findGroup(NodeHandle parent) const;
+    std::span<const FrontierEntry> entries() const;
+    float threshold() const;
+    bool complete() const;
+    bool depthLimitReached() const;
+    bool nodeLimitReached() const;
+    bool empty() const;
+};
+```
+
+Each dense group index identifies one existing parent `NodeHandle` and one
+complete visible immediate-child cover. Groups are returned breadth-first;
+depth 1 replaces a node in the supplied current frontier. `entries()` is the
+concatenation of all child spans and does not itself preserve group boundaries.
+`findGroup()` returns `kInvalidIndex` when the parent has no emitted group.
+
+`complete()` means neither requested bound stopped the analysis. A false
+result is explained by `depthLimitReached()` or `nodeLimitReached()`. The view
+uses query-owned storage and remains valid until the query's next selection,
+refinement computation, `reset()`, move assignment, or destruction.
 
 ### Fixed output sinks
 
@@ -992,21 +999,8 @@ public:
 - Caller storage must remain valid and unmodified for the selection call. The
   sink does not own it.
 
-```cpp
-struct FrontierResultSink {
-    Sink<FrontierEntry> shared;
-    Sink<FrontierEntry> currentOnly;
-    Sink<FrontierEntry> idealOnly;
-
-    FrontierResultSink();
-    FrontierResultSink(Sink<FrontierEntry> shared,
-                       Sink<FrontierEntry> currentOnly,
-                       Sink<FrontierEntry> idealOnly);
-};
-```
-
-One independently sized sink per result bucket. Inspect each member's count
-and overflow state after selection.
+The fixed-output selection overload accepts one `Sink<FrontierEntry>` and
+writes the same ordered current frontier as the view-returning overload.
 
 ### Selection inputs and diagnostics
 
@@ -1025,10 +1019,10 @@ struct SelectionParams {
 ```
 
 - `PreferReadyDescendants` uses a complete ready descendant cut below an
-  unavailable ideal node when possible, and otherwise falls back to a ready
+  unavailable threshold-target node when possible, and otherwise falls back to a ready
   ancestor. It normally produces the most detailed current cut and is the
   default.
-- `PreferReadyAncestors` does not search below an unavailable ideal node. It
+- `PreferReadyAncestors` does not search below an unavailable threshold-target node. It
   falls back to a ready ancestor, normally producing fewer, coarser entries.
 - `threshold` is the screen-error refinement threshold in pixels and must be
   positive and finite.
@@ -1161,7 +1155,7 @@ FrontierResultView selectFrontier(
 void selectFrontier(const SpatialDatabase& database,
                     const Camera& camera,
                     const SelectionParams& params,
-                    FrontierResultSink& outResult);
+                    Sink<FrontierEntry>& output);
 
 void selectFrontier(const SpatialDatabase& database,
                     const Camera& camera,
@@ -1174,10 +1168,10 @@ void selectFrontier(const SpatialDatabase& database,
   controls refinement, contribution culling, and current-cut fallback policy.
   The final overload argument selects query-owned, caller-fixed, or
   caller-owned output.
-- **Returns/results:** all overloads produce the same ordered three-bucket cut.
+- **Returns/results:** all overloads produce the same ordered current cut.
   The returned view uses query-owned storage. The sink overload reports
-  truncation through its sinks. The owning overload replaces `outResult`'s
-  contents.
+  truncation through `Sink::overflowed()`. The owning overload replaces
+  `outResult`'s contents.
 - **Threading:** the function mutates the query. Do not select concurrently on
   one query. Distinct queries may read the same published database snapshot
   concurrently.
@@ -1200,6 +1194,51 @@ void selectFrontier(const SpatialDatabase& database,
   two small candidate keys and never copy a cut; damping, usage tracking,
   caller sinks, and owning-result overloads use the normal path.
 
+### Refinement computation
+
+```cpp
+static constexpr uint32_t UnlimitedDepth = UINT32_MAX;
+
+FrontierRefinementView computeFrontierRefinement(
+    const SpatialDatabase& database,
+    FrontierResultView current,
+    uint32_t maxDepth,
+    uint32_t maxNodes = UINT32_MAX);
+```
+
+This opt-in query walks downward from the immediately preceding current
+frontier using the exact damped camera and selection context retained by the
+query. It skips TLAS discovery and top-level contribution culling, but performs
+the local frustum, placement, overlay, error-clamp, and projected-error work
+needed to produce valid child covers.
+
+- `current` must describe the complete result of this query's immediately
+  preceding handle selection. A non-overflowed fixed sink can be wrapped in a
+  view over its caller-owned written storage; an owning `FrontierResult` can be
+  passed directly. The exact storage and entry bytes must remain unchanged
+  until this call. A render-native selection cannot be used as the source.
+- `database` must be the bound database and its published mapping, spatial, and
+  content versions must be unchanged since selection.
+- `maxDepth` is measured in refinement transitions below current and must be
+  positive. `UnlimitedDepth` requests exhaustive traversal of mounted
+  threshold-directed topology.
+- `maxNodes` limits the total child entries stored. A group is committed only
+  if all of its children fit, so the result never contains a partial coverage
+  group. `UINT32_MAX` removes this bound.
+- The method is read-only and policy-free: it does not alter readiness, choose
+  a target cut, or manage external resources.
+- A current entry already finer than the implicit threshold target is never
+  coarsened. Unmounted topology is not invented.
+
+`depthLimitReached()` is conservative at the horizon: it becomes true when an
+over-threshold boundary entry has finer mounted topology. Child visibility
+beyond the requested depth is deliberately not evaluated merely to refine this
+diagnostic.
+
+To derive a candidate cut, start with `current`, then apply chosen groups only
+when their parent is present in that cut. The application owns byte budgets,
+priorities, async request state, and aggregation across cameras.
+
 ### Reset and storage
 
 ```cpp
@@ -1211,7 +1250,7 @@ size_t bytes() const;
 pending usage, last counters, and current output while retaining allocations,
 reuse mode, and configured half-life. Call it for camera cuts or teleports.
 `bytes()` returns retained query/cache/scratch capacity in bytes, including
-any recurring-view output snapshots.
+any recurring-view output snapshots and retained refinement buffers.
 
 ### `TerminalRenderQuery`
 

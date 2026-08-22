@@ -31,9 +31,13 @@ library's macro-based public payload customization.
 - `BM_SharedNodeReadinessFanout` toggles one house definition node shared by
   32, 128, or 400 mounted houses and measures complete coverage propagation.
 - `BM_MixedReadinessFrontier` compares ancestor- and descendant-preferring
-  current cuts on a hierarchy where an unavailable ideal node has a complete
-  ready descendant cover. Counters report current, ideal, physically stored
-  bucket-entry counts, and retained query bytes.
+  current cuts on a hierarchy where an unavailable threshold target has a
+  complete ready descendant cover. Counters report current entries and
+  retained query bytes.
+- `BM_UnavailableThresholdGap` isolates the extreme current-root case with
+  4,096 or 32,768 unavailable target leaves. It verifies that current-only
+  selection stops after rejecting descendant coverage instead of walking or
+  storing the implicit target cut under either current-cut policy.
 - `BM_SharedNodeReadinessLargeFanout` extends shared-readiness propagation to
   1,024 and 10,000 placements of one definition node.
 - `BM_MountUnmountLifecycle` measures steady-state mount/unmount operations in

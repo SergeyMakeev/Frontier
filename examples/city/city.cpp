@@ -997,8 +997,9 @@ private:
         ImGui::Text("%u cars | %u pedestrians",
                     unsigned(carHandles_.size()),
                     unsigned(pedestrianHandles_.size()));
-        ImGui::Text("Current cut %u | ideal %u", lastCurrentSize_,
-                    lastIdealSize_);
+        ImGui::Text("Current cut %u", lastCurrentSize_);
+        ImGui::Text("Refinement %u groups | %u entries",
+                    lastRefinementGroups_, lastRefinementEntries_);
         ImGui::Text("Resources ready %u", resourcesPublished_);
         ImGui::Text("Query cache %u reused | %u walked",
                     lastQueryReused_, lastQueryWalked_);
@@ -1432,7 +1433,6 @@ private:
                               Payload payload, bool defaultOpen = false)
     {
         const uint32_t current = payloadCount(currentPayloadCounts_, payload);
-        const uint32_t ideal = payloadCount(idealPayloadCounts_, payload);
         const ImVec4 color = current != 0
                                  ? payloadUiColor(payload)
                                  : ImVec4(0.52f, 0.52f, 0.56f, 1.0f);
@@ -1443,7 +1443,7 @@ private:
         if (defaultOpen)
             flags |= ImGuiTreeNodeFlags_DefaultOpen;
         const bool open = ImGui::TreeNodeEx(
-            id, flags, "%s  [current %u | ideal %u]", label, current, ideal);
+            id, flags, "%s  [current %u]", label, current);
         ImGui::PopStyleColor();
         return open;
     }
@@ -1452,7 +1452,6 @@ private:
                              Payload payload)
     {
         const uint32_t current = payloadCount(currentPayloadCounts_, payload);
-        const uint32_t ideal = payloadCount(idealPayloadCounts_, payload);
         const ImVec4 color = current != 0
                                  ? payloadUiColor(payload)
                                  : ImVec4(0.52f, 0.52f, 0.56f, 1.0f);
@@ -1462,7 +1461,7 @@ private:
             ImGuiTreeNodeFlags_Leaf |
                 ImGuiTreeNodeFlags_NoTreePushOnOpen |
                 ImGuiTreeNodeFlags_SpanAvailWidth,
-            "%s  [current %u | ideal %u]", label, current, ideal);
+            "%s  [current %u]", label, current);
         ImGui::PopStyleColor();
     }
 
@@ -1479,7 +1478,7 @@ private:
         }
         ImGui::TextWrapped(
             "Live Frontier topology. Bright nodes participate in the current "
-            "cut; values show current / ideal selected entries.");
+            "cut; values show current selected entries.");
         ImGui::Separator();
 
         const uint32_t staticCount = houseCount_ + towerCount_ + treeCount_;
@@ -1718,26 +1717,19 @@ private:
     void updateFrontierStats(const FrontierResultView& frontier)
     {
         currentPayloadCounts_.fill(0);
-        idealPayloadCounts_.fill(0);
         if (showSceneHierarchy_)
         {
-            const auto countCut = [&](const auto& cut, auto& counts)
+            for (const FrontierEntry& entry : frontier)
             {
-                for (const FrontierEntry& entry : cut)
-                {
-                    const UserPayload rawPayload =
-                        database_.tryGetPayload(entry.nodeHandle);
-                    const size_t slot = size_t(rawPayload);
-                    if (rawPayload != kInvalidPayload &&
-                        slot < kPayloadSlotCount)
-                        ++counts[slot];
-                }
-            };
-            countCut(frontier.current(), currentPayloadCounts_);
-            countCut(frontier.ideal(), idealPayloadCounts_);
+                const UserPayload rawPayload =
+                    database_.tryGetPayload(entry.nodeHandle);
+                const size_t slot = size_t(rawPayload);
+                if (rawPayload != kInvalidPayload &&
+                    slot < kPayloadSlotCount)
+                    ++currentPayloadCounts_[slot];
+            }
         }
-        lastCurrentSize_ = uint32_t(frontier.currentSize());
-        lastIdealSize_ = uint32_t(frontier.idealSize());
+        lastCurrentSize_ = uint32_t(frontier.size());
         lastQueryReused_ = query_.reused();
         lastQueryWalked_ = query_.walked();
     }
@@ -2820,7 +2812,7 @@ private:
         DebugDrawEncoder encoder;
         encoder.begin(kMainView);
         drawWorld(encoder);
-        for (const FrontierEntry& entry : frontier.current())
+        for (const FrontierEntry& entry : frontier)
         {
             const UserPayload rawPayload =
                 database_.tryGetPayload(entry.nodeHandle);
@@ -2839,18 +2831,33 @@ private:
 
     void publishVisibleResources(const FrontierResultView& frontier)
     {
-        // This is a tiny stand-in for an async GPU streamer: ideal-cut nodes
-        // become ready after first visibility and are renderable next frame.
+        // This is a tiny stand-in for an async GPU streamer. Look ahead three
+        // complete refinement levels, then publish only whole sibling groups.
         uint32_t budget = 12u * uint32_t(kDistrictCount);
-        for (const FrontierEntry& entry : frontier.ideal())
+        const FrontierRefinementView refinement =
+            query_.computeFrontierRefinement(database_, frontier, 3,
+                                             budget * 4u);
+        lastRefinementGroups_ = uint32_t(refinement.groupCount());
+        lastRefinementEntries_ = uint32_t(refinement.entries().size());
+        for (uint32_t groupIndex = 0;
+             groupIndex < refinement.groupCount(); ++groupIndex)
         {
-            if (budget == 0)
-                break;
-            if (!database_.isNodeReady(entry.nodeHandle))
+            const std::span<const FrontierEntry> children =
+                refinement.children(groupIndex);
+            uint32_t missing = 0;
+            for (const FrontierEntry& entry : children)
+                missing += !database_.isNodeReady(entry.nodeHandle);
+            if (missing > budget)
+                continue;
+
+            for (const FrontierEntry& entry : children)
             {
-                database_.markNodeReady(entry.nodeHandle);
-                --budget;
-                ++resourcesPublished_;
+                if (!database_.isNodeReady(entry.nodeHandle))
+                {
+                    database_.markNodeReady(entry.nodeHandle);
+                    --budget;
+                    ++resourcesPublished_;
+                }
             }
         }
     }
@@ -2956,12 +2963,12 @@ private:
     uint32_t towerCount_ = 0;
     uint32_t treeCount_ = 0;
     uint32_t lastCurrentSize_ = 0;
-    uint32_t lastIdealSize_ = 0;
+    uint32_t lastRefinementGroups_ = 0;
+    uint32_t lastRefinementEntries_ = 0;
     uint32_t lastQueryReused_ = 0;
     uint32_t lastQueryWalked_ = 0;
     uint32_t resourcesPublished_ = 0;
     std::array<uint32_t, kPayloadSlotCount> currentPayloadCounts_{};
-    std::array<uint32_t, kPayloadSlotCount> idealPayloadCounts_{};
     PerformanceSample performance_;
     std::array<std::array<float, kPerformanceHistorySize>,
                kPerformanceTimerCount> performanceHistory_{};

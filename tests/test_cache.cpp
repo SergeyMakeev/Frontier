@@ -69,9 +69,9 @@ TEST(QueryCache, AngularMotionMatchesUncachedSelection)
                               yawRotation(angle)});
         database.applyUpdates(0);
         const std::vector<UserPayload> actual = payloads(
-            database, cached.selectFrontier(database, camera, {}), false);
+            database, cached.selectFrontier(database, camera, {}));
         const std::vector<UserPayload> expected = payloads(
-            database, reference.selectFrontier(database, camera, {}), false);
+            database, reference.selectFrontier(database, camera, {}));
         EXPECT_EQ(actual, expected);
         totalReused += cached.reused();
     }
@@ -99,10 +99,10 @@ TEST(QueryCache, RetainsWholeInternalResultButStillFillsExternalSinks)
     const Camera camera = cameraAt(-1000.0f);
     const FrontierResultView first =
         query.selectFrontier(database, camera, {});
-    const FrontierEntry* retained = first.shared.data();
+    const FrontierEntry* retained = first.entries.data();
     const FrontierResultView second =
         query.selectFrontier(database, camera, {});
-    EXPECT_EQ(second.shared.data(), retained);
+    EXPECT_EQ(second.entries.data(), retained);
     EXPECT_EQ(query.reused(), 32u);
 
     database.moveInstance(
@@ -110,22 +110,20 @@ TEST(QueryCache, RetainsWholeInternalResultButStillFillsExternalSinks)
     database.applyUpdates(0);
     const FrontierResultView patched =
         query.selectFrontier(database, camera, {});
-    EXPECT_EQ(patched.shared.data(), retained);
-    EXPECT_EQ(patched.shared.size(), 32u);
+    EXPECT_EQ(patched.entries.data(), retained);
+    EXPECT_EQ(patched.entries.size(), 32u);
     EXPECT_EQ(query.reused(), 32u);
     EXPECT_EQ(query.walked(), 0u);
 
-    std::array<FrontierEntry, 32> shared{};
-    FrontierResultSink sink{Sink<FrontierEntry>{shared},
-                            Sink<FrontierEntry>{{}},
-                            Sink<FrontierEntry>{{}}};
+    std::array<FrontierEntry, 32> storage{};
+    Sink<FrontierEntry> sink{storage};
     query.selectFrontier(database, camera, {}, sink);
-    EXPECT_EQ(sink.shared.count(), shared.size());
-    EXPECT_EQ(sink.shared.dropped(), 0u);
+    EXPECT_EQ(sink.count(), storage.size());
+    EXPECT_EQ(sink.dropped(), 0u);
 
     const FrontierResultView afterExternal =
         query.selectFrontier(database, camera, {});
-    EXPECT_EQ(afterExternal.shared.size(), shared.size());
+    EXPECT_EQ(afterExternal.entries.size(), storage.size());
 }
 
 TEST(QueryCache, MountedStateMutationInvalidatesRecordedCut)
@@ -162,9 +160,9 @@ TEST(QueryCache, RecurringViewMemoReturnsExactCutsAndTracksSceneVersions)
     SpatialQuery reference;
     reference.setReuseEnabled(false);
     const std::vector<UserPayload> nearExpected = payloads(
-        database, reference.selectFrontier(database, nearView, {}), false);
+        database, reference.selectFrontier(database, nearView, {}));
     const std::vector<UserPayload> farExpected = payloads(
-        database, reference.selectFrontier(database, farView, {}), false);
+        database, reference.selectFrontier(database, farView, {}));
 
     SpatialQuery query;
     const Camera sequence[] = {
@@ -173,7 +171,7 @@ TEST(QueryCache, RecurringViewMemoReturnsExactCutsAndTracksSceneVersions)
     {
         const FrontierResultView result =
             query.selectFrontier(database, camera, {});
-        EXPECT_EQ(payloads(database, result, false),
+        EXPECT_EQ(payloads(database, result),
                   camera.pos.z == nearView.pos.z ? nearExpected : farExpected);
     }
     EXPECT_EQ(query.walked(), 0u);
@@ -183,7 +181,7 @@ TEST(QueryCache, RecurringViewMemoReturnsExactCutsAndTracksSceneVersions)
     database.applyUpdates(0);
     const FrontierResultView updated =
         query.selectFrontier(database, nearView, {});
-    EXPECT_EQ(payloads(database, updated, false),
+    EXPECT_EQ(payloads(database, updated),
               (std::vector<UserPayload>{11, 12}));
 }
 
@@ -236,7 +234,7 @@ TEST(QueryCache, TlasOnlyObjectsBypassEntryCaching)
     {
         const FrontierResultView result =
             query.selectFrontier(database, camera, {});
-        EXPECT_EQ(result.shared.size(), count);
+        EXPECT_EQ(result.entries.size(), count);
         EXPECT_EQ(query.reused(), 0u);
         EXPECT_EQ(query.walked(), count);
     }

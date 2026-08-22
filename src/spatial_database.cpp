@@ -58,14 +58,11 @@ inline uint32_t nextMountGeneration(uint32_t generation)
     return generation == 0 ? 1u : generation;
 }
 
-inline uint32_t frontierCount(uint32_t counts, uint32_t bucket)
-{
-    return (counts >> (bucket * 10)) & 0x3ffu;
-}
+constexpr uint32_t kFrontierInlineCountMask = (1u << 30) - 1u;
 
-inline uint32_t frontierTotal(uint32_t counts)
+inline uint32_t frontierCount(uint32_t counts)
 {
-    return frontierCount(counts, 0) + frontierCount(counts, 1) + frontierCount(counts, 2);
+    return counts & kFrontierInlineCountMask;
 }
 
 inline uint32_t frontierDependencyCount(uint32_t counts)
@@ -138,7 +135,7 @@ inline bool validSelectionCamera(const Camera& camera)
     return true;
 }
 
-inline bool frontierCountsOverflow(uint32_t counts)
+inline bool frontierCountOverflows(uint32_t counts)
 {
     return frontierDependencyCount(counts) == 3;
 }
@@ -148,10 +145,12 @@ inline uint32_t frontierOverflowIndex(uint32_t counts)
     return counts & 0x3fffffffu;
 }
 
-inline uint32_t packFrontierCounts(uint32_t shared, uint32_t currentOnly,
-                              uint32_t idealOnly, uint32_t depCount)
+inline uint32_t packFrontierCount(uint32_t count, uint32_t depCount)
 {
-    return shared | (currentOnly << 10) | (idealOnly << 20) | (depCount << 30);
+    FRONTIER_ASSERT(count <= kFrontierInlineCountMask,
+                    "frontier count does not fit inline");
+    FRONTIER_ASSERT(depCount <= 2, "frontier dependency count overflow");
+    return count | (depCount << 30);
 }
 
 inline uint8_t encodeFrontierErrorRatio(float ratio, bool above)
@@ -208,6 +207,15 @@ inline FrontierEntry makeFrontierEntry(NodeHandle node, float error, float thres
 // ownership by SpatialQuery is what makes every query a read-only SpatialDatabase operation.
 struct QueryScratch
 {
+    struct RefinementWork
+    {
+        FrontierEntry entry;
+        uint32_t depth = 0;
+        uint8_t mask = 0;
+        uint8_t padding[3]{};
+    };
+    static_assert(sizeof(RefinementWork) == 20);
+
     struct ViewMemo
     {
         Camera camera{};
@@ -229,6 +237,21 @@ struct QueryScratch
     detail::AppendBuffer<UserPayload> resolvedPayloadCurrent;
     detail::AppendBuffer<uint8_t> resolvedErrorCurrent;
     detail::AppendBuffer<RenderFrontierRun> renderRuns;
+    detail::AppendBuffer<NodeHandle> refinementParents;
+    detail::AppendBuffer<uint32_t> refinementOffsets;
+    detail::AppendBuffer<uint32_t> refinementDepths;
+    detail::AppendBuffer<FrontierEntry> refinementEntries;
+    detail::AppendBuffer<RefinementWork> refinementWork;
+    detail::AppendBuffer<FrontierEntry> refinementGroupEntries;
+    detail::AppendBuffer<uint8_t> refinementGroupMasks;
+    Camera refinementCamera{};
+    SelectionParams refinementParams{};
+    const FrontierEntry* currentData = nullptr;
+    size_t currentSize = 0;
+    uint32_t currentMappingVersion = 0;
+    uint32_t currentContentGeneration = 0;
+    uint64_t currentSpatialVersion = 0;
+    bool currentAvailable = false;
     ViewMemo viewMemo[2];
     uint64_t memoClock = 0;
     uint32_t lastSceneMappingVersion = 0;
@@ -247,17 +270,20 @@ struct QueryScratch
                    previousVisible.capacity() * sizeof(previousVisible[0]) +
                    tlasStack.capacity() * sizeof(tlasStack[0]) +
                    workers.capacity() * sizeof(SpatialDatabase::Worker) +
-                   output.shared.capacity() * sizeof(FrontierEntry) +
-                   output.currentOnly.capacity() * sizeof(FrontierEntry) +
-                   output.idealOnly.capacity() * sizeof(FrontierEntry) +
+                   output.entries.capacity() * sizeof(FrontierEntry) +
                    resolvedPayloadCurrent.capacity() * sizeof(UserPayload) +
                    resolvedErrorCurrent.capacity() * sizeof(uint8_t) +
-                   renderRuns.capacity() * sizeof(RenderFrontierRun);
+                   renderRuns.capacity() * sizeof(RenderFrontierRun) +
+                   refinementParents.capacity() * sizeof(NodeHandle) +
+                   refinementOffsets.capacity() * sizeof(uint32_t) +
+                   refinementDepths.capacity() * sizeof(uint32_t) +
+                   refinementEntries.capacity() * sizeof(FrontierEntry) +
+                   refinementWork.capacity() * sizeof(RefinementWork) +
+                   refinementGroupEntries.capacity() * sizeof(FrontierEntry) +
+                   refinementGroupMasks.capacity() * sizeof(uint8_t);
         for (const ViewMemo& memo : viewMemo)
         {
-            n += memo.output.shared.capacity() * sizeof(FrontierEntry);
-            n += memo.output.currentOnly.capacity() * sizeof(FrontierEntry);
-            n += memo.output.idealOnly.capacity() * sizeof(FrontierEntry);
+            n += memo.output.entries.capacity() * sizeof(FrontierEntry);
         }
         for (const SpatialDatabase::Worker& w : workers)
         {
@@ -267,11 +293,9 @@ struct QueryScratch
             n += w.nodeCandidates.capacity() * sizeof(uint32_t);
             n += w.ancestorCandidates.capacity() *
                  sizeof(SpatialDatabase::Worker::AncestorCandidate);
-            n += w.ancestorIdeal.capacity() *
-                 sizeof(SpatialDatabase::Worker::AncestorIdealEntry);
-            n += w.frontierBuffer.shared.capacity() * sizeof(FrontierEntry);
-            n += w.frontierBuffer.currentOnly.capacity() * sizeof(FrontierEntry);
-            n += w.frontierBuffer.idealOnly.capacity() * sizeof(FrontierEntry);
+            n += w.ancestorTarget.capacity() *
+                 sizeof(SpatialDatabase::Worker::AncestorTargetEntry);
+            n += w.frontierBuffer.entries.capacity() * sizeof(FrontierEntry);
             n += w.touched.capacity() * sizeof(uint32_t);
         }
         return n;
@@ -1322,7 +1346,8 @@ detail::PayloadWord SpatialDatabase::tryGetPayloadWord(NodeHandle h) const
 }
 
 std::span<ResolvedFrontierEntry> SpatialDatabase::resolveFrontier(
-    FrontierCutView cut, std::span<ResolvedFrontierEntry> storage) const
+    std::span<const FrontierEntry> cut,
+    std::span<ResolvedFrontierEntry> storage) const
 {
     const size_t required = cut.size();
     if (storage.size() < required) return {};
@@ -1382,7 +1407,7 @@ std::span<ResolvedFrontierEntry> SpatialDatabase::resolveFrontier(
 }
 
 bool SpatialDatabase::resolveRenderLeaves(
-    FrontierCutView cut, std::span<UserPayload> payloads,
+    std::span<const FrontierEntry> cut, std::span<UserPayload> payloads,
     std::span<uint8_t> errors) const
 {
     const size_t required = cut.size();
@@ -2327,14 +2352,13 @@ WideBoundsRef SpatialDatabase::wideBoundsFor(
     return subtreeView(rt).wideBounds();
 }
 
-SpatialDatabase::WorkItem SpatialDatabase::makeWorkItem(uint32_t slot, const Instance& inst,
-                                    uint8_t current, uint8_t ideal,
-                                    uint8_t mask) const
+SpatialDatabase::WorkItem SpatialDatabase::makeWorkItem(
+    uint32_t slot, const Instance& inst, uint8_t target, uint8_t mask) const
 {
     uint32_t sparse = kInvalidIndex;
     const WideBoundsRef wide =
         wideBoundsFor(inst, slot, slots_[slot], &sparse);
-    return WorkItem{slot, wide, current, ideal, mask, sparse};
+    return WorkItem{slot, wide, target, mask, sparse};
 }
 
 Camera SpatialDatabase::mountLocalCamera(const Camera& rootLocal,
@@ -4123,8 +4147,8 @@ CollectResult SpatialDatabase::collect(std::span<SpatialQuery* const> queries,
 // ============================================================================
 
 // One SIMD issue per kWide children: masked tri-state frustum, distance and
-// screen error, lanes = children. Surviving PLAIN LEAVES are emitted right
-// here (they are in both cuts by definition — no visit, no metadata reads);
+// screen error, lanes = children. Surviving PLAIN LEAVES needed by current are
+// emitted right here (no visit and no scalar metadata reads);
 // surviving interior/mountable nodes go onto the DFS stack with their err and
 // narrowed plane mask carried along.
 //
@@ -4134,8 +4158,8 @@ CollectResult SpatialDatabase::collect(std::span<SpatialQuery* const> queries,
 template<bool FullyReady, bool SparseOverlay, bool TrackAncestor>
 void SpatialDatabase::wideVisit(
     const WorkItem& item, const SubtreeView& pg, float errClamp, uint32_t gen,
-    InstanceId instance, uint32_t node, uint8_t mask, uint8_t currentKids,
-    uint8_t idealKids, const Camera& local, Worker& w,
+    InstanceId instance, uint32_t node, uint8_t mask, uint8_t targetKids,
+    const Camera& local, Worker& w,
     uint32_t ancestorCandidate) const
 {
     const uint32_t cc = pg.childCount(node);
@@ -4190,12 +4214,12 @@ void SpatialDatabase::wideVisit(
                     const bool ready =
                         subtrees_[slots_[item.slot()].definition]
                             .isNodeReady(c);
-                    w.addAncestorIdeal(entry, ancestorCandidate, ready);
+                    w.addAncestorTarget(entry, ancestorCandidate, ready);
                 }
                 else if constexpr (FullyReady)
-                    w.result.shared.push(entry);
+                    w.result.current.push(entry);
                 else
-                    w.emit(entry, currentKids != 0, idealKids != 0);
+                    w.result.current.push(entry);
             }
             continue;
         }
@@ -4224,12 +4248,12 @@ void SpatialDatabase::wideVisit(
             {
                 const bool ready =
                     subtrees_[slots_[item.slot()].definition].isNodeReady(c);
-                w.addAncestorIdeal(entry, ancestorCandidate, ready);
+                w.addAncestorTarget(entry, ancestorCandidate, ready);
             }
             else if constexpr (FullyReady)
-                w.result.shared.push(entry);
+                w.result.current.push(entry);
             else
-                w.emit(entry, currentKids != 0, idealKids != 0);
+                w.result.current.push(entry);
         }
 
         uint32_t inner = survivors & ~leafLanes;
@@ -4240,10 +4264,9 @@ void SpatialDatabase::wideVisit(
             const uint32_t c = blk.child[l];
             const uint8_t planes = outMasks[l];
             if constexpr (FullyReady)
-                w.nodeStack.push_back({c, errs.v[l], planes, 1, 1});
+                w.nodeStack.push_back({c, errs.v[l], planes, 1});
             else
-                w.nodeStack.push_back(
-                    {c, errs.v[l], planes, currentKids, idealKids});
+                w.nodeStack.push_back({c, errs.v[l], planes, targetKids});
             if constexpr (TrackAncestor)
                 w.nodeCandidates.push_back(ancestorCandidate);
 
@@ -4253,7 +4276,7 @@ void SpatialDatabase::wideVisit(
             // distance reaches eff * k / bar, so the gap between where this
             // node is and where that happens is how far the camera may travel
             // before this instance's cut could differ. See SpatialQuery.
-            if (w.trackMargin && (FullyReady || idealKids))
+            if (w.trackMargin && (FullyReady || targetKids))
             {
                 const float mountScale = mountTransforms_[item.slot()].scale;
                 w.maxError = std::max(w.maxError, eff.v[l] * mountScale);
@@ -4292,7 +4315,7 @@ void SpatialDatabase::emitMountedRootLeavesInside(
         {
             const uint32_t lane = uint32_t(std::countr_zero(remaining));
             remaining &= remaining - 1;
-            w.result.shared.push(makeFrontierEntry(
+            w.result.current.push(makeFrontierEntry(
                 NodeHandle{item.slot(), children.child[lane], generation},
                 screen.v[lane], w.bar, w.barInv, instance));
         }
@@ -4352,7 +4375,7 @@ void SpatialDatabase::emitMountedLeafBatchInside(
                 const uint32_t lane =
                     uint32_t(std::countr_zero(remaining));
                 remaining &= remaining - 1;
-                w.result.shared.push(makeFrontierEntry(
+                w.result.current.push(makeFrontierEntry(
                     NodeHandle{childSlot, children.child[lane],
                                mount.generation},
                     screen.v[lane], w.bar, w.barInv, instance));
@@ -4467,7 +4490,7 @@ void SpatialDatabase::runFullyReadyRootLeaves(
         publicInstanceId(InstanceId(&inst - instances_.data()));
     w.nodeStack.clear();
     wideVisit<true, false>(item, pg, rt.errClamp, gen, instance, 0,
-                           item.mask(), 1, 1, local, w);
+                           item.mask(), 1, local, w);
     FRONTIER_ASSERT(w.nodeStack.empty(),
                     "root-leaf definition produced interior work");
 }
@@ -4524,7 +4547,7 @@ bool SpatialDatabase::tryRunFullyRefinedBoundary(
             const FullyRefinedLeafRange range = plan.ranges[node];
             const uint32_t* terminal =
                 plan.terminalNodes.data() + range.begin;
-            w.result.shared.pushGenerated(
+            w.result.current.pushGenerated(
                 range.count, [&](uint32_t i)
                 {
                     return FrontierEntry{
@@ -4555,7 +4578,7 @@ bool SpatialDatabase::tryRunFullyRefinedBoundary(
             {
                 const uint32_t lane = uint32_t(std::countr_zero(leaves));
                 leaves &= leaves - 1;
-                w.result.shared.push(FrontierEntry{
+                w.result.current.push(FrontierEntry{
                     NodeHandle{item.slot(), children.child[lane], gen},
                     uint8_t(0), instance});
             }
@@ -4566,7 +4589,7 @@ bool SpatialDatabase::tryRunFullyRefinedBoundary(
                 const uint32_t lane = uint32_t(std::countr_zero(inner));
                 inner &= inner - 1;
                 w.nodeStack.push_back(
-                    {children.child[lane], 0.0f, outMasks[lane], 1, 1});
+                    {children.child[lane], 0.0f, outMasks[lane], 1});
             }
         }
     };
@@ -4622,7 +4645,7 @@ void SpatialDatabase::runSubtreeAncestorImpl(
     w.nodeStack.clear();
     w.nodeCandidates.clear();
     wideVisit<false, SparseOverlay, true>(
-        item, pg, rt.errClamp, gen, instance, 0, item.mask(), 0, 1, local, w,
+        item, pg, rt.errClamp, gen, instance, 0, item.mask(), 1, local, w,
         ancestorCandidate);
 
     while (!w.nodeStack.empty())
@@ -4643,7 +4666,7 @@ void SpatialDatabase::runSubtreeAncestorImpl(
 
         if (!(e.err > bar))
         {
-            w.addAncestorIdeal(entry, candidate, ready);
+            w.addAncestorTarget(entry, candidate, ready);
             continue;
         }
 
@@ -4652,7 +4675,7 @@ void SpatialDatabase::runSubtreeAncestorImpl(
             mountable ? mountedChildSlot(rt, i) : kInvalidIndex;
         if (mountable && childSlot == kInvalidIndex)
         {
-            w.addAncestorIdeal(entry, candidate, ready);
+            w.addAncestorTarget(entry, candidate, ready);
             continue;
         }
 
@@ -4662,13 +4685,13 @@ void SpatialDatabase::runSubtreeAncestorImpl(
         if (mountable)
         {
             w.work.push_back(
-                makeWorkItem(childSlot, inst, 0, 1, e.planes()));
+                makeWorkItem(childSlot, inst, 1, e.planes()));
             w.workCandidates.push_back(candidate);
         }
         else
         {
             wideVisit<false, SparseOverlay, true>(
-                item, pg, rt.errClamp, gen, instance, i, e.planes(), 0, 1,
+                item, pg, rt.errClamp, gen, instance, i, e.planes(), 1,
                 local, w, candidate);
         }
     }
@@ -4710,8 +4733,8 @@ void SpatialDatabase::runSubtreeImpl(const WorkItem& item,
     w.nodeStack.clear();
     const size_t stackBase = 0;
     wideVisit<FullyReady, SparseOverlay>(
-        item, pg, rt.errClamp, gen, instance, 0, item.mask(), item.current(),
-        item.ideal(), local, w);
+        item, pg, rt.errClamp, gen, instance, 0, item.mask(), item.target(),
+        local, w);
 
     while (!w.nodeStack.empty())
     {
@@ -4742,7 +4765,7 @@ void SpatialDatabase::runSubtreeImpl(const WorkItem& item,
 
             if (!(e.err > bar))
             {
-                w.result.shared.push(
+                w.result.current.push(
                     makeFrontierEntry(here, e.err, bar, w.barInv, instance));
                 continue;
             }
@@ -4753,7 +4776,7 @@ void SpatialDatabase::runSubtreeImpl(const WorkItem& item,
             if (exp)
             {
                 if (childSlot == kInvalidIndex)
-                    w.result.shared.push(
+                    w.result.current.push(
                         makeFrontierEntry(here, e.err, bar, w.barInv, instance));
                 else
                 {
@@ -4794,52 +4817,50 @@ void SpatialDatabase::runSubtreeImpl(const WorkItem& item,
                             wideVisit<true, false>(
                                 childItem, childView, childMount.errClamp,
                                 childMount.generation, instance, 0,
-                                e.planes(), 1, 1, childLocal, w);
+                                e.planes(), 1, childLocal, w);
                         }
                     }
                     else
                         w.work.push_back(
-                            makeWorkItem(childSlot, inst, 1, 1,
-                                         e.planes()));
+                            makeWorkItem(childSlot, inst, 1, e.planes()));
                 }
             }
             else
                 wideVisit<true, SparseOverlay>(item, pg, rt.errClamp, gen,
-                                               instance, i, e.planes(), 1, 1,
+                                               instance, i, e.planes(), 1,
                                                local, w);
         }
         else
         {
-            const bool current = e.current();
-            const bool ideal = e.ideal();
-            uint8_t nextCurrent = 0;
-            uint8_t nextIdeal = 0;
+            const bool target = e.target();
+            uint8_t nextTarget = 0;
 
-            // Current-only traversal happens when the ideal frontier stopped
-            // at an unavailable proxy whose descendants nevertheless form a
-            // complete ready cover. Stop at the nearest ready descendant;
-            // otherwise continue through the precomputed cover.
-            if (!ideal)
+            // Current-only traversal happens when the implicit threshold
+            // target stopped at an unavailable proxy whose descendants
+            // nevertheless form a complete ready cover. Stop at the nearest
+            // ready descendant; otherwise continue through the precomputed
+            // cover.
+            if (!target)
             {
                 if (definition.isNodeReady(i))
                 {
-                    w.result.currentOnly.push(
+                    w.result.current.push(
                         makeFrontierEntry(here, e.err, bar, w.barInv, instance));
                     continue;
                 }
-                nextCurrent = 1;
             }
             else if (!(e.err > bar))
             {
-                const bool shared = current &&
-                                    definition.isNodeReady(i);
                 const FrontierEntry entry =
                     makeFrontierEntry(here, e.err, bar, w.barInv, instance);
-                w.emit(entry, shared, true);
-                if (!current || shared) continue;
-                // The ideal proxy is unavailable, but a recursively complete
-                // ready descendant cut exists because the current walk reached it.
-                nextCurrent = 1;
+                if (definition.isNodeReady(i))
+                {
+                    w.result.current.push(entry);
+                    continue;
+                }
+                // The threshold target is unavailable, but the current walk
+                // reached it only after proving a complete ready descendant
+                // cover. Continue without making deeper LOD decisions.
             }
 
             const uint32_t m = pg.meta_[i];
@@ -4848,46 +4869,43 @@ void SpatialDatabase::runSubtreeImpl(const WorkItem& item,
             const uint32_t childSlot =
                 exp ? mountedChildSlot(rt, i) : kInvalidIndex;
 
-            if (ideal && e.err > bar && exp && childSlot == kInvalidIndex)
+            if (target && e.err > bar && exp && childSlot == kInvalidIndex)
             {
-                FRONTIER_ASSERT(!current || definition.isNodeReady(i),
+                FRONTIER_ASSERT(definition.isNodeReady(i),
                                 "unavailable current mount proxy");
-                const FrontierEntry entry =
-                    makeFrontierEntry(here, e.err, bar, w.barInv, instance);
-                w.emit(entry, current, true);
+                w.result.current.push(
+                    makeFrontierEntry(here, e.err, bar, w.barInv, instance));
                 continue;
             }
 
-            if (ideal && e.err > bar)
+            if (target && e.err > bar)
             {
                 const bool canDescend =
-                    !current ||
-                    visibleDescendantsCovered(item.slot(), i, e.planes(), inst, rootLocal,
-                                               w.trackTouches ? &w : nullptr);
-                if (current && !canDescend)
+                    visibleDescendantsCovered(
+                        item.slot(), i, e.planes(), inst, rootLocal,
+                        w.trackTouches ? &w : nullptr);
+                if (!canDescend)
                 {
                     FRONTIER_ASSERT(definition.isNodeReady(i),
                                     "uncovered current subtree");
-                    w.result.currentOnly.push(
+                    w.result.current.push(
                         makeFrontierEntry(here, e.err, bar, w.barInv, instance));
+                    continue;
                 }
-                nextCurrent = uint8_t(current && canDescend);
-                nextIdeal = 1;
+                nextTarget = 1;
             }
 
-            FRONTIER_ASSERT(nextCurrent || nextIdeal,
-                            "node has no current or ideal continuation");
             if (exp)
             {
                 FRONTIER_ASSERT(childSlot != kInvalidIndex,
                                 "uncovered mounted subtree");
                 w.work.push_back(makeWorkItem(
-                    childSlot, inst, nextCurrent, nextIdeal, e.planes()));
+                    childSlot, inst, nextTarget, e.planes()));
             }
             else
                 wideVisit<false, SparseOverlay>(
                     item, pg, rt.errClamp, gen, instance, i, e.planes(),
-                    nextCurrent, nextIdeal, local, w);
+                    nextTarget, local, w);
         }
     }
 }
@@ -4924,7 +4942,7 @@ void SpatialDatabase::runTlasRootInstance(
     const uint32_t childSlot = inst.rootSlot;
     if (!(error > params.threshold) || childSlot == kInvalidIndex)
     {
-        w.result.shared.push(makeFrontierEntry(
+        w.result.current.push(makeFrontierEntry(
             root, error, w.bar, w.barInv, outputInstance));
         return;
     }
@@ -4934,7 +4952,7 @@ void SpatialDatabase::runTlasRootInstance(
     if (fullyReady)
     {
         const WorkItem rootItem =
-            makeWorkItem(childSlot, inst, 1, 1, mask);
+            makeWorkItem(childSlot, inst, 1, mask);
         if (mountTransforms_[childSlot].rootLeavesOnly() &&
             !inst.hasOverlayList())
         {
@@ -4960,17 +4978,29 @@ void SpatialDatabase::runTlasRootInstance(
         return;
     }
 
+    const bool currentCanDescend = visibleDescendantsCovered(
+        childSlot, 0, mask, inst, local,
+        w.trackTouches ? &w : nullptr);
+    if (!currentCanDescend)
+    {
+        w.result.current.push(makeFrontierEntry(
+            root, error, w.bar, w.barInv, outputInstance));
+        // Refinement below this fallback is explicit and bounded through
+        // computeFrontierRefinement(); selection has no second cut to build.
+        return;
+    }
+
     if (params.currentCutPolicy == CurrentCutPolicy::PreferReadyAncestors)
     {
         w.work.clear();
         w.workCandidates.clear();
         w.ancestorCandidates.clear();
-        w.ancestorIdeal.clear();
+        w.ancestorTarget.clear();
 
         const uint32_t rootCandidate = w.addAncestorCandidate(
             kInvalidIndex,
             makeFrontierEntry(root, error, w.bar, w.barInv, outputInstance));
-        runSubtreeAncestor(makeWorkItem(childSlot, inst, 0, 1, mask), inst,
+        runSubtreeAncestor(makeWorkItem(childSlot, inst, 1, mask), inst,
                            local, params, rootCandidate, w);
         while (!w.work.empty())
         {
@@ -4988,21 +5018,13 @@ void SpatialDatabase::runTlasRootInstance(
         return;
     }
 
-    const bool currentCanDescend = visibleDescendantsCovered(
-        childSlot, 0, mask, inst, local,
-        w.trackTouches ? &w : nullptr);
-    if (!currentCanDescend)
-        w.result.currentOnly.push(makeFrontierEntry(
-            root, error, w.bar, w.barInv, outputInstance));
-
-    runSubtree<false>(makeWorkItem(childSlot, inst,
-                                  uint8_t(currentCanDescend), 1, mask),
+    runSubtree<false>(makeWorkItem(childSlot, inst, 1, mask),
                       inst, local, params, w);
     while (!w.work.empty())
     {
         const WorkItem item = w.work.back();
         w.work.pop_back();
-        const bool branchFullyReady = item.current() && item.ideal() &&
+        const bool branchFullyReady = item.target() &&
                                       mountedTreeFullyReady(item.slot());
         if (branchFullyReady)
             runSubtree<true>(item, inst, local, params, w);
@@ -5046,7 +5068,7 @@ void SpatialDatabase::runOrientedTlasRootInstance(
     const uint32_t childSlot = inst.rootSlot;
     if (!(error > params.threshold) || childSlot == kInvalidIndex)
     {
-        w.result.shared.push(makeFrontierEntry(
+        w.result.current.push(makeFrontierEntry(
             root, error, w.bar, w.barInv, outputInstance));
         return;
     }
@@ -5059,7 +5081,7 @@ void SpatialDatabase::runOrientedTlasRootInstance(
     if (fullyReady)
     {
         const WorkItem rootItem =
-            makeWorkItem(childSlot, inst, 1, 1, mask);
+            makeWorkItem(childSlot, inst, 1, mask);
         if (mountTransforms_[childSlot].rootLeavesOnly() &&
             !inst.hasOverlayList())
         {
@@ -5080,17 +5102,29 @@ void SpatialDatabase::runOrientedTlasRootInstance(
         return;
     }
 
+    const bool currentCanDescend = visibleDescendantsCovered(
+        childSlot, 0, mask, inst, local,
+        w.trackTouches ? &w : nullptr);
+    if (!currentCanDescend)
+    {
+        w.result.current.push(makeFrontierEntry(
+            root, error, w.bar, w.barInv, outputInstance));
+        // Refinement below this fallback is explicit and bounded through
+        // computeFrontierRefinement(); selection has no second cut to build.
+        return;
+    }
+
     if (params.currentCutPolicy == CurrentCutPolicy::PreferReadyAncestors)
     {
         w.work.clear();
         w.workCandidates.clear();
         w.ancestorCandidates.clear();
-        w.ancestorIdeal.clear();
+        w.ancestorTarget.clear();
 
         const uint32_t rootCandidate = w.addAncestorCandidate(
             kInvalidIndex,
             makeFrontierEntry(root, error, w.bar, w.barInv, outputInstance));
-        runSubtreeAncestor(makeWorkItem(childSlot, inst, 0, 1, mask), inst,
+        runSubtreeAncestor(makeWorkItem(childSlot, inst, 1, mask), inst,
                            local, params, rootCandidate, w);
         while (!w.work.empty())
         {
@@ -5108,21 +5142,13 @@ void SpatialDatabase::runOrientedTlasRootInstance(
         return;
     }
 
-    const bool currentCanDescend = visibleDescendantsCovered(
-        childSlot, 0, mask, inst, local,
-        w.trackTouches ? &w : nullptr);
-    if (!currentCanDescend)
-        w.result.currentOnly.push(makeFrontierEntry(
-            root, error, w.bar, w.barInv, outputInstance));
-
-    runSubtree<false>(makeWorkItem(childSlot, inst,
-                                  uint8_t(currentCanDescend), 1, mask),
+    runSubtree<false>(makeWorkItem(childSlot, inst, 1, mask),
                       inst, local, params, w);
     while (!w.work.empty())
     {
         const WorkItem item = w.work.back();
         w.work.pop_back();
-        const bool branchFullyReady = item.current() && item.ideal() &&
+        const bool branchFullyReady = item.target() &&
                                       mountedTreeFullyReady(item.slot());
         if (branchFullyReady)
             runSubtree<true>(item, inst, local, params, w);
@@ -5150,7 +5176,7 @@ void SpatialDatabase::runTlasFlatInstance(uint32_t instIdx,
     handle.lo = NodeHandle::kInvalidSlot |
                 ((outputInstance & 0xfffu) << NodeHandle::kSlotBits);
     handle.hi = marker;
-    w.result.shared.push(makeFrontierEntry(
+    w.result.current.push(makeFrontierEntry(
         handle,
         error, w.bar, w.barInv, outputInstance));
 }
@@ -5164,18 +5190,16 @@ void SpatialDatabase::runZeroErrorTlasFlatInstance(
     handle.lo = NodeHandle::kInvalidSlot |
                 ((outputInstance & 0xfffu) << NodeHandle::kSlotBits);
     handle.hi = instanceFlatSlots_[instIdx];
-    w.result.shared.push(makeFrontierEntry(
+    w.result.current.push(makeFrontierEntry(
         handle, 0.0f, w.bar, w.barInv, outputInstance));
 }
 
 void SpatialDatabase::selectFrontierUncached(const Camera& camera, const SelectionParams& params,
                               SpatialQuery& query, SpatialQuery* usage,
-                              FrontierResultSink& outResult) const
+                              detail::SelectionSink& outResult) const
 {
     QueryScratch& scratch = *query.scratch_;
-    outResult.shared.clear();
-    outResult.currentOnly.clear();
-    outResult.idealOnly.clear();
+    outResult.current.clear();
     scratch.retainedVisible = false;
     query.wholeReusable_ = false;
 #ifdef FRONTIER_STATS
@@ -5190,6 +5214,11 @@ void SpatialDatabase::selectFrontierUncached(const Camera& camera, const Selecti
     }
 
     const Camera damped = query.damper_.damp(camera);
+    scratch.refinementCamera = damped;
+    scratch.refinementParams = params;
+    scratch.currentMappingVersion = instanceMappingVersion_;
+    scratch.currentContentGeneration = frontierContentGeneration_;
+    scratch.currentSpatialVersion = instanceSpatialVersion_;
     const Camera tlasView =
         (tlasGlobalOffset_.x == 0.0f && tlasGlobalOffset_.y == 0.0f &&
          tlasGlobalOffset_.z == 0.0f)
@@ -5281,7 +5310,7 @@ void SpatialDatabase::selectFrontierUncached(const Camera& camera, const Selecti
         }
 
         outResult = w.result;
-        w.result = FrontierResultSink{};
+        w.result = detail::SelectionSink{};
         if (usage)
             for (const uint32_t slot : w.touched) recordMountUsage(*usage, slot);
 #ifdef FRONTIER_STATS
@@ -5405,12 +5434,8 @@ void SpatialDatabase::selectFrontierUncached(const Camera& camera, const Selecti
     for (uint32_t k = 0; k < workerCount; ++k)
     {
         Worker& w = scratch.workers[k];
-        outResult.shared.pushRange(w.frontierBuffer.shared.data(),
-                                uint32_t(w.frontierBuffer.shared.size()));
-        outResult.currentOnly.pushRange(w.frontierBuffer.currentOnly.data(),
-                                     uint32_t(w.frontierBuffer.currentOnly.size()));
-        outResult.idealOnly.pushRange(w.frontierBuffer.idealOnly.data(),
-                                   uint32_t(w.frontierBuffer.idealOnly.size()));
+        outResult.current.pushRange(w.frontierBuffer.entries.data(),
+                                    uint32_t(w.frontierBuffer.entries.size()));
         if (usage)
             for (const uint32_t slot : w.touched) recordMountUsage(*usage, slot);
 #ifdef FRONTIER_STATS
@@ -5420,7 +5445,7 @@ void SpatialDatabase::selectFrontierUncached(const Camera& camera, const Selecti
         query.stats_.wideBlocksTested += w.stats.wideBlocksTested;
         query.stats_.lanesSurvived += w.stats.lanesSurvived;
 #endif
-        w.result = FrontierResultSink{};
+        w.result = detail::SelectionSink{};
     }
 }
 
@@ -5461,6 +5486,16 @@ void SpatialQuery::reset()
         scratch_->resolvedPayloadCurrent.clear();
         scratch_->resolvedErrorCurrent.clear();
         scratch_->renderRuns.clear();
+        scratch_->refinementParents.clear();
+        scratch_->refinementOffsets.clear();
+        scratch_->refinementDepths.clear();
+        scratch_->refinementEntries.clear();
+        scratch_->refinementWork.clear();
+        scratch_->refinementGroupEntries.clear();
+        scratch_->refinementGroupMasks.clear();
+        scratch_->currentData = nullptr;
+        scratch_->currentSize = 0;
+        scratch_->currentAvailable = false;
         scratch_->segmentedRenderRequested = false;
         scratch_->renderRunsValid = false;
         scratch_->renderEntryCount = 0;
@@ -5497,7 +5532,7 @@ size_t SpatialQuery::bytes() const
     return rec_.capacity() * sizeof(Rec) +
            recCold_.capacity() * sizeof(RecCold) +
            secondDep_.capacity() * sizeof(SecondDep) +
-           overflowCounts_.capacity() * sizeof(OverflowCounts) +
+           overflowCounts_.capacity() * sizeof(OverflowCount) +
            freeOverflowCounts_.capacity() * sizeof(uint32_t) +
            store_.capacity() * sizeof(FrontierEntry) +
            resolvedPayloadStore_.capacity() * sizeof(UserPayload) +
@@ -5560,35 +5595,27 @@ void SpatialQuery::compact()
         {
             // Not reusable anyway: drop the block rather than move it.
             cold.capacity = 0;
-            if (frontierCountsOverflow(r.counts))
+            if (frontierCountOverflows(r.counts))
                 freeOverflowCounts_.push_back(frontierOverflowIndex(r.counts));
             r.counts = 0;
             if (!resolvedRecords_.empty()) resolvedRecords_[i] = 0;
             continue;
         }
-        uint32_t shared = frontierCount(r.counts, 0);
-        uint32_t current = frontierCount(r.counts, 1);
-        uint32_t ideal = frontierCount(r.counts, 2);
-        if (frontierCountsOverflow(r.counts))
-        {
-            const OverflowCounts& counts = overflowCounts_[frontierOverflowIndex(r.counts)];
-            shared = counts.shared;
-            current = counts.current;
-            ideal = counts.ideal;
-        }
-        const uint32_t count = shared + current + ideal;
+        uint32_t count = frontierCount(r.counts);
+        if (frontierCountOverflows(r.counts))
+            count = overflowCounts_[frontierOverflowIndex(r.counts)].count;
         if (count)
             std::memcpy(packed.data() + w, store_.data() + r.begin,
                         size_t(count) * sizeof(FrontierEntry));
         if (haveResolved && !resolvedRecords_.empty() && resolvedRecords_[i] &&
-            shared + current != 0)
+            count != 0)
         {
             std::memcpy(resolvedPayloadsPacked.data() + w,
                         resolvedPayloadStore_.data() + r.begin,
-                        size_t(shared + current) * sizeof(UserPayload));
+                        size_t(count) * sizeof(UserPayload));
             std::memcpy(resolvedErrorsPacked.data() + w,
                         resolvedErrorStore_.data() + r.begin,
-                        size_t(shared + current) * sizeof(uint8_t));
+                        size_t(count) * sizeof(uint8_t));
         }
         r.begin = w;
         cold.capacity = count;
@@ -5606,7 +5633,7 @@ void SpatialQuery::compact()
 
 void SpatialDatabase::selectFrontierCached(const Camera& camera, const SelectionParams& params,
                             SpatialQuery& query, SpatialQuery* usage,
-                            FrontierResultSink& outResult) const
+                            detail::SelectionSink& outResult) const
 {
     QueryScratch& scratch = *query.scratch_;
     const bool segmentedRender = scratch.segmentedRenderRequested;
@@ -5626,6 +5653,11 @@ void SpatialDatabase::selectFrontierCached(const Camera& camera, const Selection
     // and only `dv`, which is what makes the reuse argument about the envelope
     // rather than about the camera.
     const Camera dv = query.damper_.damp(camera);
+    scratch.refinementCamera = dv;
+    scratch.refinementParams = params;
+    scratch.currentMappingVersion = instanceMappingVersion_;
+    scratch.currentContentGeneration = frontierContentGeneration_;
+    scratch.currentSpatialVersion = instanceSpatialVersion_;
 
     // An all-visible stream is exactly `liveInstances_` with zero plane masks.
     // If the root lanes remain wholly inside, one BVH-width test proves that
@@ -5757,9 +5789,7 @@ void SpatialDatabase::selectFrontierCached(const Camera& camera, const Selection
     bool rebuildOutput = false;
     if (!patchOutput)
     {
-        outResult.shared.clear();
-        outResult.currentOnly.clear();
-        outResult.idealOnly.clear();
+        outResult.current.clear();
         if (!segmentedRender) scratch.retainedVisible = false;
     }
 
@@ -5803,11 +5833,11 @@ void SpatialDatabase::selectFrontierCached(const Camera& camera, const Selection
                 ? 0
                 : visibleMask;
         SpatialQuery::Rec& r = query.rec_[instIdx];
-        const bool overflow = frontierCountsOverflow(r.counts);
-        const SpatialQuery::OverflowCounts* fullCounts =
+        const bool overflow = frontierCountOverflows(r.counts);
+        const SpatialQuery::OverflowCount* fullCount =
             overflow ? &query.overflowCounts_[frontierOverflowIndex(r.counts)]
                      : nullptr;
-        const uint32_t depCount = overflow ? fullCounts->dependencies
+        const uint32_t depCount = overflow ? fullCount->dependencies
                                            : frontierDependencyCount(r.counts);
 
         // Everything the record was taken under, re-checked, in one cache
@@ -5845,50 +5875,41 @@ void SpatialDatabase::selectFrontierCached(const Camera& camera, const Selection
             // recorded entries out is ~1.5% of the call at 80k instances, and
             // handing back a descriptor instead measured no better while
             // costing the caller an indirection: see SpatialQuery.
-            const uint32_t shared = overflow ? fullCounts->shared
-                                             : frontierCount(r.counts, 0);
-            const uint32_t current = overflow ? fullCounts->current
-                                              : frontierCount(r.counts, 1);
-            const uint32_t ideal = overflow ? fullCounts->ideal
-                                            : frontierCount(r.counts, 2);
+            const uint32_t count = overflow ? fullCount->count
+                                            : frontierCount(r.counts);
             if (segmentedRender)
             {
-                const uint32_t renderCount = shared + current;
-                if (renderCount != 0)
+                if (count != 0)
                 {
                     if (!query.resolvedRecords_[instIdx])
                     {
                         const std::span<const FrontierEntry> source(
-                            query.store_.data() + r.begin, renderCount);
+                            query.store_.data() + r.begin, count);
                         const std::span<UserPayload> payloads(
                             query.resolvedPayloadStore_.data() + r.begin,
-                            renderCount);
+                            count);
                         const std::span<uint8_t> errors(
                             query.resolvedErrorStore_.data() + r.begin,
-                            renderCount);
-                        const bool resolved = resolveRenderLeaves(
-                            FrontierCutView{source, {}}, payloads, errors);
+                            count);
+                        const bool resolved =
+                            resolveRenderLeaves(source, payloads, errors);
                         FRONTIER_ASSERT(resolved,
                                         "render leaf resolution size mismatch");
                         (void)resolved;
                         query.resolvedRecords_[instIdx] = 1;
                     }
                     scratch.renderRuns.push_back(
-                        {r.begin, renderCount,
+                        {r.begin, count,
                          publicInstanceId(InstanceId(instIdx))});
-                    scratch.renderEntryCount += renderCount;
+                    scratch.renderEntryCount += count;
                 }
             }
             else if (!patchOutput && !rebuildOutput)
             {
                 SpatialQuery::RecCold& cold = query.recCold_[instIdx];
-                cold.output[0] = outResult.shared.count();
-                cold.output[1] = outResult.currentOnly.count();
-                cold.output[2] = outResult.idealOnly.count();
+                cold.output = outResult.current.count();
                 const FrontierEntry* entries = query.store_.data() + r.begin;
-                outResult.shared.pushRange(entries, shared);
-                outResult.currentOnly.pushRange(entries + shared, current);
-                outResult.idealOnly.pushRange(entries + shared + current, ideal);
+                outResult.current.pushRange(entries, count);
             }
             const float remaining =
                 r.validUntil - query.travel_ -
@@ -5929,19 +5950,12 @@ void SpatialDatabase::selectFrontierCached(const Camera& camera, const Selection
         w.trackMargin = false;
         for (const uint32_t slot : w.touched) recordUsage(slot);
 
-        const uint32_t nShared = uint32_t(w.frontierBuffer.shared.size());
-        const uint32_t nCurrent = uint32_t(w.frontierBuffer.currentOnly.size());
-        const uint32_t nIdeal = uint32_t(w.frontierBuffer.idealOnly.size());
-        const uint32_t n = nShared + nCurrent + nIdeal;
+        const uint32_t n = uint32_t(w.frontierBuffer.entries.size());
         const bool eligible = mask == 0 &&
                               w.touched.size() <= SpatialQuery::kMaxDeps;
         SpatialQuery::RecCold& cold = query.recCold_[instIdx];
-        const uint32_t oldShared = overflow ? fullCounts->shared
-                                            : frontierCount(r.counts, 0);
-        const uint32_t oldCurrent = overflow ? fullCounts->current
-                                             : frontierCount(r.counts, 1);
-        const uint32_t oldIdeal = overflow ? fullCounts->ideal
-                                           : frontierCount(r.counts, 2);
+        const uint32_t oldCount = overflow ? fullCount->count
+                                           : frontierCount(r.counts);
         if (cold.capacity < n)
         {
             query.garbage_ += cold.capacity;
@@ -5964,20 +5978,18 @@ void SpatialDatabase::selectFrontierCached(const Camera& camera, const Selection
         if (eligible && w.touched.size() == 2 && query.secondDep_.empty())
             query.secondDep_.resize_uninitialized(instances_.size());
         const uint32_t oldCounts = r.counts;
-        if (nShared <= 0x3ffu && nCurrent <= 0x3ffu && nIdeal <= 0x3ffu)
+        if (n <= kFrontierInlineCountMask)
         {
-            if (frontierCountsOverflow(oldCounts))
+            if (frontierCountOverflows(oldCounts))
                 query.freeOverflowCounts_.push_back(
                     frontierOverflowIndex(oldCounts));
-            r.counts = packFrontierCounts(nShared, nCurrent, nIdeal,
-                                          eligible
-                                              ? uint32_t(w.touched.size())
-                                              : 0u);
+            r.counts = packFrontierCount(
+                n, eligible ? uint32_t(w.touched.size()) : 0u);
         }
         else
         {
             uint32_t overflowIndex;
-            if (frontierCountsOverflow(oldCounts))
+            if (frontierCountOverflows(oldCounts))
                 overflowIndex = frontierOverflowIndex(oldCounts);
             else if (!query.freeOverflowCounts_.empty())
             {
@@ -5991,36 +6003,28 @@ void SpatialDatabase::selectFrontierCached(const Camera& camera, const Selection
                 query.overflowCounts_.emplace_back();
             }
             query.overflowCounts_[overflowIndex] = {
-                nShared, nCurrent, nIdeal,
-                eligible ? uint32_t(w.touched.size()) : 0u};
+                n, eligible ? uint32_t(w.touched.size()) : 0u};
             r.counts = packFrontierOverflow(overflowIndex);
         }
         FrontierEntry* dst = query.store_.data() + r.begin;
-        if (nShared)
-            std::memcpy(dst, w.frontierBuffer.shared.data(),
-                        size_t(nShared) * sizeof(FrontierEntry));
-        if (nCurrent)
-            std::memcpy(dst + nShared, w.frontierBuffer.currentOnly.data(),
-                        size_t(nCurrent) * sizeof(FrontierEntry));
-        if (nIdeal)
-            std::memcpy(dst + nShared + nCurrent, w.frontierBuffer.idealOnly.data(),
-                        size_t(nIdeal) * sizeof(FrontierEntry));
+        if (n)
+            std::memcpy(dst, w.frontierBuffer.entries.data(),
+                        size_t(n) * sizeof(FrontierEntry));
 
         if (!query.resolvedRecords_.empty())
         {
             query.resolvedRecords_[instIdx] = 0;
-            if (segmentedRender && nShared + nCurrent != 0)
+            if (segmentedRender && n != 0)
             {
-                const std::span<const FrontierEntry> source(
-                    dst, nShared + nCurrent);
+                const std::span<const FrontierEntry> source(dst, n);
                 const std::span<UserPayload> payloads(
                     query.resolvedPayloadStore_.data() + r.begin,
-                    nShared + nCurrent);
+                    n);
                 const std::span<uint8_t> errors(
                     query.resolvedErrorStore_.data() + r.begin,
-                    nShared + nCurrent);
-                const bool resolved = resolveRenderLeaves(
-                    FrontierCutView{source, {}}, payloads, errors);
+                    n);
+                const bool resolved =
+                    resolveRenderLeaves(source, payloads, errors);
                 FRONTIER_ASSERT(resolved,
                                 "render leaf resolution size mismatch");
                 (void)resolved;
@@ -6075,22 +6079,12 @@ void SpatialDatabase::selectFrontierCached(const Camera& camera, const Selection
 
         if (patchOutput)
         {
-            if (oldShared == nShared && oldCurrent == nCurrent &&
-                oldIdeal == nIdeal)
+            if (oldCount == n)
             {
-                if (nShared)
-                    std::memcpy(scratch.output.shared.data() + cold.output[0],
-                                w.frontierBuffer.shared.data(),
-                                size_t(nShared) * sizeof(FrontierEntry));
-                if (nCurrent)
-                    std::memcpy(
-                        scratch.output.currentOnly.data() + cold.output[1],
-                        w.frontierBuffer.currentOnly.data(),
-                        size_t(nCurrent) * sizeof(FrontierEntry));
-                if (nIdeal)
-                    std::memcpy(scratch.output.idealOnly.data() + cold.output[2],
-                                w.frontierBuffer.idealOnly.data(),
-                                size_t(nIdeal) * sizeof(FrontierEntry));
+                if (n)
+                    std::memcpy(scratch.output.entries.data() + cold.output,
+                                w.frontierBuffer.entries.data(),
+                                size_t(n) * sizeof(FrontierEntry));
             }
             else
             {
@@ -6101,55 +6095,40 @@ void SpatialDatabase::selectFrontierCached(const Camera& camera, const Selection
         else if (!segmentedRender && !rebuildOutput)
         {
             // From the walk buffer, not from the slab: same bytes, still hot.
-            cold.output[0] = outResult.shared.count();
-            cold.output[1] = outResult.currentOnly.count();
-            cold.output[2] = outResult.idealOnly.count();
-            outResult.shared.pushRange(w.frontierBuffer.shared.data(), nShared);
-            outResult.currentOnly.pushRange(w.frontierBuffer.currentOnly.data(), nCurrent);
-            outResult.idealOnly.pushRange(w.frontierBuffer.idealOnly.data(), nIdeal);
+            cold.output = outResult.current.count();
+            outResult.current.pushRange(w.frontierBuffer.entries.data(), n);
         }
-        if (segmentedRender && nShared + nCurrent != 0)
+        if (segmentedRender && n != 0)
         {
             scratch.renderRuns.push_back(
-                {r.begin, nShared + nCurrent,
-                 publicInstanceId(InstanceId(instIdx))});
-            scratch.renderEntryCount += nShared + nCurrent;
+                {r.begin, n, publicInstanceId(InstanceId(instIdx))});
+            scratch.renderEntryCount += n;
         }
         ++query.walked_;
     }
 
     if (rebuildOutput)
     {
-        outResult.shared.clear();
-        outResult.currentOnly.clear();
-        outResult.idealOnly.clear();
+        outResult.current.clear();
         for (const VisibleItem visible : scratch.visible)
         {
             const uint32_t instIdx = visible.instance();
             const SpatialQuery::Rec& r = query.rec_[instIdx];
-            const bool overflow = frontierCountsOverflow(r.counts);
-            const SpatialQuery::OverflowCounts* fullCounts =
+            const bool overflow = frontierCountOverflows(r.counts);
+            const SpatialQuery::OverflowCount* fullCount =
                 overflow
                     ? &query.overflowCounts_[frontierOverflowIndex(r.counts)]
                     : nullptr;
-            const uint32_t shared = overflow ? fullCounts->shared
-                                             : frontierCount(r.counts, 0);
-            const uint32_t current = overflow ? fullCounts->current
-                                              : frontierCount(r.counts, 1);
-            const uint32_t ideal = overflow ? fullCounts->ideal
-                                            : frontierCount(r.counts, 2);
+            const uint32_t count = overflow ? fullCount->count
+                                            : frontierCount(r.counts);
             SpatialQuery::RecCold& cold = query.recCold_[instIdx];
-            cold.output[0] = outResult.shared.count();
-            cold.output[1] = outResult.currentOnly.count();
-            cold.output[2] = outResult.idealOnly.count();
+            cold.output = outResult.current.count();
             const FrontierEntry* entries = query.store_.data() + r.begin;
-            outResult.shared.pushRange(entries, shared);
-            outResult.currentOnly.pushRange(entries + shared, current);
-            outResult.idealOnly.pushRange(entries + shared + current, ideal);
+            outResult.current.pushRange(entries, count);
         }
     }
 
-    w.result = FrontierResultSink{};
+    w.result = detail::SelectionSink{};
     query.wholeReusable_ = wholeReusable;
     query.wholeMargin_ = wholeMargin;
     query.wholeMaxSlope_ = wholeMaxSlope;
@@ -6168,9 +6147,22 @@ void SpatialDatabase::selectFrontierCached(const Camera& camera, const Selection
 #endif
 }
 
-void SpatialQuery::selectFrontier(const SpatialDatabase& database, const Camera& camera,
-                             const SelectionParams& params, FrontierResultSink& outResult)
+void SpatialQuery::selectFrontierInternal(
+    const SpatialDatabase& database, const Camera& camera,
+    const SelectionParams& params, detail::SelectionSink& outResult)
 {
+    QueryScratch& scratch = *scratch_;
+    scratch.refinementParents.clear();
+    scratch.refinementOffsets.clear();
+    scratch.refinementDepths.clear();
+    scratch.refinementEntries.clear();
+    scratch.refinementWork.clear();
+    scratch.refinementGroupEntries.clear();
+    scratch.refinementGroupMasks.clear();
+    scratch.currentData = nullptr;
+    scratch.currentSize = 0;
+    scratch.currentAvailable = false;
+
     FRONTIER_CHECK(database_ == nullptr || database_ == &database,
                "SpatialQuery::selectFrontier: SpatialQuery belongs to another SpatialDatabase; call reset()");
     FRONTIER_CHECK(params.threshold > 0.0f &&
@@ -6201,13 +6193,31 @@ void SpatialQuery::selectFrontier(const SpatialDatabase& database, const Camera&
         database.selectFrontierUncached(camera, params, *this, usage, outResult);
 }
 
+void SpatialQuery::selectFrontier(const SpatialDatabase& database,
+                                  const Camera& camera,
+                                  const SelectionParams& params,
+                                  Sink<FrontierEntry>& output)
+{
+    detail::SelectionSink sink{output};
+    selectFrontierInternal(database, camera, params, sink);
+    output = sink.current;
+    QueryScratch& scratch = *scratch_;
+    scratch.currentData = output.data_;
+    scratch.currentSize = output.count();
+    scratch.currentAvailable = !output.overflowed();
+}
+
 void SpatialQuery::selectFrontier(const SpatialDatabase& database, const Camera& camera,
                              const SelectionParams& params,
                              FrontierResult& outResult)
 {
-    FrontierResultSink sink = SpatialDatabase::makeSink(outResult.buffers_);
-    selectFrontier(database, camera, params, sink);
+    detail::SelectionSink sink = SpatialDatabase::makeSink(outResult.buffers_);
+    selectFrontierInternal(database, camera, params, sink);
     outResult.sync();
+    QueryScratch& scratch = *scratch_;
+    scratch.currentData = outResult.entries.data();
+    scratch.currentSize = outResult.size();
+    scratch.currentAvailable = true;
 }
 
 FrontierResultView SpatialQuery::selectFrontier(const SpatialDatabase& database, const Camera& camera,
@@ -6232,6 +6242,16 @@ FrontierResultView SpatialQuery::selectFrontier(const SpatialDatabase& database,
                    "SpatialQuery::selectFrontier: invalid camera");
 
     QueryScratch& scratch = *scratch_;
+    scratch.refinementParents.clear();
+    scratch.refinementOffsets.clear();
+    scratch.refinementDepths.clear();
+    scratch.refinementEntries.clear();
+    scratch.refinementWork.clear();
+    scratch.refinementGroupEntries.clear();
+    scratch.refinementGroupMasks.clear();
+    scratch.currentData = nullptr;
+    scratch.currentSize = 0;
+    scratch.currentAvailable = false;
     const bool memoEligible =
         reuseEnabled_ && !mountUsageEnabled_ && damper_.halfLife() == 0.0f &&
         database.flatInstanceCount_ != database.liveInstances_.size();
@@ -6264,13 +6284,23 @@ FrontierResultView SpatialQuery::selectFrontier(const SpatialDatabase& database,
                 database.frontierContentGeneration_;
             scratch.lastSceneSpatialVersion = database.instanceSpatialVersion_;
             scratch.haveLastScene = true;
-            return memo.output.view();
+            scratch.refinementCamera = camera;
+            scratch.refinementParams = params;
+            scratch.currentMappingVersion = database.instanceMappingVersion_;
+            scratch.currentContentGeneration =
+                database.frontierContentGeneration_;
+            scratch.currentSpatialVersion = database.instanceSpatialVersion_;
+            const FrontierResultView result = memo.output.view();
+            scratch.currentData = result.entries.data();
+            scratch.currentSize = result.size();
+            scratch.currentAvailable = true;
+            return result;
         }
     }
 
     detail::FrontierBuffers& output = scratch_->output;
-    FrontierResultSink sink = SpatialDatabase::makeSink(output, true);
-    selectFrontier(database, camera, params, sink);
+    detail::SelectionSink sink = SpatialDatabase::makeSink(output, true);
+    selectFrontierInternal(database, camera, params, sink);
 
     if (memoEligible && stableScene)
     {
@@ -6326,7 +6356,269 @@ FrontierResultView SpatialQuery::selectFrontier(const SpatialDatabase& database,
     scratch.lastSceneContentGeneration = database.frontierContentGeneration_;
     scratch.lastSceneSpatialVersion = database.instanceSpatialVersion_;
     scratch.haveLastScene = memoEligible;
-    return output.view();
+    const FrontierResultView result = output.view();
+    scratch.currentData = result.entries.data();
+    scratch.currentSize = result.size();
+    scratch.currentAvailable = true;
+    return result;
+}
+
+FrontierRefinementView SpatialQuery::computeFrontierRefinement(
+    const SpatialDatabase& database, FrontierResultView current,
+    uint32_t maxDepth, uint32_t maxNodes)
+{
+    FRONTIER_CHECK(maxDepth != 0,
+                   "SpatialQuery::computeFrontierRefinement: maxDepth must "
+                   "be positive or UnlimitedDepth");
+    FRONTIER_CHECK(database_ == &database,
+                   "SpatialQuery::computeFrontierRefinement: query belongs "
+                   "to another SpatialDatabase or has not selected");
+
+    QueryScratch& scratch = *scratch_;
+    FRONTIER_CHECK(scratch.currentAvailable,
+                   "SpatialQuery::computeFrontierRefinement: no complete "
+                   "current frontier is available");
+    FRONTIER_CHECK(current.size() == scratch.currentSize &&
+                       (current.empty() ||
+                        current.entries.data() == scratch.currentData),
+                   "SpatialQuery::computeFrontierRefinement: current must be "
+                   "the immediately preceding complete selection result");
+    FRONTIER_CHECK(
+        scratch.currentMappingVersion == database.instanceMappingVersion_ &&
+            scratch.currentContentGeneration ==
+                database.frontierContentGeneration_ &&
+            scratch.currentSpatialVersion == database.instanceSpatialVersion_,
+        "SpatialQuery::computeFrontierRefinement: database changed since "
+        "selection");
+
+    scratch.refinementParents.clear();
+    scratch.refinementOffsets.clear();
+    scratch.refinementDepths.clear();
+    scratch.refinementEntries.clear();
+    scratch.refinementWork.clear();
+    scratch.refinementGroupEntries.clear();
+    scratch.refinementGroupMasks.clear();
+    scratch.refinementOffsets.push_back(0);
+
+    const Camera tlasView =
+        (database.tlasGlobalOffset_.x == 0.0f &&
+         database.tlasGlobalOffset_.y == 0.0f &&
+         database.tlasGlobalOffset_.z == 0.0f)
+            ? scratch.refinementCamera
+            : toLocal(scratch.refinementCamera,
+                      database.tlasGlobalOffset_, 1.0f);
+    const float threshold = scratch.refinementParams.threshold;
+    const float thresholdInv = 1.0f / threshold;
+
+    const auto denseInstance = [&](const FrontierEntry& entry)
+    {
+        const InstanceId publicId = entry.instance();
+        FRONTIER_CHECK(publicId < database.instanceHandleToDense_.size(),
+                       "SpatialQuery::computeFrontierRefinement: frontier "
+                       "entry has an invalid instance id");
+        const InstanceId dense = database.instanceHandleToDense_[publicId];
+        FRONTIER_CHECK(dense < database.instances_.size() &&
+                           database.instances_[dense].alive() &&
+                           database.publicInstanceId(dense) == publicId,
+                       "SpatialQuery::computeFrontierRefinement: frontier "
+                       "entry refers to a stale instance");
+        return dense;
+    };
+
+    const auto rootLocalCamera = [&](InstanceId dense, uint8_t mask)
+    {
+        const SpatialDatabase::Instance& instance = database.instances_[dense];
+        if (database.instanceOrientations_.empty())
+            return toLocal(tlasView, instance.pos, instance.scale, mask);
+        const YawRotation yaw = database.instanceOrientations_[dense].yaw;
+        return identityYaw(yaw)
+                   ? toLocal(tlasView, instance.pos, instance.scale, mask)
+                   : toLocal(tlasView, instance.pos, instance.scale, yaw,
+                             mask);
+    };
+
+    const auto expansionTarget = [&](const FrontierEntry& entry,
+                                     InstanceId dense, uint32_t& slot,
+                                     uint32_t& node)
+    {
+        const NodeHandle handle = entry.nodeHandle;
+        const SpatialDatabase::Instance& instance = database.instances_[dense];
+        if (handle.isTlasRoot())
+        {
+            FRONTIER_CHECK(database.resolveTlasRoot(handle) == dense,
+                           "SpatialQuery::computeFrontierRefinement: stale "
+                           "TLAS root handle");
+            slot = instance.rootSlot;
+            node = 0;
+            if (slot == kInvalidIndex) return false;
+        }
+        else
+        {
+            const SpatialDatabase::SubtreeInstanceRt* owner =
+                database.resolve(handle);
+            FRONTIER_CHECK(owner != nullptr &&
+                               database.mountBelongsTo(instance, handle.slot()),
+                           "SpatialQuery::computeFrontierRefinement: stale or "
+                           "unrelated mounted node handle");
+            const detail::SubtreeView& ownerView =
+                database.subtreeView(*owner);
+            if (ownerView.isMountable(handle.index()))
+            {
+                slot = database.mountedChildSlot(*owner, handle.index());
+                node = 0;
+                if (slot == kInvalidIndex) return false;
+            }
+            else
+            {
+                slot = handle.slot();
+                node = handle.index();
+            }
+        }
+
+        const SpatialDatabase::SubtreeInstanceRt& target =
+            database.slots_[slot];
+        return database.subtreeView(target).childCount(node) != 0;
+    };
+
+    const auto initialMask = [&](const FrontierEntry& entry,
+                                 InstanceId dense)
+    {
+        uint8_t mask = kAllPlanes;
+        const NodeHandle handle = entry.nodeHandle;
+        const SpatialDatabase::Instance& instance = database.instances_[dense];
+        CullState state = CullState::Outside;
+        if (handle.isTlasRoot())
+        {
+            FRONTIER_CHECK(database.resolveTlasRoot(handle) == dense,
+                           "SpatialQuery::computeFrontierRefinement: stale "
+                           "TLAS root handle");
+            state = testAabb(instance.worldBox, tlasView.frustum, mask);
+        }
+        else
+        {
+            const SpatialDatabase::SubtreeInstanceRt* placement =
+                database.resolve(handle);
+            FRONTIER_CHECK(
+                placement != nullptr &&
+                    database.mountBelongsTo(instance, handle.slot()),
+                "SpatialQuery::computeFrontierRefinement: stale or unrelated "
+                "mounted node handle");
+            const Camera rootLocal = rootLocalCamera(dense, kAllPlanes);
+            const Camera local = database.mountLocalCamera(
+                rootLocal, handle.slot(), kAllPlanes);
+            const AABB bounds = database.effectiveNodeBounds(
+                instance, handle.slot(), *placement, handle.index());
+            state = testAabb(bounds, local.frustum, mask);
+        }
+        FRONTIER_CHECK(state != CullState::Outside,
+                       "SpatialQuery::computeFrontierRefinement: current "
+                       "contains a node outside the retained view");
+        return mask;
+    };
+
+    for (const FrontierEntry& entry : current)
+    {
+        if (!entry.overThreshold()) continue;
+        const InstanceId dense = denseInstance(entry);
+        scratch.refinementWork.push_back(
+            QueryScratch::RefinementWork{entry, 0, initialMask(entry, dense)});
+    }
+
+    bool depthLimitReached = false;
+    bool nodeLimitReached = false;
+    size_t cursor = 0;
+    while (cursor < scratch.refinementWork.size())
+    {
+        const QueryScratch::RefinementWork work =
+            scratch.refinementWork[cursor++];
+        const InstanceId dense = denseInstance(work.entry);
+        uint32_t slot = kInvalidIndex;
+        uint32_t node = kInvalidIndex;
+        if (!expansionTarget(work.entry, dense, slot, node)) continue;
+
+        if (work.depth >= maxDepth)
+        {
+            depthLimitReached = true;
+            continue;
+        }
+
+        const SpatialDatabase::Instance& instance = database.instances_[dense];
+        const SpatialDatabase::SubtreeInstanceRt& placement =
+            database.slots_[slot];
+        const detail::SubtreeView& subtree = database.subtreeView(placement);
+        const Camera rootLocal = rootLocalCamera(dense, work.mask);
+        const Camera local =
+            database.mountLocalCamera(rootLocal, slot, work.mask);
+        const SpatialDatabase::Overlay* overlay =
+            database.findOverlay(instance, slot);
+
+        scratch.refinementGroupEntries.clear();
+        scratch.refinementGroupMasks.clear();
+        uint32_t child = node + 1;
+        const uint32_t childCount = subtree.childCount(node);
+        for (uint32_t i = 0; i < childCount; ++i)
+        {
+            uint8_t childMask = work.mask;
+            const AABB bounds =
+                database.nodeBoundsFrom(overlay, subtree, child);
+            if (testAabb(bounds, local.frustum, childMask) !=
+                CullState::Outside)
+            {
+                const float geometricError =
+                    std::min(subtree.geometricError_[child],
+                             placement.errClamp);
+                const float error =
+                    geometricError > 0.0f
+                        ? screenError(geometricError, local.k,
+                                      distanceToBox(bounds, local.queryMin(),
+                                                    local.queryMax()))
+                        : 0.0f;
+                scratch.refinementGroupEntries.push_back(makeFrontierEntry(
+                    NodeHandle{slot, child, placement.generation()}, error,
+                    threshold, thresholdInv, work.entry.instance()));
+                scratch.refinementGroupMasks.push_back(childMask);
+            }
+            child += subtree.subtreeSize_[child];
+        }
+
+        const uint32_t groupSize =
+            uint32_t(scratch.refinementGroupEntries.size());
+        if (groupSize == 0) continue;
+        const uint32_t emitted =
+            uint32_t(scratch.refinementEntries.size());
+        if (emitted > maxNodes || groupSize > maxNodes - emitted)
+        {
+            nodeLimitReached = true;
+            break;
+        }
+
+        const uint32_t groupDepth = work.depth + 1;
+        scratch.refinementParents.push_back(work.entry.nodeHandle);
+        scratch.refinementDepths.push_back(groupDepth);
+        scratch.refinementEntries.append(
+            scratch.refinementGroupEntries.data(), groupSize);
+        scratch.refinementOffsets.push_back(
+            uint32_t(scratch.refinementEntries.size()));
+
+        for (uint32_t i = 0; i < groupSize; ++i)
+        {
+            const FrontierEntry& childEntry =
+                scratch.refinementGroupEntries[i];
+            if (!childEntry.overThreshold()) continue;
+            scratch.refinementWork.push_back(QueryScratch::RefinementWork{
+                childEntry, groupDepth, scratch.refinementGroupMasks[i]});
+        }
+    }
+
+    return FrontierRefinementView{
+        {scratch.refinementParents.data(),
+         scratch.refinementParents.size()},
+        {scratch.refinementOffsets.data(),
+         scratch.refinementOffsets.size()},
+        {scratch.refinementDepths.data(), scratch.refinementDepths.size()},
+        {scratch.refinementEntries.data(),
+         scratch.refinementEntries.size()},
+        threshold, depthLimitReached, nodeLimitReached};
 }
 
 RenderFrontierView SpatialQuery::selectRenderFrontier(
@@ -6348,8 +6640,9 @@ RenderFrontierView SpatialQuery::selectRenderFrontier(
                 scratch.segmentedRenderRequested = false;
             }
         } guard{scratch};
-        FrontierResultSink discard;
-        selectFrontier(database, camera, params, discard);
+        detail::SelectionSink discard;
+        selectFrontierInternal(database, camera, params, discard);
+        scratch.currentAvailable = false;
         return {
             std::span<const UserPayload>(resolvedPayloadStore_.data(),
                                          resolvedPayloadStore_.size()),
@@ -6364,11 +6657,11 @@ RenderFrontierView SpatialQuery::selectRenderFrontier(
     // hierarchical records. Materialize one contiguous fallback run so the
     // renderer consumes the same scatter/gather interface in every mode.
     const FrontierResultView frontier = selectFrontier(database, camera, params);
-    const size_t count = frontier.currentSize();
+    const size_t count = frontier.size();
     scratch.resolvedPayloadCurrent.resize_uninitialized(count);
     scratch.resolvedErrorCurrent.resize_uninitialized(count);
     const bool resolved = database.resolveRenderLeaves(
-        frontier.current(),
+        frontier.entries,
         std::span<UserPayload>(scratch.resolvedPayloadCurrent.data(), count),
         std::span<uint8_t>(scratch.resolvedErrorCurrent.data(), count));
     FRONTIER_ASSERT(resolved,
@@ -6380,7 +6673,7 @@ RenderFrontierView SpatialQuery::selectRenderFrontier(
         FRONTIER_CHECK(count <= UINT32_MAX,
                        "render frontier exceeds 32-bit run capacity");
         uint32_t index = 0;
-        for (const FrontierEntry& entry : frontier.current())
+        for (const FrontierEntry& entry : frontier)
         {
             const InstanceId instance = entry.instance();
             if (scratch.renderRuns.empty() ||
@@ -6393,6 +6686,7 @@ RenderFrontierView SpatialQuery::selectRenderFrontier(
     }
     scratch.renderEntryCount = count;
     scratch.renderRunsValid = false;
+    scratch.currentAvailable = false;
     return {
         std::span<const UserPayload>(scratch.resolvedPayloadCurrent.data(),
                                      count),

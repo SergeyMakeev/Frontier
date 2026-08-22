@@ -34,10 +34,8 @@ designs, old APIs, optimization experiments, rejected prototypes, and
 before/after measurements. They are engineering records and are not part of
 the current integration contract.
 
-## Design proposals
+## Implemented design records
 
 - [Frontier refinement computation API](proposals/FRONTIER_REFINEMENT_API.md):
-  proposed current-only selection result and policy-free
-  `SpatialQuery::computeFrontierRefinement()` building block for bounded or
-  exhaustive streaming analysis. This API is not yet implemented and is not
-  part of the current contract.
+  rationale and invariants behind the current-only selection result and
+  policy-free `SpatialQuery::computeFrontierRefinement()` building block.

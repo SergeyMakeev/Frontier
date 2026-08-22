@@ -131,7 +131,7 @@ std::unique_ptr<AssemblyScene> buildMixedReadinessScene(uint32_t count)
     const uint32_t side =
         uint32_t(std::ceil(std::sqrt(double(count))));
 
-    // A ready coarse house C refines into ready F plus unavailable ideal node
+    // A ready coarse house C refines into ready F plus unavailable target node
     // G. G's descendants K/M/N/O form a complete ready cut. Ancestor mode
     // therefore emits C; descendant mode emits F/K/M/N/O.
     SubtreeBuilder houseBuilder;
@@ -577,9 +577,7 @@ std::array<TerminalInstanceBatch, 2> liveCityActorBatches(
 
 void consume(const FrontierResultView& cut)
 {
-    benchmark::DoNotOptimize(cut.shared.data());
-    benchmark::DoNotOptimize(cut.currentOnly.data());
-    benchmark::DoNotOptimize(cut.idealOnly.data());
+    benchmark::DoNotOptimize(cut.entries.data());
     benchmark::DoNotOptimize(cut.size());
 }
 
@@ -1132,8 +1130,7 @@ static void BM_MixedReadinessFrontier(benchmark::State& state)
         consume(cut);
     }
     state.counters["stored_entries"] = double(cut.size());
-    state.counters["current"] = double(cut.currentSize());
-    state.counters["ideal"] = double(cut.idealSize());
+    state.counters["current"] = double(cut.size());
     state.counters["query_bytes"] = double(query.bytes());
 }
 
@@ -1141,6 +1138,70 @@ BENCHMARK(BM_MixedReadinessFrontier)
     ->Args({128, 0})->Args({128, 1})
     ->Args({400, 0})->Args({400, 1})
     ->ArgNames({"houses", "ready_descendants"})
+    ->Unit(benchmark::kMicrosecond);
+
+static void BM_UnavailableThresholdGap(benchmark::State& state)
+{
+    const uint32_t depth = uint32_t(state.range(0));
+    const bool preferAncestors = state.range(1) != 0;
+    SubtreeBuilder builder;
+    uint32_t levelWidth = 1;
+    uint32_t nodeCount = 1;
+    for (uint32_t level = 0; level < depth; ++level)
+    {
+        levelWidth *= 8;
+        nodeCount += levelWidth;
+    }
+    builder.reserve(nodeCount);
+
+    UserPayload payload = 1000;
+    std::vector<SubtreeBuilder::NodeId> level{
+        builder.createNode(node(payload++, 64.0f, box(4.0f)))};
+    for (uint32_t childDepth = 1; childDepth <= depth; ++childDepth)
+    {
+        std::vector<SubtreeBuilder::NodeId> next;
+        next.reserve(level.size() * 8);
+        const float error = childDepth == depth ? 0.0f : 64.0f;
+        for (const SubtreeBuilder::NodeId parent : level)
+            for (uint32_t child = 0; child < 8; ++child)
+                next.push_back(builder.createNode(
+                    parent, node(payload++, error, box(4.0f))));
+        level.swap(next);
+    }
+
+    SpatialDatabase world;
+    SubtreeBytes bytes = builder.build();
+    const AABB bounds = detail::viewSubtreeBytes(bytes).bounds();
+    const SubtreeHandle definition =
+        world.registerSubtree(std::move(bytes));
+    const InstanceHandle instance =
+        world.instantiate(node(1, 64.0f, bounds, true));
+    world.mountSubtree(instance.rootNode(), definition);
+    world.applyUpdates(0);
+
+    SpatialQuery query;
+    query.setReuseEnabled(false);
+    SelectionParams params;
+    params.currentCutPolicy =
+        preferAncestors
+            ? CurrentCutPolicy::PreferReadyAncestors
+            : CurrentCutPolicy::PreferReadyDescendants;
+    const Camera camera = cameraAt(-20.0f);
+    FrontierResultView result;
+    for (auto _ : state)
+    {
+        result = query.selectFrontier(world, camera, params);
+        consume(result);
+    }
+    state.counters["stored_entries"] = double(result.size());
+    state.counters["target_leaves"] = double(levelWidth);
+    state.counters["query_bytes"] = double(query.bytes());
+}
+
+BENCHMARK(BM_UnavailableThresholdGap)
+    ->Args({4, 0})->Args({4, 1})
+    ->Args({5, 0})->Args({5, 1})
+    ->ArgNames({"depth", "prefer_ancestors"})
     ->Unit(benchmark::kMicrosecond);
 
 static void BM_SubtreeBuilder_ConstructCost(benchmark::State& state)

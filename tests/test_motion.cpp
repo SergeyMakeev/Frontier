@@ -282,7 +282,7 @@ TEST(Motion, LargeBoundsOverlayPromotesFromSparseToDense)
     SpatialQuery query;
     const FrontierResultView sparseResult =
         select(database, query, cameraAt(-1000.0f));
-    EXPECT_EQ(sparseResult.idealSize(), count);
+    EXPECT_EQ(refinedPayloads(database, query, sparseResult).size(), count);
 
     // Cross the one-sixteenth promotion threshold. Block zero was patched
     // above; BVH4 has twice as many half-sized blocks as BVH8.
@@ -299,7 +299,7 @@ TEST(Motion, LargeBoundsOverlayPromotesFromSparseToDense)
 
     const FrontierResultView denseResult =
         select(database, query, cameraAt(-1000.0f));
-    EXPECT_EQ(denseResult.idealSize(), count);
+    EXPECT_EQ(refinedPayloads(database, query, denseResult).size(), count);
 }
 
 TEST(Motion, MountedTransformsCompose)

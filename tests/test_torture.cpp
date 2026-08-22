@@ -123,9 +123,9 @@ TEST(Torture, RandomizedTlasChurnMatchesTheLiveInstanceModel)
         std::sort(expected.begin(), expected.end());
 
         const std::vector<UserPayload> cachedPayloads = payloads(
-            database, cached.selectFrontier(database, camera, {}), false);
+            database, cached.selectFrontier(database, camera, {}));
         const std::vector<UserPayload> uncachedPayloads = payloads(
-            database, uncached.selectFrontier(database, camera, {}), false);
+            database, uncached.selectFrontier(database, camera, {}));
         EXPECT_EQ(cachedPayloads, expected) << "step " << step;
         EXPECT_EQ(uncachedPayloads, expected) << "step " << step;
         EXPECT_EQ(TestAccess::liveInstanceSlots(database), liveCount)
@@ -221,10 +221,10 @@ TEST(Torture, RandomizedReadinessMaintainsACompleteRenderableCover)
     };
     refreshHandles();
 
-    std::vector<UserPayload> expectedIdeal;
+    std::vector<UserPayload> expectedTargets;
     for (const ModelNode& entry : model)
-        if (entry.children.empty()) expectedIdeal.push_back(entry.payload);
-    std::sort(expectedIdeal.begin(), expectedIdeal.end());
+        if (entry.children.empty()) expectedTargets.push_back(entry.payload);
+    std::sort(expectedTargets.begin(), expectedTargets.end());
 
     const std::function<bool(uint32_t, std::vector<UserPayload>&)> cover =
         [&](uint32_t index, std::vector<UserPayload>& output)
@@ -283,9 +283,9 @@ TEST(Torture, RandomizedReadinessMaintainsACompleteRenderableCover)
 
         const FrontierResultView result =
             select(database, query, camera, params);
-        EXPECT_EQ(payloads(database, result, false), expectedCurrent)
+        EXPECT_EQ(payloads(database, result), expectedCurrent)
             << "step " << step;
-        EXPECT_EQ(payloads(database, result, true), expectedIdeal)
+        EXPECT_EQ(refinedPayloads(database, query, result), expectedTargets)
             << "step " << step;
     }
 }
@@ -320,11 +320,7 @@ TEST(Torture, ParallelAndSerialSelectionAreBitIdentical)
     const FrontierResultView parallelResult =
         parallel.selectFrontier(database, camera, {});
 
-    EXPECT_TRUE(sameEntries(serialResult.shared, parallelResult.shared));
-    EXPECT_TRUE(sameEntries(serialResult.currentOnly,
-                            parallelResult.currentOnly));
-    EXPECT_TRUE(sameEntries(serialResult.idealOnly,
-                            parallelResult.idealOnly));
+    EXPECT_TRUE(sameEntries(serialResult.entries, parallelResult.entries));
 }
 
 TEST(Torture, IndependentQueriesReadOnePublishedSnapshotConcurrently)
@@ -355,14 +351,12 @@ TEST(Torture, IndependentQueriesReadOnePublishedSnapshotConcurrently)
                 {
                     const FrontierResultView result =
                         query.selectFrontier(database, camera, {});
-                    if (result.shared.size() != count ||
-                        !result.currentOnly.empty() ||
-                        !result.idealOnly.empty())
+                    if (result.entries.size() != count)
                     {
                         valid.store(false, std::memory_order_relaxed);
                         return;
                     }
-                    for (const FrontierEntry& entry : result.shared)
+                    for (const FrontierEntry& entry : result)
                     {
                         if (database.tryGetPayload(entry.nodeHandle) ==
                             kInvalidPayload)

@@ -70,27 +70,30 @@ Builder output and every mount boundary maintain:
 The runtime carries the parent's effective error ceiling as a per-placement
 scalar. It does not modify shared error arrays.
 
-## 6. Two frontiers, one traversal
+## 6. Current selection and opt-in refinement
 
-Selection returns three sequences:
-
-```text
-current = shared + currentOnly
-ideal   = shared + idealOnly
-```
-
-The current cut contains only ready definition nodes plus permanent TLAS roots
-and has complete hierarchy coverage. By default, complete ready descendants
-may replace an unavailable node; otherwise a ready parent remains selected.
+Selection returns one ordered current cut. It contains only ready definition
+nodes plus permanent TLAS roots and has complete hierarchy coverage. By
+default, complete ready descendants may replace an unavailable
+threshold-target node; otherwise a ready parent remains selected.
 `CurrentCutPolicy::PreferReadyAncestors` disables the descendant substitution
 and permits only upward fallback, producing a smaller, coarser cut. This is the
 meaning of the hole-free guarantee; it does not concern mesh seams or
-rasterization. The ideal cut assumes all known nodes are available. A missing
-mounted definition stops both cuts at its mountable parent; application
-metadata decides which definition handle to request.
+rasterization.
 
-Plain leaves emit directly. Interior and mountable nodes are decided by
-projected geometric error. Frustum plane masks narrow as traversal descends.
+Streaming analysis is a separate `computeFrontierRefinement()` call on the
+same query. It resumes below the immediately preceding current result with the
+retained camera and selection parameters, skips TLAS discovery, and emits
+complete visible immediate-child covers in breadth-first order. Depth bounds
+limit lookahead. The node bound is checked before committing a group, so a
+result never truncates sibling coverage. Unlimited depth makes exhaustive work
+explicit rather than part of every selection.
+
+A missing mounted definition stops both selection and refinement at its
+mountable parent; application metadata decides which definition handle to
+request. Plain leaves emit directly. Interior and mountable nodes are decided
+by projected geometric error. Frustum plane masks narrow as traversal
+descends.
 
 ## 7. Readiness and coverage
 

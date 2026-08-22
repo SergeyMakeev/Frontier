@@ -133,7 +133,7 @@ is reset, destroyed, or used for another selection.
 
 | Path | Use it for | Output and restrictions |
 |---|---|---|
-| `SpatialQuery` | General LOD, streaming readiness, nested mounts, nonzero error, deformed bounds | Current/ideal frontier buckets containing `FrontierEntry` handles |
+| `SpatialQuery` | General LOD, streaming readiness, nested mounts, nonzero error, deformed bounds | One current `FrontierEntry` cut plus opt-in complete-group refinement analysis |
 | `TerminalRenderQuery` | Fully resident terminal leaves with zero terminal error | Ordered `TerminalRenderRun` payload ranges; no general streaming/LOD semantics |
 | `TerminalInstanceBatch` | Large homogeneous moving cohorts | Caller-owned position/yaw streams plus one definition, constant bounds/scale/mask, consecutive ids |
 
@@ -181,18 +181,22 @@ broadphase. Cluster bounds may be reduced from current member transforms or
 supplied as conservative published envelopes. Supplied bounds must contain
 every represented actor transform for the entire query snapshot.
 
-## Readiness and current cuts
+## Readiness, current cuts, and refinement
 
-The ideal cut assumes every known node is renderable. The current cut is the
-hole-free renderable cover available now.
+Selection returns the hole-free renderable cover available now. Applications
+request bounded or exhaustive complete-child-group refinement only when they
+need streaming decisions.
 
-- `PreferReadyDescendants` uses a complete visible descendant cover when an
-  ideal node is unavailable.
+- `PreferReadyDescendants` uses a complete visible descendant cover when a
+  threshold-target node is unavailable.
 - `PreferReadyAncestors` emits the nearest ready ancestor fallback instead.
 
 Readiness changes update every placement of the affected registered
 definition node through its intrusive placement list. They do not scan
 unrelated definitions or infer relationships from equal payload values.
+`computeFrontierRefinement()` resumes below the current cut with the exact
+retained view context, returns breadth-first complete sibling groups, and
+honors depth and group-atomic node limits without choosing a streaming policy.
 
 ## Bounds and overlays
 
@@ -226,8 +230,8 @@ flags themselves.
 
 ## Correctness and measured capacity
 
-The current Debug matrix contains 452 tests across payload32/payload64 and
-BVH4/BVH8. It covers serialization, contracts, current/ideal cuts, streaming,
+The current Debug matrix contains 532 tests across payload32/payload64 and
+BVH4/BVH8. It covers serialization, contracts, current cuts and refinement, streaming,
 mounting, cache validity, motion, TLAS maintenance, parallel determinism,
 randomized churn, and concurrent snapshot reads.
 

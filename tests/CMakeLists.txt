@@ -3,6 +3,7 @@ set(FRONTIER_TEST_SOURCES
     test_math.cpp
     test_builder.cpp
     test_frontier.cpp
+    test_refinement.cpp
     test_streaming.cpp
     test_motion.cpp
     test_tlas.cpp

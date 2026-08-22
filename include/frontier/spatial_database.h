@@ -215,123 +215,91 @@ static_assert(sizeof(ResolvedFrontierEntry) ==
                   (sizeof(UserPayload) == 4 ? 8u : 16u),
               "resolved frontier entry has unexpected padding");
 
-// Zero-copy forward range over two result buckets. Iteration exhausts `first`
-// before continuing with `second`; neither bucket is copied or made contiguous.
-class FrontierCutView
-{
-public:
-    class iterator
-    {
-    public:
-        using iterator_category = std::forward_iterator_tag;
-        using iterator_concept = std::forward_iterator_tag;
-        using value_type = FrontierEntry;
-        using difference_type = std::ptrdiff_t;
-        using pointer = const FrontierEntry*;
-        using reference = const FrontierEntry&;
-
-        iterator() = default;
-
-        reference operator*() const { return *current_; }
-        pointer operator->() const { return current_; }
-
-        iterator& operator++()
-        {
-            ++current_;
-            if (firstEnd_)
-            {
-                if (current_ != firstEnd_) return *this;
-                current_ = secondBegin_;
-                firstEnd_ = nullptr;
-                if (current_ != secondEnd_) return *this;
-            }
-            else if (current_ != secondEnd_)
-            {
-                return *this;
-            }
-
-            *this = iterator{};
-            return *this;
-        }
-
-        iterator operator++(int)
-        {
-            iterator previous = *this;
-            ++*this;
-            return previous;
-        }
-
-        friend bool operator==(const iterator&, const iterator&) = default;
-
-    private:
-        friend class FrontierCutView;
-
-        iterator(std::span<const FrontierEntry> first,
-                 std::span<const FrontierEntry> second)
-            : secondBegin_(second.data()),
-              secondEnd_(second.empty() ? second.data()
-                                        : second.data() + second.size())
-        {
-            if (!first.empty())
-            {
-                current_ = first.data();
-                firstEnd_ = first.data() + first.size();
-            }
-            else if (!second.empty())
-            {
-                current_ = second.data();
-            }
-            else
-            {
-                *this = iterator{};
-            }
-        }
-
-        const FrontierEntry* current_ = nullptr;
-        const FrontierEntry* firstEnd_ = nullptr;
-        const FrontierEntry* secondBegin_ = nullptr;
-        const FrontierEntry* secondEnd_ = nullptr;
-    };
-
-    FrontierCutView() = default;
-    FrontierCutView(std::span<const FrontierEntry> first,
-                    std::span<const FrontierEntry> second)
-        : first_(first), second_(second)
-    {}
-
-    iterator begin() const { return iterator(first_, second_); }
-    iterator end() const { return {}; }
-    size_t size() const { return first_.size() + second_.size(); }
-    bool empty() const { return first_.empty() && second_.empty(); }
-
-private:
-    std::span<const FrontierEntry> first_;
-    std::span<const FrontierEntry> second_;
-};
-static_assert(sizeof(FrontierCutView) == 4 * sizeof(void*),
-              "two-span frontier cut view grew");
-
-// One traversal produces both realities without per-entry tags. The current
-// render frontier is shared + currentOnly. The fully-ready ideal frontier is
-// shared + idealOnly. A high-error ideal-side mountable node can be used
-// directly as the parent in mountSubtree().
-// Non-owning result of one SpatialQuery selection. The spans remain valid until the
-// next selection or reset on that SpatialQuery, or until the SpatialQuery is destroyed.
+// Non-owning current, renderable frontier produced by one SpatialQuery
+// selection. The span remains valid until the next selection or reset on that
+// query, or until the query is destroyed.
 struct FrontierResultView
 {
-    std::span<const FrontierEntry> shared;
-    std::span<const FrontierEntry> currentOnly;
-    std::span<const FrontierEntry> idealOnly;
+    std::span<const FrontierEntry> entries;
 
-    FrontierCutView current() const { return {shared, currentOnly}; }
-    FrontierCutView ideal() const { return {shared, idealOnly}; }
-    size_t currentSize() const { return shared.size() + currentOnly.size(); }
-    size_t idealSize() const { return shared.size() + idealOnly.size(); }
-    size_t size() const
+    auto begin() const { return entries.begin(); }
+    auto end() const { return entries.end(); }
+    size_t size() const { return entries.size(); }
+    bool empty() const { return entries.empty(); }
+};
+
+// Policy-free, non-owning hierarchy refinement analysis. A group is addressed
+// by a dense view-local index and represented by its existing parent
+// NodeHandle plus one complete visible immediate-child span. The view remains
+// valid until the next selection, refinement computation, or reset on its
+// SpatialQuery, or until that query is destroyed.
+class FrontierRefinementView
+{
+public:
+    size_t groupCount() const { return parents_.size(); }
+
+    NodeHandle parent(uint32_t groupIndex) const
     {
-        return shared.size() + currentOnly.size() + idealOnly.size();
+        FRONTIER_CHECK(groupIndex < parents_.size(),
+                       "FrontierRefinementView: group index out of range");
+        return parents_[groupIndex];
     }
-    bool empty() const { return size() == 0; }
+
+    std::span<const FrontierEntry> children(uint32_t groupIndex) const
+    {
+        FRONTIER_CHECK(groupIndex < parents_.size(),
+                       "FrontierRefinementView: group index out of range");
+        return entries_.subspan(offsets_[groupIndex],
+                                offsets_[groupIndex + 1] -
+                                    offsets_[groupIndex]);
+    }
+
+    uint32_t depth(uint32_t groupIndex) const
+    {
+        FRONTIER_CHECK(groupIndex < parents_.size(),
+                       "FrontierRefinementView: group index out of range");
+        return depths_[groupIndex];
+    }
+
+    uint32_t findGroup(NodeHandle node) const
+    {
+        for (uint32_t i = 0; i < parents_.size(); ++i)
+            if (parents_[i] == node) return i;
+        return kInvalidIndex;
+    }
+
+    std::span<const FrontierEntry> entries() const { return entries_; }
+    float threshold() const { return threshold_; }
+    bool complete() const
+    {
+        return !depthLimitReached_ && !nodeLimitReached_;
+    }
+    bool depthLimitReached() const { return depthLimitReached_; }
+    bool nodeLimitReached() const { return nodeLimitReached_; }
+    bool empty() const { return parents_.empty(); }
+
+private:
+    friend class SpatialQuery;
+
+    FrontierRefinementView(std::span<const NodeHandle> parents,
+                           std::span<const uint32_t> offsets,
+                           std::span<const uint32_t> depths,
+                           std::span<const FrontierEntry> entries,
+                           float threshold, bool depthLimitReached,
+                           bool nodeLimitReached)
+        : parents_(parents), offsets_(offsets), depths_(depths),
+          entries_(entries), threshold_(threshold),
+          depthLimitReached_(depthLimitReached),
+          nodeLimitReached_(nodeLimitReached)
+    {}
+
+    std::span<const NodeHandle> parents_;
+    std::span<const uint32_t> offsets_;
+    std::span<const uint32_t> depths_;
+    std::span<const FrontierEntry> entries_;
+    float threshold_ = 0.0f;
+    bool depthLimitReached_ = false;
+    bool nodeLimitReached_ = false;
 };
 
 // One per-instance run in the renderer-facing cache slab. Offsets instead of
@@ -503,22 +471,13 @@ namespace detail {
 
 struct FrontierBuffers
 {
-    AppendBuffer<FrontierEntry> shared;
-    AppendBuffer<FrontierEntry> currentOnly;
-    AppendBuffer<FrontierEntry> idealOnly;
+    AppendBuffer<FrontierEntry> entries;
 
-    void clear()
-    {
-        shared.clear();
-        currentOnly.clear();
-        idealOnly.clear();
-    }
+    void clear() { entries.clear(); }
 
     FrontierResultView view() const
     {
-        return {{shared.data(), shared.size()},
-                {currentOnly.data(), currentOnly.size()},
-                {idealOnly.data(), idealOnly.size()}};
+        return {{entries.data(), entries.size()}};
     }
 };
 
@@ -566,7 +525,7 @@ private:
     detail::FrontierBuffers buffers_;
 };
 
-// How the renderable current cut replaces an unavailable ideal-cut node.
+// How the renderable current cut replaces an unavailable threshold target.
 enum class CurrentCutPolicy : uint8_t
 {
     // Prefer a complete ready descendant cut. Fall back to a ready ancestor
@@ -574,7 +533,7 @@ enum class CurrentCutPolicy : uint8_t
     // detailed renderable result and is the default.
     PreferReadyDescendants,
 
-    // Do not search below an unavailable ideal-cut node. Replace it with the
+    // Do not search below an unavailable threshold-target node. Replace it with the
     // nearest ready ancestor that can cover the affected branches. This
     // normally emits fewer, coarser entries.
     PreferReadyAncestors,
@@ -708,23 +667,25 @@ private:
     uint32_t        dropped_ = 0;
 };
 
-struct FrontierResultSink
-{
-    Sink<FrontierEntry> shared;
-    Sink<FrontierEntry> currentOnly;
-    Sink<FrontierEntry> idealOnly;
+namespace detail {
 
-    FrontierResultSink() = default;
-    FrontierResultSink(Sink<FrontierEntry> sharedSink,
-                  Sink<FrontierEntry> currentOnlySink,
-                  Sink<FrontierEntry> idealOnlySink)
-        : shared(sharedSink), currentOnly(currentOnlySink), idealOnly(idealOnlySink)
+// Selection writes only the current result. Threshold-target state remains
+// private to the traversal work items.
+struct SelectionSink
+{
+    Sink<FrontierEntry> current;
+
+    SelectionSink() = default;
+    explicit SelectionSink(Sink<FrontierEntry> currentSink)
+        : current(currentSink)
     {}
 
 private:
     friend class SpatialDatabase;
     bool retainsExisting_ = false;
 };
+
+} // namespace detail
 
 // Traversal counters, filled only when the library is built with FRONTIER_STATS.
 struct SelectionStats
@@ -834,11 +795,11 @@ struct CollectResult
 // the per-instance fixed cost (resolve the instance, transform the view, touch
 // the mounted root) was being paid over and over for an answer that never moved.
 //
-// BUCKETED OUTPUT
-// ---------------
-// Cached and uncached modes write the same three FrontierEntry sequences. Reused
-// entries are copied from SpatialQuery-owned storage into the matching caller bucket;
-// no SpatialDatabase-owned mutable query state is involved.
+// CONTIGUOUS OUTPUT
+// -----------------
+// Cached and uncached modes write the same current FrontierEntry sequence.
+// Reused entries are copied from SpatialQuery-owned storage into the caller's
+// current output; no SpatialDatabase-owned mutable query state is involved.
 //
 // WHAT IS EXACT AND WHAT IS NOT
 // -----------------------------
@@ -848,8 +809,8 @@ struct CollectResult
 // threshold classification; do not expect a cached result to reproduce a
 // freshly measured pixel error.
 //
-// Streaming demand and readiness are part of the recorded three-bucket result. Mount
-// content versions invalidate a record when any dependency changes. Instances
+// Readiness affects the recorded current result. Mount content versions
+// invalidate a record when any dependency changes. Instances
 // that cross more dependencies than the compact record can hold are
 // simply re-walked.
 // ---------------------------------------------------------------------------
@@ -908,7 +869,16 @@ public:
     // may read the same const SpatialDatabase concurrently. A query binds to the
     // first database it reads, and reset() releases that binding.
     FrontierResultView selectFrontier(const SpatialDatabase& database, const Camera& camera,
-                            const SelectionParams& params);
+                             const SelectionParams& params);
+
+    // Inspect complete visible immediate-child groups below the current
+    // frontier. `current` must be the complete result of this query's
+    // immediately preceding handle selection. A fixed sink must not have
+    // overflowed; owning results can be passed directly.
+    static constexpr uint32_t UnlimitedDepth = UINT32_MAX;
+    FrontierRefinementView computeFrontierRefinement(
+        const SpatialDatabase& database, FrontierResultView current,
+        uint32_t maxDepth, uint32_t maxNodes = UINT32_MAX);
 
     // Render-native cached query. Resolved current cuts are retained per
     // instance and returned as compact zero-copy runs. Cache hits preserve
@@ -921,7 +891,8 @@ public:
 
     // Advanced zero-copy path: write directly to fixed caller storage.
     void selectFrontier(const SpatialDatabase& database, const Camera& camera,
-                   const SelectionParams& params, FrontierResultSink& outResult);
+                        const SelectionParams& params,
+                        Sink<FrontierEntry>& output);
 
     // Explicit owning-result path for callers that must retain a frontier after the
     // next selection on this SpatialQuery.
@@ -944,6 +915,11 @@ public:
 
 private:
     friend class SpatialDatabase;
+
+    void selectFrontierInternal(const SpatialDatabase& database,
+                                const Camera& camera,
+                                const SelectionParams& params,
+                                detail::SelectionSink& output);
 
     // Mounted trees whose state this instance's frontier depended on. Every
     // descendant mutation bumps the tree root, so a city assembled from any
@@ -972,9 +948,9 @@ private:
         uint32_t epoch = 0;          // cache epoch (threshold generation)
         uint32_t frontierVersion = 0;     // unique instance transform/deform version
         uint32_t begin = 0;          // block in store_
-        // Three 10-bit counts for [shared, currentOnly, idealOnly], plus the
-        // two-bit dependency count. Dependency count 3 is an escape marker;
-        // the low 30 bits then index sparse full-width counts.
+        // One 30-bit current-frontier count plus the two-bit dependency count.
+        // Dependency count 3 is an escape marker; the low 30 bits then index
+        // a sparse full-width count.
         uint32_t counts = 0;
         // The overwhelmingly common one-mount dependency stays inline. A
         // second dependency lives in the cold spill array below.
@@ -988,10 +964,10 @@ private:
     struct RecCold
     {
         uint32_t capacity = 0;
-        uint32_t output[3]{};
+        uint32_t output = 0;
     };
-    static_assert(sizeof(RecCold) == 16,
-                  "SpatialQuery cold record must stay 16 bytes");
+    static_assert(sizeof(RecCold) == 8,
+                  "SpatialQuery cold record must stay 8 bytes");
 
     struct SecondDep
     {
@@ -1000,15 +976,13 @@ private:
     };
     static_assert(sizeof(SecondDep) == 8, "second dependency must stay 8 bytes");
 
-    struct OverflowCounts
+    struct OverflowCount
     {
-        uint32_t shared = 0;
-        uint32_t current = 0;
-        uint32_t ideal = 0;
+        uint32_t count = 0;
         uint32_t dependencies = 0;
     };
-    static_assert(sizeof(OverflowCounts) == 16,
-                  "large-frontier count spill must stay 16 bytes");
+    static_assert(sizeof(OverflowCount) == 8,
+                  "large-frontier count spill must stay 8 bytes");
 
     struct MountUseRec
     {
@@ -1048,16 +1022,15 @@ private:
     // Allocated only after a cacheable walk actually needs two dependencies.
     // Ordinary selection coalesces a whole mounted tree to its root stamp.
     detail::AppendBuffer<SecondDep> secondDep_;
-    // Sparse: allocated only for cacheable frontiers whose bucket counts do
-    // not fit the inline 10-bit fields.
-    detail::AppendBuffer<OverflowCounts> overflowCounts_;
+    // Sparse: allocated only for cacheable frontiers whose entry count does
+    // not fit the inline 30-bit field.
+    detail::AppendBuffer<OverflowCount> overflowCounts_;
     detail::AppendBuffer<uint32_t> freeOverflowCounts_;
     detail::AppendBuffer<FrontierEntry> store_;   // slab of recorded runs
-    // Lazily allocated renderer mirror of the shared + currentOnly prefix in
-    // each cached run. Payload and one-byte error streams omit the per-leaf
-    // instance id, which is invariant for the run. Ideal-only slots remain
-    // unused. One byte per instance records whether the mirror matches the
-    // handle slab.
+    // Lazily allocated renderer mirror of each cached current run. Payload and
+    // one-byte error streams omit the per-leaf instance id, which is invariant
+    // for the run. One byte per instance records whether the mirror matches
+    // the handle slab.
     detail::AppendBuffer<UserPayload> resolvedPayloadStore_;
     detail::AppendBuffer<uint8_t> resolvedErrorStore_;
     std::vector<uint8_t> resolvedRecords_;
@@ -1373,8 +1346,9 @@ public:
     void translateInstances(MotionGroup& group, float4 delta);
 
     // ---- topology streaming -------------------------------------------------
-    // A mount-point handle normally comes from a high-error ideal-side
-    // FrontierEntry. A stale handle returns an invalid placement, covering the
+    // A mount-point handle normally comes from a high-error current or
+    // refinement FrontierEntry. A stale handle returns an invalid placement,
+    // covering the
     // normal race with collection. True contract violations still fail: the
     // parent must be mountable, empty, and contain the transformed child
     // bounds.
@@ -1407,14 +1381,14 @@ public:
         return detail::decodePayload(tryGetPayloadWord(h));
     }
 
-    // Resolve one complete current or ideal cut into caller-owned render
-    // storage. Unlike repeated tryGetPayload() calls, this recognizes runs from
+    // Resolve a frontier entry span into caller-owned render storage. Unlike
+    // repeated tryGetPayload() calls, this recognizes runs from
     // the same mounted subtree, validates the placement once, and streams its
     // immutable payload array directly. Stale handles still produce
     // kInvalidPayload. Returns an empty span without writing when storage is too
     // small; otherwise the returned prefix has exactly cut.size() entries.
     std::span<ResolvedFrontierEntry> resolveFrontier(
-        FrontierCutView cut,
+        std::span<const FrontierEntry> cut,
         std::span<ResolvedFrontierEntry> storage) const;
 
     // ---- motion --------------------------------------------------------------
@@ -2113,27 +2087,26 @@ private:
     struct WorkItem
     {
         const std::byte* wideBase = nullptr;
-        // slot[20] | plane mask[6] | current[1] | ideal[1] | packed bounds[1]
+        // slot[20] | plane mask[6] | threshold target[1] | packed bounds[1]
         uint32_t      state = 0;
         // Sparse overlay index, or kInvalidIndex. This occupies WorkItem's old
         // tail padding, so sparse support does not grow the traversal stack.
         uint32_t      sparseOverlay = kInvalidIndex;
 
         WorkItem() = default;
-        WorkItem(uint32_t slot, detail::WideBoundsRef bounds, uint8_t current,
-                 uint8_t ideal, uint8_t mask,
+        WorkItem(uint32_t slot, detail::WideBoundsRef bounds, uint8_t target,
+                 uint8_t mask,
                  uint32_t sparse = kInvalidIndex)
             : wideBase(bounds.base),
               state((slot & NodeHandle::kSlotMask) |
                     (uint32_t(mask & 0x3fu) << NodeHandle::kSlotBits) |
-                    (uint32_t(current != 0) << 26) |
-                    (uint32_t(ideal != 0) << 27) |
-                    (uint32_t(bounds.stride == sizeof(WideBounds)) << 28)),
+                    (uint32_t(target != 0) << 26) |
+                    (uint32_t(bounds.stride == sizeof(WideBounds)) << 27)),
               sparseOverlay(sparse)
         {}
         const WideBounds& bounds(uint32_t block) const
         {
-            const size_t stride = (state & (1u << 28)) != 0
+            const size_t stride = (state & (1u << 27)) != 0
                                       ? sizeof(WideBounds)
                                       : sizeof(detail::WideBlock);
             return *reinterpret_cast<const WideBounds*>(
@@ -2144,36 +2117,33 @@ private:
         {
             return uint8_t((state >> NodeHandle::kSlotBits) & 0x3fu);
         }
-        bool current() const { return (state & (1u << 26)) != 0; }
-        bool ideal() const { return (state & (1u << 27)) != 0; }
+        bool target() const { return (state & (1u << 26)) != 0; }
     };
     static_assert(sizeof(WorkItem) == 16, "subtree work item must stay 16 bytes");
 
     // Node visit carried on the walk's explicit DFS stack; err and planes are
-    // computed by the parent's wide test; current/ideal identify which walks
-    // still contain the node.
+    // computed by the parent's wide test. The target bit distinguishes the
+    // threshold-directed walk from current-cover descent below an unavailable
+    // target.
     struct NodeItem
     {
         float    err;
-        // node[20] | plane mask[6] | current[1] | ideal[1]
+        // node[20] | plane mask[6] | threshold target[1]
         uint32_t state = 0;
 
         NodeItem() = default;
-        NodeItem(uint32_t node, float error, uint8_t planes, uint8_t current,
-                 uint8_t ideal)
+        NodeItem(uint32_t node, float error, uint8_t planes, uint8_t target)
             : err(error),
               state((node & NodeHandle::kIndexMask) |
                     (uint32_t(planes & 0x3fu) << NodeHandle::kIndexBits) |
-                    (uint32_t(current != 0) << 26) |
-                    (uint32_t(ideal != 0) << 27))
+                    (uint32_t(target != 0) << 26))
         {}
         uint32_t node() const { return state & NodeHandle::kIndexMask; }
         uint8_t planes() const
         {
             return uint8_t((state >> NodeHandle::kIndexBits) & 0x3fu);
         }
-        bool current() const { return (state & (1u << 26)) != 0; }
-        bool ideal() const { return (state & (1u << 27)) != 0; }
+        bool target() const { return (state & (1u << 26)) != 0; }
     };
     static_assert(sizeof(NodeItem) == 8, "node work item must stay 8 bytes");
 
@@ -2190,13 +2160,13 @@ private:
             FrontierEntry fallback;
             // Before finishAncestorCut(), the low bits hold parent + 1.
             // Afterwards they hold the selected covering candidate + 1.
-            // Zero means neither; the high bit records a failed ideal leaf.
+            // Zero means neither; the high bit records a failed target leaf.
             uint32_t state = 0;
         };
         static_assert(sizeof(AncestorCandidate) == 16,
                       "ancestor candidate must stay compact");
 
-        struct AncestorIdealEntry
+        struct AncestorTargetEntry
         {
             static constexpr uint32_t Ready = 1u << 31;
             static constexpr uint32_t CandidateMask = ~Ready;
@@ -2210,8 +2180,8 @@ private:
             }
             bool ready() const { return (candidateAndReady & Ready) != 0; }
         };
-        static_assert(sizeof(AncestorIdealEntry) == 16,
-                      "ancestor ideal entry must stay compact");
+        static_assert(sizeof(AncestorTargetEntry) == 16,
+                      "ancestor target entry must stay compact");
 
         std::vector<WorkItem> work;
         std::vector<NodeItem> nodeStack;
@@ -2222,24 +2192,14 @@ private:
         std::vector<uint32_t> workCandidates;
         std::vector<uint32_t> nodeCandidates;
         std::vector<AncestorCandidate> ancestorCandidates;
-        std::vector<AncestorIdealEntry> ancestorIdeal;
+        std::vector<AncestorTargetEntry> ancestorTarget;
 
         // Backing storage for the parallel path, where each worker collects
         // into its own buffers; the serial path points the sinks straight at
         // the caller's output instead.
         detail::FrontierBuffers frontierBuffer;
 
-        FrontierResultSink result;
-
-        void emit(const FrontierEntry& entry, bool current, bool ideal)
-        {
-            if (current && ideal)
-                result.shared.push(entry);
-            else if (current)
-                result.currentOnly.push(entry);
-            else
-                result.idealOnly.push(entry);
-        }
+        detail::SelectionSink result;
 
         uint32_t addAncestorCandidate(uint32_t parent,
                                       const FrontierEntry& fallback)
@@ -2254,13 +2214,14 @@ private:
             return id;
         }
 
-        void addAncestorIdeal(const FrontierEntry& entry, uint32_t candidate,
-                              bool ready)
+        void addAncestorTarget(const FrontierEntry& entry, uint32_t candidate,
+                               bool ready)
         {
             FRONTIER_ASSERT(candidate < ancestorCandidates.size(),
-                            "ideal entry has no ready ancestor");
-            ancestorIdeal.push_back(AncestorIdealEntry{
-                entry, candidate | (ready ? AncestorIdealEntry::Ready : 0u)});
+                            "target entry has no ready ancestor");
+            ancestorTarget.push_back(AncestorTargetEntry{
+                entry,
+                candidate | (ready ? AncestorTargetEntry::Ready : 0u)});
             if (!ready)
                 ancestorCandidates[candidate].state |=
                     AncestorCandidate::Collapsed;
@@ -2285,20 +2246,18 @@ private:
                 else if ((candidate.state & AncestorCandidate::Collapsed) != 0)
                 {
                     candidate.state = i + 1u;
-                    result.currentOnly.push(candidate.fallback);
+                    result.current.push(candidate.fallback);
                 }
                 else
                     candidate.state = 0;
             }
 
-            for (const AncestorIdealEntry& ideal : ancestorIdeal)
+            for (const AncestorTargetEntry& target : ancestorTarget)
             {
                 const bool swallowed =
-                    ancestorCandidates[ideal.candidate()].state != 0;
-                if (ideal.ready() && !swallowed)
-                    result.shared.push(ideal.entry);
-                else
-                    result.idealOnly.push(ideal.entry);
+                    ancestorCandidates[target.candidate()].state != 0;
+                if (target.ready() && !swallowed)
+                    result.current.push(target.entry);
             }
         }
 
@@ -2328,9 +2287,9 @@ private:
     }
     InstanceId resolveTlasRoot(NodeHandle h) const;
     detail::PayloadWord tryGetPayloadWord(NodeHandle h) const;
-    bool resolveRenderLeaves(FrontierCutView cut,
-                             std::span<UserPayload> payloads,
-                             std::span<uint8_t> errors) const;
+    bool resolveRenderLeaves(std::span<const FrontierEntry> cut,
+                              std::span<UserPayload> payloads,
+                              std::span<uint8_t> errors) const;
 
     uint32_t allocSubtree();
     void destroySubtree(uint32_t definition);
@@ -2381,14 +2340,11 @@ private:
     void lruTouch(uint32_t slot, uint32_t epoch);
     void consumeMountUsage(SpatialQuery& query);
     void consumeMountUsage(std::span<SpatialQuery* const> queries);
-    static FrontierResultSink makeSink(detail::FrontierBuffers& buffers,
-                                       bool retainExisting = false)
+    static detail::SelectionSink makeSink(detail::FrontierBuffers& buffers,
+                                          bool retainExisting = false)
     {
         if (!retainExisting) buffers.clear();
-        FrontierResultSink sink{
-            Sink<FrontierEntry>(buffers.shared),
-            Sink<FrontierEntry>(buffers.currentOnly),
-            Sink<FrontierEntry>(buffers.idealOnly)};
+        detail::SelectionSink sink{Sink<FrontierEntry>(buffers.entries)};
         sink.retainsExisting_ = retainExisting;
         return sink;
     }
@@ -2418,8 +2374,7 @@ private:
         const Instance& inst, uint32_t slot,
         const SubtreeInstanceRt& instance, uint32_t* sparseOverlay) const;
     WorkItem       makeWorkItem(uint32_t slot, const Instance& inst,
-                                uint8_t current, uint8_t ideal,
-                                uint8_t mask) const;
+                                uint8_t target, uint8_t mask) const;
     // Debug-only: is `slot` reachable from this instance's root mount?
     bool mountBelongsTo(const Instance& inst, uint32_t slot) const;
 
@@ -2514,7 +2469,7 @@ private:
     void wideVisit(const WorkItem& item, const detail::SubtreeView& subtree,
                    float errClamp,
                    uint32_t gen, InstanceId instance, uint32_t node, uint8_t mask,
-                   uint8_t currentKids, uint8_t idealKids,
+                   uint8_t targetKids,
                    const Camera& local, Worker& w,
                    uint32_t ancestorCandidate = kInvalidIndex) const;
     void emitMountedRootLeavesInside(const WorkItem& item,
@@ -2533,10 +2488,10 @@ private:
     void selectFrontierCached(const Camera& camera,
                               const SelectionParams& params,
                               SpatialQuery& query, SpatialQuery* usage,
-                              FrontierResultSink& outResult) const;
+                              detail::SelectionSink& outResult) const;
     void selectFrontierUncached(const Camera& camera, const SelectionParams& params,
                            SpatialQuery& query, SpatialQuery* usage,
-                           FrontierResultSink& outResult) const;
+                           detail::SelectionSink& outResult) const;
     void recordMountUsage(SpatialQuery& query, uint32_t slot) const;
 
     // ---- state ----
