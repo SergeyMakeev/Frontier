@@ -172,6 +172,10 @@ motion/database work, and virtual streaming first. The virtual-streaming total
 is decomposed into all `computeFrontierRefinement()` calls, the remaining
 application-side streaming planner, and hero-scenario checks; those three
 subtimers are diagnostic children and are not counted again in total CPU time.
+The planner is further divided into index construction, demand/group
+classification, scoring/ranking, residency policy, and residual timing. These
+are also diagnostic children and sum to the planner total rather than adding
+new frame time.
 bgfx timing and backend counters follow, with UI, camera, and diagnostic
 overhead last. Every timer has
 its own rolling raw-sample chart covering roughly 5-10 seconds, including

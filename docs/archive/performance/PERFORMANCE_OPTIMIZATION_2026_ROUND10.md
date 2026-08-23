@@ -315,3 +315,32 @@ The inclusive total remains the only streaming value included in measured CPU
 frame accounting. The three child timers receive the same smoothing and raw
 5-to-10-second histories as the existing performance counters, allowing the
 next optimization experiment to target the measured dominant component.
+
+### Planner-stage follow-up
+
+The first decomposed city run measured approximately 652.7 us average virtual
+streaming time: 11.0 us in Frontier refinement, 641.6 us in the application
+planner, and effectively zero in scenario checks. The planner therefore
+accounts for about 98.3% of this stage and needs its own decomposition before
+any implementation change.
+
+Five non-overlapping planner child timers were added:
+
+- `Index build`: reset per-resource statistics, construct and sort the
+  refinement-parent index, and construct and sort the node/instance error
+  index;
+- `Demand + groups`: classify current, ideal, transition, and optional
+  predicted-camera demand, map entries to resources, and construct/deduplicate
+  complete candidate groups;
+- `Score + rank`: mark fallback chains, compute resource and group scores,
+  rank candidates, update memory accounting, and record convergence;
+- `Residency policy`: cancel or complete pending groups, enforce the budget,
+  unload expired resources, simulate candidate eviction plans, and schedule
+  loads;
+- `Planner residual`: inclusive planner time not covered by the four explicit
+  regions, including function preamble/return and measurement overhead.
+
+Optional lookahead `computeFrontierRefinement()` time remains attributed only
+to `Frontier refine`; the demand timer is paused around that call. The planner
+total and its children remain diagnostic descendants of the inclusive virtual-
+streaming timer and are not added to CPU-frame accounting.

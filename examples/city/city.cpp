@@ -229,6 +229,11 @@ enum class PerformanceTimer : uint8_t
     Streaming,
     StreamingRefinement,
     StreamingPlanner,
+    StreamingPlannerIndex,
+    StreamingPlannerDemand,
+    StreamingPlannerScore,
+    StreamingPlannerResidency,
+    StreamingPlannerOther,
     StreamingScenario,
     FrameSubmit,
     RenderThread,
@@ -328,6 +333,11 @@ struct PerformanceSample
     float streamingMs = 0.0f;
     float streamingRefinementMs = 0.0f;
     float streamingPlannerMs = 0.0f;
+    float streamingPlannerIndexMs = 0.0f;
+    float streamingPlannerDemandMs = 0.0f;
+    float streamingPlannerScoreMs = 0.0f;
+    float streamingPlannerResidencyMs = 0.0f;
+    float streamingPlannerOtherMs = 0.0f;
     float streamingScenarioMs = 0.0f;
     float frameSubmitMs = 0.0f;
     float renderThreadMs = 0.0f;
@@ -923,7 +933,7 @@ public:
 
         stageStart = stageEnd;
         updateVirtualStreaming(frontier, prefetchFrontier, deltaTime,
-                               performance.streamingRefinementMs);
+                               performance);
         const int64_t streamingPlannerEnd = bx::getHPCounter();
         updateHeroPressureScenario();
         stageEnd = bx::getHPCounter();
@@ -931,6 +941,13 @@ public:
             milliseconds(stageStart, streamingPlannerEnd);
         performance.streamingPlannerMs = std::max(
             0.0f, streamingUpdateMs - performance.streamingRefinementMs);
+        const float accountedPlannerMs =
+            performance.streamingPlannerIndexMs +
+            performance.streamingPlannerDemandMs +
+            performance.streamingPlannerScoreMs +
+            performance.streamingPlannerResidencyMs;
+        performance.streamingPlannerOtherMs = std::max(
+            0.0f, performance.streamingPlannerMs - accountedPlannerMs);
         performance.streamingScenarioMs =
             milliseconds(streamingPlannerEnd, stageEnd);
         performance.streamingMs = milliseconds(stageStart, stageEnd);
@@ -1889,6 +1906,16 @@ private:
             return sample.streamingRefinementMs;
         case PerformanceTimer::StreamingPlanner:
             return sample.streamingPlannerMs;
+        case PerformanceTimer::StreamingPlannerIndex:
+            return sample.streamingPlannerIndexMs;
+        case PerformanceTimer::StreamingPlannerDemand:
+            return sample.streamingPlannerDemandMs;
+        case PerformanceTimer::StreamingPlannerScore:
+            return sample.streamingPlannerScoreMs;
+        case PerformanceTimer::StreamingPlannerResidency:
+            return sample.streamingPlannerResidencyMs;
+        case PerformanceTimer::StreamingPlannerOther:
+            return sample.streamingPlannerOtherMs;
         case PerformanceTimer::StreamingScenario:
             return sample.streamingScenarioMs;
         case PerformanceTimer::FrameSubmit: return sample.frameSubmitMs;
@@ -1990,6 +2017,23 @@ private:
         drawPerformanceTimer("Streaming planner",
                              PerformanceTimer::StreamingPlanner,
                              ImVec4(0.82f, 0.52f, 0.22f, 1.0f));
+        ImGui::Indent();
+        drawPerformanceTimer("Index build",
+                             PerformanceTimer::StreamingPlannerIndex,
+                             ImVec4(0.90f, 0.58f, 0.24f, 1.0f));
+        drawPerformanceTimer("Demand + groups",
+                             PerformanceTimer::StreamingPlannerDemand,
+                             ImVec4(0.86f, 0.50f, 0.22f, 1.0f));
+        drawPerformanceTimer("Score + rank",
+                             PerformanceTimer::StreamingPlannerScore,
+                             ImVec4(0.80f, 0.44f, 0.20f, 1.0f));
+        drawPerformanceTimer("Residency policy",
+                             PerformanceTimer::StreamingPlannerResidency,
+                             ImVec4(0.74f, 0.38f, 0.18f, 1.0f));
+        drawPerformanceTimer("Planner residual",
+                             PerformanceTimer::StreamingPlannerOther,
+                             ImVec4(0.62f, 0.34f, 0.18f, 1.0f));
+        ImGui::Unindent();
         drawPerformanceTimer("Scenario checks",
                              PerformanceTimer::StreamingScenario,
                              ImVec4(0.70f, 0.42f, 0.18f, 1.0f));
@@ -2632,6 +2676,16 @@ private:
         smooth(performance_.streamingRefinementMs,
                sample.streamingRefinementMs);
         smooth(performance_.streamingPlannerMs, sample.streamingPlannerMs);
+        smooth(performance_.streamingPlannerIndexMs,
+               sample.streamingPlannerIndexMs);
+        smooth(performance_.streamingPlannerDemandMs,
+               sample.streamingPlannerDemandMs);
+        smooth(performance_.streamingPlannerScoreMs,
+               sample.streamingPlannerScoreMs);
+        smooth(performance_.streamingPlannerResidencyMs,
+               sample.streamingPlannerResidencyMs);
+        smooth(performance_.streamingPlannerOtherMs,
+               sample.streamingPlannerOtherMs);
         smooth(performance_.streamingScenarioMs, sample.streamingScenarioMs);
         smooth(performance_.frameSubmitMs, sample.frameSubmitMs);
         smooth(performance_.renderThreadMs, sample.renderThreadMs);
@@ -4745,9 +4799,15 @@ private:
 
     void updateVirtualStreaming(const FrontierResultView& frontier,
                                 const FrontierResultView& prefetchFrontier,
-                                float deltaTime, float& refinementMs)
+                                float deltaTime,
+                                PerformanceSample& performance)
     {
-        refinementMs = 0.0f;
+        performance.streamingRefinementMs = 0.0f;
+        performance.streamingPlannerIndexMs = 0.0f;
+        performance.streamingPlannerDemandMs = 0.0f;
+        performance.streamingPlannerScoreMs = 0.0f;
+        performance.streamingPlannerResidencyMs = 0.0f;
+        const int64_t plannerStageStart = bx::getHPCounter();
         if (!streamingPaused_)
             streamingTime_ += deltaTime;
 
@@ -4820,6 +4880,8 @@ private:
             streamingPlanValid_ = true;
             refinementPlanComplete_ = true;
             recordStreamingConvergence(deltaTime);
+            performance.streamingPlannerDemandMs =
+                milliseconds(plannerStageStart, bx::getHPCounter());
             return;
         }
 
@@ -4828,7 +4890,9 @@ private:
             query_.computeFrontierRefinement(
                 database_, frontier, SpatialQuery::UnlimitedDepth);
         int64_t refinementEnd = bx::getHPCounter();
-        refinementMs += milliseconds(refinementStart, refinementEnd);
+        performance.streamingRefinementMs +=
+            milliseconds(refinementStart, refinementEnd);
+        const int64_t indexStart = refinementEnd;
         lastRefinementGroups_ = uint32_t(refinement.groupCount());
         lastRefinementEntries_ = uint32_t(refinement.entries().size());
         streamingPlanValid_ = true;
@@ -4940,6 +5004,11 @@ private:
                        : refinementThreshold;
         };
 
+        const int64_t indexEnd = bx::getHPCounter();
+        performance.streamingPlannerIndexMs =
+            milliseconds(indexStart, indexEnd);
+        int64_t demandStart = indexEnd;
+
         lastIdealEntryCount_ = 0;
         lastConvergedEntryCount_ = 0;
         for (const FrontierEntry& entry : frontier)
@@ -5034,12 +5103,16 @@ private:
         if (!prefetchFrontier.empty())
         {
             refinementStart = bx::getHPCounter();
+            performance.streamingPlannerDemandMs +=
+                milliseconds(demandStart, refinementStart);
             const FrontierRefinementView prefetchRefinement =
                 streamingLookaheadQuery_.computeFrontierRefinement(
                     database_, prefetchFrontier,
                     SpatialQuery::UnlimitedDepth);
             refinementEnd = bx::getHPCounter();
-            refinementMs += milliseconds(refinementStart, refinementEnd);
+            performance.streamingRefinementMs +=
+                milliseconds(refinementStart, refinementEnd);
+            demandStart = refinementEnd;
             lastPrefetchGroupCount_ =
                 uint32_t(prefetchRefinement.groupCount());
             const float prefetchThreshold = prefetchRefinement.threshold();
@@ -5170,6 +5243,11 @@ private:
             }
         }
 
+        const int64_t demandEnd = bx::getHPCounter();
+        performance.streamingPlannerDemandMs +=
+            milliseconds(demandStart, demandEnd);
+        const int64_t scoreStart = demandEnd;
+
         for (size_t slot = 0; slot < currentDemand.size(); ++slot)
             if (currentDemand[slot] || prefetchDemand[slot])
                 markStreamingFallbackAncestors(slot, fallbackDemand);
@@ -5249,8 +5327,14 @@ private:
 
         recordStreamingConvergence(deltaTime);
 
+        const int64_t scoreEnd = bx::getHPCounter();
+        performance.streamingPlannerScoreMs =
+            milliseconds(scoreStart, scoreEnd);
+
         if (streamingPaused_)
             return;
+
+        const int64_t residencyStart = scoreEnd;
 
         struct ResidentGroup
         {
@@ -5638,6 +5722,8 @@ private:
 
         if (streamingLatencySeconds_ <= 0.0f)
             completePendingStreamingGroups();
+        performance.streamingPlannerResidencyMs =
+            milliseconds(residencyStart, bx::getHPCounter());
     }
 
     SpatialDatabase database_;
