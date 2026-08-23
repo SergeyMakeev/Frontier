@@ -344,3 +344,43 @@ Optional lookahead `computeFrontierRefinement()` time remains attributed only
 to `Frontier refine`; the demand timer is paused around that call. The planner
 total and its children remain diagnostic descendants of the inclusive virtual-
 streaming timer and are not added to CPU-frame accounting.
+
+### Direct refinement-forest links experiment
+
+The second decomposed city run measured these rolling averages:
+
+| Stage | Average | Share of planner |
+|---|---:|---:|
+| Index build | 354.2 us | 57.7% |
+| Demand + groups | 223.5 us | 36.4% |
+| Score + rank | 4.6 us | 0.7% |
+| Residency policy | 30.0 us | 4.9% |
+| Planner residual | 1.0 us | 0.2% |
+
+Index construction and demand classification total 577.7 us, or 94.2% of the
+613.3 us planner. Frontier produced the refinement forest itself in 12.1 us,
+but the sample then reconstructed that forest with a sorted parent-handle
+array, a sorted `(node, instance, error)` array, and binary searches for every
+current/refinement entry.
+
+The experiment changes the refinement result layout so those relationships are
+explicit. Every group now retains its complete 12-byte parent `FrontierEntry`.
+Two query-owned 32-bit streams align with the source current cut and returned
+child entries; each value directly names the group that expands the entry or is
+`kInvalidIndex` at the returned horizon. The work queue carries the originating
+stream/index and writes the link only when a complete group commits, preserving
+depth and group-atomic node-limit semantics.
+
+The city planner now reads parent error directly from `parentEntry(group)` and
+uses `currentExpansion()` / `childExpansion()` for endpoint classification. It
+no longer allocates or sorts either reconstruction index and no longer performs
+their per-entry binary searches. The tradeoff is retained query scratch: four
+bytes per source-current entry, four bytes per returned refinement entry, four
+additional bytes per group parent, and a 24-byte rather than 20-byte transient
+work item. This replaces larger per-frame application temporaries and preserves
+a linear access pattern.
+
+The follow-up city run confirmed a substantial reduction in virtual-streaming
+and planner time, so the direct-link layout was accepted. Exact follow-up timer
+values were not supplied with the acceptance report and are therefore not
+invented here.

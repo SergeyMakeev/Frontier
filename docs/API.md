@@ -586,12 +586,19 @@ Each group has the following contract:
 
 - `parent(group)` is an existing node. At depth 1 it is in `cut`; at greater
   depths it is a child in an earlier group.
+- `parentEntry(group)` is that complete entry, including its instance and
+  projected error. Consumers do not need to reconstruct parent-error lookup
+  tables.
 - `children(group)` is the complete set of that parent's visible immediate
   children. Authored children outside the retained frustum are absent by
   design. A parent with no visible children does not produce a group.
 - `depth(group)` counts refinement transitions below `cut`, starting at 1.
 - groups are ordered breadth-first. `findGroup(node)` returns the group that
   expands `node`, or `kInvalidIndex` when none was emitted.
+- `currentExpansion(index)` and `childExpansion(group, child)` return the next
+  group directly, or `kInvalidIndex` when that entry is an endpoint of the
+  returned horizon. They are the linear-time path for bulk planners;
+  `findGroup()` is intended for occasional handle lookup.
 - `entries()` concatenates every child span for bulk inspection but does not
   preserve the group boundaries. Each entry retains the top-level
   `InstanceId` and a fresh error code relative to `threshold()`.
@@ -640,7 +647,8 @@ change since selection. Contract violations route through `FRONTIER_FATAL`.
 The returned view is query-owned. It remains valid until the next selection,
 refinement computation, `reset()`, move assignment, or destruction of that
 query. `threshold()` remains available so the application can decode each
-entry with `approximateError(refinement.threshold())`.
+entry with `approximateError(refinement.threshold())`. Parent entries and both
+expansion-link streams have the same lifetime.
 
 ### Applying refinement groups
 

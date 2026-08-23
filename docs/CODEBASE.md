@@ -198,6 +198,8 @@ unrelated definitions or infer relationships from equal payload values.
 `computeFrontierRefinement()` resumes below the current cut with the exact
 retained view context, returns breadth-first complete sibling groups, and
 honors depth and group-atomic node limits without choosing a streaming policy.
+Complete parent entries and direct current/child expansion links preserve the
+forest relationships for linear application-side planning.
 
 ## Bounds and overlays
 

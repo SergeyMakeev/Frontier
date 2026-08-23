@@ -211,10 +211,12 @@ struct QueryScratch
     {
         FrontierEntry entry;
         uint32_t depth = 0;
+        uint32_t sourceIndex = 0;
         uint8_t mask = 0;
-        uint8_t padding[3]{};
+        uint8_t sourceIsCurrent = 0;
+        uint8_t padding[2]{};
     };
-    static_assert(sizeof(RefinementWork) == 20);
+    static_assert(sizeof(RefinementWork) == 24);
 
     struct ViewMemo
     {
@@ -237,10 +239,12 @@ struct QueryScratch
     detail::AppendBuffer<UserPayload> resolvedPayloadCurrent;
     detail::AppendBuffer<uint8_t> resolvedErrorCurrent;
     detail::AppendBuffer<RenderFrontierRun> renderRuns;
-    detail::AppendBuffer<NodeHandle> refinementParents;
+    detail::AppendBuffer<FrontierEntry> refinementParents;
     detail::AppendBuffer<uint32_t> refinementOffsets;
     detail::AppendBuffer<uint32_t> refinementDepths;
     detail::AppendBuffer<FrontierEntry> refinementEntries;
+    detail::AppendBuffer<uint32_t> refinementCurrentExpansions;
+    detail::AppendBuffer<uint32_t> refinementEntryExpansions;
     detail::AppendBuffer<RefinementWork> refinementWork;
     detail::AppendBuffer<FrontierEntry> refinementGroupEntries;
     detail::AppendBuffer<uint8_t> refinementGroupMasks;
@@ -274,10 +278,12 @@ struct QueryScratch
                    resolvedPayloadCurrent.capacity() * sizeof(UserPayload) +
                    resolvedErrorCurrent.capacity() * sizeof(uint8_t) +
                    renderRuns.capacity() * sizeof(RenderFrontierRun) +
-                   refinementParents.capacity() * sizeof(NodeHandle) +
+                   refinementParents.capacity() * sizeof(FrontierEntry) +
                    refinementOffsets.capacity() * sizeof(uint32_t) +
                    refinementDepths.capacity() * sizeof(uint32_t) +
                    refinementEntries.capacity() * sizeof(FrontierEntry) +
+                   refinementCurrentExpansions.capacity() * sizeof(uint32_t) +
+                   refinementEntryExpansions.capacity() * sizeof(uint32_t) +
                    refinementWork.capacity() * sizeof(RefinementWork) +
                    refinementGroupEntries.capacity() * sizeof(FrontierEntry) +
                    refinementGroupMasks.capacity() * sizeof(uint8_t);
@@ -6154,6 +6160,8 @@ void SpatialQuery::selectFrontierInternal(
     scratch.refinementOffsets.clear();
     scratch.refinementDepths.clear();
     scratch.refinementEntries.clear();
+    scratch.refinementCurrentExpansions.clear();
+    scratch.refinementEntryExpansions.clear();
     scratch.refinementWork.clear();
     scratch.refinementGroupEntries.clear();
     scratch.refinementGroupMasks.clear();
@@ -6244,6 +6252,8 @@ FrontierResultView SpatialQuery::selectFrontier(const SpatialDatabase& database,
     scratch.refinementOffsets.clear();
     scratch.refinementDepths.clear();
     scratch.refinementEntries.clear();
+    scratch.refinementCurrentExpansions.clear();
+    scratch.refinementEntryExpansions.clear();
     scratch.refinementWork.clear();
     scratch.refinementGroupEntries.clear();
     scratch.refinementGroupMasks.clear();
@@ -6393,6 +6403,10 @@ FrontierRefinementView SpatialQuery::computeFrontierRefinement(
     scratch.refinementOffsets.clear();
     scratch.refinementDepths.clear();
     scratch.refinementEntries.clear();
+    scratch.refinementCurrentExpansions.resize_uninitialized(current.size());
+    std::fill(scratch.refinementCurrentExpansions.begin(),
+              scratch.refinementCurrentExpansions.end(), kInvalidIndex);
+    scratch.refinementEntryExpansions.clear();
     scratch.refinementWork.clear();
     scratch.refinementGroupEntries.clear();
     scratch.refinementGroupMasks.clear();
@@ -6514,12 +6528,15 @@ FrontierRefinementView SpatialQuery::computeFrontierRefinement(
         return mask;
     };
 
-    for (const FrontierEntry& entry : current)
+    for (uint32_t currentIndex = 0; currentIndex < current.size();
+         ++currentIndex)
     {
+        const FrontierEntry& entry = current.entries[currentIndex];
         if (!entry.overThreshold()) continue;
         const InstanceId dense = denseInstance(entry);
         scratch.refinementWork.push_back(
-            QueryScratch::RefinementWork{entry, 0, initialMask(entry, dense)});
+            QueryScratch::RefinementWork{
+                entry, 0, currentIndex, initialMask(entry, dense), 1});
     }
 
     bool depthLimitReached = false;
@@ -6591,10 +6608,20 @@ FrontierRefinementView SpatialQuery::computeFrontierRefinement(
         }
 
         const uint32_t groupDepth = work.depth + 1;
-        scratch.refinementParents.push_back(work.entry.nodeHandle);
+        const uint32_t groupIndex =
+            uint32_t(scratch.refinementParents.size());
+        if (work.sourceIsCurrent)
+            scratch.refinementCurrentExpansions[work.sourceIndex] = groupIndex;
+        else
+            scratch.refinementEntryExpansions[work.sourceIndex] = groupIndex;
+        scratch.refinementParents.push_back(work.entry);
         scratch.refinementDepths.push_back(groupDepth);
         scratch.refinementEntries.append(
             scratch.refinementGroupEntries.data(), groupSize);
+        scratch.refinementEntryExpansions.resize_uninitialized(
+            scratch.refinementEntries.size());
+        std::fill(scratch.refinementEntryExpansions.begin() + emitted,
+                  scratch.refinementEntryExpansions.end(), kInvalidIndex);
         scratch.refinementOffsets.push_back(
             uint32_t(scratch.refinementEntries.size()));
 
@@ -6604,7 +6631,8 @@ FrontierRefinementView SpatialQuery::computeFrontierRefinement(
                 scratch.refinementGroupEntries[i];
             if (!childEntry.overThreshold()) continue;
             scratch.refinementWork.push_back(QueryScratch::RefinementWork{
-                childEntry, groupDepth, scratch.refinementGroupMasks[i]});
+                childEntry, groupDepth, emitted + i,
+                scratch.refinementGroupMasks[i], 0});
         }
     }
 
@@ -6616,6 +6644,10 @@ FrontierRefinementView SpatialQuery::computeFrontierRefinement(
         {scratch.refinementDepths.data(), scratch.refinementDepths.size()},
         {scratch.refinementEntries.data(),
          scratch.refinementEntries.size()},
+        {scratch.refinementCurrentExpansions.data(),
+         scratch.refinementCurrentExpansions.size()},
+        {scratch.refinementEntryExpansions.data(),
+         scratch.refinementEntryExpansions.size()},
         threshold, depthLimitReached, nodeLimitReached};
 }
 

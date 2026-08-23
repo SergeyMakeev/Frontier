@@ -442,6 +442,13 @@ makes output depth order deterministic. `SpatialQuery::UnlimitedDepth` removes
 the depth horizon; it does not invent unmounted topology or coarsen a current
 node that is already finer than the implicit threshold target.
 
+The parent buffer stores the complete `FrontierEntry`, not only its handle.
+Two 32-bit expansion streams align with the supplied current cut and the
+returned child-entry stream. Each value is the group that expands that entry,
+or `kInvalidIndex` at the returned horizon. This makes parent error propagation
+and endpoint classification linear and avoids rebuilding forest indexes in
+streaming code.
+
 ## 6. Fast-path inventory
 
 The table below is a practical map of work that the implementation can skip.

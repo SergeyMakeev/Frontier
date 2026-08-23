@@ -229,16 +229,25 @@ struct FrontierResultView
 };
 
 // Policy-free, non-owning hierarchy refinement analysis. A group is addressed
-// by a dense view-local index and represented by its existing parent
-// NodeHandle plus one complete visible immediate-child span. The view remains
-// valid until the next selection, refinement computation, or reset on its
-// SpatialQuery, or until that query is destroyed.
+// by a dense view-local index and represented by its complete parent entry plus
+// one complete visible immediate-child span. Direct expansion links identify
+// which current and child entries own another group, so consumers can process
+// the forest linearly without rebuilding handle indexes. The view remains valid
+// until the next selection, refinement computation, or reset on its SpatialQuery,
+// or until that query is destroyed.
 class FrontierRefinementView
 {
 public:
     size_t groupCount() const { return parents_.size(); }
 
     NodeHandle parent(uint32_t groupIndex) const
+    {
+        FRONTIER_CHECK(groupIndex < parents_.size(),
+                       "FrontierRefinementView: group index out of range");
+        return parents_[groupIndex].nodeHandle;
+    }
+
+    const FrontierEntry& parentEntry(uint32_t groupIndex) const
     {
         FRONTIER_CHECK(groupIndex < parents_.size(),
                        "FrontierRefinementView: group index out of range");
@@ -261,10 +270,31 @@ public:
         return depths_[groupIndex];
     }
 
+    // Return the group that expands a source-current entry or a child entry.
+    // kInvalidIndex means that the entry is an endpoint of the returned
+    // refinement horizon. Child indices are local to children(groupIndex).
+    uint32_t currentExpansion(uint32_t currentIndex) const
+    {
+        FRONTIER_CHECK(currentIndex < currentExpansions_.size(),
+                       "FrontierRefinementView: current index out of range");
+        return currentExpansions_[currentIndex];
+    }
+
+    uint32_t childExpansion(uint32_t groupIndex,
+                            uint32_t childIndex) const
+    {
+        FRONTIER_CHECK(groupIndex < parents_.size(),
+                       "FrontierRefinementView: group index out of range");
+        const uint32_t begin = offsets_[groupIndex];
+        FRONTIER_CHECK(childIndex < offsets_[groupIndex + 1] - begin,
+                       "FrontierRefinementView: child index out of range");
+        return entryExpansions_[begin + childIndex];
+    }
+
     uint32_t findGroup(NodeHandle node) const
     {
         for (uint32_t i = 0; i < parents_.size(); ++i)
-            if (parents_[i] == node) return i;
+            if (parents_[i].nodeHandle == node) return i;
         return kInvalidIndex;
     }
 
@@ -281,22 +311,27 @@ public:
 private:
     friend class SpatialQuery;
 
-    FrontierRefinementView(std::span<const NodeHandle> parents,
+    FrontierRefinementView(std::span<const FrontierEntry> parents,
                            std::span<const uint32_t> offsets,
                            std::span<const uint32_t> depths,
                            std::span<const FrontierEntry> entries,
+                           std::span<const uint32_t> currentExpansions,
+                           std::span<const uint32_t> entryExpansions,
                            float threshold, bool depthLimitReached,
                            bool nodeLimitReached)
         : parents_(parents), offsets_(offsets), depths_(depths),
-          entries_(entries), threshold_(threshold),
+          entries_(entries), currentExpansions_(currentExpansions),
+          entryExpansions_(entryExpansions), threshold_(threshold),
           depthLimitReached_(depthLimitReached),
           nodeLimitReached_(nodeLimitReached)
     {}
 
-    std::span<const NodeHandle> parents_;
+    std::span<const FrontierEntry> parents_;
     std::span<const uint32_t> offsets_;
     std::span<const uint32_t> depths_;
     std::span<const FrontierEntry> entries_;
+    std::span<const uint32_t> currentExpansions_;
+    std::span<const uint32_t> entryExpansions_;
     float threshold_ = 0.0f;
     bool depthLimitReached_ = false;
     bool nodeLimitReached_ = false;

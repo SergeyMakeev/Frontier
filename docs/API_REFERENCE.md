@@ -972,8 +972,12 @@ class FrontierRefinementView {
 public:
     size_t groupCount() const;
     NodeHandle parent(uint32_t groupIndex) const;
+    const FrontierEntry& parentEntry(uint32_t groupIndex) const;
     std::span<const FrontierEntry> children(uint32_t groupIndex) const;
     uint32_t depth(uint32_t groupIndex) const;
+    uint32_t currentExpansion(uint32_t currentIndex) const;
+    uint32_t childExpansion(uint32_t groupIndex,
+                            uint32_t childIndex) const;
     uint32_t findGroup(NodeHandle parent) const;
     std::span<const FrontierEntry> entries() const;
     float threshold() const;
@@ -984,14 +988,20 @@ public:
 };
 ```
 
-Each dense group index identifies one existing parent `NodeHandle` and one
-complete visible immediate-child cover. Groups are returned breadth-first;
-depth 1 replaces a node in the supplied current frontier. `entries()` is the
-concatenation of all child spans and does not itself preserve group boundaries.
-`findGroup()` returns `kInvalidIndex` when the parent has no emitted group.
-`parent()`, `children()`, and `depth()` route an out-of-range group index
-through `FRONTIER_FATAL`; `findGroup()` is a linear scan of the view-local
-parents.
+Each dense group index identifies one complete parent `FrontierEntry` and one
+complete visible immediate-child cover. `parent()` returns its handle, while
+`parentEntry()` also preserves the parent instance and freshly retained error.
+Groups are returned breadth-first; depth 1 replaces a node in the supplied
+current frontier. `entries()` is the concatenation of all child spans and does
+not itself preserve group boundaries.
+
+`currentExpansion(currentIndex)` maps an index in the supplied current cut to
+the group that expands it. `childExpansion(groupIndex, childIndex)` does the
+same for an entry in `children(groupIndex)`. Both return `kInvalidIndex` when
+the entry is an endpoint of the returned horizon. These direct links let a
+planner inspect the group forest in linear time. `findGroup()` remains a linear
+handle search for occasional lookup. Indexed access routes an out-of-range
+index through `FRONTIER_FATAL`.
 
 Each child is a `FrontierEntry` with the same top-level instance id as its
 parent context and a freshly computed error code relative to `threshold()`.

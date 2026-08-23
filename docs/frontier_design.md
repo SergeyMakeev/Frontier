@@ -87,7 +87,9 @@ retained camera and selection parameters, skips TLAS discovery, and emits
 complete visible immediate-child covers in breadth-first order. Depth bounds
 limit lookahead. The node bound is checked before committing a group, so a
 result never truncates sibling coverage. Unlimited depth makes exhaustive work
-explicit rather than part of every selection.
+explicit rather than part of every selection. The result retains each complete
+parent entry and direct 32-bit expansion links for current and child entries,
+so consumers do not need to reconstruct the forest with handle searches.
 
 A missing mounted definition stops both selection and refinement at its
 mountable parent; application metadata decides which definition handle to

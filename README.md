@@ -145,7 +145,11 @@ values in frontier results, then retained while asynchronous loading runs.
 `cut` is always a complete render frontier. Refinement analysis is opt-in and
 returns only complete visible immediate-child groups, in breadth-first depth
 order. `maxDepth` bounds lookahead, while `maxNodes` bounds candidate storage
-without ever truncating a group. `complete()` reports whether those bounds
+without ever truncating a group. Each group retains its complete parent entry,
+and direct expansion links map source-current and returned child entries to
+their next group. Bulk streaming planners can therefore classify endpoints and
+propagate parent error in linear time without sorting handles or rebuilding a
+forest index. `complete()` reports whether those bounds
 truncated known mounted refinement; use `depthLimitReached()` and
 `nodeLimitReached()` to distinguish the cause. The source cut must be the
 complete, unchanged result of the same query's immediately preceding handle

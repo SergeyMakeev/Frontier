@@ -175,7 +175,9 @@ subtimers are diagnostic children and are not counted again in total CPU time.
 The planner is further divided into index construction, demand/group
 classification, scoring/ranking, residency policy, and residual timing. These
 are also diagnostic children and sum to the planner total rather than adding
-new frame time.
+new frame time. The sample consumes the refinement view's complete parent
+entries and direct expansion links, so index construction contains only fixed
+resource-state preparation rather than rebuilding and sorting forest maps.
 bgfx timing and backend counters follow, with UI, camera, and diagnostic
 overhead last. Every timer has
 its own rolling raw-sample chart covering roughly 5-10 seconds, including

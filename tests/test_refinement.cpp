@@ -76,9 +76,15 @@ TEST(Refinement, UnlimitedTraversalReturnsCompleteBreadthFirstGroups)
     EXPECT_EQ(refinement.entries().size(), 5u);
 
     EXPECT_EQ(refinement.parent(0), current.entries[0].nodeHandle);
+    EXPECT_EQ(refinement.parentEntry(0).instance(),
+              current.entries[0].instance());
+    EXPECT_EQ(refinement.parentEntry(0).errorCode(),
+              current.entries[0].errorCode());
+    EXPECT_EQ(refinement.currentExpansion(0), 0u);
     EXPECT_EQ(refinement.depth(0), 1u);
     EXPECT_EQ(groupPayloads(scene.database, refinement.children(0)),
               (std::vector<UserPayload>{10}));
+    EXPECT_EQ(refinement.childExpansion(0, 0), 1u);
 
     const NodeHandle coarse = refinement.children(0)[0].nodeHandle;
     EXPECT_EQ(refinement.findGroup(coarse), 1u);
@@ -91,10 +97,16 @@ TEST(Refinement, UnlimitedTraversalReturnsCompleteBreadthFirstGroups)
         secondLevel.begin(), secondLevel.end(), [&](const FrontierEntry& entry)
         { return scene.database.tryGetPayload(entry.nodeHandle) == 20; });
     ASSERT_NE(left, secondLevel.end());
+    const uint32_t leftIndex = uint32_t(left - secondLevel.begin());
+    const uint32_t rightIndex = leftIndex == 0 ? 1u : 0u;
+    EXPECT_EQ(refinement.childExpansion(1, leftIndex), 2u);
+    EXPECT_EQ(refinement.childExpansion(1, rightIndex), kInvalidIndex);
     EXPECT_EQ(refinement.findGroup(left->nodeHandle), 2u);
     EXPECT_EQ(refinement.depth(2), 3u);
     EXPECT_EQ(groupPayloads(scene.database, refinement.children(2)),
               (std::vector<UserPayload>{21, 22}));
+    EXPECT_EQ(refinement.childExpansion(2, 0), kInvalidIndex);
+    EXPECT_EQ(refinement.childExpansion(2, 1), kInvalidIndex);
     EXPECT_EQ(refinement.findGroup(NodeHandle{}), kInvalidIndex);
 
     EXPECT_EQ(refinedPayloads(scene.database, scene.query, current),
@@ -136,6 +148,7 @@ TEST(Refinement, NodeLimitNeverSplitsAChildGroup)
     EXPECT_TRUE(none.empty());
     EXPECT_TRUE(none.nodeLimitReached());
     EXPECT_FALSE(none.complete());
+    EXPECT_EQ(none.currentExpansion(0), kInvalidIndex);
 
     const FrontierRefinementView firstOnly =
         scene.query.computeFrontierRefinement(
@@ -144,6 +157,8 @@ TEST(Refinement, NodeLimitNeverSplitsAChildGroup)
     EXPECT_EQ(firstOnly.children(0).size(), 1u);
     EXPECT_EQ(firstOnly.entries().size(), 1u);
     EXPECT_TRUE(firstOnly.nodeLimitReached());
+    EXPECT_EQ(firstOnly.currentExpansion(0), 0u);
+    EXPECT_EQ(firstOnly.childExpansion(0, 0), kInvalidIndex);
 
     const FrontierRefinementView firstTwo =
         scene.query.computeFrontierRefinement(
@@ -224,6 +239,7 @@ TEST(Refinement, ACurrentCutAlreadyFinerThanThresholdIsNotCoarsened)
             database, current, SpatialQuery::UnlimitedDepth);
     EXPECT_TRUE(refinement.empty());
     EXPECT_TRUE(refinement.complete());
+    EXPECT_EQ(refinement.currentExpansion(0), kInvalidIndex);
     EXPECT_EQ(refinedPayloads(database, query, current),
               (std::vector<UserPayload>{11, 12}));
 }
@@ -421,6 +437,13 @@ TEST(Refinement, RejectsInvalidHorizonOverflowAndStaleSelectionContext)
     const FrontierResultView current = scene.selectCurrent();
     EXPECT_THROW(scene.query.computeFrontierRefinement(
                      scene.database, current, 0),
+                 std::logic_error);
+
+    const FrontierRefinementView valid =
+        scene.query.computeFrontierRefinement(scene.database, current, 1);
+    EXPECT_THROW(valid.currentExpansion(uint32_t(current.size())),
+                 std::logic_error);
+    EXPECT_THROW(valid.childExpansion(0, uint32_t(valid.children(0).size())),
                  std::logic_error);
 
     SpatialQuery unrelated;

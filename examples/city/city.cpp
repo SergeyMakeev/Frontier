@@ -4920,22 +4920,6 @@ private:
             resource.decision = "not demanded by current plan";
         }
 
-        std::vector<uint64_t> refinementParents;
-        refinementParents.reserve(refinement.groupCount());
-        for (uint32_t group = 0; group < refinement.groupCount(); ++group)
-        {
-            const NodeHandle parent = refinement.parent(group);
-            refinementParents.push_back(
-                (uint64_t(parent.hi) << 32) | uint64_t(parent.lo));
-        }
-        std::sort(refinementParents.begin(), refinementParents.end());
-        const auto isRefinementParent = [&refinementParents](NodeHandle node)
-        {
-            const uint64_t key =
-                (uint64_t(node.hi) << 32) | uint64_t(node.lo);
-            return std::binary_search(refinementParents.begin(),
-                                      refinementParents.end(), key);
-        };
         const auto resourceForEntry = [this](const FrontierEntry& entry)
         {
             const UserPayload rawPayload =
@@ -4952,57 +4936,6 @@ private:
         };
 
         const float refinementThreshold = refinement.threshold();
-        struct NodeInstanceError
-        {
-            uint64_t node = 0;
-            InstanceId instance = kInvalidInstanceId;
-            float error = 0.0f;
-        };
-        std::vector<NodeInstanceError> nodeErrors;
-        nodeErrors.reserve(frontier.size() + refinement.entries().size());
-        const auto appendNodeError =
-            [&nodeErrors, refinementThreshold](const FrontierEntry& entry)
-        {
-            const uint64_t key =
-                (uint64_t(entry.nodeHandle.hi) << 32) |
-                uint64_t(entry.nodeHandle.lo);
-            nodeErrors.push_back(
-                {key, entry.instance(),
-                 entry.approximateError(refinementThreshold)});
-        };
-        for (const FrontierEntry& entry : frontier)
-            appendNodeError(entry);
-        for (const FrontierEntry& entry : refinement.entries())
-            appendNodeError(entry);
-        std::sort(nodeErrors.begin(), nodeErrors.end(),
-                  [](const NodeInstanceError& lhs,
-                     const NodeInstanceError& rhs)
-                  {
-                      if (lhs.node != rhs.node)
-                          return lhs.node < rhs.node;
-                      return lhs.instance < rhs.instance;
-                  });
-        const auto nodeScreenError =
-            [&nodeErrors, refinementThreshold](NodeHandle node,
-                                                InstanceId instance)
-        {
-            const uint64_t key =
-                (uint64_t(node.hi) << 32) | uint64_t(node.lo);
-            const auto found = std::lower_bound(
-                nodeErrors.begin(), nodeErrors.end(),
-                std::pair<uint64_t, InstanceId>{key, instance},
-                [](const NodeInstanceError& item,
-                   const std::pair<uint64_t, InstanceId>& value)
-                {
-                    return item.node != value.first
-                               ? item.node < value.first
-                               : item.instance < value.second;
-                });
-            return found != nodeErrors.end() && found->node == key &&
-                           found->instance == instance
-                       ? found->error
-                       : refinementThreshold;
-        };
 
         const int64_t indexEnd = bx::getHPCounter();
         performance.streamingPlannerIndexMs =
@@ -5011,8 +4944,10 @@ private:
 
         lastIdealEntryCount_ = 0;
         lastConvergedEntryCount_ = 0;
-        for (const FrontierEntry& entry : frontier)
+        for (uint32_t currentIndex = 0; currentIndex < frontier.size();
+             ++currentIndex)
         {
+            const FrontierEntry& entry = frontier.entries[currentIndex];
             const size_t slot = resourceForEntry(entry);
             if (slot == kStreamingResourceSlotCount)
                 continue;
@@ -5039,7 +4974,7 @@ private:
                 if (districtSlot < qualityFloorDemand.size())
                     qualityFloorDemand[districtSlot] = true;
             }
-            if (!isRefinementParent(entry.nodeHandle))
+            if (refinement.currentExpansion(currentIndex) == kInvalidIndex)
             {
                 idealDemand[slot] = true;
                 virtualResources_[slot].idealErrors.add(screenError);
@@ -5053,15 +4988,21 @@ private:
              groupIndex < refinement.groupCount(); ++groupIndex)
         {
             const bool immediate = refinement.depth(groupIndex) == 1;
+            const float parentError =
+                refinement.parentEntry(groupIndex).approximateError(
+                    refinementThreshold);
             std::vector<size_t> groupResources;
-            for (const FrontierEntry& entry : refinement.children(groupIndex))
+            const std::span<const FrontierEntry> children =
+                refinement.children(groupIndex);
+            for (uint32_t childIndex = 0; childIndex < children.size();
+                 ++childIndex)
             {
-                const float parentError = nodeScreenError(
-                    refinement.parent(groupIndex), entry.instance());
+                const FrontierEntry& entry = children[childIndex];
                 const size_t slot = resourceForEntry(entry);
                 if (slot == kStreamingResourceSlotCount)
                     continue;
-                if (!isRefinementParent(entry.nodeHandle))
+                if (refinement.childExpansion(groupIndex, childIndex) ==
+                    kInvalidIndex)
                 {
                     idealDemand[slot] = true;
                     virtualResources_[slot].idealErrors.add(parentError);
@@ -5116,56 +5057,6 @@ private:
             lastPrefetchGroupCount_ =
                 uint32_t(prefetchRefinement.groupCount());
             const float prefetchThreshold = prefetchRefinement.threshold();
-            std::vector<NodeInstanceError> prefetchNodeErrors;
-            prefetchNodeErrors.reserve(
-                prefetchFrontier.size() +
-                prefetchRefinement.entries().size());
-            const auto appendPrefetchError =
-                [&prefetchNodeErrors, prefetchThreshold](
-                    const FrontierEntry& entry)
-            {
-                const uint64_t key =
-                    (uint64_t(entry.nodeHandle.hi) << 32) |
-                    uint64_t(entry.nodeHandle.lo);
-                prefetchNodeErrors.push_back(
-                    {key, entry.instance(),
-                     entry.approximateError(prefetchThreshold)});
-            };
-            for (const FrontierEntry& entry : prefetchFrontier)
-                appendPrefetchError(entry);
-            for (const FrontierEntry& entry : prefetchRefinement.entries())
-                appendPrefetchError(entry);
-            std::sort(
-                prefetchNodeErrors.begin(), prefetchNodeErrors.end(),
-                [](const NodeInstanceError& lhs,
-                   const NodeInstanceError& rhs)
-                {
-                    if (lhs.node != rhs.node)
-                        return lhs.node < rhs.node;
-                    return lhs.instance < rhs.instance;
-                });
-            const auto prefetchNodeScreenError =
-                [&prefetchNodeErrors, prefetchThreshold](
-                    NodeHandle node, InstanceId instance)
-            {
-                const uint64_t key =
-                    (uint64_t(node.hi) << 32) | uint64_t(node.lo);
-                const auto found = std::lower_bound(
-                    prefetchNodeErrors.begin(), prefetchNodeErrors.end(),
-                    std::pair<uint64_t, InstanceId>{key, instance},
-                    [](const NodeInstanceError& item,
-                       const std::pair<uint64_t, InstanceId>& value)
-                    {
-                        return item.node != value.first
-                                   ? item.node < value.first
-                                   : item.instance < value.second;
-                    });
-                return found != prefetchNodeErrors.end() &&
-                               found->node == key &&
-                               found->instance == instance
-                           ? found->error
-                           : prefetchThreshold;
-            };
 
             for (const FrontierEntry& entry : prefetchFrontier)
             {
@@ -5202,6 +5093,9 @@ private:
             {
                 if (prefetchRefinement.depth(groupIndex) != 1)
                     continue;
+                const float parentError =
+                    prefetchRefinement.parentEntry(groupIndex)
+                        .approximateError(prefetchThreshold);
                 std::vector<size_t> groupResources;
                 for (const FrontierEntry& entry :
                      prefetchRefinement.children(groupIndex))
@@ -5209,9 +5103,6 @@ private:
                     const size_t slot = resourceForEntry(entry);
                     if (slot == kStreamingResourceSlotCount)
                         continue;
-                    const float parentError = prefetchNodeScreenError(
-                        prefetchRefinement.parent(groupIndex),
-                        entry.instance());
                     groupResources.push_back(slot);
                     prefetchDemand[slot] = true;
                     virtualResources_[slot].prefetchErrors.add(parentError);

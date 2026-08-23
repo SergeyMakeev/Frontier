@@ -172,7 +172,11 @@ and database versions for the immediately preceding handle result. The walk
 starts at those current entries, carries placement transforms and error clamps
 across mounts, and commits complete visible immediate-child groups
 breadth-first. Depth and node-limit flags distinguish bounded results from an
-exhaustive threshold-directed closure.
+exhaustive threshold-directed closure. Each group stores its complete parent
+entry. Parallel 32-bit expansion streams map the source current cut and every
+returned child entry directly to the group that expands it, or `kInvalidIndex`
+at a horizon endpoint. Streaming planners can consume the forest linearly
+without constructing handle maps or sorted parent-error indexes.
 
 ## TLAS maintenance
 
