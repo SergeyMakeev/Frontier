@@ -288,3 +288,30 @@ meaning of `true` or `false`.
 This change only consolidates dispatch and public naming. The builders, data
 layouts, rebuild work, and post-rebuild query topology are unchanged, so the
 corrected performance measurements above remain the applicable numbers.
+
+## Virtual-streaming timing decomposition
+
+### Observation and theory
+
+The city performance UI reported roughly 640 us for `Virtual streaming`
+against roughly 122 us for Frontier selection. The total covered much more than
+the Frontier refinement walk: it also included ideal-demand construction,
+sorting and lookup tables, scoring, candidate deduplication, admission and
+eviction planning, and hero-pressure bookkeeping. The city requests only
+immediate refinement groups for loading but computes its diagnostic ideal
+endpoint with `SpatialQuery::UnlimitedDepth`, so tree depth alone does not bound
+the number of refinement entries processed.
+
+The first experiment is measurement-only. Preserve the existing inclusive
+`Virtual streaming` timer and decompose it into non-overlapping subtimers:
+
+- `Frontier refine`: elapsed time inside every
+  `computeFrontierRefinement()` call, including the optional lookahead query;
+- `Streaming planner`: the remainder of `updateVirtualStreaming()` after
+  subtracting measured refinement calls;
+- `Scenario checks`: `updateHeroPressureScenario()` outside the planner.
+
+The inclusive total remains the only streaming value included in measured CPU
+frame accounting. The three child timers receive the same smoothing and raw
+5-to-10-second histories as the existing performance counters, allowing the
+next optimization experiment to target the measured dominant component.

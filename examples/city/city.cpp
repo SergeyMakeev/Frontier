@@ -227,6 +227,9 @@ enum class PerformanceTimer : uint8_t
     CutStats,
     Render,
     Streaming,
+    StreamingRefinement,
+    StreamingPlanner,
+    StreamingScenario,
     FrameSubmit,
     RenderThread,
     Gpu,
@@ -323,6 +326,9 @@ struct PerformanceSample
     float cutStatsMs = 0.0f;
     float renderMs = 0.0f;
     float streamingMs = 0.0f;
+    float streamingRefinementMs = 0.0f;
+    float streamingPlannerMs = 0.0f;
+    float streamingScenarioMs = 0.0f;
     float frameSubmitMs = 0.0f;
     float renderThreadMs = 0.0f;
     float gpuMs = 0.0f;
@@ -916,9 +922,17 @@ public:
         performance.renderMs = milliseconds(stageStart, stageEnd);
 
         stageStart = stageEnd;
-        updateVirtualStreaming(frontier, prefetchFrontier, deltaTime);
+        updateVirtualStreaming(frontier, prefetchFrontier, deltaTime,
+                               performance.streamingRefinementMs);
+        const int64_t streamingPlannerEnd = bx::getHPCounter();
         updateHeroPressureScenario();
         stageEnd = bx::getHPCounter();
+        const float streamingUpdateMs =
+            milliseconds(stageStart, streamingPlannerEnd);
+        performance.streamingPlannerMs = std::max(
+            0.0f, streamingUpdateMs - performance.streamingRefinementMs);
+        performance.streamingScenarioMs =
+            milliseconds(streamingPlannerEnd, stageEnd);
         performance.streamingMs = milliseconds(stageStart, stageEnd);
 
         stageStart = stageEnd;
@@ -1871,6 +1885,12 @@ private:
         case PerformanceTimer::CutStats: return sample.cutStatsMs;
         case PerformanceTimer::Render: return sample.renderMs;
         case PerformanceTimer::Streaming: return sample.streamingMs;
+        case PerformanceTimer::StreamingRefinement:
+            return sample.streamingRefinementMs;
+        case PerformanceTimer::StreamingPlanner:
+            return sample.streamingPlannerMs;
+        case PerformanceTimer::StreamingScenario:
+            return sample.streamingScenarioMs;
         case PerformanceTimer::FrameSubmit: return sample.frameSubmitMs;
         case PerformanceTimer::RenderThread: return sample.renderThreadMs;
         case PerformanceTimer::Gpu: return sample.gpuMs;
@@ -1963,6 +1983,17 @@ private:
                              ImVec4(0.98f, 0.50f, 0.18f, 1.0f));
         drawPerformanceTimer("Virtual streaming", PerformanceTimer::Streaming,
                              ImVec4(0.90f, 0.60f, 0.25f, 1.0f));
+        ImGui::Indent();
+        drawPerformanceTimer("Frontier refine",
+                             PerformanceTimer::StreamingRefinement,
+                             ImVec4(0.98f, 0.70f, 0.28f, 1.0f));
+        drawPerformanceTimer("Streaming planner",
+                             PerformanceTimer::StreamingPlanner,
+                             ImVec4(0.82f, 0.52f, 0.22f, 1.0f));
+        drawPerformanceTimer("Scenario checks",
+                             PerformanceTimer::StreamingScenario,
+                             ImVec4(0.70f, 0.42f, 0.18f, 1.0f));
+        ImGui::Unindent();
 
         ImGui::TextColored(ImVec4(0.90f, 0.45f, 0.85f, 1.0f), "bgfx");
         ImGui::Separator();
@@ -2598,6 +2629,10 @@ private:
         smooth(performance_.cutStatsMs, sample.cutStatsMs);
         smooth(performance_.renderMs, sample.renderMs);
         smooth(performance_.streamingMs, sample.streamingMs);
+        smooth(performance_.streamingRefinementMs,
+               sample.streamingRefinementMs);
+        smooth(performance_.streamingPlannerMs, sample.streamingPlannerMs);
+        smooth(performance_.streamingScenarioMs, sample.streamingScenarioMs);
         smooth(performance_.frameSubmitMs, sample.frameSubmitMs);
         smooth(performance_.renderThreadMs, sample.renderThreadMs);
         smooth(performance_.gpuMs, sample.gpuMs);
@@ -4710,8 +4745,9 @@ private:
 
     void updateVirtualStreaming(const FrontierResultView& frontier,
                                 const FrontierResultView& prefetchFrontier,
-                                float deltaTime)
+                                float deltaTime, float& refinementMs)
     {
+        refinementMs = 0.0f;
         if (!streamingPaused_)
             streamingTime_ += deltaTime;
 
@@ -4787,9 +4823,12 @@ private:
             return;
         }
 
+        int64_t refinementStart = bx::getHPCounter();
         const FrontierRefinementView refinement =
             query_.computeFrontierRefinement(
                 database_, frontier, SpatialQuery::UnlimitedDepth);
+        int64_t refinementEnd = bx::getHPCounter();
+        refinementMs += milliseconds(refinementStart, refinementEnd);
         lastRefinementGroups_ = uint32_t(refinement.groupCount());
         lastRefinementEntries_ = uint32_t(refinement.entries().size());
         streamingPlanValid_ = true;
@@ -4994,10 +5033,13 @@ private:
         lastPrefetchGroupCount_ = 0;
         if (!prefetchFrontier.empty())
         {
+            refinementStart = bx::getHPCounter();
             const FrontierRefinementView prefetchRefinement =
                 streamingLookaheadQuery_.computeFrontierRefinement(
                     database_, prefetchFrontier,
                     SpatialQuery::UnlimitedDepth);
+            refinementEnd = bx::getHPCounter();
+            refinementMs += milliseconds(refinementStart, refinementEnd);
             lastPrefetchGroupCount_ =
                 uint32_t(prefetchRefinement.groupCount());
             const float prefetchThreshold = prefetchRefinement.threshold();

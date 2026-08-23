@@ -168,8 +168,12 @@ Wireframe can also be toggled directly from the top-bar
 **Rendering** menu and composes with hierarchy tinting. **Scene stats** contains
 entity, cut, streaming, cache, simulation, and camera status.
 **Performance** reports timings in microseconds and puts Frontier selection,
-motion/database work, and virtual streaming first. bgfx timing and backend
-counters follow, with UI, camera, and diagnostic overhead last. Every timer has
+motion/database work, and virtual streaming first. The virtual-streaming total
+is decomposed into all `computeFrontierRefinement()` calls, the remaining
+application-side streaming planner, and hero-scenario checks; those three
+subtimers are diagnostic children and are not counted again in total CPU time.
+bgfx timing and backend counters follow, with UI, camera, and diagnostic
+overhead last. Every timer has
 its own rolling raw-sample chart covering roughly 5-10 seconds, including
 Frontier selection, motion submission, `applyUpdates`, TLAS rebuild, resource
 publication, bgfx submit/render/GPU/wait, UI, camera, accounting, unaccounted,
