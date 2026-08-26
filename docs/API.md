@@ -223,6 +223,45 @@ The descriptor occupies 36 bytes with a four-byte payload and 40 bytes with an
 eight-byte payload. The remaining flag bits are reserved and must remain zero.
 Builders accept only `FlagMountable`; TLAS roots accept both defined flags.
 
+### Multiple payload LODs on one node
+
+`NodeDesc::payload` and `NodeDesc::geometricError` are always slot zero. A node
+may add up to seven finer representations that share the exact same bound and
+children:
+
+```cpp
+std::array<PayloadLodDesc, 3> finer{{
+    {buildingMediumPayload, 16.0f},
+    {buildingFinePayload, 4.0f},
+    {buildingFullPayload, 0.0f},
+}};
+auto building = buildingBuilder.createNode(
+    NodeDesc{
+        .payload = buildingCoarsePayload,
+        .geometricError = 32.0f,
+        .bounds = buildingBounds,
+    },
+    finer);
+```
+
+Additional errors must be finite, non-negative, and non-increasing. Frontier
+walks choose the first slot whose projected error satisfies the threshold;
+only when the finest slot remains over threshold do they descend to structural
+children. `FrontierEntry::payloadIndex()` identifies the chosen slot, so payload
+lookup must pass it:
+
+```cpp
+UserPayload payload = database.tryGetPayload(
+    entry.nodeHandle, entry.payloadIndex());
+```
+
+Slots stream independently through `markPayloadReady()` and
+`markPayloadUnavailable()`. Hole-free coverage remains per node: every payload
+is a complete representation of the common node bound, so any ready slot can
+cover it. The legacy node readiness methods operate on slot zero. Scalar-only
+definitions keep the original serialized streams and scalar traversal
+specialization; multi-payload nodes use sparse, padded sidecar records.
+
 `UserPayload` defaults to `uint64_t`, with `UINT64_MAX` as the invalid value.
 Applications can replace both build-wide using preprocessor definitions; the
 library and every consumer must use the same definitions:
@@ -288,7 +327,8 @@ SubtreeBytes buildingBytes = buildingBuilder.build();
 
 `createNode(desc)` creates a direct child of the node on which the eventual
 definition is mounted. `createNode(parent, desc)` creates a local child of an
-earlier builder node. A definition may therefore have several direct nodes; the
+earlier builder node. Both forms have an overload accepting the additional
+payload span. A definition may therefore have several direct nodes; the
 serialized representation uses an internal implicit-parent sentinel to keep
 those roots contiguous. The sentinel is never renderable and has no public
 handle.
@@ -428,6 +468,10 @@ existing placement. Mounting verifies that the transformed definition bounds
 fit inside the parent and applies the parent's effective error as a ceiling.
 The definition bytes are never rewritten.
 
+The overload `instantiate(root, additionalPayloads, desc)` authors slots 1–7
+on the permanent root. Root slot zero is permanently ready; additional slots
+use the normal per-payload readiness API.
+
 ```cpp
 if (!database.hasMountedSubtree(houseProxy)) {
     SubtreeInstanceHandle house = database.mountSubtree(
@@ -538,7 +582,8 @@ Render the zero-copy current-cut view:
 
 ```cpp
 for (const FrontierEntry& entry : cut) {
-    if (UserPayload payload = database.tryGetPayload(entry.nodeHandle);
+    if (UserPayload payload = database.tryGetPayload(
+            entry.nodeHandle, entry.payloadIndex());
         payload != kInvalidPayload)
         submitPayload(payload, entry.instance());
 }
@@ -695,7 +740,8 @@ auto requestMissingTopology = [&](std::span<const FrontierEntry> entries) {
             database.hasMountedSubtree(entry.nodeHandle))
             continue;
 
-        if (UserPayload payload = database.tryGetPayload(entry.nodeHandle);
+        if (UserPayload payload = database.tryGetPayload(
+                entry.nodeHandle, entry.payloadIndex());
             payload != kInvalidPayload && content.isExpandable(payload))
             requestChildDefinition(entry.nodeHandle, payload);
     }
@@ -862,17 +908,20 @@ for (uint32_t group = 0; group < refinement.groupCount(); ++group) {
         continue;
 
     for (const FrontierEntry& entry : children) {
-        if (database.isNodeReady(entry.nodeHandle))
+        if (database.isPayloadReady(entry.nodeHandle,
+                                    entry.payloadIndex()))
             continue;
-        if (UserPayload payload = database.tryGetPayload(entry.nodeHandle);
+        if (UserPayload payload = database.tryGetPayload(
+                entry.nodeHandle, entry.payloadIndex());
             payload != kInvalidPayload)
-            gpuStreamer.request(entry.nodeHandle, payload);
+            gpuStreamer.request(entry.nodeHandle, entry.payloadIndex(),
+                                payload);
     }
 }
 
 // Applied later, during a writer phase after the upload finishes.
 for (const GpuCompletion& completed : gpuStreamer.completed())
-    database.markNodeReady(completed.node);
+    database.markPayloadReady(completed.node, completed.payloadIndex);
 ```
 
 The readiness test is still necessary: a complete candidate group may contain
@@ -897,7 +946,8 @@ load and mount its child definition:
 
 ```cpp
 for (const FrontierEntry& entry : cut) {
-    const UserPayload payload = database.tryGetPayload(entry.nodeHandle);
+    const UserPayload payload = database.tryGetPayload(
+        entry.nodeHandle, entry.payloadIndex());
     if (payload == kInvalidPayload)
         continue;
 
@@ -1409,7 +1459,8 @@ void requestReadiness(const FrontierRefinementView& refinement)
         for (const FrontierEntry& entry : children) {
             if (database.isNodeReady(entry.nodeHandle))
                 continue;
-            if (UserPayload payload = database.tryGetPayload(entry.nodeHandle);
+            if (UserPayload payload = database.tryGetPayload(
+                    entry.nodeHandle, entry.payloadIndex());
                 payload != kInvalidPayload)
                 payloadStreamer.request(entry.nodeHandle, payload);
         }
@@ -1423,8 +1474,8 @@ void expandHouses(FrontierResultView current)
             database.hasMountedSubtree(entry.nodeHandle))
             continue;
 
-        const UserPayload payload =
-            database.tryGetPayload(entry.nodeHandle);
+        const UserPayload payload = database.tryGetPayload(
+            entry.nodeHandle, entry.payloadIndex());
         if (payload == kInvalidPayload ||
             !applicationSaysHouseProxy(payload))
             continue;

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(Frontier VERSION 0.7.0 LANGUAGES CXX)
+project(Frontier VERSION 0.8.0 LANGUAGES CXX)
 
 # A standalone checkout is developer-friendly by default. When Frontier is
 # embedded with add_subdirectory(), do not fetch or build its test-only

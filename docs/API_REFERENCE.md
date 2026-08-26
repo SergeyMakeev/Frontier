@@ -1,6 +1,6 @@
 # Frontier API Reference
 
-This document is the exhaustive reference for Frontier 0.7.0. Start with the
+This document is the exhaustive reference for Frontier 0.8.0. Start with the
 [API guide](API.md) for the integration flow. All names below are in namespace
 `frontier` unless stated otherwise. `QueryScratch`,
 `SpatialDatabase::TestAccess`, and all declarations in `frontier::detail` are
@@ -64,9 +64,9 @@ Declared in `frontier/config.h`.
 
 ```cpp
 FRONTIER_VERSION_MAJOR   // 0
-FRONTIER_VERSION_MINOR   // 7
+FRONTIER_VERSION_MINOR   // 8
 FRONTIER_VERSION_PATCH   // 0
-FRONTIER_VERSION_STRING  // "0.7.0"
+FRONTIER_VERSION_STRING  // "0.8.0"
 ```
 
 ### Diagnostics macros
@@ -636,6 +636,27 @@ A mountable builder node must remain a local leaf. A mountable TLAS root or
 mounted node may receive one runtime child placement. `NodeDesc` occupies 36
 bytes with a four-byte payload and 40 bytes with an eight-byte payload.
 
+### `PayloadLodDesc`
+
+```cpp
+inline constexpr uint32_t kMaxNodePayloads = 8;
+
+struct PayloadLodDesc {
+    UserPayload payload{};
+    float geometricError = 0.0f;
+};
+```
+
+Describes one additional complete payload LOD sharing a node's bound and
+topology. `NodeDesc` is slot zero; a span passed to a builder or `instantiate()`
+supplies slots 1–7 in coarse-to-fine order. Every payload must be valid, every
+error finite and non-negative, and errors must be non-increasing. The first
+slot whose projected error meets the threshold is the desired in-node cut;
+structural refinement begins only after the finest slot remains over threshold.
+Projected payload errors preserve that non-increasing order and saturate
+overflow instead of producing NaN. Debug builds additionally assert record,
+slot, readiness-mask, and projected-error monotonicity at traversal time.
+
 ## 4. Serialized subtree storage
 
 Declared in `frontier/subtree.h`.
@@ -702,6 +723,12 @@ to address that lane directly. The definition-wide aggregate bound is stored in
 the header because the implicit parent has no parent block. These are serialized
 layout details, not additional public objects or lifetime rules.
 
+Payload slot zero and its error remain in the original scalar streams. A
+definition with additional slots appends a per-node sparse record index and one
+32-byte-aligned padded record per multi-payload node; scalar-only definitions
+append neither stream. Serialized format version 8 includes these optional
+offsets and rejects older native traversal blobs at registration.
+
 ## 5. `SubtreeBuilder`
 
 Declared in `frontier/builder.h`.
@@ -715,6 +742,12 @@ public:
     void reserve(uint32_t nodeCount);
     NodeId createNode(const NodeDesc& node);
     NodeId createNode(NodeId parent, const NodeDesc& node);
+    NodeId createNode(
+        const NodeDesc& node,
+        std::span<const PayloadLodDesc> additionalPayloads);
+    NodeId createNode(
+        NodeId parent, const NodeDesc& node,
+        std::span<const PayloadLodDesc> additionalPayloads);
     SubtreeBytes build(
         const FrontierContext& context = defaultContext());
 };
@@ -744,6 +777,12 @@ public:
 - **Contract:** `parent` exists and is not mountable, the builder is
   unconsumed, error is finite/non-negative, reserved flag bits are zero, and
   parent fanout stays at or below 511.
+
+The two overloads accepting `additionalPayloads` apply the same topology
+contracts and additionally require at most seven valid, coarse-to-fine payload
+descriptors. Scalar nodes allocate no sidecar storage. Definitions containing
+multi-payload nodes store one per-node sidecar index plus one 32-byte-aligned,
+padded record for each node that uses additional slots.
 
 #### `build(context)`
 
@@ -850,6 +889,9 @@ using InstanceId = uint32_t;
 inline constexpr uint32_t kInstanceIdBits = 24;
 inline constexpr InstanceId kInstanceIdMask = (1u << 24) - 1;
 inline constexpr InstanceId kInvalidInstanceId = kInstanceIdMask;
+inline constexpr uint32_t kFrontierInstanceIdBits = 21;
+inline constexpr InstanceId kFrontierInstanceIdMask = (1u << 21) - 1;
+inline constexpr uint32_t kFrontierPayloadIndexBits = 3;
 
 struct InstanceHandle {
     InstanceId id = kInvalidInstanceId;
@@ -862,7 +904,10 @@ struct InstanceHandle {
 
 Names one top-level instance. `rootNode()` returns its permanent renderable
 root, or an invalid node for an invalid instance handle. `valid()` does not
-consult a database. Size: 8 bytes.
+consult a database. `NodeHandle` retains its 24-bit root encoding, while live
+public instance allocation is limited to the 21-bit range representable in a
+`FrontierEntry`; the remaining three metadata bits select the payload slot.
+Size: 8 bytes.
 
 ## 7. Frontier result types
 
@@ -889,11 +934,12 @@ struct FrontierEntry {
 
     FrontierEntry();
     FrontierEntry(NodeHandle node, float error, float threshold,
-                  InstanceId instance);
+                  InstanceId instance, uint8_t payloadIndex = 0);
     FrontierEntry(NodeHandle node, uint8_t encodedError,
-                  InstanceId instance);
+                  InstanceId instance, uint8_t payloadIndex = 0);
 
     InstanceId instance() const;
+    uint8_t payloadIndex() const;
     uint8_t errorCode() const;
     bool overThreshold() const;
     float approximateError(float threshold) const;
@@ -905,6 +951,8 @@ struct FrontierEntry {
   stable while that instance is live and suitable for indexing a caller-side
   entity/transform table during that lifetime; ids may be recycled after
   removal.
+- `payloadIndex()` selects slot 0–7 on `nodeHandle`. Pass it to
+  `tryGetPayload()`, `isPayloadReady()`, and payload streaming APIs.
 - `errorCode()` returns the packed threshold-relative value.
 - `overThreshold()` is true for code 128 or greater.
 - `approximateError()` decodes a representative pixel error for the supplied
@@ -920,13 +968,15 @@ struct ResolvedFrontierEntry {
     uint32_t instanceAndError = kInvalidInstanceId;
 
     InstanceId instance() const;
+    uint8_t payloadIndex() const;
     uint8_t errorCode() const;
     bool overThreshold() const;
 };
 ```
 
 This renderer-facing form replaces the opaque node handle with its immutable
-application payload while preserving the packed instance id and error code.
+application payload while preserving the packed instance id, payload index,
+and error code.
 It is trivially copyable and occupies 8 bytes with a four-byte `UserPayload`
 or 16 bytes with an eight-byte payload because of alignment. Resolve it from a
 handle cut with `SpatialDatabase::resolveFrontier()`; stale handles produce
@@ -979,6 +1029,8 @@ public:
     uint32_t childExpansion(uint32_t groupIndex,
                             uint32_t childIndex) const;
     uint32_t findGroup(NodeHandle parent) const;
+    uint32_t findGroup(NodeHandle parent, uint8_t payloadIndex) const;
+    uint32_t findGroup(const FrontierEntry& parent) const;
     std::span<const FrontierEntry> entries() const;
     float threshold() const;
     bool complete() const;
@@ -999,8 +1051,11 @@ not itself preserve group boundaries.
 the group that expands it. `childExpansion(groupIndex, childIndex)` does the
 same for an entry in `children(groupIndex)`. Both return `kInvalidIndex` when
 the entry is an endpoint of the returned horizon. These direct links let a
-planner inspect the group forest in linear time. `findGroup()` remains a linear
-handle search for occasional lookup. Indexed access routes an out-of-range
+planner inspect the group forest in linear time. Refinement advances additional
+payload slots as singleton groups before structural children, so consecutive
+groups may have the same `NodeHandle`. Use the payload-index or entry overload
+of `findGroup()` when that distinction matters; the handle-only form returns
+the first match. Indexed access routes an out-of-range
 index through `FRONTIER_FATAL`.
 
 Each child is a `FrontierEntry` with the same top-level instance id as its
@@ -1422,6 +1477,7 @@ struct TerminalRenderRun {
     uint32_t instanceAndError = kInvalidInstanceId;
 
     InstanceId instance() const;
+    uint8_t payloadIndex() const;
     uint8_t errorCode() const;
     std::span<const UserPayload> payloadSpan() const;
 };
@@ -1482,8 +1538,9 @@ public:
 ```
 
 This is the max-detail output path for fully resident immutable scenes. It
-selects every visible zero-error terminal leaf and represents consecutive
-definition leaves as referenced payload ranges. Each run stores one stable
+selects every visible terminal node whose finest payload slot has zero error,
+uses that finest slot, and represents consecutive definition leaves as
+referenced payload ranges. Each run stores one stable
 `InstanceId`, one terminal error code, a payload pointer, and a payload count.
 The descriptor occupies 16 bytes on a 64-bit target. The renderer must still
 iterate every logical payload unless it has a higher-level instancing scheme;
@@ -1492,15 +1549,16 @@ iterate every logical payload unless it has a higher-level instancing scheme;
 The contract is intentionally narrower than `SpatialQuery`:
 
 - every selected mounted tree must be fully ready;
-- definitions must contain no nested mount points and every terminal node must
-  have zero geometric error;
+- definitions must contain no nested mount points and every terminal node's
+  finest payload slot must have zero geometric error;
 - selected instances must not have copy-on-write bound deformation;
 - the caller must publish changes with `applyUpdates(budget)` first.
 
 Violations are contract errors; the query does not silently fall back to a
 proxy because that would change max-detail semantics. TLAS-only roots remain
-valid one-element runs. `errorThreshold` controls their threshold-relative
-error encoding; terminal leaves always use code zero.
+valid one-element runs and use their finest ready slot. `errorThreshold`
+controls their threshold-relative error encoding; terminal definition leaves
+always use code zero.
 
 With `coarsenRenderUnits=true`, an instance opted into
 `setInstanceRenderAsUnit()` is descendant-conservative: once its root
@@ -1698,9 +1756,14 @@ size_t subtreeCount() const;
 ```cpp
 InstanceHandle instantiate(const NodeDesc& root,
                            const InstanceDesc& desc = {});
+InstanceHandle instantiate(
+    const NodeDesc& root,
+    std::span<const PayloadLodDesc> additionalPayloads,
+    const InstanceDesc& desc = {});
 ```
 
-- **Parameters:** `root` describes the permanent renderable fallback;
+- **Parameters:** `root` describes slot zero of the permanent renderable
+  fallback; the optional overload's `additionalPayloads` supplies slots 1–7;
   `desc` supplies world translation, uniform scale, planar yaw, and view mask.
 - **Returns:** a generation-stamped instance handle whose `rootNode()` is live
   immediately.
@@ -1712,8 +1775,9 @@ InstanceHandle instantiate(const NodeDesc& root,
   transformed root bound and error must remain representable as finite floats.
   If `FlagYawInvariantBounds` is set, the application guarantees that the
   authored root bound contains all content at every possible submitted yaw.
-- **Readiness:** the live TLAS root is always ready. Its payload value does not
-  affect the readiness of mounted definition nodes with the same value.
+- **Readiness:** TLAS-root slot zero is always ready. Additional slots begin
+  unavailable and use the per-payload readiness calls. Root payload values do
+  not affect mounted definition nodes with the same values.
 
 ```cpp
 void removeInstance(InstanceHandle instance);
@@ -1946,6 +2010,7 @@ bool tryGetNodeTransform(NodeHandle node, Transform& outTransform) const;
 
 ```cpp
 void markNodeReady(NodeHandle node);
+void markPayloadReady(NodeHandle node, uint8_t payloadIndex);
 ```
 
 - **Parameters:** a live mounted node whose complete GPU resource set is now
@@ -1956,9 +2021,13 @@ void markNodeReady(NodeHandle node);
   the call is a no-op.
 - **Repeat/stale behavior:** no-op when already ready or when the handle is
   stale or invalid.
+- **Payload behavior:** `markNodeReady()` is the source-compatible slot-zero
+  form. `markPayloadReady()` publishes one slot. Readiness is shared by
+  definition node and slot across all placements.
 
 ```cpp
 void markNodeUnavailable(NodeHandle node);
+void markPayloadUnavailable(NodeHandle node, uint8_t payloadIndex);
 ```
 
 - **Parameters:** a mounted node that can no longer be dispatched.
@@ -1967,30 +2036,36 @@ void markNodeUnavailable(NodeHandle node);
   definition. Equal payload values in other definition nodes are unaffected.
 - **Repeat/stale behavior:** no-op when already unavailable or when the handle
   is stale or invalid.
-- **Contract:** a live TLAS root may not be made unavailable because it is the
-  permanent renderable fallback.
+- **Contract:** TLAS-root slot zero may not be made unavailable because it is
+  the permanent renderable fallback. Additional root slots can transition.
 
 ```cpp
 bool isNodeReady(NodeHandle node) const;
+bool isPayloadReady(NodeHandle node, uint8_t payloadIndex) const;
 ```
 
 Returns `true` for a live TLAS root or a mounted node whose registered
 definition-node bit is ready. Returns `false` for unavailable, stale, or invalid
 mounted handles. Readiness survives unmounting and is inherited by later
 placements of the same registered definition; releasing the definition
-discards it. A readiness change cannot be published before the definition has
-at least one live placement because the public identifier is a `NodeHandle`.
+discards it. `isNodeReady()` queries slot zero; `isPayloadReady()` queries the
+specified slot. Payload slots stream independently, but hole-free coverage is
+per node: any ready slot completely represents the common node bound. A
+readiness change cannot be published before the definition has at least one
+live placement because the public identifier is a `NodeHandle`.
 
 ```cpp
-UserPayload tryGetPayload(NodeHandle node) const;
+UserPayload tryGetPayload(NodeHandle node,
+                          uint8_t payloadIndex = 0) const;
 ```
 
-Returns the immutable node payload when the handle resolves and
+Returns the immutable selected-slot payload when the handle resolves and
 `kInvalidPayload` for stale or invalid input. The value is reserved by the
 authoring contract, rejected by checked builders and validated registration,
 and is therefore unambiguous. An entry produced by a selection resolves
 throughout the same published read interval; failure is relevant when the
 application retains a handle across a later writer phase.
+For a frontier entry, always pass `entry.payloadIndex()`.
 
 ```cpp
 std::span<ResolvedFrontierEntry> resolveFrontier(
@@ -2000,7 +2075,7 @@ std::span<ResolvedFrontierEntry> resolveFrontier(
 
 `resolveFrontier()` converts a complete or partial handle span into
 caller-owned renderer-facing entries. It preserves order and copies each
-entry's packed instance/error metadata unchanged. Consecutive handles from one
+entry's packed instance/payload-index/error metadata unchanged. Consecutive handles from one
 mounted placement share slot/generation validation and stream directly from
 the immutable payload array; TLAS roots retain scalar generation validation.
 Stale handles write `kInvalidPayload` rather than touching recycled state.
@@ -2275,8 +2350,11 @@ reuse-record updates are query-local and ordered.
 - Mounted placement slots and definition-local node indices use 20 bits.
 - Mounted-node generations use 24 bits.
 - TLAS root generations use 20 bits.
-- Public instance ids use 24 bits, with the all-ones value reserved.
-- `FrontierEntry` instance ids and error codes are packed into one 32-bit word.
+- Internal dense TLAS instance ids use 24 bits. Public instance ids use 21
+  bits so a `FrontierEntry` can also carry a 3-bit payload slot.
+- One node has one to eight ordered payload slots.
+- `FrontierEntry` instance ids, payload indices, and error codes are packed
+  into one 32-bit word.
 - Top-level runtime transforms support translation, positive uniform scale,
   and planar yaw. Mounted-subtree transforms support translation and scale.
 

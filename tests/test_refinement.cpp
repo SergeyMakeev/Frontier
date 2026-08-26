@@ -28,7 +28,8 @@ std::vector<UserPayload> groupPayloads(
 {
     std::vector<UserPayload> result;
     for (const FrontierEntry& entry : entries)
-        result.push_back(database.tryGetPayload(entry.nodeHandle));
+        result.push_back(database.tryGetPayload(
+            entry.nodeHandle, entry.payloadIndex()));
     std::sort(result.begin(), result.end());
     return result;
 }
@@ -111,6 +112,59 @@ TEST(Refinement, UnlimitedTraversalReturnsCompleteBreadthFirstGroups)
 
     EXPECT_EQ(refinedPayloads(scene.database, scene.query, current),
               (std::vector<UserPayload>{21, 22, 30}));
+}
+
+TEST(Refinement, PayloadSlotsExpandBeforeStructuralChildren)
+{
+    const std::array<PayloadLodDesc, 3> lods{{
+        {11, 16.0f},
+        {12, 4.0f},
+        {13, 0.0f},
+    }};
+    SubtreeBuilder builder;
+    builder.createNode(node(10, 32.0f, box(2.0f)), lods);
+
+    SpatialDatabase database;
+    const SubtreeHandle definition =
+        database.registerSubtree(builder.build());
+    instantiateFor(database, definition, box(4.0f), 64.0f);
+    const NodeHandle payloadNode = handleOf(database, 10);
+    database.markPayloadReady(payloadNode, 0);
+    database.applyUpdates(0);
+
+    SpatialQuery query;
+    const SelectionParams params{.threshold = 1.0f};
+    const FrontierResultView current =
+        query.selectFrontier(database, cameraAt(), params);
+    ASSERT_EQ(current.size(), 1u);
+    ASSERT_EQ(current.entries[0].nodeHandle, payloadNode);
+    ASSERT_EQ(current.entries[0].payloadIndex(), 0u);
+
+    const FrontierRefinementView refinement =
+        query.computeFrontierRefinement(
+            database, current, SpatialQuery::UnlimitedDepth);
+    ASSERT_EQ(refinement.groupCount(), 3u);
+    EXPECT_TRUE(refinement.complete());
+    for (uint32_t group = 0; group < 3; ++group)
+    {
+        EXPECT_EQ(refinement.parent(group), payloadNode);
+        EXPECT_EQ(refinement.parentEntry(group).payloadIndex(), group);
+        ASSERT_EQ(refinement.children(group).size(), 1u);
+        EXPECT_EQ(refinement.children(group)[0].nodeHandle, payloadNode);
+        EXPECT_EQ(refinement.children(group)[0].payloadIndex(), group + 1u);
+        EXPECT_EQ(refinement.findGroup(payloadNode, uint8_t(group)), group);
+    }
+    EXPECT_EQ(refinement.currentExpansion(0), 0u);
+    EXPECT_EQ(refinement.childExpansion(0, 0), 1u);
+    EXPECT_EQ(refinement.childExpansion(1, 0), 2u);
+    EXPECT_EQ(refinement.childExpansion(2, 0), kInvalidIndex);
+    EXPECT_EQ(refinedPayloads(database, query, current),
+              (std::vector<UserPayload>{13}));
+
+    const FrontierRefinementView limited =
+        query.computeFrontierRefinement(database, current, 2);
+    EXPECT_EQ(limited.groupCount(), 2u);
+    EXPECT_TRUE(limited.depthLimitReached());
 }
 
 TEST(Refinement, FiniteDepthProvidesACompleteDecisionHorizon)

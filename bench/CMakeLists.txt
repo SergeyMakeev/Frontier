@@ -14,6 +14,28 @@ if(FRONTIER_IPO)
     set_property(TARGET frontier_bench_payload32 PROPERTY INTERPROCEDURAL_OPTIMIZATION ON)
 endif()
 
+# Kept separate so the motivating multi-payload workload cannot perturb the
+# LTO/link layout of the established scalar-selection performance guards.
+add_executable(frontier_payload_lod_bench bench_payload_lod.cpp)
+target_link_libraries(frontier_payload_lod_bench PRIVATE
+    frontier_bench_payload64_lib benchmark::benchmark Threads::Threads)
+target_include_directories(frontier_payload_lod_bench PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../tests)
+if(FRONTIER_IPO)
+    set_property(TARGET frontier_payload_lod_bench PROPERTY
+        INTERPROCEDURAL_OPTIMIZATION ON)
+endif()
+
+add_executable(frontier_payload_lod_bench_payload32 bench_payload_lod.cpp)
+target_link_libraries(frontier_payload_lod_bench_payload32 PRIVATE
+    frontier_bench_payload32_lib benchmark::benchmark Threads::Threads)
+target_include_directories(frontier_payload_lod_bench_payload32 PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../tests)
+if(FRONTIER_IPO)
+    set_property(TARGET frontier_payload_lod_bench_payload32 PROPERTY
+        INTERPROCEDURAL_OPTIMIZATION ON)
+endif()
+
 # Keep the realistic downstream-consumption case in separate executables. A
 # large benchmark function in the primary executable can otherwise perturb the
 # LTO/link layout of the production traversal code it is trying to measure.

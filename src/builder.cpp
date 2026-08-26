@@ -33,11 +33,25 @@ void SubtreeBuilder::reserve(uint32_t nodeCount)
 
 SubtreeBuilder::NodeId SubtreeBuilder::createNode(const NodeDesc& node)
 {
-    return createNode(kInvalidIndex, node);
+    return createNode(kInvalidIndex, node, {});
 }
 
 SubtreeBuilder::NodeId SubtreeBuilder::createNode(NodeId parent,
                                                    const NodeDesc& node)
+{
+    return createNode(parent, node, {});
+}
+
+SubtreeBuilder::NodeId SubtreeBuilder::createNode(
+    const NodeDesc& node,
+    std::span<const PayloadLodDesc> additionalPayloads)
+{
+    return createNode(kInvalidIndex, node, additionalPayloads);
+}
+
+SubtreeBuilder::NodeId SubtreeBuilder::createNode(
+    NodeId parent, const NodeDesc& node,
+    std::span<const PayloadLodDesc> additionalPayloads)
 {
     using namespace detail;
     FRONTIER_CHECK(!built_, "SubtreeBuilder: builder already consumed");
@@ -70,6 +84,31 @@ SubtreeBuilder::NodeId SubtreeBuilder::createNode(NodeId parent,
     built.bounds = node.bounds;
     built.payload = nodePayload;
     built.geometricError = node.geometricError;
+    FRONTIER_CHECK(additionalPayloads.size() < kMaxNodePayloads,
+                   "SubtreeBuilder: too many payloads on one node");
+    if (!additionalPayloads.empty())
+    {
+        BuildExtraPayloadRecord extra;
+        extra.count = uint32_t(additionalPayloads.size());
+        float previousError = node.geometricError;
+        for (uint32_t i = 0; i < extra.count; ++i)
+        {
+            const PayloadLodDesc& lod = additionalPayloads[i];
+            const PayloadWord payload = encodePayload(lod.payload);
+            FRONTIER_CHECK(payload != invalidPayloadWord(),
+                           "SubtreeBuilder: reserved invalid extra payload");
+            FRONTIER_CHECK(
+                lod.geometricError >= 0.0f &&
+                    std::isfinite(lod.geometricError) &&
+                    lod.geometricError <= previousError,
+                "SubtreeBuilder: extra payload errors must be finite, non-negative, and sorted");
+            extra.payload[i] = payload;
+            extra.geometricError[i] = lod.geometricError;
+            previousError = lod.geometricError;
+        }
+        built.extraPayloadRecord = uint32_t(extraPayloads_.size());
+        extraPayloads_.push_back(extra);
+    }
     built.parent = parent;
     built.setMountable(node.isMountable());
     nodes_.push_back(built);
@@ -133,7 +172,10 @@ SubtreeBytes SubtreeBuilder::build(const FrontierContext& context)
                    "SubtreeBuilder: wide offset overflow");
     const uint32_t wideCount = uint32_t(wideCount64);
 
-    const SubtreeLayout layout = subtreeLayout(total, wideCount);
+    const uint32_t extraPayloadRecordCount =
+        uint32_t(extraPayloads_.size());
+    const SubtreeLayout layout =
+        subtreeLayout(total, wideCount, extraPayloadRecordCount);
     SubtreeBytes bytes(layout.totalBytes, context);
     std::memset(bytes.data(), 0, bytes.size());
 
@@ -153,6 +195,9 @@ SubtreeBytes SubtreeBuilder::build(const FrontierContext& context)
     header->subtreeSizeOffset = layout.subtreeSize;
     header->metaOffset = layout.meta;
     header->errorOffset = layout.error;
+    header->extraPayloadIndexOffset = layout.extraPayloadIndex;
+    header->extraPayloadRecordOffset = layout.extraPayloadRecord;
+    header->extraPayloadRecordCount = extraPayloadRecordCount;
     header->branchingFactor = kWide;
     header->invalidPayloadWord = uint64_t(invalidPayloadWord());
     header->payloadBytes = sizeof(PayloadWord);
@@ -164,8 +209,19 @@ SubtreeBytes SubtreeBuilder::build(const FrontierContext& context)
     auto* subtreeSize = reinterpret_cast<uint32_t*>(base + layout.subtreeSize);
     auto* meta = reinterpret_cast<uint32_t*>(base + layout.meta);
     auto* geometricError = reinterpret_cast<float*>(base + layout.error);
+    auto* extraPayloadIndex = extraPayloadRecordCount
+                                  ? reinterpret_cast<uint32_t*>(
+                                        base + layout.extraPayloadIndex)
+                                  : nullptr;
+    auto* extraPayloadRecords = extraPayloadRecordCount
+                                    ? reinterpret_cast<ExtraPayloadRecord*>(
+                                          base + layout.extraPayloadRecord)
+                                    : nullptr;
+    if (extraPayloadIndex)
+        std::fill(extraPayloadIndex, extraPayloadIndex + total, kInvalidIndex);
 
     uint32_t emitted = 0;
+    uint32_t emittedExtraPayloads = 0;
 
     const auto emit = [&](uint32_t packedParent, uint32_t childCount,
                           bool mountable, PayloadWord nodePayload,
@@ -209,6 +265,21 @@ SubtreeBytes SubtreeBuilder::build(const FrontierContext& context)
             emit(packParent(parentIndex, ordinal), node.childCount(),
                  node.mountable(), node.payload, node.geometricError, source);
         remap[source] = packed;
+        if (extraPayloadIndex &&
+            node.extraPayloadRecord != kInvalidIndex)
+        {
+            const BuildExtraPayloadRecord& sourceExtra =
+                extraPayloads_[node.extraPayloadRecord];
+            const uint32_t record = emittedExtraPayloads++;
+            extraPayloadIndex[packed] = record;
+            ExtraPayloadRecord& target = extraPayloadRecords[record];
+            target.count = sourceExtra.count;
+            std::copy(sourceExtra.payload.begin(), sourceExtra.payload.end(),
+                      target.payload);
+            std::copy(sourceExtra.geometricError.begin(),
+                      sourceExtra.geometricError.end(),
+                      target.geometricError);
+        }
         siblingScratch.clear();
         for (NodeId child = node.firstChild; child != kInvalidIndex;
              child = nodes_[child].nextSibling)
@@ -220,14 +291,39 @@ SubtreeBytes SubtreeBuilder::build(const FrontierContext& context)
     }
     FRONTIER_CHECK(emitted == total,
                    "SubtreeBuilder: internal emission count mismatch");
+    FRONTIER_CHECK(emittedExtraPayloads == extraPayloadRecordCount,
+                   "SubtreeBuilder: internal extra-payload count mismatch");
 
-    // Clamp error monotonically from the implicit parent down.
+    // A child starts after the parent's finest in-node representation, so that
+    // final payload is the hierarchy ceiling rather than conservative slot 0.
     for (uint32_t i = 1; i < total; ++i)
     {
+        const uint32_t parentIndex = packedParentIndex(parent[i]);
+        const uint32_t parentExtra = extraPayloadIndex
+                                         ? extraPayloadIndex[parentIndex]
+                                         : kInvalidIndex;
         const float parentError =
-            geometricError[packedParentIndex(parent[i])];
+            parentExtra != kInvalidIndex
+                ? extraPayloadRecords[parentExtra].geometricError[
+                      extraPayloadRecords[parentExtra].count - 1]
+                : geometricError[parentIndex];
         if (geometricError[i] > parentError)
             geometricError[i] = parentError;
+        const uint32_t record = extraPayloadIndex
+                                    ? extraPayloadIndex[i]
+                                    : kInvalidIndex;
+        if (record != kInvalidIndex)
+        {
+            ExtraPayloadRecord& extra = extraPayloadRecords[record];
+            float ceiling = geometricError[i];
+            for (uint32_t payloadIndex = 0;
+                 payloadIndex < extra.count; ++payloadIndex)
+            {
+                extra.geometricError[payloadIndex] =
+                    std::min(extra.geometricError[payloadIndex], ceiling);
+                ceiling = extra.geometricError[payloadIndex];
+            }
+        }
     }
 
     uint32_t wideIndex = 0;
@@ -250,6 +346,7 @@ SubtreeBytes SubtreeBuilder::build(const FrontierContext& context)
             uint32_t valid = 0;
             uint32_t leaf = 0;
             uint32_t zeroError = 0;
+            uint32_t multiPayload = 0;
             for (uint32_t lane = 0;
                  lane < kWide && first + lane < childCount; ++lane)
             {
@@ -265,6 +362,9 @@ SubtreeBytes SubtreeBuilder::build(const FrontierContext& context)
                 valid |= 1u << lane;
                 if (geometricError[child] == 0.0f)
                     zeroError |= 1u << lane;
+                if (extraPayloadIndex &&
+                    extraPayloadIndex[child] != kInvalidIndex)
+                    multiPayload |= 1u << lane;
                 if (metaChildCount(meta[child]) == 0 &&
                     !metaIsMountable(meta[child]))
                     leaf |= 1u << lane;
@@ -274,7 +374,8 @@ SubtreeBytes SubtreeBuilder::build(const FrontierContext& context)
             wide[wideIndex] = block;
             blockMask[wideIndex] =
                 valid | (leaf << kBlockLeafShift) |
-                (zeroError << kBlockZeroErrorShift);
+                (zeroError << kBlockZeroErrorShift) |
+                (multiPayload << kBlockMultiPayloadShift);
             ++wideIndex;
         }
         FRONTIER_ASSERT(i == 0 || childSource == kInvalidIndex,
@@ -317,7 +418,15 @@ SubtreeBytes SubtreeBuilder::build(const FrontierContext& context)
         const AABB parentBounds = packedNodeBounds(parentIndex);
         FRONTIER_CHECK(parentBounds.contains(nodeBounds),
                        "SubtreeBuilder: bounds containment violated");
-        FRONTIER_CHECK(geometricError[i] <= geometricError[parentIndex],
+        const uint32_t parentExtra = extraPayloadIndex
+                                         ? extraPayloadIndex[parentIndex]
+                                         : kInvalidIndex;
+        const float parentFinestError =
+            parentExtra != kInvalidIndex
+                ? extraPayloadRecords[parentExtra].geometricError[
+                      extraPayloadRecords[parentExtra].count - 1]
+                : geometricError[parentIndex];
+        FRONTIER_CHECK(geometricError[i] <= parentFinestError,
                        "SubtreeBuilder: error monotonicity violated");
         FRONTIER_CHECK(metaChildCount(meta[i]) == 0 ||
                            !metaIsMountable(meta[i]),

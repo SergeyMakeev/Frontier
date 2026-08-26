@@ -100,6 +100,17 @@ inline PayloadWord invalidPayloadWord() noexcept
 } // namespace detail
 
 inline constexpr uint32_t kInvalidIndex = 0xFFFFFFFFu;
+inline constexpr uint32_t kMaxNodePayloads = 8;
+
+// One additional complete representation of a node's common conservative
+// bound. NodeDesc::payload/geometricError remain payload slot zero so existing
+// scalar authoring stays source-compatible and keeps its compact fast path.
+// Additional slots are ordered from coarser to finer representation.
+struct PayloadLodDesc
+{
+    UserPayload payload{};
+    float geometricError = 0.0f;
+};
 
 // Translation plus positive uniform scale for mounted subtrees.
 struct Transform
@@ -182,7 +193,6 @@ struct NodeDesc
     float geometricError = 0.0f;
     uint32_t flags = 0;
     ScalarAABB bounds = AABB::empty();
-
     bool isMountable() const noexcept
     {
         return (flags & FlagMountable) != 0;

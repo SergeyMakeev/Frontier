@@ -1,6 +1,7 @@
 #include "frontier/spatial_database.h"
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cmath>
 #include <memory>
@@ -9,10 +10,12 @@
 namespace frontier {
 
 using detail::MutWideBoundsRef;
+using detail::ExtraPayloadRecord;
 using detail::SubtreeView;
 using detail::WideBlock;
 using detail::WideBoundsRef;
 using detail::blockLeafLanes;
+using detail::blockMultiPayloadLanes;
 using detail::blockZeroErrorLanes;
 using detail::blockValidLanes;
 using detail::metaIsMountable;
@@ -191,14 +194,250 @@ float decodeFrontierError(uint8_t code, float threshold)
 namespace {
 
 inline FrontierEntry makeFrontierEntry(NodeHandle node, float error, float threshold,
-                             float thresholdInv, InstanceId instance)
+                             float thresholdInv, InstanceId instance,
+                             uint8_t payloadIndex = 0)
 {
-    if (!(error > 0.0f)) return FrontierEntry{node, uint8_t(0), instance};
+    if (!(error > 0.0f))
+        return FrontierEntry{node, uint8_t(0), instance, payloadIndex};
     if (!(threshold > 0.0f))
-        return FrontierEntry{node, uint8_t(error > threshold ? 255 : 127), instance};
+        return FrontierEntry{node, uint8_t(error > threshold ? 255 : 127),
+                             instance, payloadIndex};
     return FrontierEntry{node,
                     encodeFrontierErrorRatio(error * thresholdInv, error > threshold),
-                    instance};
+                    instance, payloadIndex};
+}
+
+struct PayloadChoice
+{
+    uint8_t index = 0;
+    float error = 0.0f;
+    bool overThreshold = false;
+};
+
+#ifndef NDEBUG
+inline void assertPayloadErrorsMonotonic(
+    const SubtreeView& view, uint32_t node, float errorClamp)
+{
+    FRONTIER_ASSERT(view.valid() && node != 0 && node <= view.nodeCount(),
+                    "multi-payload node index is invalid");
+    FRONTIER_ASSERT(errorClamp >= 0.0f && std::isfinite(errorClamp),
+                    "multi-payload error clamp is invalid");
+    const detail::ExtraPayloadRecord* extra =
+        view.extraPayloadRecord(node);
+    if (!extra) return;
+    FRONTIER_ASSERT(extra->count != 0 && extra->count < kMaxNodePayloads,
+                    "multi-payload record count is invalid");
+    float previous = std::min(view.geometricError_[node], errorClamp);
+    FRONTIER_ASSERT(previous >= 0.0f && std::isfinite(previous),
+                    "multi-payload base error is invalid");
+    for (uint32_t payloadIndex = 0;
+         payloadIndex < extra->count; ++payloadIndex)
+    {
+        const float current = std::min(
+            extra->geometricError[payloadIndex], errorClamp);
+        FRONTIER_ASSERT(current >= 0.0f && std::isfinite(current) &&
+                            current <= previous,
+                        "multi-payload geometric errors are not monotonic");
+        previous = current;
+    }
+}
+
+inline void assertPayloadErrorsMonotonic(
+    const ExtraPayloadRecord* extra)
+{
+    if (!extra) return;
+    FRONTIER_ASSERT(extra->count != 0 && extra->count < kMaxNodePayloads,
+                    "TLAS multi-payload record count is invalid");
+    float previous = extra->geometricError[0];
+    FRONTIER_ASSERT(previous >= 0.0f && std::isfinite(previous),
+                    "TLAS multi-payload base error is invalid");
+    for (uint32_t payloadIndex = 1;
+         payloadIndex <= extra->count; ++payloadIndex)
+    {
+        const float current = extra->geometricError[payloadIndex];
+        FRONTIER_ASSERT(current >= 0.0f && std::isfinite(current) &&
+                            current <= previous,
+                        "TLAS multi-payload geometric errors are not monotonic");
+        previous = current;
+    }
+}
+#endif
+
+inline float scalePayloadProjectedError(float baseProjectedError,
+                                        float ratio)
+{
+    FRONTIER_ASSERT(baseProjectedError >= 0.0f &&
+                        !std::isnan(baseProjectedError),
+                    "projected base payload error is invalid");
+    FRONTIER_ASSERT(ratio >= 0.0f && ratio <= 1.0f &&
+                        std::isfinite(ratio),
+                    "payload projected-error ratio is invalid");
+    if (!(ratio > 0.0f)) return 0.0f;
+    if (!std::isfinite(baseProjectedError)) return FLT_MAX;
+    const float projected = baseProjectedError * ratio;
+    return std::isfinite(projected)
+               ? std::min(projected, baseProjectedError)
+               : FLT_MAX;
+}
+
+inline float payloadProjectedError(
+    const SubtreeView& view, uint32_t node, uint8_t payloadIndex,
+    float errorClamp, float baseProjectedError)
+{
+    FRONTIER_ASSERT(view.valid() && node != 0 && node <= view.nodeCount(),
+                    "projected payload node index is invalid");
+    FRONTIER_ASSERT(errorClamp >= 0.0f && std::isfinite(errorClamp),
+                    "projected payload error clamp is invalid");
+    FRONTIER_ASSERT(baseProjectedError >= 0.0f &&
+                        !std::isnan(baseProjectedError),
+                    "projected base payload error is invalid");
+    if (payloadIndex == 0) return baseProjectedError;
+    const detail::ExtraPayloadRecord* extra =
+        view.extraPayloadRecord(node);
+    FRONTIER_ASSERT(extra && payloadIndex <= extra->count,
+                    "projected payload index is outside the node");
+    if (!extra || payloadIndex > extra->count) return baseProjectedError;
+    const float baseGeometric =
+        std::min(view.geometricError_[node], errorClamp);
+    const float payloadGeometric = std::min(
+        extra->geometricError[payloadIndex - 1], errorClamp);
+    FRONTIER_ASSERT(baseGeometric > 0.0f,
+                    "finer payload requested below a zero base error");
+    FRONTIER_ASSERT(payloadGeometric >= 0.0f &&
+                        std::isfinite(payloadGeometric) &&
+                        payloadGeometric <= baseGeometric,
+                    "payload geometric error is not monotonic");
+    const float ratio = payloadGeometric / baseGeometric;
+    FRONTIER_ASSERT(ratio >= 0.0f && ratio <= 1.0f &&
+                        std::isfinite(ratio),
+                    "payload projected-error ratio is invalid");
+    const float projected =
+        scalePayloadProjectedError(baseProjectedError, ratio);
+    FRONTIER_ASSERT(projected >= 0.0f && std::isfinite(projected) &&
+                        (!std::isfinite(baseProjectedError) ||
+                         projected <= baseProjectedError),
+                    "payload projected error is not monotonic");
+    return projected;
+}
+
+inline PayloadChoice choosePayload(
+    const SubtreeView& view, uint32_t node, float errorClamp,
+    float baseProjectedError, float threshold)
+{
+#ifndef NDEBUG
+    assertPayloadErrorsMonotonic(view, node, errorClamp);
+#endif
+    FRONTIER_ASSERT(baseProjectedError >= 0.0f &&
+                        !std::isnan(baseProjectedError) &&
+                        threshold > 0.0f && std::isfinite(threshold),
+                    "payload choice inputs are invalid");
+    PayloadChoice choice{0, baseProjectedError,
+                         baseProjectedError > threshold};
+    if (!choice.overThreshold) return choice;
+    const detail::ExtraPayloadRecord* extra =
+        view.extraPayloadRecord(node);
+    if (!extra) return choice;
+    for (uint8_t payloadIndex = 1;
+         payloadIndex <= extra->count; ++payloadIndex)
+    {
+        choice.index = payloadIndex;
+        choice.error = payloadProjectedError(
+            view, node, payloadIndex, errorClamp, baseProjectedError);
+        choice.overThreshold = choice.error > threshold;
+        if (!choice.overThreshold) break;
+    }
+    return choice;
+}
+
+inline float payloadProjectedError(
+    const ExtraPayloadRecord* extra, uint8_t payloadIndex,
+    float baseProjectedError)
+{
+    FRONTIER_ASSERT(baseProjectedError >= 0.0f &&
+                        !std::isnan(baseProjectedError),
+                    "TLAS projected base payload error is invalid");
+    if (payloadIndex == 0) return baseProjectedError;
+    FRONTIER_ASSERT(extra && payloadIndex <= extra->count,
+                    "TLAS projected payload index is outside the node");
+    if (!extra || payloadIndex > extra->count) return baseProjectedError;
+    FRONTIER_ASSERT(extra->geometricError[0] > 0.0f,
+                    "finer root payload requested below a zero base error");
+    FRONTIER_ASSERT(extra->geometricError[payloadIndex] >= 0.0f &&
+                        std::isfinite(
+                            extra->geometricError[payloadIndex]) &&
+                        extra->geometricError[payloadIndex] <=
+                            extra->geometricError[0],
+                    "TLAS payload geometric error is not monotonic");
+    const float ratio = extra->geometricError[payloadIndex] /
+                        extra->geometricError[0];
+    FRONTIER_ASSERT(ratio >= 0.0f && ratio <= 1.0f &&
+                        std::isfinite(ratio),
+                    "TLAS payload projected-error ratio is invalid");
+    const float projected =
+        scalePayloadProjectedError(baseProjectedError, ratio);
+    FRONTIER_ASSERT(projected >= 0.0f && std::isfinite(projected) &&
+                        (!std::isfinite(baseProjectedError) ||
+                         projected <= baseProjectedError),
+                    "TLAS payload projected error is not monotonic");
+    return projected;
+}
+
+inline PayloadChoice choosePayload(
+    const ExtraPayloadRecord* extra, float baseProjectedError,
+    float threshold)
+{
+#ifndef NDEBUG
+    assertPayloadErrorsMonotonic(extra);
+#endif
+    FRONTIER_ASSERT(baseProjectedError >= 0.0f &&
+                        !std::isnan(baseProjectedError) &&
+                        threshold > 0.0f && std::isfinite(threshold),
+                    "TLAS payload choice inputs are invalid");
+    PayloadChoice choice{0, baseProjectedError,
+                         baseProjectedError > threshold};
+    if (!choice.overThreshold || !extra) return choice;
+    for (uint8_t payloadIndex = 1;
+         payloadIndex <= extra->count; ++payloadIndex)
+    {
+        choice.index = payloadIndex;
+        choice.error = payloadProjectedError(
+            extra, payloadIndex, baseProjectedError);
+        choice.overThreshold = choice.error > threshold;
+        if (!choice.overThreshold) break;
+    }
+    return choice;
+}
+
+inline int32_t readyPayloadNear(uint8_t readiness, uint8_t count,
+                                uint8_t ideal)
+{
+    FRONTIER_ASSERT(count < kMaxNodePayloads && ideal <= count,
+                    "payload readiness search range is invalid");
+#ifndef NDEBUG
+    const uint32_t validMask = (1u << (uint32_t(count) + 1u)) - 1u;
+    FRONTIER_ASSERT((uint32_t(readiness) & ~validMask) == 0,
+                    "payload readiness contains out-of-range bits");
+#endif
+    if ((readiness & (1u << ideal)) != 0) return ideal;
+    for (uint8_t p = uint8_t(ideal + 1); p <= count; ++p)
+        if ((readiness & (1u << p)) != 0) return p;
+    for (uint32_t p = ideal; p-- > 0;)
+        if ((readiness & (1u << p)) != 0) return int32_t(p);
+    return -1;
+}
+
+inline int32_t finestReadyPayload(uint8_t readiness, uint8_t count)
+{
+    FRONTIER_ASSERT(count < kMaxNodePayloads,
+                    "payload readiness search range is invalid");
+#ifndef NDEBUG
+    const uint32_t validMask = (1u << (uint32_t(count) + 1u)) - 1u;
+    FRONTIER_ASSERT((uint32_t(readiness) & ~validMask) == 0,
+                    "payload readiness contains out-of-range bits");
+#endif
+    for (uint32_t p = uint32_t(count) + 1; p-- > 0;)
+        if ((readiness & (1u << p)) != 0) return int32_t(p);
+    return -1;
 }
 
 } // namespace
@@ -554,6 +793,7 @@ uint32_t SpatialDatabase::allocSubtree()
     }
     subtrees_.emplace_back();
     nodeStatePools_.emplace_back();
+    extraPayloadReadiness_.emplace_back();
     return uint32_t(subtrees_.size() - 1);
 }
 
@@ -566,6 +806,7 @@ void SpatialDatabase::destroySubtree(uint32_t definition)
                    "SpatialDatabase::releaseSubtree: live instances remain");
     subtree = SubtreeDefinitionRt{};
     nodeStatePools_[definition] = NodeStatePoolRt{};
+    extraPayloadReadiness_[definition].reset();
     if (fullyRefinedLeafPlans_ &&
         definition < fullyRefinedLeafPlans_->size())
         (*fullyRefinedLeafPlans_)[definition] = FullyRefinedLeafPlan{};
@@ -624,6 +865,14 @@ SubtreeHandle SpatialDatabase::registerSubtree(SubtreeBytes&& bytes)
     }
     if (minInnerError == FLT_MAX || !terminalLeavesZeroError)
         minInnerError = 0.0f;
+    // The direct terminal/range walkers intentionally remain scalar-only.
+    // Multi-payload definitions use the ordinary traversal so the payload
+    // threshold and readiness decision is made exactly once at each node.
+    if (runtime.view.hasExtraPayloads())
+    {
+        rootLeavesOnly = false;
+        minInnerError = 0.0f;
+    }
     runtime.minInnerErrorAndRootFlag =
         std::copysign(minInnerError, rootLeavesOnly ? -1.0f : 1.0f);
 
@@ -780,8 +1029,14 @@ void SpatialDatabase::initializeMountCoverage(uint32_t slot)
     instance.nodeState = nodeStatePools_[instance.definition].shared(
         definition.view.packedNodeCount());
     definition.sharedNodeState = instance.nodeState;
+    if (definition.view.hasExtraPayloads() &&
+        !extraPayloadReadiness_[instance.definition])
+        extraPayloadReadiness_[instance.definition] =
+            std::make_unique<uint8_t[]>(
+                definition.view.extraPayloadRecordCount());
 
     MountReadiness& readiness = mountReadiness_[slot];
+    readiness.setMultiPayload(definition.view.hasExtraPayloads());
     readiness.setFullyReady(definition.allNodesReady());
 }
 
@@ -905,7 +1160,8 @@ SubtreeInstanceHandle SpatialDatabase::mountTransformed(
     // same definition can hang under many mount points, each with
     // its own ceiling, without rewriting the definition's node data.
     const float childClamp =
-        std::min(subtreeView(slots_[owner.slot]).geometricError_[owner.index],
+        std::min(subtreeView(slots_[owner.slot])
+                     .finestGeometricError(owner.index),
                  slots_[owner.slot].errClamp) /
         transform.scale;
 
@@ -989,7 +1245,10 @@ SubtreeInstanceHandle SpatialDatabase::mountTlasRoot(
                    "SpatialDatabase::mount: mounted subtree escapes the TLAS root's "
                    "authored bounds");
 
-    const float rootError = inst.maxErrWorld * invInstanceScale;
+    float rootError = inst.maxErrWorld * invInstanceScale;
+    if (const TlasRootExtraPayloadRt* extra =
+            tlasRootExtraPayload(dense))
+        rootError = extra->record.geometricError[extra->record.count];
     const float childClamp = rootError / transform.scale;
     const uint32_t slot = registerMount(
         subtreeHandle.slot, NodeRef{kInvalidIndex, dense});
@@ -1153,7 +1412,7 @@ bool SpatialDatabase::computeCovered(uint32_t slot, uint32_t node) const
 {
     const SubtreeInstanceRt& rt = slots_[slot];
     return (node != 0 &&
-            subtrees_[rt.definition].isNodeReady(node)) ||
+            definitionNodeAnyPayloadReady(rt.definition, node)) ||
            descendantsCovered(slot, node);
 }
 
@@ -1207,7 +1466,8 @@ void SpatialDatabase::propagateSharedCoverage(uint32_t definitionIndex,
         const bool was = (state[node] & SubtreeInstanceRt::kCovered) != 0;
         const uint32_t children = subtree.childCount(node);
         const bool now =
-            (node != 0 && definition.isNodeReady(node)) ||
+            (node != 0 &&
+             definitionNodeAnyPayloadReady(definitionIndex, node)) ||
             (children != 0 &&
              (uint32_t(state[node] >>
                        SubtreeInstanceRt::kCoveredChildShift) &
@@ -1260,28 +1520,99 @@ void SpatialDatabase::propagateSharedRootCoverage(uint32_t slot,
     propagateCoverage(owner.slot, owner.index);
 }
 
-void SpatialDatabase::setDefinitionNodeReadiness(
-    uint32_t definitionIndex, uint32_t node, bool ready)
+bool SpatialDatabase::definitionPayloadReady(
+    uint32_t definitionIndex, uint32_t node,
+    uint8_t payloadIndex) const
+{
+    const SubtreeDefinitionRt& definition = subtrees_[definitionIndex];
+    const SubtreeView& view = definition.view;
+    const ExtraPayloadRecord* extra = view.extraPayloadRecord(node);
+    if (!extra)
+        return payloadIndex == 0 && definition.isNodeReady(node);
+    if (payloadIndex > extra->count) return false;
+    const uint32_t record = view.extraPayloadIndices()[node];
+    const uint8_t* readiness = extraPayloadReadiness_[definitionIndex].get();
+    return readiness && (readiness[record] & (1u << payloadIndex)) != 0;
+}
+
+bool SpatialDatabase::definitionNodeAnyPayloadReady(
+    uint32_t definitionIndex, uint32_t node) const
+{
+    const SubtreeDefinitionRt& definition = subtrees_[definitionIndex];
+    const SubtreeView& view = definition.view;
+    if (!view.extraPayloadRecord(node)) return definition.isNodeReady(node);
+    const uint8_t* readiness = extraPayloadReadiness_[definitionIndex].get();
+    return readiness && readiness[view.extraPayloadIndices()[node]] != 0;
+}
+
+bool SpatialDatabase::definitionNodeAllPayloadsReady(
+    uint32_t definitionIndex, uint32_t node) const
+{
+    const SubtreeDefinitionRt& definition = subtrees_[definitionIndex];
+    const SubtreeView& view = definition.view;
+    const ExtraPayloadRecord* extra = view.extraPayloadRecord(node);
+    if (!extra) return definition.isNodeReady(node);
+    const uint8_t* readiness = extraPayloadReadiness_[definitionIndex].get();
+    const uint8_t required = uint8_t((1u << (extra->count + 1u)) - 1u);
+    return readiness &&
+           readiness[view.extraPayloadIndices()[node]] == required;
+}
+
+void SpatialDatabase::setDefinitionPayloadReadiness(
+    uint32_t definitionIndex, uint32_t node,
+    uint8_t payloadIndex, bool ready)
 {
     SubtreeDefinitionRt& definition = subtrees_[definitionIndex];
-    if (definition.isNodeReady(node) == ready) return;
+    const SubtreeView& view = definition.view;
+    const uint32_t payloadCount = view.payloadCount(node);
+    FRONTIER_CHECK(payloadIndex < payloadCount,
+                   "SpatialDatabase: payload index is outside the node");
+    const bool oldReady =
+        definitionPayloadReady(definitionIndex, node, payloadIndex);
+    if (oldReady == ready) return;
+
+    const bool anyWasReady =
+        definitionNodeAnyPayloadReady(definitionIndex, node);
+    const bool allWereReady =
+        definitionNodeAllPayloadsReady(definitionIndex, node);
+
+    const ExtraPayloadRecord* extra = view.extraPayloadRecord(node);
+    if (!extra)
+        definition.setNodeReady(node, ready);
+    else
+    {
+        uint8_t* readiness = extraPayloadReadiness_[definitionIndex].get();
+        FRONTIER_ASSERT(readiness != nullptr,
+                        "multi-payload readiness was not initialized");
+        const uint32_t record = view.extraPayloadIndices()[node];
+        const uint8_t bit = uint8_t(1u << payloadIndex);
+        if (ready) readiness[record] |= bit;
+        else readiness[record] &= uint8_t(~bit);
+    }
+
+    const bool anyReady =
+        definitionNodeAnyPayloadReady(definitionIndex, node);
+    const bool allReady =
+        definitionNodeAllPayloadsReady(definitionIndex, node);
+    if (allReady != allWereReady)
+    {
+        if (allReady)
+            ++definition.readyNodes;
+        else
+        {
+            FRONTIER_ASSERT(definition.readyNodes != 0,
+                            "node readiness count underflow");
+            --definition.readyNodes;
+        }
+    }
 
     const uint16_t* sharedState = nodeStatePools_[definitionIndex].sharedState;
     const bool sharedRootWasCovered =
         sharedState &&
         (sharedState[0] & SubtreeInstanceRt::kCovered) != 0;
 
-    definition.setNodeReady(node, ready);
-    if (ready)
-        ++definition.readyNodes;
-    else
-    {
-        FRONTIER_ASSERT(definition.readyNodes != 0,
-                        "node readiness count underflow");
-        --definition.readyNodes;
-    }
-
-    propagateSharedCoverage(definitionIndex, node);
+    if (anyReady != anyWasReady)
+        propagateSharedCoverage(definitionIndex, node);
 
     // A definition fanout commonly touches hundreds of placements below one
     // mounted-tree root. Each placement keeps its own exact stamp, but the
@@ -1313,12 +1644,42 @@ void SpatialDatabase::setDefinitionNodeReadiness(
     }
 }
 
+void SpatialDatabase::setDefinitionNodeReadiness(
+    uint32_t definitionIndex, uint32_t node, bool ready)
+{
+    setDefinitionPayloadReadiness(definitionIndex, node, 0, ready);
+}
+
 void SpatialDatabase::markNodeReady(NodeHandle node)
 {
     if (resolveTlasRoot(node) != kInvalidInstanceId) return;
     const SubtreeInstanceRt* placement = resolve(node);
     if (!placement) return;
     setDefinitionNodeReadiness(placement->definition, node.index(), true);
+}
+
+void SpatialDatabase::markPayloadReady(NodeHandle node,
+                                       uint8_t payloadIndex)
+{
+    const InstanceId root = resolveTlasRoot(node);
+    if (root != kInvalidInstanceId)
+    {
+        if (payloadIndex == 0) return;
+        TlasRootExtraPayloadRt* extra = tlasRootExtraPayload(root);
+        FRONTIER_CHECK(extra && payloadIndex <= extra->record.count,
+                       "SpatialDatabase: TLAS root has no such payload");
+        const uint8_t bit = uint8_t(1u << payloadIndex);
+        if ((extra->readiness & bit) == 0)
+        {
+            extra->readiness |= bit;
+            invalidateInstanceFrontier(root);
+        }
+        return;
+    }
+    const SubtreeInstanceRt* placement = resolve(node);
+    if (!placement) return;
+    setDefinitionPayloadReadiness(placement->definition, node.index(),
+                                  payloadIndex, true);
 }
 
 void SpatialDatabase::markNodeUnavailable(NodeHandle node)
@@ -1333,22 +1694,71 @@ void SpatialDatabase::markNodeUnavailable(NodeHandle node)
     setDefinitionNodeReadiness(placement->definition, node.index(), false);
 }
 
+void SpatialDatabase::markPayloadUnavailable(NodeHandle node,
+                                             uint8_t payloadIndex)
+{
+    const InstanceId root = resolveTlasRoot(node);
+    if (root != kInvalidInstanceId)
+    {
+        FRONTIER_CHECK(payloadIndex != 0,
+                       "SpatialDatabase: TLAS root payload zero must stay "
+                       "ready");
+        TlasRootExtraPayloadRt* extra = tlasRootExtraPayload(root);
+        FRONTIER_CHECK(extra && payloadIndex <= extra->record.count,
+                       "SpatialDatabase: TLAS root has no such payload");
+        const uint8_t bit = uint8_t(1u << payloadIndex);
+        if ((extra->readiness & bit) != 0)
+        {
+            extra->readiness &= uint8_t(~bit);
+            invalidateInstanceFrontier(root);
+        }
+        return;
+    }
+    const SubtreeInstanceRt* placement = resolve(node);
+    if (!placement) return;
+    setDefinitionPayloadReadiness(placement->definition, node.index(),
+                                  payloadIndex, false);
+}
+
 bool SpatialDatabase::isNodeReady(NodeHandle node) const
 {
     if (resolveTlasRoot(node) != kInvalidInstanceId) return true;
     const SubtreeInstanceRt* placement = resolve(node);
-    return placement &&
-           subtrees_[placement->definition].isNodeReady(node.index());
+    return placement && definitionPayloadReady(
+                            placement->definition, node.index(), 0);
 }
 
-detail::PayloadWord SpatialDatabase::tryGetPayloadWord(NodeHandle h) const
+bool SpatialDatabase::isPayloadReady(NodeHandle node,
+                                     uint8_t payloadIndex) const
+{
+    const InstanceId root = resolveTlasRoot(node);
+    if (root != kInvalidInstanceId)
+    {
+        if (payloadIndex == 0) return true;
+        const TlasRootExtraPayloadRt* extra = tlasRootExtraPayload(root);
+        return extra && payloadIndex <= extra->record.count &&
+               (extra->readiness & (1u << payloadIndex)) != 0;
+    }
+    const SubtreeInstanceRt* placement = resolve(node);
+    return placement && definitionPayloadReady(
+                            placement->definition, node.index(), payloadIndex);
+}
+
+detail::PayloadWord SpatialDatabase::tryGetPayloadWord(
+    NodeHandle h, uint8_t payloadIndex) const
 {
     const InstanceId root = resolveTlasRoot(h);
     if (root != kInvalidInstanceId)
-        return tlasRootPayloads_[root];
+    {
+        if (payloadIndex == 0) return tlasRootPayloads_[root];
+        const TlasRootExtraPayloadRt* extra = tlasRootExtraPayload(root);
+        return extra && payloadIndex <= extra->record.count
+                   ? extra->record.payload[payloadIndex - 1]
+                   : detail::invalidPayloadWord();
+    }
     const SubtreeInstanceRt* rt = resolve(h);
     if (!rt) return detail::invalidPayloadWord();
-    return subtreeView(*rt).payload_[h.index()];
+    return subtreeView(*rt).payload(h.index(), payloadIndex);
 }
 
 std::span<ResolvedFrontierEntry> SpatialDatabase::resolveFrontier(
@@ -1363,6 +1773,9 @@ std::span<ResolvedFrontierEntry> SpatialDatabase::resolveFrontier(
     uint32_t cachedGeneration = 0;
     uint32_t cachedNodeCount = 0;
     const detail::PayloadWord* cachedPayloads = nullptr;
+    const uint32_t* cachedExtraPayloadIndex = nullptr;
+    const detail::ExtraPayloadRecord* cachedExtraPayloads = nullptr;
+    uint32_t cachedExtraPayloadCount = 0;
 
     for (const FrontierEntry& entry : cut)
     {
@@ -1378,6 +1791,9 @@ std::span<ResolvedFrontierEntry> SpatialDatabase::resolveFrontier(
                 cachedSlot = slot;
                 cachedGeneration = generation;
                 cachedPayloads = nullptr;
+                cachedExtraPayloadIndex = nullptr;
+                cachedExtraPayloads = nullptr;
+                cachedExtraPayloadCount = 0;
                 cachedNodeCount = 0;
                 if (slot < slots_.size())
                 {
@@ -1387,6 +1803,11 @@ std::span<ResolvedFrontierEntry> SpatialDatabase::resolveFrontier(
                         const detail::SubtreeView& view =
                             subtreeView(slots_[slot]);
                         cachedPayloads = view.payload_;
+                        cachedExtraPayloadIndex =
+                            view.extraPayloadIndices();
+                        cachedExtraPayloads = view.extraPayloadRecords();
+                        cachedExtraPayloadCount =
+                            view.extraPayloadRecordCount();
                         cachedNodeCount = view.packedNodeCount();
                     }
                 }
@@ -1394,14 +1815,35 @@ std::span<ResolvedFrontierEntry> SpatialDatabase::resolveFrontier(
 
             const uint32_t index = handle.index();
             if (cachedPayloads && index != 0 && index < cachedNodeCount)
-                payload = cachedPayloads[index];
+            {
+                const uint8_t payloadIndex = entry.payloadIndex();
+                if (payloadIndex == 0)
+                    payload = cachedPayloads[index];
+                else if (cachedExtraPayloadIndex)
+                {
+                    const uint32_t record = cachedExtraPayloadIndex[index];
+                    if (record < cachedExtraPayloadCount &&
+                        payloadIndex <= cachedExtraPayloads[record].count)
+                        payload = cachedExtraPayloads[record]
+                                      .payload[payloadIndex - 1];
+                }
+            }
         }
         else
         {
             // TLAS roots are not naturally grouped by mount slot. Preserve the
             // scalar path's generation validation for these uncommon entries.
             const InstanceId root = resolveTlasRoot(handle);
-            if (root != kInvalidInstanceId) payload = tlasRootPayloads_[root];
+            if (root != kInvalidInstanceId)
+            {
+                const uint8_t payloadIndex = entry.payloadIndex();
+                if (payloadIndex == 0)
+                    payload = tlasRootPayloads_[root];
+                else if (const TlasRootExtraPayloadRt* extra =
+                             tlasRootExtraPayload(root);
+                         extra && payloadIndex <= extra->record.count)
+                    payload = extra->record.payload[payloadIndex - 1];
+            }
         }
 
         dst->payload = detail::decodePayload(payload);
@@ -1425,6 +1867,9 @@ bool SpatialDatabase::resolveRenderLeaves(
     uint32_t cachedGeneration = 0;
     uint32_t cachedNodeCount = 0;
     const detail::PayloadWord* cachedPayloads = nullptr;
+    const uint32_t* cachedExtraPayloadIndex = nullptr;
+    const detail::ExtraPayloadRecord* cachedExtraPayloads = nullptr;
+    uint32_t cachedExtraPayloadCount = 0;
 
     for (const FrontierEntry& entry : cut)
     {
@@ -1440,6 +1885,9 @@ bool SpatialDatabase::resolveRenderLeaves(
                 cachedSlot = slot;
                 cachedGeneration = generation;
                 cachedPayloads = nullptr;
+                cachedExtraPayloadIndex = nullptr;
+                cachedExtraPayloads = nullptr;
+                cachedExtraPayloadCount = 0;
                 cachedNodeCount = 0;
                 if (slot < slots_.size())
                 {
@@ -1449,6 +1897,11 @@ bool SpatialDatabase::resolveRenderLeaves(
                         const detail::SubtreeView& view =
                             subtreeView(slots_[slot]);
                         cachedPayloads = view.payload_;
+                        cachedExtraPayloadIndex =
+                            view.extraPayloadIndices();
+                        cachedExtraPayloads = view.extraPayloadRecords();
+                        cachedExtraPayloadCount =
+                            view.extraPayloadRecordCount();
                         cachedNodeCount = view.packedNodeCount();
                     }
                 }
@@ -1456,12 +1909,33 @@ bool SpatialDatabase::resolveRenderLeaves(
 
             const uint32_t index = handle.index();
             if (cachedPayloads && index != 0 && index < cachedNodeCount)
-                payload = cachedPayloads[index];
+            {
+                const uint8_t payloadIndex = entry.payloadIndex();
+                if (payloadIndex == 0)
+                    payload = cachedPayloads[index];
+                else if (cachedExtraPayloadIndex)
+                {
+                    const uint32_t record = cachedExtraPayloadIndex[index];
+                    if (record < cachedExtraPayloadCount &&
+                        payloadIndex <= cachedExtraPayloads[record].count)
+                        payload = cachedExtraPayloads[record]
+                                      .payload[payloadIndex - 1];
+                }
+            }
         }
         else
         {
             const InstanceId root = resolveTlasRoot(handle);
-            if (root != kInvalidInstanceId) payload = tlasRootPayloads_[root];
+            if (root != kInvalidInstanceId)
+            {
+                const uint8_t payloadIndex = entry.payloadIndex();
+                if (payloadIndex == 0)
+                    payload = tlasRootPayloads_[root];
+                else if (const TlasRootExtraPayloadRt* extra =
+                             tlasRootExtraPayload(root);
+                         extra && payloadIndex <= extra->record.count)
+                    payload = extra->record.payload[payloadIndex - 1];
+            }
         }
 
         *payloadDst++ = detail::decodePayload(payload);
@@ -1475,7 +1949,9 @@ bool SpatialDatabase::resolveRenderLeaves(
 // ============================================================================
 
 InstanceHandle SpatialDatabase::addTlasRootInstance(
-    const NodeDesc& root, const InstanceDesc& desc)
+    const NodeDesc& root,
+    std::span<const PayloadLodDesc> extraPayloads,
+    const InstanceDesc& desc)
 {
     FRONTIER_CHECK(representableScale(desc.scale) &&
                        finitePosition(desc.pos) && validYaw(desc.yaw),
@@ -1486,6 +1962,27 @@ InstanceHandle SpatialDatabase::addTlasRootInstance(
     const detail::PayloadWord rootPayload = detail::encodePayload(root.payload);
     FRONTIER_CHECK(rootPayload != detail::invalidPayloadWord(),
                    "SpatialDatabase::instantiate: reserved invalid payload");
+    FRONTIER_CHECK(extraPayloads.size() < kMaxNodePayloads,
+                   "SpatialDatabase::instantiate: a node supports at most "
+                   "eight payloads");
+    std::array<detail::PayloadWord, kMaxNodePayloads - 1>
+        encodedExtraPayloads{};
+    float previousError = root.geometricError;
+    for (size_t i = 0; i < extraPayloads.size(); ++i)
+    {
+        const PayloadLodDesc& payload = extraPayloads[i];
+        FRONTIER_CHECK(payload.geometricError >= 0.0f &&
+                           std::isfinite(payload.geometricError) &&
+                           payload.geometricError <= previousError,
+                       "SpatialDatabase::instantiate: payload errors must be "
+                       "finite, nonnegative, and sorted coarse to fine");
+        encodedExtraPayloads[i] = detail::encodePayload(payload.payload);
+        FRONTIER_CHECK(encodedExtraPayloads[i] !=
+                           detail::invalidPayloadWord(),
+                       "SpatialDatabase::instantiate: reserved invalid "
+                       "payload");
+        previousError = payload.geometricError;
+    }
     constexpr uint32_t kTlasRootFlags =
         NodeDesc::FlagMountable | NodeDesc::FlagYawInvariantBounds;
     FRONTIER_CHECK((root.flags & ~kTlasRootFlags) == 0,
@@ -1536,8 +2033,10 @@ InstanceHandle SpatialDatabase::addTlasRootInstance(
     }
     else
     {
-        FRONTIER_CHECK(instanceHandleToDense_.size() < kInvalidInstanceId,
-                       "SpatialDatabase: exhausted the 24-bit instance-handle space");
+        FRONTIER_CHECK(instanceHandleToDense_.size() <=
+                           kFrontierInstanceIdMask,
+                       "SpatialDatabase: exhausted the 21-bit public "
+                       "instance-handle space");
         handle = InstanceId(instanceHandleToDense_.size());
         instanceHandleToDense_.push_back(kInvalidInstanceId);
     }
@@ -1551,6 +2050,42 @@ InstanceHandle SpatialDatabase::addTlasRootInstance(
     Instance& inst = instances_[id];
     inst = Instance{};
     tlasRootPayloads_[id] = rootPayload;
+    if (!tlasRootExtraPayloadIndex_.empty())
+    {
+        if (tlasRootExtraPayloadIndex_.size() < instances_.size())
+            tlasRootExtraPayloadIndex_.resize(
+                instances_.size(), kInvalidIndex);
+        tlasRootExtraPayloadIndex_[id] = kInvalidIndex;
+    }
+    if (!extraPayloads.empty())
+    {
+        if (tlasRootExtraPayloadIndex_.empty())
+            tlasRootExtraPayloadIndex_.resize(
+                instances_.size(), kInvalidIndex);
+        uint32_t extraIndex;
+        if (!freeTlasRootExtraPayloads_.empty())
+        {
+            extraIndex = freeTlasRootExtraPayloads_.back();
+            freeTlasRootExtraPayloads_.pop_back();
+        }
+        else
+        {
+            extraIndex = uint32_t(tlasRootExtraPayloads_.size());
+            tlasRootExtraPayloads_.emplace_back();
+        }
+        TlasRootExtraPayloadRt& extra =
+            tlasRootExtraPayloads_[extraIndex];
+        extra = TlasRootExtraPayloadRt{};
+        extra.record.geometricError[0] = root.geometricError;
+        extra.record.count = uint32_t(extraPayloads.size());
+        for (uint32_t i = 0; i < extra.record.count; ++i)
+        {
+            extra.record.geometricError[i + 1] =
+                extraPayloads[i].geometricError;
+            extra.record.payload[i] = encodedExtraPayloads[i];
+        }
+        tlasRootExtraPayloadIndex_[id] = extraIndex;
+    }
     inst.pos = desc.pos;
     inst.scale = desc.scale;
     inst.rootSlot = kInvalidIndex;
@@ -1606,7 +2141,15 @@ InstanceHandle SpatialDatabase::addTlasRootInstance(
 InstanceHandle SpatialDatabase::instantiate(
     const NodeDesc& root, const InstanceDesc& desc)
 {
-    return addTlasRootInstance(root, desc);
+    return addTlasRootInstance(root, {}, desc);
+}
+
+InstanceHandle SpatialDatabase::instantiate(
+    const NodeDesc& root,
+    std::span<const PayloadLodDesc> extraPayloads,
+    const InstanceDesc& desc)
+{
+    return addTlasRootInstance(root, extraPayloads, desc);
 }
 
 SpatialDatabase::Instance* SpatialDatabase::resolveInstance(
@@ -1728,6 +2271,18 @@ void SpatialDatabase::removeInstance(InstanceHandle ref)
     freeInstances_.push_back(id);
 
     tlasRootPayloads_[id] = 0;
+    if (!tlasRootExtraPayloadIndex_.empty())
+    {
+        const uint32_t extra = tlasRootExtraPayloadIndex_[id];
+        if (extra != kInvalidIndex)
+        {
+            FRONTIER_ASSERT(extra < tlasRootExtraPayloads_.size(),
+                            "invalid TLAS root payload sidecar");
+            tlasRootExtraPayloads_[extra] = TlasRootExtraPayloadRt{};
+            freeTlasRootExtraPayloads_.push_back(extra);
+            tlasRootExtraPayloadIndex_[id] = kInvalidIndex;
+        }
+    }
 }
 
 void SpatialDatabase::moveInstance(InstanceHandle ref,
@@ -3552,6 +4107,11 @@ void SpatialDatabase::reorderInstancesByTlas()
     std::vector<detail::PayloadWord> newTlasRootPayloads;
     const bool hadTlasRootPayloads = !tlasRootPayloads_.empty();
     if (hadTlasRootPayloads) newTlasRootPayloads.resize(liveCount);
+    std::vector<uint32_t> newTlasRootExtraPayloadIndex;
+    const bool hadTlasRootExtraPayloadIndex =
+        !tlasRootExtraPayloadIndex_.empty();
+    if (hadTlasRootExtraPayloadIndex)
+        newTlasRootExtraPayloadIndex.resize(liveCount, kInvalidIndex);
     std::vector<uint32_t> newFrontierVersions(liveCount);
     std::vector<float> newMotionTravel(liveCount);
     std::vector<uint8_t> newTlasLoose(liveCount);
@@ -3568,6 +4128,9 @@ void SpatialDatabase::reorderInstancesByTlas()
             newOrientations[next] = instanceOrientations_[old];
         if (hadTlasRootPayloads)
             newTlasRootPayloads[next] = tlasRootPayloads_[old];
+        if (hadTlasRootExtraPayloadIndex)
+            newTlasRootExtraPayloadIndex[next] =
+                tlasRootExtraPayloadIndex_[old];
         newFrontierVersions[next] = instanceFrontierVersions_[old];
         newMotionTravel[next] = instanceMotionTravel_[old];
         newTlasLoose[next] = instanceTlasLoose_[old];
@@ -3581,6 +4144,8 @@ void SpatialDatabase::reorderInstancesByTlas()
         instanceOrientations_.swap(newOrientations);
     if (hadTlasRootPayloads)
         tlasRootPayloads_.swap(newTlasRootPayloads);
+    if (hadTlasRootExtraPayloadIndex)
+        tlasRootExtraPayloadIndex_.swap(newTlasRootExtraPayloadIndex);
     instanceFrontierVersions_.swap(newFrontierVersions);
     instanceMotionTravel_.swap(newMotionTravel);
     instanceTlasLoose_.swap(newTlasLoose);
@@ -4159,7 +4724,8 @@ CollectResult SpatialDatabase::collect(std::span<SpatialQuery* const> queries,
 // Normal and dense-overlay bounds come through item.bounds() without a per-block
 // branch. The sparse-overlay instantiation consults its compact patch table;
 // template dispatch happens once per subtree rather than once per block.
-template<bool FullyReady, bool SparseOverlay, bool TrackAncestor>
+template<bool FullyReady, bool SparseOverlay, bool TrackAncestor,
+         bool MultiPayload>
 void SpatialDatabase::wideVisit(
     const WorkItem& item, const SubtreeView& pg, float errClamp, uint32_t gen,
     InstanceId instance, uint32_t node, uint8_t mask, uint8_t targetKids,
@@ -4199,7 +4765,18 @@ void SpatialDatabase::wideVisit(
         if (!survivors) continue;
         FRONTIER_STAT(w, lanesSurvived, uint64_t(std::popcount(survivors)));
 
-        const uint32_t leafLanes = blockLeafLanes(lanes);
+        uint32_t leafLanes = blockLeafLanes(lanes);
+        if constexpr (MultiPayload)
+        {
+            const uint32_t multiPayloadLanes =
+                blockMultiPayloadLanes(lanes);
+            // A terminal multi-payload node with nonzero slot-zero error still
+            // needs the scalar in-node cut. Zero-error nodes can retain the
+            // direct leaf emission because all finer errors are necessarily
+            // zero too.
+            leafLanes &=
+                ~(multiPayloadLanes & ~blockZeroErrorLanes(lanes));
+        }
         if ((survivors & ~leafLanes) == 0 &&
             (errClamp <= 0.0f ||
              (survivors & ~blockZeroErrorLanes(lanes)) == 0))
@@ -4216,8 +4793,8 @@ void SpatialDatabase::wideVisit(
                 if constexpr (TrackAncestor)
                 {
                     const bool ready =
-                        subtrees_[slots_[item.slot()].definition]
-                            .isNodeReady(c);
+                        definitionPayloadReady(
+                            slots_[item.slot()].definition, c, 0);
                     w.addAncestorTarget(entry, ancestorCandidate, ready);
                 }
                 else if constexpr (FullyReady)
@@ -4251,7 +4828,8 @@ void SpatialDatabase::wideVisit(
             if constexpr (TrackAncestor)
             {
                 const bool ready =
-                    subtrees_[slots_[item.slot()].definition].isNodeReady(c);
+                    definitionPayloadReady(
+                        slots_[item.slot()].definition, c, 0);
                 w.addAncestorTarget(entry, ancestorCandidate, ready);
             }
             else if constexpr (FullyReady)
@@ -4466,10 +5044,25 @@ void SpatialDatabase::runSubtree(const WorkItem& item, const Instance& inst,
                     const Camera& local,
                     const SelectionParams& params, Worker& w) const
 {
-    if (item.sparseOverlay == kInvalidIndex)
-        runSubtreeImpl<FullyReady, false>(item, inst, local, params, w);
+    const bool multiPayload =
+        mountReadiness_[item.slot()].multiPayload();
+    if (multiPayload)
+        runSubtreeMode<FullyReady, true>(item, inst, local, params, w);
     else
-        runSubtreeImpl<FullyReady, true>(item, inst, local, params, w);
+        runSubtreeMode<FullyReady, false>(item, inst, local, params, w);
+}
+
+template<bool FullyReady, bool MultiPayload>
+void SpatialDatabase::runSubtreeMode(
+    const WorkItem& item, const Instance& inst, const Camera& local,
+    const SelectionParams& params, Worker& w) const
+{
+    if (item.sparseOverlay == kInvalidIndex)
+        runSubtreeImpl<FullyReady, false, MultiPayload>(
+            item, inst, local, params, w);
+    else
+        runSubtreeImpl<FullyReady, true, MultiPayload>(
+            item, inst, local, params, w);
 }
 
 void SpatialDatabase::runFullyReadyRootLeaves(
@@ -4613,15 +5206,29 @@ void SpatialDatabase::runSubtreeAncestor(
     const WorkItem& item, const Instance& inst, const Camera& local,
     const SelectionParams& params, uint32_t ancestorCandidate, Worker& w) const
 {
+    const bool multiPayload =
+        mountReadiness_[item.slot()].multiPayload();
     if (item.sparseOverlay == kInvalidIndex)
-        runSubtreeAncestorImpl<false>(
-            item, inst, local, params, ancestorCandidate, w);
+    {
+        if (multiPayload)
+            runSubtreeAncestorImpl<false, true>(
+                item, inst, local, params, ancestorCandidate, w);
+        else
+            runSubtreeAncestorImpl<false, false>(
+                item, inst, local, params, ancestorCandidate, w);
+    }
     else
-        runSubtreeAncestorImpl<true>(
-            item, inst, local, params, ancestorCandidate, w);
+    {
+        if (multiPayload)
+            runSubtreeAncestorImpl<true, true>(
+                item, inst, local, params, ancestorCandidate, w);
+        else
+            runSubtreeAncestorImpl<true, false>(
+                item, inst, local, params, ancestorCandidate, w);
+    }
 }
 
-template<bool SparseOverlay>
+template<bool SparseOverlay, bool MultiPayload>
 void SpatialDatabase::runSubtreeAncestorImpl(
     const WorkItem& item, const Instance& inst, const Camera& rootLocal,
     const SelectionParams& params, uint32_t ancestorCandidate, Worker& w) const
@@ -4648,7 +5255,7 @@ void SpatialDatabase::runSubtreeAncestorImpl(
 
     w.nodeStack.clear();
     w.nodeCandidates.clear();
-    wideVisit<false, SparseOverlay, true>(
+    wideVisit<false, SparseOverlay, true, MultiPayload>(
         item, pg, rt.errClamp, gen, instance, 0, item.mask(), 1, local, w,
         ancestorCandidate);
 
@@ -4664,27 +5271,75 @@ void SpatialDatabase::runSubtreeAncestorImpl(
         const uint32_t i = e.node();
         FRONTIER_STAT(w, nodesVisited, 1);
         const NodeHandle here{item.slot(), i, gen};
-        const bool ready = definition.isNodeReady(i);
-        const FrontierEntry entry =
-            makeFrontierEntry(here, e.err, bar, w.barInv, instance);
-
-        if (!(e.err > bar))
+        PayloadChoice choice{0, e.err, e.err > bar};
+        if constexpr (MultiPayload)
         {
-            w.addAncestorTarget(entry, candidate, ready);
+            choice = choosePayload(pg, i, rt.errClamp, e.err, bar);
+            if (pg.extraPayloadRecord(i) && w.trackMargin)
+                w.margin = 0.0f;
+        }
+
+        auto payloadEntry = [&](uint8_t payloadIndex) {
+            return makeFrontierEntry(
+                here,
+                payloadProjectedError(
+                    pg, i, payloadIndex, rt.errClamp, e.err),
+                bar, w.barInv, instance, payloadIndex);
+        };
+        auto finestReadyAtOrBefore = [&](uint8_t last) {
+            if constexpr (!MultiPayload)
+            {
+                (void)last;
+                return definition.isNodeReady(i)
+                           ? int32_t(0)
+                           : int32_t(-1);
+            }
+            else
+            {
+                for (uint32_t p = uint32_t(last) + 1; p-- > 0;)
+                    if (definitionPayloadReady(
+                            rt.definition, i, uint8_t(p)))
+                        return int32_t(p);
+                return int32_t(-1);
+            }
+        };
+
+        if (!choice.overThreshold)
+        {
+            const bool ready =
+                definitionPayloadReady(rt.definition, i, choice.index);
+            if (!ready && choice.index != 0)
+            {
+                const int32_t fallback =
+                    finestReadyAtOrBefore(uint8_t(choice.index - 1));
+                if (fallback >= 0)
+                    candidate = w.addAncestorCandidate(
+                        candidate, payloadEntry(uint8_t(fallback)));
+            }
+            w.addAncestorTarget(payloadEntry(choice.index), candidate, ready);
             continue;
         }
 
         const bool mountable = metaIsMountable(pg.meta_[i]);
         const uint32_t childSlot =
             mountable ? mountedChildSlot(rt, i) : kInvalidIndex;
-        if (mountable && childSlot == kInvalidIndex)
+        if ((mountable && childSlot == kInvalidIndex) ||
+            (!mountable && pg.childCount(i) == 0))
         {
-            w.addAncestorTarget(entry, candidate, ready);
+            const int32_t ready = finestReadyAtOrBefore(choice.index);
+            const bool targetReady = ready == int32_t(choice.index);
+            if (!targetReady && ready >= 0)
+                candidate = w.addAncestorCandidate(
+                    candidate, payloadEntry(uint8_t(ready)));
+            w.addAncestorTarget(payloadEntry(choice.index), candidate,
+                                targetReady);
             continue;
         }
 
-        if (ready)
-            candidate = w.addAncestorCandidate(candidate, entry);
+        const int32_t ready = finestReadyAtOrBefore(choice.index);
+        if (ready >= 0)
+            candidate = w.addAncestorCandidate(
+                candidate, payloadEntry(uint8_t(ready)));
 
         if (mountable)
         {
@@ -4694,7 +5349,7 @@ void SpatialDatabase::runSubtreeAncestorImpl(
         }
         else
         {
-            wideVisit<false, SparseOverlay, true>(
+            wideVisit<false, SparseOverlay, true, MultiPayload>(
                 item, pg, rt.errClamp, gen, instance, i, e.planes(), 1,
                 local, w, candidate);
         }
@@ -4704,7 +5359,7 @@ void SpatialDatabase::runSubtreeAncestorImpl(
                     "ancestor candidate stack mismatch");
 }
 
-template<bool FullyReady, bool SparseOverlay>
+template<bool FullyReady, bool SparseOverlay, bool MultiPayload>
 void SpatialDatabase::runSubtreeImpl(const WorkItem& item,
                         const Instance& inst,
                         const Camera& rootLocal, const SelectionParams& params,
@@ -4736,7 +5391,7 @@ void SpatialDatabase::runSubtreeImpl(const WorkItem& item,
 
     w.nodeStack.clear();
     const size_t stackBase = 0;
-    wideVisit<FullyReady, SparseOverlay>(
+    wideVisit<FullyReady, SparseOverlay, false, MultiPayload>(
         item, pg, rt.errClamp, gen, instance, 0, item.mask(), item.target(),
         local, w);
 
@@ -4748,10 +5403,189 @@ void SpatialDatabase::runSubtreeImpl(const WorkItem& item,
         FRONTIER_STAT(w, nodesVisited, 1);
 
         const NodeHandle here{item.slot(), i, gen};
+        if constexpr (!MultiPayload)
+        {
+            if constexpr (FullyReady)
+            {
+                if (e.err > bar && e.planes() == 0 &&
+                    !inst.hasOverlayList() &&
+                    metaIsMountable(pg.meta_[i]) &&
+                    rt.mountLinks != kInvalidIndex)
+                {
+                    const uint32_t childSlot =
+                        mountLinks_[rt.mountLinks].slots[i];
+                    if (childSlot != kInvalidIndex &&
+                        mountTransforms_[childSlot].rootLeavesOnly())
+                    {
+                        emitMountedLeafBatchInside(
+                            rt, pg, e, stackBase, instance, rootLocal, w);
+                        continue;
+                    }
+                }
+
+                if (!(e.err > bar))
+                {
+                    w.result.current.push(makeFrontierEntry(
+                        here, e.err, bar, w.barInv, instance));
+                    continue;
+                }
+
+                const bool exp = metaIsMountable(pg.meta_[i]);
+                const uint32_t childSlot =
+                    exp ? mountedChildSlot(rt, i) : kInvalidIndex;
+                if (exp)
+                {
+                    if (childSlot == kInvalidIndex)
+                        w.result.current.push(makeFrontierEntry(
+                            here, e.err, bar, w.barInv, instance));
+                    else
+                    {
+                        const MountTransformRt& childMount =
+                            mountTransforms_[childSlot];
+                        const bool directLeaves =
+                            childMount.rootLeavesOnly() &&
+                            !inst.hasOverlayList();
+                        if (directLeaves)
+                        {
+                            recordTraversalDependency(w, childSlot);
+                            const SubtreeView& childView =
+                                subtrees_[childMount.definition()].view;
+                            const WorkItem childItem{
+                                childSlot, childView.wideBounds(), 1, 1,
+                                e.planes()};
+                            FRONTIER_STAT(w, subtreesVisited, 1);
+                            if (e.planes() == 0)
+                            {
+                                const MountTransformRt& childTransform =
+                                    mountTransforms_[childSlot];
+                                const float invScale =
+                                    1.0f / childTransform.scale;
+                                const float4 qmn =
+                                    (rootLocal.queryMin() -
+                                     childTransform.pos) * invScale;
+                                const float4 qmx =
+                                    (rootLocal.queryMax() -
+                                     childTransform.pos) * invScale;
+                                emitMountedRootLeavesInside(
+                                    childItem, childView,
+                                    childMount.errClamp,
+                                    childMount.generation, instance,
+                                    qmn, qmx, rootLocal.k, w);
+                            }
+                            else
+                            {
+                                const Camera childLocal =
+                                    mountLocalCamera(
+                                        rootLocal, childSlot, e.planes());
+                                wideVisit<true, false, false, false>(
+                                    childItem, childView,
+                                    childMount.errClamp,
+                                    childMount.generation, instance, 0,
+                                    e.planes(), 1, childLocal, w);
+                            }
+                        }
+                        else
+                            w.work.push_back(makeWorkItem(
+                                childSlot, inst, 1, e.planes()));
+                    }
+                }
+                else
+                    wideVisit<true, SparseOverlay, false, false>(
+                        item, pg, rt.errClamp, gen, instance, i,
+                        e.planes(), 1, local, w);
+            }
+            else
+            {
+                const bool target = e.target();
+                uint8_t nextTarget = 0;
+
+                // Preserve the original scalar readiness path verbatim: it
+                // must not pay for node-local payload fallback machinery.
+                if (!target)
+                {
+                    if (definition.isNodeReady(i))
+                    {
+                        w.result.current.push(makeFrontierEntry(
+                            here, e.err, bar, w.barInv, instance));
+                        continue;
+                    }
+                }
+                else if (!(e.err > bar))
+                {
+                    const FrontierEntry entry = makeFrontierEntry(
+                        here, e.err, bar, w.barInv, instance);
+                    if (definition.isNodeReady(i))
+                    {
+                        w.result.current.push(entry);
+                        continue;
+                    }
+                }
+
+                const uint32_t m = pg.meta_[i];
+                const bool exp = metaIsMountable(m);
+                const uint32_t childSlot =
+                    exp ? mountedChildSlot(rt, i) : kInvalidIndex;
+
+                if (target && e.err > bar && exp &&
+                    childSlot == kInvalidIndex)
+                {
+                    FRONTIER_ASSERT(definition.isNodeReady(i),
+                                    "unavailable current mount proxy");
+                    w.result.current.push(makeFrontierEntry(
+                        here, e.err, bar, w.barInv, instance));
+                    continue;
+                }
+
+                if (target && e.err > bar)
+                {
+                    const bool canDescend = visibleDescendantsCovered(
+                        item.slot(), i, e.planes(), inst, rootLocal,
+                        w.trackTouches ? &w : nullptr);
+                    if (!canDescend)
+                    {
+                        FRONTIER_ASSERT(definition.isNodeReady(i),
+                                        "uncovered current subtree");
+                        w.result.current.push(makeFrontierEntry(
+                            here, e.err, bar, w.barInv, instance));
+                        continue;
+                    }
+                    nextTarget = 1;
+                }
+
+                if (exp)
+                {
+                    FRONTIER_ASSERT(childSlot != kInvalidIndex,
+                                    "uncovered mounted subtree");
+                    w.work.push_back(makeWorkItem(
+                        childSlot, inst, nextTarget, e.planes()));
+                }
+                else
+                    wideVisit<false, SparseOverlay, false, false>(
+                        item, pg, rt.errClamp, gen, instance, i,
+                        e.planes(), nextTarget, local, w);
+            }
+            continue;
+        }
+
+        PayloadChoice choice{0, e.err, e.err > bar};
+        if constexpr (MultiPayload)
+        {
+            choice = choosePayload(pg, i, rt.errClamp, e.err, bar);
+            if (pg.extraPayloadRecord(i) && w.trackMargin)
+                w.margin = 0.0f;
+        }
+
+        auto payloadEntry = [&](uint8_t payloadIndex) {
+            return makeFrontierEntry(
+                here,
+                payloadProjectedError(
+                    pg, i, payloadIndex, rt.errClamp, e.err),
+                bar, w.barInv, instance, payloadIndex);
+        };
 
         if constexpr (FullyReady)
         {
-            if (e.err > bar && e.planes() == 0 &&
+            if (choice.overThreshold && e.planes() == 0 &&
                 !inst.hasOverlayList() &&
                 metaIsMountable(pg.meta_[i]) &&
                 rt.mountLinks != kInvalidIndex)
@@ -4767,10 +5601,9 @@ void SpatialDatabase::runSubtreeImpl(const WorkItem& item,
                 }
             }
 
-            if (!(e.err > bar))
+            if (!choice.overThreshold)
             {
-                w.result.current.push(
-                    makeFrontierEntry(here, e.err, bar, w.barInv, instance));
+                w.result.current.push(payloadEntry(choice.index));
                 continue;
             }
 
@@ -4780,8 +5613,7 @@ void SpatialDatabase::runSubtreeImpl(const WorkItem& item,
             if (exp)
             {
                 if (childSlot == kInvalidIndex)
-                    w.result.current.push(
-                        makeFrontierEntry(here, e.err, bar, w.barInv, instance));
+                    w.result.current.push(payloadEntry(choice.index));
                 else
                 {
                     const MountTransformRt& childMount =
@@ -4818,7 +5650,7 @@ void SpatialDatabase::runSubtreeImpl(const WorkItem& item,
                         {
                             const Camera childLocal = mountLocalCamera(
                                 rootLocal, childSlot, e.planes());
-                            wideVisit<true, false>(
+                            wideVisit<true, false, false, false>(
                                 childItem, childView, childMount.errClamp,
                                 childMount.generation, instance, 0,
                                 e.planes(), 1, childLocal, w);
@@ -4829,15 +5661,56 @@ void SpatialDatabase::runSubtreeImpl(const WorkItem& item,
                             makeWorkItem(childSlot, inst, 1, e.planes()));
                 }
             }
-            else
-                wideVisit<true, SparseOverlay>(item, pg, rt.errClamp, gen,
+            else if (pg.childCount(i) != 0)
+                wideVisit<true, SparseOverlay, false, MultiPayload>(
+                                               item, pg, rt.errClamp, gen,
                                                instance, i, e.planes(), 1,
                                                local, w);
+            else
+                w.result.current.push(payloadEntry(choice.index));
         }
         else
         {
             const bool target = e.target();
             uint8_t nextTarget = 0;
+
+            auto readyNear = [&](uint8_t ideal) {
+                if constexpr (!MultiPayload)
+                {
+                    (void)ideal;
+                    return definition.isNodeReady(i)
+                               ? int32_t(0)
+                               : int32_t(-1);
+                }
+                else
+                {
+                    const uint8_t count = uint8_t(pg.payloadCount(i));
+                    if (definitionPayloadReady(rt.definition, i, ideal))
+                        return int32_t(ideal);
+                    for (uint8_t p = uint8_t(ideal + 1); p < count; ++p)
+                        if (definitionPayloadReady(rt.definition, i, p))
+                            return int32_t(p);
+                    for (uint32_t p = ideal; p-- > 0;)
+                        if (definitionPayloadReady(
+                                rt.definition, i, uint8_t(p)))
+                            return int32_t(p);
+                    return int32_t(-1);
+                }
+            };
+            auto finestReady = [&]() {
+                if constexpr (!MultiPayload)
+                    return definition.isNodeReady(i)
+                               ? int32_t(0)
+                               : int32_t(-1);
+                else
+                {
+                    for (uint32_t p = pg.payloadCount(i); p-- > 0;)
+                        if (definitionPayloadReady(
+                                rt.definition, i, uint8_t(p)))
+                            return int32_t(p);
+                    return int32_t(-1);
+                }
+            };
 
             // Current-only traversal happens when the implicit threshold
             // target stopped at an unavailable proxy whose descendants
@@ -4846,20 +5719,19 @@ void SpatialDatabase::runSubtreeImpl(const WorkItem& item,
             // cover.
             if (!target)
             {
-                if (definition.isNodeReady(i))
+                const int32_t ready = readyNear(choice.index);
+                if (ready >= 0)
                 {
-                    w.result.current.push(
-                        makeFrontierEntry(here, e.err, bar, w.barInv, instance));
+                    w.result.current.push(payloadEntry(uint8_t(ready)));
                     continue;
                 }
             }
-            else if (!(e.err > bar))
+            else if (!choice.overThreshold)
             {
-                const FrontierEntry entry =
-                    makeFrontierEntry(here, e.err, bar, w.barInv, instance);
-                if (definition.isNodeReady(i))
+                const int32_t ready = readyNear(choice.index);
+                if (ready >= 0)
                 {
-                    w.result.current.push(entry);
+                    w.result.current.push(payloadEntry(uint8_t(ready)));
                     continue;
                 }
                 // The threshold target is unavailable, but the current walk
@@ -4873,16 +5745,17 @@ void SpatialDatabase::runSubtreeImpl(const WorkItem& item,
             const uint32_t childSlot =
                 exp ? mountedChildSlot(rt, i) : kInvalidIndex;
 
-            if (target && e.err > bar && exp && childSlot == kInvalidIndex)
+            if (target && choice.overThreshold && exp &&
+                childSlot == kInvalidIndex)
             {
-                FRONTIER_ASSERT(definition.isNodeReady(i),
+                const int32_t ready = finestReady();
+                FRONTIER_ASSERT(ready >= 0,
                                 "unavailable current mount proxy");
-                w.result.current.push(
-                    makeFrontierEntry(here, e.err, bar, w.barInv, instance));
+                w.result.current.push(payloadEntry(uint8_t(ready)));
                 continue;
             }
 
-            if (target && e.err > bar)
+            if (target && choice.overThreshold)
             {
                 const bool canDescend =
                     visibleDescendantsCovered(
@@ -4890,10 +5763,10 @@ void SpatialDatabase::runSubtreeImpl(const WorkItem& item,
                         w.trackTouches ? &w : nullptr);
                 if (!canDescend)
                 {
-                    FRONTIER_ASSERT(definition.isNodeReady(i),
+                    const int32_t ready = finestReady();
+                    FRONTIER_ASSERT(ready >= 0,
                                     "uncovered current subtree");
-                    w.result.current.push(
-                        makeFrontierEntry(here, e.err, bar, w.barInv, instance));
+                    w.result.current.push(payloadEntry(uint8_t(ready)));
                     continue;
                 }
                 nextTarget = 1;
@@ -4906,15 +5779,37 @@ void SpatialDatabase::runSubtreeImpl(const WorkItem& item,
                 w.work.push_back(makeWorkItem(
                     childSlot, inst, nextTarget, e.planes()));
             }
-            else
-                wideVisit<false, SparseOverlay>(
+            else if (pg.childCount(i) != 0)
+                wideVisit<false, SparseOverlay, false, MultiPayload>(
                     item, pg, rt.errClamp, gen, instance, i, e.planes(),
                     nextTarget, local, w);
+            else
+            {
+                const int32_t ready = finestReady();
+                FRONTIER_ASSERT(ready >= 0,
+                                "unavailable terminal payload node");
+                w.result.current.push(payloadEntry(uint8_t(ready)));
+            }
         }
     }
 }
 
 void SpatialDatabase::runTlasRootInstance(
+    uint32_t instIdx, const Camera& view, const SelectionParams& params,
+    uint8_t mask, Worker& w) const
+{
+    runTlasRootInstanceImpl<true>(instIdx, view, params, mask, w);
+}
+
+void SpatialDatabase::runScalarTlasRootInstance(
+    uint32_t instIdx, const Camera& view, const SelectionParams& params,
+    uint8_t mask, Worker& w) const
+{
+    runTlasRootInstanceImpl<false>(instIdx, view, params, mask, w);
+}
+
+template<bool MultiPayloadRoot>
+void SpatialDatabase::runTlasRootInstanceImpl(
     uint32_t instIdx, const Camera& view, const SelectionParams& params,
     uint8_t mask, Worker& w) const
 {
@@ -4943,17 +5838,63 @@ void SpatialDatabase::runTlasRootInstance(
     const InstanceId outputInstance = publicInstanceId(instIdx);
     const NodeHandle root = NodeHandle::tlasRoot(outputInstance,
                                                  inst.generation);
-    const uint32_t childSlot = inst.rootSlot;
-    if (!(error > params.threshold) || childSlot == kInvalidIndex)
+    const TlasRootExtraPayloadRt* rootExtra = nullptr;
+    const ExtraPayloadRecord* rootPayloads = nullptr;
+    PayloadChoice rootChoice{0, error, error > params.threshold};
+    uint8_t rootReadiness = 1u;
+    uint8_t rootPayloadCount = 0u;
+    if constexpr (MultiPayloadRoot)
     {
-        w.result.current.push(makeFrontierEntry(
-            root, error, w.bar, w.barInv, outputInstance));
+        rootExtra = tlasRootExtraPayload(instIdx);
+        rootPayloads = rootExtra ? &rootExtra->record : nullptr;
+        rootChoice = choosePayload(
+            rootPayloads, error, params.threshold);
+        rootReadiness = rootExtra ? rootExtra->readiness : 1u;
+        rootPayloadCount =
+            rootExtra ? uint8_t(rootExtra->record.count) : 0u;
+        if (rootExtra && w.trackMargin) w.margin = 0.0f;
+    }
+    auto rootEntry = [&](uint8_t payloadIndex) {
+        if constexpr (MultiPayloadRoot)
+            return makeFrontierEntry(
+                root,
+                payloadProjectedError(rootPayloads, payloadIndex, error),
+                w.bar, w.barInv, outputInstance, payloadIndex);
+        else
+        {
+            (void)payloadIndex;
+            return makeFrontierEntry(
+                root, error, w.bar, w.barInv, outputInstance);
+        }
+    };
+    const uint32_t childSlot = inst.rootSlot;
+    if (!rootChoice.overThreshold)
+    {
+        if constexpr (MultiPayloadRoot)
+        {
+            const int32_t ready = readyPayloadNear(
+                rootReadiness, rootPayloadCount, rootChoice.index);
+            FRONTIER_ASSERT(ready >= 0,
+                            "TLAS root has no ready payload");
+            w.result.current.push(rootEntry(uint8_t(ready)));
+        }
+        else
+            w.result.current.push(rootEntry(0));
+        return;
+    }
+    const int32_t rootFallback = MultiPayloadRoot
+        ? finestReadyPayload(rootReadiness, rootPayloadCount)
+        : 0;
+    FRONTIER_ASSERT(rootFallback >= 0, "TLAS root has no ready payload");
+    if (childSlot == kInvalidIndex)
+    {
+        w.result.current.push(rootEntry(uint8_t(rootFallback)));
         return;
     }
 
     const Camera local = toLocal(view, inst.pos, inst.scale, mask);
-    const bool fullyReady = mountedTreeFullyReady(childSlot);
-    if (fullyReady)
+    const MountReadiness& mountSummary = mountReadiness_[childSlot];
+    if (mountSummary.fullyReadyScalar())
     {
         const WorkItem rootItem =
             makeWorkItem(childSlot, inst, 1, mask);
@@ -4972,7 +5913,20 @@ void SpatialDatabase::runTlasRootInstance(
             return;
         // The first placement is already in hand. Enter it directly; the work
         // stack is only needed for mounted descendants discovered by the walk.
-        runSubtree<true>(rootItem, inst, local, params, w);
+        runSubtreeMode<true, false>(rootItem, inst, local, params, w);
+        while (!w.work.empty())
+        {
+            const WorkItem item = w.work.back();
+            w.work.pop_back();
+            runSubtree<true>(item, inst, local, params, w);
+        }
+        return;
+    }
+    if (mountSummary.fullyReady())
+    {
+        const WorkItem rootItem =
+            makeWorkItem(childSlot, inst, 1, mask);
+        runSubtreeMode<true, true>(rootItem, inst, local, params, w);
         while (!w.work.empty())
         {
             const WorkItem item = w.work.back();
@@ -4987,8 +5941,7 @@ void SpatialDatabase::runTlasRootInstance(
         w.trackTouches ? &w : nullptr);
     if (!currentCanDescend)
     {
-        w.result.current.push(makeFrontierEntry(
-            root, error, w.bar, w.barInv, outputInstance));
+        w.result.current.push(rootEntry(uint8_t(rootFallback)));
         // Refinement below this fallback is explicit and bounded through
         // computeFrontierRefinement(); selection has no second cut to build.
         return;
@@ -5003,7 +5956,7 @@ void SpatialDatabase::runTlasRootInstance(
 
         const uint32_t rootCandidate = w.addAncestorCandidate(
             kInvalidIndex,
-            makeFrontierEntry(root, error, w.bar, w.barInv, outputInstance));
+            rootEntry(uint8_t(rootFallback)));
         runSubtreeAncestor(makeWorkItem(childSlot, inst, 1, mask), inst,
                            local, params, rootCandidate, w);
         while (!w.work.empty())
@@ -5069,11 +6022,37 @@ void SpatialDatabase::runOrientedTlasRootInstance(
     const InstanceId outputInstance = publicInstanceId(instIdx);
     const NodeHandle root = NodeHandle::tlasRoot(outputInstance,
                                                  inst.generation);
+    const TlasRootExtraPayloadRt* rootExtra =
+        tlasRootExtraPayload(instIdx);
+    const ExtraPayloadRecord* rootPayloads =
+        rootExtra ? &rootExtra->record : nullptr;
+    const PayloadChoice rootChoice =
+        choosePayload(rootPayloads, error, params.threshold);
+    const uint8_t rootReadiness = rootExtra ? rootExtra->readiness : 1u;
+    const uint8_t rootPayloadCount =
+        rootExtra ? uint8_t(rootExtra->record.count) : 0u;
+    if (rootExtra && w.trackMargin) w.margin = 0.0f;
+    auto rootEntry = [&](uint8_t payloadIndex) {
+        return makeFrontierEntry(
+            root,
+            payloadProjectedError(rootPayloads, payloadIndex, error),
+            w.bar, w.barInv, outputInstance, payloadIndex);
+    };
     const uint32_t childSlot = inst.rootSlot;
-    if (!(error > params.threshold) || childSlot == kInvalidIndex)
+    if (!rootChoice.overThreshold)
     {
-        w.result.current.push(makeFrontierEntry(
-            root, error, w.bar, w.barInv, outputInstance));
+        const int32_t ready = readyPayloadNear(
+            rootReadiness, rootPayloadCount, rootChoice.index);
+        FRONTIER_ASSERT(ready >= 0, "TLAS root has no ready payload");
+        w.result.current.push(rootEntry(uint8_t(ready)));
+        return;
+    }
+    const int32_t rootFallback =
+        finestReadyPayload(rootReadiness, rootPayloadCount);
+    FRONTIER_ASSERT(rootFallback >= 0, "TLAS root has no ready payload");
+    if (childSlot == kInvalidIndex)
+    {
+        w.result.current.push(rootEntry(uint8_t(rootFallback)));
         return;
     }
 
@@ -5081,8 +6060,8 @@ void SpatialDatabase::runOrientedTlasRootInstance(
     const Camera local = identityYaw(yaw)
                              ? toLocal(view, inst.pos, inst.scale, mask)
                              : toLocal(view, inst.pos, inst.scale, yaw, mask);
-    const bool fullyReady = mountedTreeFullyReady(childSlot);
-    if (fullyReady)
+    const MountReadiness& mountSummary = mountReadiness_[childSlot];
+    if (mountSummary.fullyReadyScalar())
     {
         const WorkItem rootItem =
             makeWorkItem(childSlot, inst, 1, mask);
@@ -5096,7 +6075,20 @@ void SpatialDatabase::runOrientedTlasRootInstance(
             mountTransforms_[childSlot].fullyRefinedCandidate() &&
             tryRunFullyRefinedBoundary(rootItem, inst, local, w)) [[unlikely]]
             return;
-        runSubtree<true>(rootItem, inst, local, params, w);
+        runSubtreeMode<true, false>(rootItem, inst, local, params, w);
+        while (!w.work.empty())
+        {
+            const WorkItem item = w.work.back();
+            w.work.pop_back();
+            runSubtree<true>(item, inst, local, params, w);
+        }
+        return;
+    }
+    if (mountSummary.fullyReady())
+    {
+        const WorkItem rootItem =
+            makeWorkItem(childSlot, inst, 1, mask);
+        runSubtreeMode<true, true>(rootItem, inst, local, params, w);
         while (!w.work.empty())
         {
             const WorkItem item = w.work.back();
@@ -5111,8 +6103,7 @@ void SpatialDatabase::runOrientedTlasRootInstance(
         w.trackTouches ? &w : nullptr);
     if (!currentCanDescend)
     {
-        w.result.current.push(makeFrontierEntry(
-            root, error, w.bar, w.barInv, outputInstance));
+        w.result.current.push(rootEntry(uint8_t(rootFallback)));
         // Refinement below this fallback is explicit and bounded through
         // computeFrontierRefinement(); selection has no second cut to build.
         return;
@@ -5127,7 +6118,7 @@ void SpatialDatabase::runOrientedTlasRootInstance(
 
         const uint32_t rootCandidate = w.addAncestorCandidate(
             kInvalidIndex,
-            makeFrontierEntry(root, error, w.bar, w.barInv, outputInstance));
+            rootEntry(uint8_t(rootFallback)));
         runSubtreeAncestor(makeWorkItem(childSlot, inst, 1, mask), inst,
                            local, params, rootCandidate, w);
         while (!w.work.empty())
@@ -5180,9 +6171,22 @@ void SpatialDatabase::runTlasFlatInstance(uint32_t instIdx,
     handle.lo = NodeHandle::kInvalidSlot |
                 ((outputInstance & 0xfffu) << NodeHandle::kSlotBits);
     handle.hi = marker;
+    const TlasRootExtraPayloadRt* extra =
+        tlasRootExtraPayload(instIdx);
+    const ExtraPayloadRecord* payloads =
+        extra ? &extra->record : nullptr;
+    const PayloadChoice choice = choosePayload(payloads, error, w.bar);
+    const uint8_t readiness = extra ? extra->readiness : 1u;
+    const uint8_t count = extra ? uint8_t(extra->record.count) : 0u;
+    const int32_t selected =
+        choice.overThreshold
+            ? finestReadyPayload(readiness, count)
+            : readyPayloadNear(readiness, count, choice.index);
+    FRONTIER_ASSERT(selected >= 0, "TLAS root has no ready payload");
     w.result.current.push(makeFrontierEntry(
         handle,
-        error, w.bar, w.barInv, outputInstance));
+        payloadProjectedError(payloads, uint8_t(selected), error),
+        w.bar, w.barInv, outputInstance, uint8_t(selected)));
 }
 
 void SpatialDatabase::runZeroErrorTlasFlatInstance(
@@ -5274,10 +6278,20 @@ void SpatialDatabase::selectFrontierUncached(const Camera& camera, const Selecti
         {
             if (instanceOrientations_.empty())
             {
-                for (uint32_t i = 0; i < nVis; ++i)
-                    runTlasRootInstance(
-                        scratch.visible[i].instance(), tlasView, params,
-                        scratch.visible[i].mask(), w);
+                if (tlasRootExtraPayloadIndex_.empty())
+                {
+                    for (uint32_t i = 0; i < nVis; ++i)
+                        runScalarTlasRootInstance(
+                            scratch.visible[i].instance(), tlasView,
+                            params, scratch.visible[i].mask(), w);
+                }
+                else
+                {
+                    for (uint32_t i = 0; i < nVis; ++i)
+                        runTlasRootInstance(
+                            scratch.visible[i].instance(), tlasView,
+                            params, scratch.visible[i].mask(), w);
+                }
             }
             else
             {
@@ -6528,6 +7542,69 @@ FrontierRefinementView SpatialQuery::computeFrontierRefinement(
         return mask;
     };
 
+    const auto payloadSuccessor = [&](const FrontierEntry& entry,
+                                      InstanceId dense, uint8_t mask,
+                                      FrontierEntry& successor)
+    {
+        const uint8_t nextPayload = uint8_t(entry.payloadIndex() + 1u);
+        const NodeHandle handle = entry.nodeHandle;
+        float error = 0.0f;
+        if (handle.isTlasRoot())
+        {
+            FRONTIER_CHECK(database.resolveTlasRoot(handle) == dense,
+                           "SpatialQuery::computeFrontierRefinement: stale "
+                           "TLAS root handle");
+            const SpatialDatabase::TlasRootExtraPayloadRt* extra =
+                database.tlasRootExtraPayload(dense);
+            if (!extra || nextPayload > extra->record.count) return false;
+            const SpatialDatabase::Instance& instance =
+                database.instances_[dense];
+            const float geometricError =
+                extra->record.geometricError[nextPayload] * instance.scale;
+            error = geometricError > 0.0f
+                        ? screenError(
+                              geometricError, tlasView.k,
+                              distanceToBox(instance.worldBox,
+                                            tlasView.queryMin(),
+                                            tlasView.queryMax()))
+                        : 0.0f;
+        }
+        else
+        {
+            const SpatialDatabase::Instance& instance =
+                database.instances_[dense];
+            const SpatialDatabase::SubtreeInstanceRt* placement =
+                database.resolve(handle);
+            FRONTIER_CHECK(
+                placement != nullptr &&
+                    database.mountBelongsTo(instance, handle.slot()),
+                "SpatialQuery::computeFrontierRefinement: stale or unrelated "
+                "mounted node handle");
+            const detail::SubtreeView& subtree =
+                database.subtreeView(*placement);
+            if (nextPayload >= subtree.payloadCount(handle.index()))
+                return false;
+            const Camera rootLocal = rootLocalCamera(dense, mask);
+            const Camera local = database.mountLocalCamera(
+                rootLocal, handle.slot(), mask);
+            const AABB bounds = database.effectiveNodeBounds(
+                instance, handle.slot(), *placement, handle.index());
+            const float geometricError = std::min(
+                subtree.geometricError(handle.index(), nextPayload),
+                placement->errClamp);
+            error = geometricError > 0.0f
+                        ? screenError(
+                              geometricError, local.k,
+                              distanceToBox(bounds, local.queryMin(),
+                                            local.queryMax()))
+                        : 0.0f;
+        }
+        successor = makeFrontierEntry(
+            handle, error, threshold, thresholdInv, entry.instance(),
+            nextPayload);
+        return true;
+    };
+
     for (uint32_t currentIndex = 0; currentIndex < current.size();
          ++currentIndex)
     {
@@ -6547,9 +7624,14 @@ FrontierRefinementView SpatialQuery::computeFrontierRefinement(
         const QueryScratch::RefinementWork work =
             scratch.refinementWork[cursor++];
         const InstanceId dense = denseInstance(work.entry);
+        FrontierEntry payloadChild;
+        const bool payloadExpansion = payloadSuccessor(
+            work.entry, dense, work.mask, payloadChild);
         uint32_t slot = kInvalidIndex;
         uint32_t node = kInvalidIndex;
-        if (!expansionTarget(work.entry, dense, slot, node)) continue;
+        if (!payloadExpansion &&
+            !expansionTarget(work.entry, dense, slot, node))
+            continue;
 
         if (work.depth >= maxDepth)
         {
@@ -6557,43 +7639,57 @@ FrontierRefinementView SpatialQuery::computeFrontierRefinement(
             continue;
         }
 
-        const SpatialDatabase::Instance& instance = database.instances_[dense];
-        const SpatialDatabase::SubtreeInstanceRt& placement =
-            database.slots_[slot];
-        const detail::SubtreeView& subtree = database.subtreeView(placement);
-        const Camera rootLocal = rootLocalCamera(dense, work.mask);
-        const Camera local =
-            database.mountLocalCamera(rootLocal, slot, work.mask);
-        const SpatialDatabase::Overlay* overlay =
-            database.findOverlay(instance, slot);
-
         scratch.refinementGroupEntries.clear();
         scratch.refinementGroupMasks.clear();
-        uint32_t child = node + 1;
-        const uint32_t childCount = subtree.childCount(node);
-        for (uint32_t i = 0; i < childCount; ++i)
+        if (payloadExpansion)
         {
-            uint8_t childMask = work.mask;
-            const AABB bounds =
-                database.nodeBoundsFrom(overlay, subtree, child);
-            if (testAabb(bounds, local.frustum, childMask) !=
-                CullState::Outside)
+            scratch.refinementGroupEntries.push_back(payloadChild);
+            scratch.refinementGroupMasks.push_back(work.mask);
+        }
+        else
+        {
+            const SpatialDatabase::Instance& instance =
+                database.instances_[dense];
+            const SpatialDatabase::SubtreeInstanceRt& placement =
+                database.slots_[slot];
+            const detail::SubtreeView& subtree =
+                database.subtreeView(placement);
+            const Camera rootLocal = rootLocalCamera(dense, work.mask);
+            const Camera local =
+                database.mountLocalCamera(rootLocal, slot, work.mask);
+            const SpatialDatabase::Overlay* overlay =
+                database.findOverlay(instance, slot);
+
+            uint32_t child = node + 1;
+            const uint32_t childCount = subtree.childCount(node);
+            for (uint32_t i = 0; i < childCount; ++i)
             {
-                const float geometricError =
-                    std::min(subtree.geometricError_[child],
-                             placement.errClamp);
-                const float error =
-                    geometricError > 0.0f
-                        ? screenError(geometricError, local.k,
-                                      distanceToBox(bounds, local.queryMin(),
-                                                    local.queryMax()))
-                        : 0.0f;
-                scratch.refinementGroupEntries.push_back(makeFrontierEntry(
-                    NodeHandle{slot, child, placement.generation()}, error,
-                    threshold, thresholdInv, work.entry.instance()));
-                scratch.refinementGroupMasks.push_back(childMask);
+                uint8_t childMask = work.mask;
+                const AABB bounds =
+                    database.nodeBoundsFrom(overlay, subtree, child);
+                if (testAabb(bounds, local.frustum, childMask) !=
+                    CullState::Outside)
+                {
+                    const float geometricError =
+                        std::min(subtree.geometricError_[child],
+                                 placement.errClamp);
+                    const float error =
+                        geometricError > 0.0f
+                            ? screenError(
+                                  geometricError, local.k,
+                                  distanceToBox(bounds, local.queryMin(),
+                                                local.queryMax()))
+                            : 0.0f;
+                    scratch.refinementGroupEntries.push_back(
+                        makeFrontierEntry(
+                            NodeHandle{slot, child,
+                                       placement.generation()},
+                            error, threshold, thresholdInv,
+                            work.entry.instance()));
+                    scratch.refinementGroupMasks.push_back(childMask);
+                }
+                child += subtree.subtreeSize_[child];
             }
-            child += subtree.subtreeSize_[child];
         }
 
         const uint32_t groupSize =

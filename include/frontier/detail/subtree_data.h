@@ -54,6 +54,7 @@ static_assert(sizeof(WideBlock) == kWide * 32,
 inline constexpr uint32_t kBlockLaneMask = (1u << kWide) - 1u;
 inline constexpr uint32_t kBlockLeafShift = kWide;
 inline constexpr uint32_t kBlockZeroErrorShift = kWide * 2u;
+inline constexpr uint32_t kBlockMultiPayloadShift = kWide * 3u;
 inline uint32_t blockValidLanes(uint32_t m) { return m & kBlockLaneMask; }
 inline uint32_t blockLeafLanes(uint32_t m)
 {
@@ -63,6 +64,23 @@ inline uint32_t blockZeroErrorLanes(uint32_t m)
 {
     return (m >> kBlockZeroErrorShift) & kBlockLaneMask;
 }
+inline uint32_t blockMultiPayloadLanes(uint32_t m)
+{
+    return (m >> kBlockMultiPayloadShift) & kBlockLaneMask;
+}
+
+// Padded so all seven additional geometric errors can be compared with one
+// aligned eight-float load. Slot zero remains in the ordinary payload/error
+// streams; this record exists only for nodes with slots 1..7.
+struct alignas(32) ExtraPayloadRecord
+{
+    float geometricError[kMaxNodePayloads]{};
+    PayloadWord payload[kMaxNodePayloads - 1]{};
+    uint32_t count = 0;
+};
+static_assert(sizeof(ExtraPayloadRecord) ==
+                  (sizeof(PayloadWord) == 8 ? 96u : 64u),
+              "extra payload record lost its SIMD-friendly layout");
 
 struct WideBoundsRef
 {
@@ -113,7 +131,7 @@ struct MutWideBoundsRef
 };
 
 inline constexpr uint32_t kSubtreeMagic = 0x42545346u; // 'FSTB'
-inline constexpr uint16_t kSubtreeVersion = 7;
+inline constexpr uint16_t kSubtreeVersion = 8;
 inline constexpr size_t kSubtreeAlign = kSubtreeByteAlignment;
 
 // The immutable in-memory layout is also the serialized format. It contains
@@ -140,7 +158,10 @@ struct SubtreeHeader
     uint32_t payloadBytes;
     float rootBoundsMin[3];
     float rootBoundsMax[3];
-    uint32_t reserved[9];
+    uint32_t extraPayloadIndexOffset;
+    uint32_t extraPayloadRecordOffset;
+    uint32_t extraPayloadRecordCount;
+    uint32_t reserved[6];
 };
 static_assert(sizeof(SubtreeHeader) == 128,
               "SubtreeHeader must stay two cache lines");
@@ -154,6 +175,8 @@ struct SubtreeLayout
     uint32_t subtreeSize = 0;
     uint32_t meta = 0;
     uint32_t error = 0;
+    uint32_t extraPayloadIndex = 0;
+    uint32_t extraPayloadRecord = 0;
     uint32_t totalBytes = 0;
 };
 
@@ -180,6 +203,75 @@ struct SubtreeView
     }
     uint32_t packedNodeCount() const { return packedNodeCount_; }
     uint32_t wideCount() const { return wideCount_; }
+    const std::byte* serializedBase() const
+    {
+        return reinterpret_cast<const std::byte*>(wide_) -
+               sizeof(SubtreeHeader);
+    }
+    const SubtreeHeader* header() const
+    {
+        return reinterpret_cast<const SubtreeHeader*>(serializedBase());
+    }
+    uint32_t extraPayloadRecordCount() const
+    {
+        return valid() ? header()->extraPayloadRecordCount : 0u;
+    }
+    bool hasExtraPayloads() const
+    {
+        return extraPayloadRecordCount() != 0;
+    }
+    const uint32_t* extraPayloadIndices() const
+    {
+        return hasExtraPayloads()
+                   ? reinterpret_cast<const uint32_t*>(
+                         serializedBase() + header()->extraPayloadIndexOffset)
+                   : nullptr;
+    }
+    const ExtraPayloadRecord* extraPayloadRecords() const
+    {
+        return hasExtraPayloads()
+                   ? reinterpret_cast<const ExtraPayloadRecord*>(
+                         serializedBase() +
+                         header()->extraPayloadRecordOffset)
+                   : nullptr;
+    }
+    const ExtraPayloadRecord* extraPayloadRecord(uint32_t i) const
+    {
+        const uint32_t* indices = extraPayloadIndices();
+        if (!indices) return nullptr;
+        const uint32_t record = indices[i];
+        return record < extraPayloadRecordCount()
+                   ? extraPayloadRecords() + record
+                   : nullptr;
+    }
+    uint32_t payloadCount(uint32_t i) const
+    {
+        const ExtraPayloadRecord* extra = extraPayloadRecord(i);
+        return i == 0 ? 0u : 1u + (extra ? extra->count : 0u);
+    }
+    PayloadWord payload(uint32_t i, uint32_t payloadIndex) const
+    {
+        if (payloadIndex == 0) return payload_[i];
+        const ExtraPayloadRecord* extra = extraPayloadRecord(i);
+        return extra && payloadIndex <= extra->count
+                   ? extra->payload[payloadIndex - 1]
+                   : invalidPayloadWord();
+    }
+    float geometricError(uint32_t i, uint32_t payloadIndex) const
+    {
+        if (payloadIndex == 0) return geometricError_[i];
+        const ExtraPayloadRecord* extra = extraPayloadRecord(i);
+        return extra && payloadIndex <= extra->count
+                   ? extra->geometricError[payloadIndex - 1]
+                   : 0.0f;
+    }
+    float finestGeometricError(uint32_t i) const
+    {
+        const ExtraPayloadRecord* extra = extraPayloadRecord(i);
+        return extra && extra->count != 0
+                   ? extra->geometricError[extra->count - 1]
+                   : geometricError_[i];
+    }
     AABB bounds() const
     {
         return valid()
@@ -236,7 +328,8 @@ struct SubtreeView
     }
 };
 
-SubtreeLayout subtreeLayout(uint32_t nodeCount, uint32_t wideCount);
+SubtreeLayout subtreeLayout(uint32_t nodeCount, uint32_t wideCount,
+                            uint32_t extraPayloadRecordCount = 0);
 void validateSubtreeBytes(const SubtreeBytes& bytes);
 SubtreeView viewSubtreeBytes(const SubtreeBytes& bytes);
 

@@ -149,6 +149,23 @@ both-width mode, do not pass `--benchmark_out` because one caller-provided path
 cannot hold both results; select one width or run the executables directly when
 custom output paths are required.
 
+`frontier_payload_lod_bench` is a separate executable for the motivating
+same-bound case. It compares eight LODs authored as a unary node chain with one
+sparse, padded eight-payload node. Both sides return one frontier entry per
+logical object; counters expose immutable bytes and stored nodes alongside raw
+selection time. Keeping this workload separate prevents it from perturbing the
+LTO/link layout of the established scalar-selection guards.
+
+```sh
+cmake --build build-perf --target frontier_payload_lod_bench \
+  frontier_payload_lod_bench_payload32
+build-perf/bench/frontier_payload_lod_bench \
+  --benchmark_filter=BM_SharedBoundPayloadLods
+```
+
+On a multi-config Windows build, use the executables below
+`build-perf/bench/Release`.
+
 Run either executable directly after a build when preferred:
 
 ```sh

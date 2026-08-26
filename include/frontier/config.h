@@ -13,9 +13,9 @@
 #include <cstdlib>
 
 #define FRONTIER_VERSION_MAJOR 0
-#define FRONTIER_VERSION_MINOR 7
+#define FRONTIER_VERSION_MINOR 8
 #define FRONTIER_VERSION_PATCH 0
-#define FRONTIER_VERSION_STRING "0.7.0"
+#define FRONTIER_VERSION_STRING "0.8.0"
 
 // Complete serialized-subtree validation is enabled by default. Defining this
 // to 0 removes the linear topology/data scan from registration; constant-time

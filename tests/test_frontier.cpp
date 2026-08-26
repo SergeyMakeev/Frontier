@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <cfloat>
 
 #include "helpers.h"
 
@@ -48,6 +49,88 @@ SubtreeBytes makeFullyRefinedReferenceSubtree(float leafError)
     return builder.build();
 }
 
+constexpr std::array<float, kMaxNodePayloads> kDensePayloadErrors{{
+    64.0f, 32.0f, 16.0f, 8.0f, 4.0f, 2.0f, 1.0f, 0.0f,
+}};
+
+struct DensePayloadScene
+{
+    static constexpr uint32_t kNodeCount = kWide * 2u + 1u;
+    static constexpr UserPayload kFirstPayload = 1000;
+
+    SpatialDatabase database;
+    NodeHandle hierarchyRoot;
+    std::vector<NodeHandle> nodes;
+    AABB payloadBounds = box(1.0f);
+    Camera camera = cameraAt();
+    float errorScale = 1.0f;
+
+    explicit DensePayloadScene(float scale = 1.0f)
+        : errorScale(scale)
+    {
+        SubtreeBuilder builder;
+        const auto root = builder.createNode(
+            node(100, kDensePayloadErrors[0] * errorScale, box(2.0f)));
+        for (uint32_t i = 0; i < kNodeCount; ++i)
+        {
+            std::array<PayloadLodDesc, kMaxNodePayloads - 1> extra{};
+            const UserPayload first = firstPayload(i);
+            for (uint32_t payloadIndex = 1;
+                 payloadIndex < kMaxNodePayloads; ++payloadIndex)
+                extra[payloadIndex - 1] = {
+                    UserPayload(first + payloadIndex),
+                    kDensePayloadErrors[payloadIndex] * errorScale};
+            builder.createNode(
+                root,
+                node(first, kDensePayloadErrors[0] * errorScale,
+                     payloadBounds),
+                extra);
+        }
+
+        const SubtreeHandle definition =
+            database.registerSubtree(builder.build());
+        instantiateFor(
+            database, definition, box(3.0f), 128.0f * errorScale);
+        hierarchyRoot = handleOf(database, 100);
+        nodes.reserve(kNodeCount);
+        for (uint32_t i = 0; i < kNodeCount; ++i)
+            nodes.push_back(handleOf(database, firstPayload(i)));
+    }
+
+    static UserPayload firstPayload(uint32_t nodeIndex)
+    {
+        return UserPayload(kFirstPayload +
+                           nodeIndex * kMaxNodePayloads);
+    }
+
+    float projectedError(uint8_t payloadIndex) const
+    {
+        return screenError(
+            kDensePayloadErrors[payloadIndex] * errorScale, camera.k,
+            distanceToBox(payloadBounds, camera.queryMin(),
+                          camera.queryMax()));
+    }
+
+    float thresholdForSlot(uint8_t payloadIndex) const
+    {
+        if (payloadIndex == 0 || payloadIndex >= kMaxNodePayloads)
+            throw std::logic_error("dense payload threshold slot is invalid");
+        return 0.5f *
+               (projectedError(uint8_t(payloadIndex - 1)) +
+                projectedError(payloadIndex));
+    }
+};
+
+const FrontierEntry* findEntry(FrontierResultView cut, NodeHandle node)
+{
+    const auto found = std::find_if(
+        cut.begin(), cut.end(), [&](const FrontierEntry& entry)
+        {
+            return entry.nodeHandle == node;
+        });
+    return found == cut.end() ? nullptr : &*found;
+}
+
 } // namespace
 
 TEST(Frontier, PermanentRootCoversMissingMountedPayloads)
@@ -63,6 +146,292 @@ TEST(Frontier, PermanentRootCoversMissingMountedPayloads)
               (std::vector<UserPayload>{1}));
     EXPECT_EQ(refinedPayloads(scene.database, query, cut),
               (std::vector<UserPayload>{11, 12}));
+}
+
+TEST(Frontier, SelectsPayloadSlotsWithoutRepeatingSpatialNodes)
+{
+    const std::array<PayloadLodDesc, 3> lods{{
+        {11, 16.0f},
+        {12, 4.0f},
+        {13, 0.0f},
+    }};
+    SubtreeBuilder builder;
+    builder.createNode(node(10, 32.0f, box(2.0f)), lods);
+
+    SpatialDatabase database;
+    const SubtreeHandle definition =
+        database.registerSubtree(builder.build());
+    const InstanceHandle instance =
+        instantiateFor(database, definition, box(4.0f), 64.0f);
+    const NodeHandle payloadNode = handleOf(database, 10);
+    for (uint8_t payloadIndex = 0; payloadIndex < 4; ++payloadIndex)
+        database.markPayloadReady(payloadNode, payloadIndex);
+
+    SpatialQuery query;
+    SelectionParams params;
+    params.threshold = 1000.0f;
+    FrontierResultView cut = select(database, query, cameraAt(), params);
+    ASSERT_EQ(cut.size(), 1u);
+    EXPECT_EQ(cut.entries[0].nodeHandle, payloadNode);
+    EXPECT_EQ(cut.entries[0].payloadIndex(), 1u);
+    EXPECT_EQ(database.tryGetPayload(cut.entries[0].nodeHandle,
+                                     cut.entries[0].payloadIndex()),
+              11u);
+    EXPECT_EQ(cut.entries[0].instance(), instance.id);
+
+    params.threshold = 500.0f;
+    cut = select(database, query, cameraAt(), params);
+    ASSERT_EQ(cut.size(), 1u);
+    EXPECT_EQ(cut.entries[0].nodeHandle, payloadNode);
+    EXPECT_EQ(cut.entries[0].payloadIndex(), 2u);
+    EXPECT_EQ(payloads(database, cut), (std::vector<UserPayload>{12}));
+
+    params.threshold = 1.0f;
+    cut = select(database, query, cameraAt(), params);
+    ASSERT_EQ(cut.size(), 1u);
+    EXPECT_EQ(cut.entries[0].nodeHandle, payloadNode);
+    EXPECT_EQ(cut.entries[0].payloadIndex(), 3u);
+    EXPECT_EQ(payloads(database, cut), (std::vector<UserPayload>{13}));
+}
+
+TEST(Frontier, PayloadReadinessFallsBackWithinTheSameNode)
+{
+    const std::array<PayloadLodDesc, 3> lods{{
+        {21, 16.0f},
+        {22, 4.0f},
+        {23, 0.0f},
+    }};
+    SubtreeBuilder builder;
+    builder.createNode(node(20, 32.0f, box(2.0f)), lods);
+
+    SpatialDatabase database;
+    const SubtreeHandle definition =
+        database.registerSubtree(builder.build());
+    instantiateFor(database, definition, box(4.0f), 64.0f);
+    const NodeHandle payloadNode = handleOf(database, 20);
+    database.markPayloadReady(payloadNode, 0);
+
+    SpatialQuery query;
+    SelectionParams params;
+    params.threshold = 500.0f; // slot two is the ideal cut
+    FrontierResultView cut = select(database, query, cameraAt(), params);
+    ASSERT_EQ(cut.size(), 1u);
+    EXPECT_EQ(cut.entries[0].payloadIndex(), 0u);
+
+    database.markPayloadReady(payloadNode, 3);
+    cut = select(database, query, cameraAt(), params);
+    ASSERT_EQ(cut.size(), 1u);
+    EXPECT_EQ(cut.entries[0].payloadIndex(), 3u);
+
+    database.markPayloadReady(payloadNode, 2);
+    cut = select(database, query, cameraAt(), params);
+    ASSERT_EQ(cut.size(), 1u);
+    EXPECT_EQ(cut.entries[0].payloadIndex(), 2u);
+
+    database.markPayloadUnavailable(payloadNode, 0);
+    EXPECT_FALSE(database.isPayloadReady(payloadNode, 0));
+    EXPECT_TRUE(database.isPayloadReady(payloadNode, 2));
+    cut = select(database, query, cameraAt(), params);
+    ASSERT_EQ(cut.size(), 1u);
+    EXPECT_EQ(cut.entries[0].payloadIndex(), 2u);
+}
+
+TEST(Frontier, TlasRootsUseSparsePayloadSlotsAndPermanentSlotZero)
+{
+    const std::array<PayloadLodDesc, 3> lods{{
+        {31, 16.0f},
+        {32, 4.0f},
+        {33, 0.0f},
+    }};
+    SpatialDatabase database;
+    const InstanceHandle instance =
+        database.instantiate(node(30, 32.0f, box(2.0f)), lods);
+
+    SpatialQuery query;
+    SelectionParams params;
+    params.threshold = 500.0f;
+    FrontierResultView cut = select(database, query, cameraAt(), params);
+    ASSERT_EQ(cut.size(), 1u);
+    EXPECT_EQ(cut.entries[0].nodeHandle, instance.rootNode());
+    EXPECT_EQ(cut.entries[0].payloadIndex(), 0u);
+
+    database.markPayloadReady(instance.rootNode(), 2);
+    cut = select(database, query, cameraAt(), params);
+    ASSERT_EQ(cut.size(), 1u);
+    EXPECT_EQ(cut.entries[0].payloadIndex(), 2u);
+    EXPECT_EQ(payloads(database, cut), (std::vector<UserPayload>{32}));
+
+    database.markPayloadUnavailable(instance.rootNode(), 2);
+    EXPECT_TRUE(database.isPayloadReady(instance.rootNode(), 0));
+    EXPECT_FALSE(database.isPayloadReady(instance.rootNode(), 2));
+    EXPECT_THROW(database.markPayloadUnavailable(instance.rootNode(), 0),
+                 std::logic_error);
+}
+
+TEST(Frontier, DensePayloadNodesCutThroughEveryWideBlock)
+{
+    DensePayloadScene scene;
+    TestAccess::markAllPayloadsReady(scene.database);
+
+    SpatialQuery query;
+    query.setReuseEnabled(false);
+    for (uint8_t payloadIndex = 1;
+         payloadIndex < kMaxNodePayloads; ++payloadIndex)
+    {
+        SCOPED_TRACE(uint32_t(payloadIndex));
+        SelectionParams params;
+        params.threshold = scene.thresholdForSlot(payloadIndex);
+        const FrontierResultView cut =
+            select(scene.database, query, scene.camera, params);
+        ASSERT_EQ(cut.size(), DensePayloadScene::kNodeCount);
+        for (uint32_t i = 0; i < scene.nodes.size(); ++i)
+        {
+            const FrontierEntry* entry = findEntry(cut, scene.nodes[i]);
+            ASSERT_NE(entry, nullptr) << "dense node " << i;
+            EXPECT_EQ(entry->payloadIndex(), payloadIndex);
+            EXPECT_EQ(scene.database.tryGetPayload(
+                          entry->nodeHandle, entry->payloadIndex()),
+                      DensePayloadScene::firstPayload(i) + payloadIndex);
+        }
+    }
+}
+
+TEST(Frontier, DensePayloadResidencyIsIndependentAndHoleFreePerNode)
+{
+    DensePayloadScene scene;
+    scene.database.markNodeReady(scene.hierarchyRoot);
+    constexpr std::array<uint8_t, 5> residentSlots{{0, 2, 3, 4, 6}};
+    std::vector<uint8_t> expected;
+    expected.reserve(scene.nodes.size());
+    for (uint32_t i = 0; i < scene.nodes.size(); ++i)
+    {
+        const uint8_t payloadIndex = residentSlots[i % residentSlots.size()];
+        scene.database.markPayloadReady(scene.nodes[i], payloadIndex);
+        expected.push_back(payloadIndex);
+    }
+
+    SpatialQuery query;
+    query.setReuseEnabled(false);
+    SelectionParams params;
+    params.threshold = scene.thresholdForSlot(3);
+    FrontierResultView cut =
+        select(scene.database, query, scene.camera, params);
+    ASSERT_EQ(cut.size(), DensePayloadScene::kNodeCount);
+    for (uint32_t i = 0; i < scene.nodes.size(); ++i)
+    {
+        const FrontierEntry* entry = findEntry(cut, scene.nodes[i]);
+        ASSERT_NE(entry, nullptr) << "dense node " << i;
+        EXPECT_EQ(entry->payloadIndex(), expected[i]);
+        EXPECT_TRUE(scene.database.isPayloadReady(
+            scene.nodes[i], expected[i]));
+    }
+
+    const NodeHandle victim = scene.nodes.front();
+    scene.database.markPayloadReady(victim, 4);
+    cut = select(scene.database, query, scene.camera, params);
+    ASSERT_NE(findEntry(cut, victim), nullptr);
+    EXPECT_EQ(findEntry(cut, victim)->payloadIndex(), 4u);
+
+    scene.database.markPayloadReady(victim, 3);
+    cut = select(scene.database, query, scene.camera, params);
+    ASSERT_NE(findEntry(cut, victim), nullptr);
+    EXPECT_EQ(findEntry(cut, victim)->payloadIndex(), 3u);
+
+    scene.database.markPayloadUnavailable(victim, 3);
+    cut = select(scene.database, query, scene.camera, params);
+    ASSERT_NE(findEntry(cut, victim), nullptr);
+    EXPECT_EQ(findEntry(cut, victim)->payloadIndex(), 4u);
+
+    scene.database.markPayloadUnavailable(victim, 4);
+    cut = select(scene.database, query, scene.camera, params);
+    ASSERT_EQ(cut.size(), DensePayloadScene::kNodeCount);
+    ASSERT_NE(findEntry(cut, victim), nullptr);
+    EXPECT_EQ(findEntry(cut, victim)->payloadIndex(), 0u);
+
+    EXPECT_FALSE(scene.database.isPayloadReady(victim, kMaxNodePayloads));
+    EXPECT_EQ(scene.database.tryGetPayload(victim, kMaxNodePayloads),
+              kInvalidPayload);
+    EXPECT_THROW(
+        scene.database.markPayloadReady(victim, kMaxNodePayloads),
+        std::logic_error);
+    EXPECT_THROW(
+        scene.database.markPayloadUnavailable(victim, kMaxNodePayloads),
+        std::logic_error);
+}
+
+TEST(Frontier, DensePayloadProjectedErrorsAreMonotonicAcrossResidency)
+{
+    DensePayloadScene scene;
+    scene.database.markNodeReady(scene.hierarchyRoot);
+    for (NodeHandle nodeHandle : scene.nodes)
+        scene.database.markPayloadReady(nodeHandle, 0);
+
+    SpatialQuery query;
+    query.setReuseEnabled(false);
+    SelectionParams params;
+    params.threshold = scene.thresholdForSlot(3);
+    std::vector<uint8_t> previousCodes(scene.nodes.size(), UINT8_MAX);
+    std::vector<float> previousErrors(scene.nodes.size(), FLT_MAX);
+
+    for (uint8_t payloadIndex = 0;
+         payloadIndex < kMaxNodePayloads; ++payloadIndex)
+    {
+        SCOPED_TRACE(uint32_t(payloadIndex));
+        if (payloadIndex != 0)
+        {
+            for (NodeHandle nodeHandle : scene.nodes)
+            {
+                scene.database.markPayloadReady(nodeHandle, payloadIndex);
+                scene.database.markPayloadUnavailable(
+                    nodeHandle, uint8_t(payloadIndex - 1));
+            }
+        }
+
+        const FrontierResultView cut =
+            select(scene.database, query, scene.camera, params);
+        ASSERT_EQ(cut.size(), DensePayloadScene::kNodeCount);
+        for (uint32_t i = 0; i < scene.nodes.size(); ++i)
+        {
+            const FrontierEntry* entry = findEntry(cut, scene.nodes[i]);
+            ASSERT_NE(entry, nullptr) << "dense node " << i;
+            EXPECT_EQ(entry->payloadIndex(), payloadIndex);
+            EXPECT_LE(entry->errorCode(), previousCodes[i]);
+            const float approximate =
+                entry->approximateError(params.threshold);
+            EXPECT_LE(approximate, previousErrors[i]);
+            EXPECT_EQ(entry->overThreshold(),
+                      scene.projectedError(payloadIndex) > params.threshold);
+            previousCodes[i] = entry->errorCode();
+            previousErrors[i] = approximate;
+        }
+    }
+}
+
+TEST(Frontier, DensePayloadProjectionAtZeroDistanceDoesNotOverflow)
+{
+    DensePayloadScene scene(1.0e30f);
+    TestAccess::markAllPayloadsReady(scene.database);
+    scene.camera = makeLookAtCamera(
+        float4::point(0.0f, 0.0f, 0.0f),
+        float4::point(0.0f, 0.0f, 1.0f));
+
+    SpatialQuery query;
+    query.setReuseEnabled(false);
+    SelectionParams params;
+    params.threshold = FLT_MAX * 0.75f;
+    const FrontierResultView cut =
+        select(scene.database, query, scene.camera, params);
+    ASSERT_EQ(cut.size(), DensePayloadScene::kNodeCount);
+    for (uint32_t i = 0; i < scene.nodes.size(); ++i)
+    {
+        const FrontierEntry* entry = findEntry(cut, scene.nodes[i]);
+        ASSERT_NE(entry, nullptr) << "dense node " << i;
+        EXPECT_EQ(entry->payloadIndex(), 7u);
+        EXPECT_FALSE(entry->overThreshold());
+        EXPECT_EQ(scene.database.tryGetPayload(
+                      entry->nodeHandle, entry->payloadIndex()),
+                  DensePayloadScene::firstPayload(i) + 7u);
+    }
 }
 
 TEST(Frontier, ReadyLeavesBecomeCurrentCut)
@@ -745,6 +1114,43 @@ TEST(Frontier, TerminalRenderRangesMatchTheFullyRefinedCurrentCut)
     }
     EXPECT_TRUE(reachedBoundary)
         << "test scene never reached a partial terminal range";
+}
+
+TEST(Frontier, TerminalRenderUsesTheFinestPayloadSlot)
+{
+    const std::array<PayloadLodDesc, 2> lods{{
+        {81, 4.0f},
+        {82, 0.0f},
+    }};
+    SubtreeBuilder builder;
+    builder.createNode(node(80, 16.0f, box(2.0f)), lods);
+
+    SpatialDatabase database;
+    const SubtreeHandle definition =
+        database.registerSubtree(builder.build());
+    instantiateFor(database, definition, box(4.0f), 64.0f);
+    const NodeHandle payloadNode = handleOf(database, 80);
+    for (uint8_t payloadIndex = 0; payloadIndex < 3; ++payloadIndex)
+        database.markPayloadReady(payloadNode, payloadIndex);
+    database.applyUpdates(0);
+
+    TerminalRenderQuery query;
+    const TerminalRenderView terminal = query.select(database, cameraAt());
+    ASSERT_EQ(terminal.size(), 1u);
+    ASSERT_EQ(terminal.runs().size(), 1u);
+    ASSERT_EQ(terminal.runs()[0].payloadSpan().size(), 1u);
+    EXPECT_EQ(terminal.runs()[0].payloadSpan()[0], 82u);
+
+    SpatialDatabase flatDatabase;
+    const InstanceHandle flat = flatDatabase.instantiate(
+        node(90, 16.0f, box(2.0f)), lods);
+    flatDatabase.markPayloadReady(flat.rootNode(), 2);
+    flatDatabase.applyUpdates(0);
+    TerminalRenderQuery flatQuery;
+    const TerminalRenderView flatTerminal =
+        flatQuery.select(flatDatabase, cameraAt());
+    ASSERT_EQ(flatTerminal.size(), 1u);
+    EXPECT_EQ(flatTerminal.runs()[0].payloadSpan()[0], 82u);
 }
 
 TEST(Frontier, TerminalActorBatchMatchesMountedYawedInstance)

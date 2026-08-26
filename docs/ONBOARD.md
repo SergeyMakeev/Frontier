@@ -191,7 +191,7 @@ constraints.
 | Record | Size | Hot-path reason |
 |---|---:|---|
 | `NodeHandle` | 8 B | 20-bit mount slot, 20-bit node, 24-bit generation; a reserved slot encoding also carries TLAS roots. |
-| `FrontierEntry` | 12 B | Handle plus packed 24-bit stable instance id and 8-bit error code. |
+| `FrontierEntry` | 12 B | Handle plus packed 21-bit stable instance id, 3-bit payload slot, and 8-bit error code. |
 | `VisibleItem` / `TlasItem` | 4 B | 24-bit dense id or node plus six-bit plane mask. |
 | `NodeItem` | 8 B | Node index, pixel error, plane mask, and one implicit-target bit. |
 | `WorkItem` | 16 B | Wide-bounds base, packed mount/mask/liveness/stride state, optional sparse-overlay index. |
@@ -201,9 +201,11 @@ constraints.
 | `InstanceOrientation` | 36 B | Lazily allocated local bound, yaw cosine/sine, signed XZ radius. |
 | `MountTransformRt` | 32 B | Accumulated root-local transform, error clamp, generation, definition and fast-path flags. |
 | `MountStamp` | 8 B | Content version, generation, liveness. |
-| `MountReadiness` | 4 B | Fully-ready flag plus recursively incomplete-child count. |
+| `MountReadiness` | 4 B | Fully-ready and sparse multi-payload flags plus recursively incomplete-child count. |
 | `SubtreeInstanceRt` | 56 B | Cold placement ownership, coverage pointer, LRU, links, and definition-list state. |
 | Placement node state | 2 B/node | Covered bit, covered-child count, and—in shared state only—the authoritative ready bit. |
+| Multi-payload definition readiness | 1 B/multi node | One shared readiness mask for slots 0–7; absent from scalar definitions. |
+| Multi-payload serialized record | 96 B payload64 / 64 B payload32 | Sparse 32-byte-aligned padded errors/payloads; one record only for nodes with slots 1–7. |
 | `SpatialQuery::Rec` | 32 B | The random-access per-instance cache-hit record. |
 | `SpatialQuery::RecCold` | 8 B | Slab allocation and current-output offset, fetched only on misses/rebuilds. |
 | `RenderFrontierRun` | 12 B | Slab begin/count plus one instance id for a cached render run. |
@@ -804,8 +806,8 @@ through instance and node generations.
 ### 11.1 General handle output
 
 `FrontierEntry` omits `UserPayload`; payloads stay in immutable definition
-arrays. The packed 24-bit stable instance id avoids repeating application
-entity data. Fixed caller `Sink`s write what fits and count overflow; internal
+arrays. Its metadata word packs a 21-bit stable instance id, a 3-bit payload
+slot, and the existing 8-bit error code. Fixed caller `Sink`s write what fits and count overflow; internal
 sinks append to retained buffers. `pushRange()` turns a cached instance hit
 into one bulk copy.
 

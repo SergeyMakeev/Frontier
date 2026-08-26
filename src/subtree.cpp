@@ -16,7 +16,8 @@ constexpr size_t alignUp(size_t value, size_t alignment)
     return (value + alignment - 1) & ~(alignment - 1);
 }
 
-detail::SubtreeLayout computeLayout(uint32_t nodeCount, uint32_t wideCount)
+detail::SubtreeLayout computeLayout(uint32_t nodeCount, uint32_t wideCount,
+                                    uint32_t extraPayloadRecordCount)
 {
     using namespace detail;
     SubtreeLayout layout;
@@ -43,6 +44,18 @@ detail::SubtreeLayout computeLayout(uint32_t nodeCount, uint32_t wideCount)
     offset += size_t(nodeCount) * sizeof(uint32_t);
     layout.error = uint32_t(offset);
     offset += size_t(nodeCount) * sizeof(float);
+
+    if (extraPayloadRecordCount != 0)
+    {
+        offset = alignUp(offset, alignof(uint32_t));
+        layout.extraPayloadIndex = uint32_t(offset);
+        offset += size_t(nodeCount) * sizeof(uint32_t);
+
+        offset = alignUp(offset, alignof(ExtraPayloadRecord));
+        layout.extraPayloadRecord = uint32_t(offset);
+        offset += size_t(extraPayloadRecordCount) *
+                  sizeof(ExtraPayloadRecord);
+    }
 
     layout.totalBytes = uint32_t(alignUp(offset, kSubtreeAlign));
     return layout;
@@ -133,9 +146,10 @@ void SubtreeBytes::moveFrom(SubtreeBytes& other) noexcept
 
 namespace detail {
 
-SubtreeLayout subtreeLayout(uint32_t nodeCount, uint32_t wideCount)
+SubtreeLayout subtreeLayout(uint32_t nodeCount, uint32_t wideCount,
+                            uint32_t extraPayloadRecordCount)
 {
-    return computeLayout(nodeCount, wideCount);
+    return computeLayout(nodeCount, wideCount, extraPayloadRecordCount);
 }
 
 void validateSubtreeBytes(const SubtreeBytes& bytes)
@@ -163,7 +177,7 @@ void validateSubtreeBytes(const SubtreeBytes& bytes)
                    "registerSubtree: payload configuration mismatch");
     FRONTIER_CHECK(header->reservedOffset == 0,
                    "registerSubtree: reserved offset is non-zero");
-    FRONTIER_CHECK(std::all_of(header->reserved, header->reserved + 9,
+    FRONTIER_CHECK(std::all_of(header->reserved, header->reserved + 6,
                                [](uint32_t value) { return value == 0; }),
                    "registerSubtree: reserved header fields are non-zero");
     FRONTIER_CHECK(header->nodeCount > 1,
@@ -176,8 +190,9 @@ void validateSubtreeBytes(const SubtreeBytes& bytes)
     FRONTIER_CHECK(header->totalBytes == bytes.size(),
                    "registerSubtree: byte-array size mismatch");
 
-    const SubtreeLayout layout =
-        computeLayout(header->nodeCount, header->wideCount);
+    const SubtreeLayout layout = computeLayout(
+        header->nodeCount, header->wideCount,
+        header->extraPayloadRecordCount);
     FRONTIER_CHECK(
         layout.totalBytes == header->totalBytes &&
             layout.wide == header->wideOffset &&
@@ -186,7 +201,9 @@ void validateSubtreeBytes(const SubtreeBytes& bytes)
             layout.parent == header->parentOffset &&
             layout.subtreeSize == header->subtreeSizeOffset &&
             layout.meta == header->metaOffset &&
-            layout.error == header->errorOffset,
+            layout.error == header->errorOffset &&
+            layout.extraPayloadIndex == header->extraPayloadIndexOffset &&
+            layout.extraPayloadRecord == header->extraPayloadRecordOffset,
         "registerSubtree: offsets inconsistent with subtree shape");
 
     const auto* payload = reinterpret_cast<const PayloadWord*>(
@@ -202,7 +219,6 @@ void validateSubtreeBytes(const SubtreeBytes& bytes)
         bytes.data() + header->metaOffset);
     const auto* error = reinterpret_cast<const float*>(
         bytes.data() + header->errorOffset);
-
     const uint32_t nodeCount = header->nodeCount;
     FRONTIER_CHECK(parent[0] == packParent(0, 0) &&
                        subtreeSize[0] == nodeCount,
@@ -218,6 +234,14 @@ void validateSubtreeBytes(const SubtreeBytes& bytes)
                    "registerSubtree: invalid implicit-parent error");
 
 #if FRONTIER_VALIDATE_SUBTREES
+    const auto* extraPayloadIndex = header->extraPayloadRecordCount
+        ? reinterpret_cast<const uint32_t*>(
+              bytes.data() + header->extraPayloadIndexOffset)
+        : nullptr;
+    const auto* extraPayloadRecords = header->extraPayloadRecordCount
+        ? reinterpret_cast<const ExtraPayloadRecord*>(
+              bytes.data() + header->extraPayloadRecordOffset)
+        : nullptr;
     const auto* wide = reinterpret_cast<const WideBlock*>(
         bytes.data() + header->wideOffset);
     const auto* blockMask = reinterpret_cast<const uint32_t*>(
@@ -233,6 +257,7 @@ void validateSubtreeBytes(const SubtreeBytes& bytes)
     // Validate all scalar arrays before using any serialized index. This is
     // deliberately linear: registration remains zero-copy, while malformed
     // persisted bytes can never become unchecked traversal pointers.
+    uint32_t expectedExtraPayloadRecord = 0;
     for (uint32_t node = 0; node < nodeCount; ++node)
     {
         if (node != 0)
@@ -249,17 +274,62 @@ void validateSubtreeBytes(const SubtreeBytes& bytes)
             FRONTIER_CHECK(subtreeSize[node] == 1,
                            "registerSubtree: leaf has descendants");
 
-        if (node == 0) continue;
+        const uint32_t extraRecord = extraPayloadIndex
+                                         ? extraPayloadIndex[node]
+                                         : kInvalidIndex;
+        if (node == 0)
+        {
+            FRONTIER_CHECK(extraRecord == kInvalidIndex,
+                           "registerSubtree: implicit parent has payloads");
+            continue;
+        }
+        FRONTIER_CHECK(extraRecord == kInvalidIndex ||
+                           extraRecord == expectedExtraPayloadRecord,
+                       "registerSubtree: non-canonical extra payload index");
+        float finestError = error[node];
+        if (extraRecord != kInvalidIndex)
+        {
+            ++expectedExtraPayloadRecord;
+            const ExtraPayloadRecord& extra =
+                extraPayloadRecords[extraRecord];
+            FRONTIER_CHECK(extra.count != 0 &&
+                               extra.count < kMaxNodePayloads,
+                           "registerSubtree: invalid extra payload count");
+            for (uint32_t payloadIndex = 0;
+                 payloadIndex < extra.count; ++payloadIndex)
+            {
+                FRONTIER_CHECK(
+                    extra.payload[payloadIndex] != invalidPayloadWord(),
+                    "registerSubtree: reserved invalid extra payload");
+                FRONTIER_CHECK(
+                    extra.geometricError[payloadIndex] >= 0.0f &&
+                        std::isfinite(extra.geometricError[payloadIndex]) &&
+                        extra.geometricError[payloadIndex] <= finestError,
+                    "registerSubtree: invalid extra payload error");
+                finestError = extra.geometricError[payloadIndex];
+            }
+        }
         const uint32_t parentIndex = packedParentIndex(parent[node]);
         const uint32_t ordinal = packedParentOrdinal(parent[node]);
         FRONTIER_CHECK(parentIndex < node &&
                            ordinal < metaChildCount(meta[parentIndex]),
                        "registerSubtree: parent ordering violated");
+        const uint32_t parentExtra = extraPayloadIndex
+                                         ? extraPayloadIndex[parentIndex]
+                                         : kInvalidIndex;
+        const float parentFinestError =
+            parentExtra != kInvalidIndex
+                ? extraPayloadRecords[parentExtra].geometricError[
+                      extraPayloadRecords[parentExtra].count - 1]
+                : error[parentIndex];
         FRONTIER_CHECK(error[node] >= 0.0f &&
                            std::isfinite(error[node]) &&
-                           error[node] <= error[parentIndex],
+                           error[node] <= parentFinestError,
                        "registerSubtree: invalid geometric error");
     }
+    FRONTIER_CHECK(expectedExtraPayloadRecord ==
+                       header->extraPayloadRecordCount,
+                   "registerSubtree: unused extra payload records");
 
     uint32_t expectedWide = 0;
     for (uint32_t node = 0; node < nodeCount; ++node)
@@ -297,6 +367,7 @@ void validateSubtreeBytes(const SubtreeBytes& bytes)
             uint32_t expectedValid = 0;
             uint32_t expectedLeaf = 0;
             uint32_t expectedZeroError = 0;
+            uint32_t expectedMultiPayload = 0;
 
             for (uint32_t lane = 0; lane < kWide; ++lane)
             {
@@ -317,6 +388,9 @@ void validateSubtreeBytes(const SubtreeBytes& bytes)
                     expectedValid |= 1u << lane;
                     if (error[child] == 0.0f)
                         expectedZeroError |= 1u << lane;
+                    if (extraPayloadIndex &&
+                        extraPayloadIndex[child] != kInvalidIndex)
+                        expectedMultiPayload |= 1u << lane;
                     if (metaChildCount(meta[child]) == 0 &&
                         !metaIsMountable(meta[child]))
                         expectedLeaf |= 1u << lane;
@@ -335,7 +409,8 @@ void validateSubtreeBytes(const SubtreeBytes& bytes)
             FRONTIER_CHECK(
                 blockMask[expectedWide + blockIndex] ==
                     (expectedValid | (expectedLeaf << kBlockLeafShift) |
-                     (expectedZeroError << kBlockZeroErrorShift)),
+                     (expectedZeroError << kBlockZeroErrorShift) |
+                     (expectedMultiPayload << kBlockMultiPayloadShift)),
                 "registerSubtree: invalid wide-block lane mask");
         }
 

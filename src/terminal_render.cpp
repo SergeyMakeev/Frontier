@@ -28,6 +28,7 @@ struct TerminalRenderQuery::Impl
     std::vector<uint32_t> nodeStack;
     std::vector<Plan> plans;
     std::vector<TerminalRenderRun> runs;
+    std::vector<UserPayload> flatRootPayloads;
     size_t leafCount = 0;
 };
 
@@ -89,8 +90,7 @@ inline uint8_t itemMask(uint32_t packed)
 
 inline uint32_t packInstanceError(InstanceId instance, uint8_t error)
 {
-    return (instance & kInstanceIdMask) |
-           (uint32_t(error) << kInstanceIdBits);
+    return packFrontierMetadata(instance, error);
 }
 
 } // namespace
@@ -113,6 +113,7 @@ size_t TerminalRenderQuery::bytes() const
                    impl_->tlasStack.capacity() * sizeof(uint32_t) +
                    impl_->nodeStack.capacity() * sizeof(uint32_t) +
                    impl_->runs.capacity() * sizeof(TerminalRenderRun) +
+                   impl_->flatRootPayloads.capacity() * sizeof(UserPayload) +
                    impl_->plans.capacity() * sizeof(Impl::Plan);
     for (const Impl::Plan& plan : impl_->plans)
         bytes += plan.payloads.capacity() * sizeof(UserPayload) +
@@ -143,6 +144,7 @@ TerminalRenderView TerminalRenderQuery::select(
                    "SpatialDatabase; call reset()");
     impl_->database = &database;
     impl_->runs.clear();
+    impl_->flatRootPayloads.clear();
     impl_->leafCount = 0;
 
     FRONTIER_CHECK(!database.tlasBuildRequired_ && database.pendingMoves_.empty() &&
@@ -251,7 +253,7 @@ TerminalRenderView TerminalRenderQuery::select(
             if (subtree.childCount(node) == 0)
             {
                 ++terminalCount;
-                if (subtree.geometricError_[node] != 0.0f)
+                if (subtree.finestGeometricError(node) != 0.0f)
                     plan.eligible = false;
             }
         }
@@ -297,7 +299,9 @@ TerminalRenderView TerminalRenderQuery::select(
                     plan.ranges[child] = {
                         uint32_t(plan.payloads.size()), 1};
                     plan.payloads.push_back(detail::decodePayload(
-                        subtree.payload_[child]));
+                        subtree.payload(
+                            child,
+                            uint8_t(subtree.payloadCount(child) - 1u))));
                 }
                 uint32_t inner = detail::blockValidLanes(lanes) &
                                  ~detail::blockLeafLanes(lanes);
@@ -397,6 +401,7 @@ TerminalRenderView TerminalRenderQuery::select(
     // A terminal query is intentionally strict: it represents the fully
     // resident zero-error cut, so it never silently substitutes an unavailable
     // proxy or applies a copy-on-write overlay to immutable definition ranges.
+    impl_->flatRootPayloads.reserve(visible.size());
     for (const uint32_t packedVisible : visible)
     {
         const InstanceId dense = itemValue(packedVisible);
@@ -406,14 +411,34 @@ TerminalRenderView TerminalRenderQuery::select(
         const uint32_t rootSlot = instance.rootSlot;
         if (rootSlot == kInvalidIndex)
         {
-            const float error = instance.maxErrWorld > 0.0f
+            const SpatialDatabase::TlasRootExtraPayloadRt* extra =
+                database.tlasRootExtraPayload(dense);
+            const float geometricError =
+                extra
+                    ? extra->record.geometricError[extra->record.count] *
+                          instance.scale
+                    : instance.maxErrWorld;
+            const float error = geometricError > 0.0f
                                     ? screenError(
-                                          instance.maxErrWorld, view.k,
+                                          geometricError, view.k,
                                           distanceToBox(instance.worldBox,
                                                         view.queryMin(),
                                                         view.queryMax()))
                                     : 0.0f;
-            appendRun(database.tlasRootPayloads_.data() + dense, 1,
+            const UserPayload* payload =
+                database.tlasRootPayloads_.data() + dense;
+            if (extra)
+            {
+                const uint8_t finest = uint8_t(extra->record.count);
+                FRONTIER_CHECK(
+                    (extra->readiness & (1u << finest)) != 0,
+                    "TerminalRenderQuery::select: finest TLAS root payload "
+                    "is not ready");
+                impl_->flatRootPayloads.push_back(detail::decodePayload(
+                    extra->record.payload[finest - 1u]));
+                payload = &impl_->flatRootPayloads.back();
+            }
+            appendRun(payload, 1,
                       packInstanceError(
                           outputInstance,
                           encodeFrontierError(error, errorThreshold)));

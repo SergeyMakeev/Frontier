@@ -24,9 +24,11 @@ struct SpatialDatabase::TestAccess
             {
                 NodeHandle handle{slot, node,
                                   database.mountStamps_[slot].generation()};
-                const UserPayload candidate = database.tryGetPayload(handle);
-                if (candidate == payload)
-                    return handle;
+                for (uint8_t payloadIndex = 0;
+                     payloadIndex < subtree.payloadCount(node);
+                     ++payloadIndex)
+                    if (database.tryGetPayload(handle, payloadIndex) == payload)
+                        return handle;
             }
         }
         return {};
@@ -61,9 +63,11 @@ struct SpatialDatabase::TestAccess
             {
                 NodeHandle handle{slot, node,
                                   database.mountStamps_[slot].generation()};
-                const UserPayload candidate = database.tryGetPayload(handle);
-                if (candidate == payload)
-                    return handle;
+                for (uint8_t payloadIndex = 0;
+                     payloadIndex < subtree.payloadCount(node);
+                     ++payloadIndex)
+                    if (database.tryGetPayload(handle, payloadIndex) == payload)
+                        return handle;
             }
         }
         throw std::logic_error("payload is not mounted on instance");
@@ -182,6 +186,27 @@ struct SpatialDatabase::TestAccess
         }
     }
 
+    static void markAllPayloadsReady(SpatialDatabase& database)
+    {
+        for (uint32_t slot = 0; slot < database.slots_.size(); ++slot)
+        {
+            const SubtreeInstanceRt& instance = database.slots_[slot];
+            if (!instance.inUse()) continue;
+            const detail::SubtreeView& subtree =
+                database.subtreeView(instance);
+            const uint32_t count = subtree.nodeCount();
+            for (uint32_t node = 1; node <= count; ++node)
+            {
+                const NodeHandle handle{
+                    slot, node, database.mountStamps_[slot].generation()};
+                for (uint8_t payloadIndex = 0;
+                     payloadIndex < subtree.payloadCount(node);
+                     ++payloadIndex)
+                    database.markPayloadReady(handle, payloadIndex);
+            }
+        }
+    }
+
     static NodeHandle nodeAt(SpatialDatabase& database,
                              SubtreeInstanceHandle instance,
                              uint32_t packedIndex)
@@ -266,7 +291,8 @@ inline std::vector<UserPayload> payloads(const SpatialDatabase& database,
     std::vector<UserPayload> output;
     for (const FrontierEntry& entry : result)
     {
-        const UserPayload payload = database.tryGetPayload(entry.nodeHandle);
+        const UserPayload payload = database.tryGetPayload(
+            entry.nodeHandle, entry.payloadIndex());
         if (payload == kInvalidPayload)
             throw std::logic_error("stale frontier handle");
         output.push_back(payload);
@@ -287,9 +313,13 @@ inline std::vector<UserPayload> refinedPayloads(
     for (uint32_t group = 0; group < refinement.groupCount(); ++group)
     {
         const NodeHandle parent = refinement.parent(group);
+        const FrontierEntry& parentEntry = refinement.parentEntry(group);
         const auto found = std::find_if(
             terminal.begin(), terminal.end(), [&](const FrontierEntry& entry)
-            { return entry.nodeHandle == parent; });
+            {
+                return entry.nodeHandle == parent &&
+                       entry.payloadIndex() == parentEntry.payloadIndex();
+            });
         if (found == terminal.end())
             throw std::logic_error("refinement group parent is not terminal");
         const size_t offset = size_t(found - terminal.begin());
@@ -304,7 +334,8 @@ inline std::vector<UserPayload> refinedPayloads(
     output.reserve(terminal.size());
     for (const FrontierEntry& entry : terminal)
     {
-        const UserPayload payload = database.tryGetPayload(entry.nodeHandle);
+        const UserPayload payload = database.tryGetPayload(
+            entry.nodeHandle, entry.payloadIndex());
         if (payload == kInvalidPayload)
             throw std::logic_error("stale refinement handle");
         output.push_back(payload);

@@ -131,7 +131,23 @@ using InstanceId = uint32_t;
 inline constexpr uint32_t kInstanceIdBits = 24;
 inline constexpr InstanceId kInstanceIdMask = (1u << kInstanceIdBits) - 1u;
 inline constexpr InstanceId kInvalidInstanceId = kInstanceIdMask;
+inline constexpr uint32_t kFrontierInstanceIdBits = 21;
+inline constexpr InstanceId kFrontierInstanceIdMask =
+    (1u << kFrontierInstanceIdBits) - 1u;
+inline constexpr uint32_t kFrontierPayloadIndexBits = 3;
+inline constexpr uint32_t kFrontierPayloadIndexShift =
+    kFrontierInstanceIdBits;
 inline constexpr uint8_t kFrontierErrorThreshold = 128;
+
+inline constexpr uint32_t packFrontierMetadata(
+    InstanceId instance, uint8_t encodedError, uint8_t payloadIndex = 0)
+{
+    return (instance & kFrontierInstanceIdMask) |
+           ((uint32_t(payloadIndex) &
+             ((1u << kFrontierPayloadIndexBits) - 1u))
+            << kFrontierPayloadIndexShift) |
+           (uint32_t(encodedError) << kInstanceIdBits);
+}
 
 // One live top-level placement. Every instance owns exactly one permanent,
 // renderable TLAS root, so rootNode() is always valid while the handle is live.
@@ -158,7 +174,8 @@ uint8_t encodeFrontierError(float error, float threshold);
 float   decodeFrontierError(uint8_t code, float threshold);
 
 // A frontier entry is deliberately 12 bytes: one logical 64-bit node handle plus
-// a packed stable 24-bit InstanceId and 8-bit screen-error code. User payloads
+// a packed stable 21-bit InstanceId, 3-bit payload index, and 8-bit screen-error
+// code. User payloads
 // and application entity data stay in caller-side tables indexed by the
 // instance id, rather than being repeated in every query result.
 struct FrontierEntry
@@ -167,19 +184,28 @@ struct FrontierEntry
     uint32_t   instanceAndError = kInvalidInstanceId;
 
     FrontierEntry() = default;
-    FrontierEntry(NodeHandle node, float error, float threshold, InstanceId instance)
+    FrontierEntry(NodeHandle node, float error, float threshold,
+                  InstanceId instance, uint8_t payloadIndex = 0)
         : nodeHandle(node),
-          instanceAndError((instance & kInstanceIdMask) |
-                           (uint32_t(encodeFrontierError(error, threshold)) <<
-                            kInstanceIdBits))
+          instanceAndError(packFrontierMetadata(
+              instance, encodeFrontierError(error, threshold), payloadIndex))
     {}
-    FrontierEntry(NodeHandle node, uint8_t encodedError, InstanceId instance)
+    FrontierEntry(NodeHandle node, uint8_t encodedError, InstanceId instance,
+                  uint8_t payloadIndex = 0)
         : nodeHandle(node),
-          instanceAndError((instance & kInstanceIdMask) |
-                           (uint32_t(encodedError) << kInstanceIdBits))
+          instanceAndError(packFrontierMetadata(instance, encodedError,
+                                                payloadIndex))
     {}
 
-    InstanceId instance() const { return instanceAndError & kInstanceIdMask; }
+    InstanceId instance() const
+    {
+        return instanceAndError & kFrontierInstanceIdMask;
+    }
+    uint8_t payloadIndex() const
+    {
+        return uint8_t((instanceAndError >> kFrontierPayloadIndexShift) &
+                       ((1u << kFrontierPayloadIndexBits) - 1u));
+    }
     uint8_t errorCode() const
     {
         return uint8_t(instanceAndError >> kInstanceIdBits);
@@ -203,7 +229,15 @@ struct ResolvedFrontierEntry
     UserPayload payload = kInvalidPayload;
     uint32_t    instanceAndError = kInvalidInstanceId;
 
-    InstanceId instance() const { return instanceAndError & kInstanceIdMask; }
+    InstanceId instance() const
+    {
+        return instanceAndError & kFrontierInstanceIdMask;
+    }
+    uint8_t payloadIndex() const
+    {
+        return uint8_t((instanceAndError >> kFrontierPayloadIndexShift) &
+                       ((1u << kFrontierPayloadIndexBits) - 1u));
+    }
     uint8_t errorCode() const
     {
         return uint8_t(instanceAndError >> kInstanceIdBits);
@@ -296,6 +330,20 @@ public:
         for (uint32_t i = 0; i < parents_.size(); ++i)
             if (parents_[i].nodeHandle == node) return i;
         return kInvalidIndex;
+    }
+
+    uint32_t findGroup(NodeHandle node, uint8_t payloadIndex) const
+    {
+        for (uint32_t i = 0; i < parents_.size(); ++i)
+            if (parents_[i].nodeHandle == node &&
+                parents_[i].payloadIndex() == payloadIndex)
+                return i;
+        return kInvalidIndex;
+    }
+
+    uint32_t findGroup(const FrontierEntry& entry) const
+    {
+        return findGroup(entry.nodeHandle, entry.payloadIndex());
     }
 
     std::span<const FrontierEntry> entries() const { return entries_; }
@@ -407,7 +455,15 @@ struct TerminalRenderRun
     uint32_t count = 0;
     uint32_t instanceAndError = kInvalidInstanceId;
 
-    InstanceId instance() const { return instanceAndError & kInstanceIdMask; }
+    InstanceId instance() const
+    {
+        return instanceAndError & kFrontierInstanceIdMask;
+    }
+    uint8_t payloadIndex() const
+    {
+        return uint8_t((instanceAndError >> kFrontierPayloadIndexShift) &
+                       ((1u << kFrontierPayloadIndexBits) - 1u));
+    }
     uint8_t errorCode() const
     {
         return uint8_t(instanceAndError >> kInstanceIdBits);
@@ -1344,6 +1400,10 @@ public:
     // when a full leaf splits; it never scans the whole instance population.
     InstanceHandle instantiate(const NodeDesc& root,
                                const InstanceDesc& desc = {});
+    InstanceHandle instantiate(
+        const NodeDesc& root,
+        std::span<const PayloadLodDesc> extraPayloads,
+        const InstanceDesc& desc = {});
 
     void removeInstance(InstanceHandle instance); // no-op if stale
     // Update exact instance state now and coalesce TLAS maintenance until the
@@ -1405,22 +1465,25 @@ public:
     // The caller composes this with its transform table at entry.instance().
     bool tryGetNodeTransform(NodeHandle node, Transform& outTransform) const;
 
-    // ---- shared definition-node readiness ----------------------------------
-    // Readiness means the renderer can dispatch this renderable node. A
-    // mounted NodeHandle resolves to one node in a registered definition; its
-    // readiness is shared by that node across every placement of the same
-    // definition. Equal UserPayload values in other nodes remain independent.
-    // TLAS roots are permanently ready. Stale mounted handles are ignored.
+    // ---- shared definition-node/payload readiness ---------------------------
+    // Every payload slot is independently streamable, but any ready slot is a
+    // complete hole-free proxy for the node's common bound. Readiness is
+    // shared across every placement of the registered definition. The legacy
+    // node methods address slot zero. TLAS-root slot zero is permanently ready;
+    // additional root slots may transition normally. Stale handles are ignored.
     void markNodeReady(NodeHandle node);
     void markNodeUnavailable(NodeHandle node);
     bool isNodeReady(NodeHandle node) const;
+    void markPayloadReady(NodeHandle node, uint8_t payloadIndex);
+    void markPayloadUnavailable(NodeHandle node, uint8_t payloadIndex);
+    bool isPayloadReady(NodeHandle node, uint8_t payloadIndex) const;
 
     // Resolve immutable application payload data for a live frontier handle.
     // Returns kInvalidPayload for the normal async race with
     // unmount/collection. The reserved value can never be authored.
-    UserPayload tryGetPayload(NodeHandle h) const
+    UserPayload tryGetPayload(NodeHandle h, uint8_t payloadIndex = 0) const
     {
-        return detail::decodePayload(tryGetPayloadWord(h));
+        return detail::decodePayload(tryGetPayloadWord(h, payloadIndex));
     }
 
     // Resolve a frontier entry span into caller-owned render storage. Unlike
@@ -1843,11 +1906,14 @@ private:
 
     // Compact placement-local summary derived from shared definition-node
     // readiness and mounted children. The high bit makes the fully-ready test
-    // one load; the remaining bits count recursively incomplete children.
+    // one load, the next bit selects the sparse multi-payload traversal, and
+    // the remaining bits count recursively incomplete children.
     struct MountReadiness
     {
         static constexpr uint32_t kFullyReady = 1u << 31;
-        static constexpr uint32_t kIncompleteMask = ~kFullyReady;
+        static constexpr uint32_t kMultiPayload = 1u << 30;
+        static constexpr uint32_t kIncompleteMask =
+            ~(kFullyReady | kMultiPayload);
 
         uint32_t incompleteChildrenAndReady = 0;
 
@@ -1859,10 +1925,25 @@ private:
         {
             return (incompleteChildrenAndReady & kFullyReady) != 0;
         }
+        bool fullyReadyScalar() const
+        {
+            return incompleteChildrenAndReady == kFullyReady;
+        }
+        bool multiPayload() const
+        {
+            return (incompleteChildrenAndReady & kMultiPayload) != 0;
+        }
+        void setMultiPayload(bool multiPayload)
+        {
+            if (multiPayload)
+                incompleteChildrenAndReady |= kMultiPayload;
+            else
+                incompleteChildrenAndReady &= ~kMultiPayload;
+        }
         void setFullyReady(bool ready)
         {
             if (ready) incompleteChildrenAndReady |= kFullyReady;
-            else incompleteChildrenAndReady &= kIncompleteMask;
+            else incompleteChildrenAndReady &= ~kFullyReady;
         }
         void addIncompleteChild()
         {
@@ -2039,6 +2120,41 @@ private:
     };
     static_assert(sizeof(InstanceOrientation) == 36,
                   "cold instance orientation layout changed");
+
+    // Sparse, padded root record. Slot zero stays in the existing Instance /
+    // tlasRootPayloads_ streams; only roots with slots 1..7 allocate one of
+    // these records. Readiness bit zero is permanent for every TLAS root.
+    struct alignas(32) TlasRootExtraPayloadRt
+    {
+        detail::ExtraPayloadRecord record;
+        uint8_t readiness = 1;
+        uint8_t padding[31]{};
+    };
+    static_assert(sizeof(TlasRootExtraPayloadRt) ==
+                      sizeof(detail::ExtraPayloadRecord) + 32,
+                  "TLAS root payload sidecar must stay SIMD padded");
+
+    const TlasRootExtraPayloadRt* tlasRootExtraPayload(
+        InstanceId dense) const
+    {
+        if (tlasRootExtraPayloadIndex_.empty() ||
+            dense >= tlasRootExtraPayloadIndex_.size())
+            return nullptr;
+        const uint32_t index = tlasRootExtraPayloadIndex_[dense];
+        return index < tlasRootExtraPayloads_.size()
+                   ? &tlasRootExtraPayloads_[index]
+                   : nullptr;
+    }
+    TlasRootExtraPayloadRt* tlasRootExtraPayload(InstanceId dense)
+    {
+        if (tlasRootExtraPayloadIndex_.empty() ||
+            dense >= tlasRootExtraPayloadIndex_.size())
+            return nullptr;
+        const uint32_t index = tlasRootExtraPayloadIndex_[dense];
+        return index < tlasRootExtraPayloads_.size()
+                   ? &tlasRootExtraPayloads_[index]
+                   : nullptr;
+    }
 
     // nullptr when the ref is stale (slot recycled) or invalid.
     Instance* resolveInstance(InstanceHandle instance);
@@ -2320,7 +2436,8 @@ private:
             static_cast<const SpatialDatabase*>(this)->resolve(h));
     }
     InstanceId resolveTlasRoot(NodeHandle h) const;
-    detail::PayloadWord tryGetPayloadWord(NodeHandle h) const;
+    detail::PayloadWord tryGetPayloadWord(NodeHandle h,
+                                          uint8_t payloadIndex) const;
     bool resolveRenderLeaves(std::span<const FrontierEntry> cut,
                               std::span<UserPayload> payloads,
                               std::span<uint8_t> errors) const;
@@ -2330,6 +2447,14 @@ private:
     const SubtreeDefinitionRt* resolveSubtree(SubtreeHandle h) const;
     void setDefinitionNodeReadiness(uint32_t definition, uint32_t node,
                                     bool ready);
+    void setDefinitionPayloadReadiness(uint32_t definition, uint32_t node,
+                                       uint8_t payloadIndex, bool ready);
+    bool definitionPayloadReady(uint32_t definition, uint32_t node,
+                                uint8_t payloadIndex) const;
+    bool definitionNodeAnyPayloadReady(uint32_t definition,
+                                       uint32_t node) const;
+    bool definitionNodeAllPayloadsReady(uint32_t definition,
+                                        uint32_t node) const;
     void initializeMountCoverage(uint32_t slot);
     void ensurePrivateCoverage(uint32_t slot);
     void releasePrivateCoverage(uint32_t slot);
@@ -2417,8 +2542,10 @@ private:
                               const detail::SubtreeView& subtree,
                               uint32_t index, const AABB& bounds);
 
-    InstanceHandle addTlasRootInstance(const NodeDesc& root,
-                                       const InstanceDesc& desc);
+    InstanceHandle addTlasRootInstance(
+        const NodeDesc& root,
+        std::span<const PayloadLodDesc> extraPayloads,
+        const InstanceDesc& desc);
 
     bool tlasRebuildRecommended() const;
     float tlasAreaGrowthRatio() const;
@@ -2473,6 +2600,13 @@ private:
     void runTlasRootInstance(uint32_t instIdx, const Camera& view,
                              const SelectionParams& params, uint8_t mask,
                              Worker& w) const;
+    void runScalarTlasRootInstance(uint32_t instIdx, const Camera& view,
+                                   const SelectionParams& params,
+                                   uint8_t mask, Worker& w) const;
+    template<bool MultiPayloadRoot>
+    void runTlasRootInstanceImpl(uint32_t instIdx, const Camera& view,
+                                 const SelectionParams& params,
+                                 uint8_t mask, Worker& w) const;
     void runOrientedTlasRootInstance(uint32_t instIdx, const Camera& view,
                                      const SelectionParams& params,
                                      uint8_t mask, Worker& w) const;
@@ -2480,9 +2614,13 @@ private:
     void runSubtree(const WorkItem& item, const Instance& inst,
                     const Camera& local, const SelectionParams& params,
                     Worker& w) const;
+    template<bool FullyReady, bool MultiPayload>
+    void runSubtreeMode(const WorkItem& item, const Instance& inst,
+                        const Camera& local,
+                        const SelectionParams& params, Worker& w) const;
     void runFullyReadyRootLeaves(const WorkItem& item, const Instance& inst,
                                  const Camera& rootLocal, Worker& w) const;
-    template<bool FullyReady, bool SparseOverlay>
+    template<bool FullyReady, bool SparseOverlay, bool MultiPayload>
     void runSubtreeImpl(const WorkItem& item, const Instance& inst,
                         const Camera& local,
                         const SelectionParams& params, Worker& w) const;
@@ -2490,7 +2628,7 @@ private:
                                     const Instance& inst,
                                     const Camera& rootLocal,
                                     Worker& worker) const;
-    template<bool SparseOverlay>
+    template<bool SparseOverlay, bool MultiPayload>
     void runSubtreeAncestorImpl(const WorkItem& item, const Instance& inst,
                                 const Camera& local,
                                 const SelectionParams& params,
@@ -2499,7 +2637,8 @@ private:
                             const Camera& local,
                             const SelectionParams& params,
                             uint32_t ancestorCandidate, Worker& w) const;
-    template<bool FullyReady, bool SparseOverlay, bool TrackAncestor = false>
+    template<bool FullyReady, bool SparseOverlay,
+             bool TrackAncestor = false, bool MultiPayload = false>
     void wideVisit(const WorkItem& item, const detail::SubtreeView& subtree,
                    float errClamp,
                    uint32_t gen, InstanceId instance, uint32_t node, uint8_t mask,
@@ -2533,6 +2672,9 @@ private:
 
     std::vector<SubtreeDefinitionRt> subtrees_;
     std::vector<NodeStatePoolRt> nodeStatePools_;
+    // One shared eight-bit readiness mask per multi-payload sidecar record.
+    // The pointer remains null for scalar-only definitions.
+    std::vector<std::unique_ptr<uint8_t[]>> extraPayloadReadiness_;
     std::vector<uint32_t> freeSubtrees_;
     size_t liveSubtrees_ = 0;
 
@@ -2551,6 +2693,11 @@ private:
     std::vector<InstanceOrientation> instanceOrientations_;
     // Cold root identity stream. Payload exists after the first TLAS root.
     std::vector<detail::PayloadWord> tlasRootPayloads_;
+    // Dense-root -> sparse padded sidecar. The index stream itself is lazy;
+    // scalar-only databases keep both vectors empty.
+    std::vector<uint32_t> tlasRootExtraPayloadIndex_;
+    std::vector<TlasRootExtraPayloadRt> tlasRootExtraPayloads_;
+    std::vector<uint32_t> freeTlasRootExtraPayloads_;
     // Packed TLAS-root marker for exact one-node instances; a cold
     // high bit also records the common zero-error case. Keeping this as a
     // lazily allocated compact stream lets mixed forests bypass the 64-byte

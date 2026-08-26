@@ -58,9 +58,36 @@ reserved and cannot be authored. `tryGetPayload()` returns that value when its
 [API reference](docs/API_REFERENCE.md#3-node-authoring-types) for the exact type
 and serialization contract.
 
+A spatial node may carry up to eight ordered payload LODs that all share its
+bound and topology. Slot zero stays in `NodeDesc`; pass slots 1–7 as
+`PayloadLodDesc` values to `SubtreeBuilder::createNode()` or
+`SpatialDatabase::instantiate()`. Errors must be sorted coarse-to-fine. Scalar
+nodes retain the original compact streams and traversal specialization; only
+multi-payload nodes allocate padded sidecar records. A frontier entry selects
+one slot through `payloadIndex()`:
+
+```cpp
+std::array<PayloadLodDesc, 3> finer{{
+    {mediumPayload, 16.0f},
+    {finePayload, 4.0f},
+    {fullPayload, 0.0f},
+}};
+builder.createNode(NodeDesc{
+    .payload = coarsePayload,
+    .geometricError = 32.0f,
+    .bounds = sharedBounds,
+}, finer);
+```
+
+Payload readiness is independent, while hole-free coverage remains a node
+property: any ready slot completely represents that node. Use
+`markPayloadReady(node, index)` and `markPayloadUnavailable(node, index)`;
+the older node readiness calls address slot zero.
+
 ## Example
 
 ```cpp
+#include <array>
 #include <frontier/builder.h>
 #include <frontier/spatial_database.h>
 
@@ -114,7 +141,8 @@ for (const FrontierEntry& entry : cut) {
         world.hasMountedSubtree(entry.nodeHandle))
         continue;
 
-    if (UserPayload payload = world.tryGetPayload(entry.nodeHandle);
+    if (UserPayload payload = world.tryGetPayload(
+            entry.nodeHandle, entry.payloadIndex());
         payload != kInvalidPayload) {
         if (payload == 10)
             world.mountSubtree(entry.nodeHandle, house,

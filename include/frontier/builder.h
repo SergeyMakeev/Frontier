@@ -1,6 +1,8 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
+#include <span>
 #include <vector>
 
 #include "node.h"
@@ -23,6 +25,10 @@ public:
 
     NodeId createNode(const NodeDesc& node);
     NodeId createNode(NodeId parent, const NodeDesc& node);
+    NodeId createNode(const NodeDesc& node,
+                      std::span<const PayloadLodDesc> additionalPayloads);
+    NodeId createNode(NodeId parent, const NodeDesc& node,
+                      std::span<const PayloadLodDesc> additionalPayloads);
 
     // Consumes the builder, establishes hierarchy invariants, and emits the
     // complete traversal-ready serialized byte array.
@@ -36,6 +42,7 @@ private:
 
         detail::PayloadWord payload{};
         float geometricError = 0.0f;
+        uint32_t extraPayloadRecord = kInvalidIndex;
         NodeId parent = kInvalidIndex;
         NodeId firstChild = kInvalidIndex;
         NodeId lastChild = kInvalidIndex;
@@ -62,10 +69,15 @@ private:
             else childCountAndFlags &= ~kMountableBit;
         }
     };
-    static_assert(sizeof(BuildNode) == sizeof(detail::PayloadWord) + 48,
-                  "BuildNode layout changed");
+    struct BuildExtraPayloadRecord
+    {
+        std::array<detail::PayloadWord, kMaxNodePayloads - 1> payload{};
+        std::array<float, kMaxNodePayloads - 1> geometricError{};
+        uint32_t count = 0;
+    };
 
     std::vector<BuildNode> nodes_;
+    std::vector<BuildExtraPayloadRecord> extraPayloads_;
     std::vector<NodeId> roots_;
     bool built_ = false;
 };

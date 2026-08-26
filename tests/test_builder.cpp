@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <array>
 #include <bit>
 #include <cstddef>
 #include <cstring>
@@ -116,6 +117,131 @@ TEST(SubtreeBuilder, BuildsTraversalReadySerializableBytes)
     EXPECT_TRUE(bytes.empty());
     EXPECT_EQ(TestAccess::definitionData(database, handle), allocation);
     EXPECT_EQ(copy.size(), byteCount);
+}
+
+TEST(SubtreeBuilder, StoresSparsePaddedMultiPayloadRecords)
+{
+    SubtreeBuilder scalarBuilder;
+    scalarBuilder.createNode(node(10, 32.0f, box(2.0f)));
+    const SubtreeBytes scalarBytes = scalarBuilder.build();
+
+    const std::array<PayloadLodDesc, 3> extra{{
+        {11, 16.0f},
+        {12, 4.0f},
+        {13, 0.0f},
+    }};
+    SubtreeBuilder builder;
+    builder.createNode(node(10, 32.0f, box(2.0f)), extra);
+    const SubtreeBytes bytes = builder.build();
+    detail::validateSubtreeBytes(bytes);
+
+    const detail::SubtreeView view = detail::viewSubtreeBytes(bytes);
+    ASSERT_TRUE(view.hasExtraPayloads());
+    EXPECT_EQ(view.extraPayloadRecordCount(), 1u);
+    EXPECT_EQ(view.payloadCount(1), 4u);
+    const std::array<float, 4> expectedErrors{{32, 16, 4, 0}};
+    for (uint8_t i = 0; i < 4; ++i)
+    {
+        EXPECT_EQ(detail::decodePayload(view.payload(1, i)), 10u + i);
+        EXPECT_FLOAT_EQ(view.geometricError(1, i), expectedErrors[i]);
+    }
+    EXPECT_EQ(reinterpret_cast<uintptr_t>(view.extraPayloadRecords()) % 32u,
+              0u);
+    EXPECT_GT(bytes.size(), scalarBytes.size());
+    EXPECT_EQ(detail::blockMultiPayloadLanes(
+                  view.blockMask_[view.wideOffset(0)]),
+              1u);
+}
+
+TEST(SubtreeBuilder, RejectsInvalidMultiPayloadSequences)
+{
+    SubtreeBuilder unsorted;
+    const std::array<PayloadLodDesc, 2> increasing{{
+        {2, 4.0f},
+        {3, 8.0f},
+    }};
+    EXPECT_THROW(unsorted.createNode(node(1, 16.0f, box()), increasing),
+                 std::logic_error);
+
+    const std::array<PayloadLodDesc, 1> negative{{
+        {2, -1.0f},
+    }};
+    SubtreeBuilder negativeBuilder;
+    EXPECT_THROW(negativeBuilder.createNode(
+                     node(1, 16.0f, box()), negative),
+                 std::logic_error);
+
+    const std::array<PayloadLodDesc, 1> notANumber{{
+        {2, std::numeric_limits<float>::quiet_NaN()},
+    }};
+    SubtreeBuilder nanBuilder;
+    EXPECT_THROW(nanBuilder.createNode(
+                     node(1, 16.0f, box()), notANumber),
+                 std::logic_error);
+
+    const std::array<PayloadLodDesc, 1> infinite{{
+        {2, std::numeric_limits<float>::infinity()},
+    }};
+    SubtreeBuilder infiniteBuilder;
+    EXPECT_THROW(infiniteBuilder.createNode(
+                     node(1, 16.0f, box()), infinite),
+                 std::logic_error);
+
+    SubtreeBuilder reserved;
+    const std::array<PayloadLodDesc, 1> invalid{{
+        {kInvalidPayload, 0.0f},
+    }};
+    EXPECT_THROW(reserved.createNode(node(1, 1.0f, box()), invalid),
+                 std::logic_error);
+
+    SubtreeBuilder tooMany;
+    std::array<PayloadLodDesc, kMaxNodePayloads> nine{};
+    for (uint32_t i = 0; i < nine.size(); ++i)
+        nine[i] = PayloadLodDesc{UserPayload(i + 2), 0.0f};
+    EXPECT_THROW(tooMany.createNode(node(1, 1.0f, box()), nine),
+                 std::logic_error);
+
+    SpatialDatabase database;
+    EXPECT_THROW(database.instantiate(
+                     node(1, 16.0f, box()), increasing),
+                 std::logic_error);
+    EXPECT_THROW(database.instantiate(
+                     node(1, 16.0f, box()), negative),
+                 std::logic_error);
+    EXPECT_THROW(database.instantiate(
+                     node(1, 16.0f, box()), notANumber),
+                 std::logic_error);
+    EXPECT_THROW(database.instantiate(
+                     node(1, 16.0f, box()), infinite),
+                 std::logic_error);
+}
+
+TEST(SubtreeBuilder, ClampsStructuralErrorsAfterTheFinestPayload)
+{
+    const std::array<PayloadLodDesc, 2> parentPayloads{{
+        {11, 80.0f},
+        {12, 20.0f},
+    }};
+    const std::array<PayloadLodDesc, 2> childPayloads{{
+        {21, 40.0f},
+        {22, 10.0f},
+    }};
+    SubtreeBuilder builder;
+    const auto parent = builder.createNode(
+        node(10, 100.0f, box(2.0f)), parentPayloads);
+    builder.createNode(
+        parent, node(20, 50.0f, box()), childPayloads);
+
+    const SubtreeBytes bytes = builder.build();
+    detail::validateSubtreeBytes(bytes);
+    const detail::SubtreeView view = detail::viewSubtreeBytes(bytes);
+    ASSERT_EQ(view.nodeCount(), 2u);
+    EXPECT_FLOAT_EQ(view.geometricError(1, 0), 100.0f);
+    EXPECT_FLOAT_EQ(view.geometricError(1, 1), 80.0f);
+    EXPECT_FLOAT_EQ(view.geometricError(1, 2), 20.0f);
+    EXPECT_FLOAT_EQ(view.geometricError(2, 0), 20.0f);
+    EXPECT_FLOAT_EQ(view.geometricError(2, 1), 20.0f);
+    EXPECT_FLOAT_EQ(view.geometricError(2, 2), 10.0f);
 }
 
 TEST(SubtreeBuilder, RejectsMixedLocalAndMountedChildren)
