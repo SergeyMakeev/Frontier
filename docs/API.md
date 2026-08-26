@@ -77,10 +77,14 @@ groups.
 
 ### Nodes, errors, and cuts
 
-Each hierarchy node is a renderable representation of everything below it. Its
-geometric error estimates how far that representation can deviate from finer
-detail. A query projects that error into screen pixels and refines while it is
-above `SelectionParams::threshold`.
+Each hierarchy node covers everything below it and carries one to eight ordered,
+complete payload representations of that same coverage. Every payload slot has
+its own geometric error, estimating how far that representation can deviate
+from finer detail. Slot zero is the coarsest and lives in `NodeDesc`; optional
+slots 1–7 are authored beside it with `PayloadLodDesc`. A query projects the
+errors into screen pixels, advances through the node's payload slots, and
+descends to structural children only when its finest payload is still above
+`SelectionParams::threshold`.
 
 A **frontier**, also called a **cut**, is the set selected by that process. No
 selected node is an ancestor of another, and together the selected nodes cover
@@ -192,7 +196,7 @@ coherence, payload width, SIMD width, compiler, and processor. Measure the
 complete public workflow—including result consumption—using the workloads and
 paired-revision procedure in [BENCHMARKING.md](BENCHMARKING.md).
 
-## 3. Describe one renderable node
+## 3. Describe one renderable node and its payload LODs
 
 `NodeDesc` is used both for TLAS roots and for nodes authored by a
 `SubtreeBuilder`:
@@ -205,6 +209,16 @@ NodeDesc proxy{
     .bounds = buildingBounds,
 };
 ```
+
+A logical node has one shared spatial/topological identity and one to eight
+ordered payload LOD slots. The authoring API splits those fields deliberately:
+
+| Scope | Authored fields | API representation |
+|---|---|---|
+| Whole node | bounds, flags, and structural children | `NodeDesc` and the builder hierarchy |
+| Payload slot 0 | payload and geometric error | `NodeDesc::payload` and `NodeDesc::geometricError` |
+| Payload slots 1–7 | payload and geometric error per slot | a `std::span<const PayloadLodDesc>` passed beside `NodeDesc` |
+| Runtime selection | selected slot on that logical node | `FrontierEntry::payloadIndex()` |
 
 - `payload` is an opaque application render-resource identifier. Equal values
   may identify the same resource, but do not couple library readiness state.
@@ -230,25 +244,80 @@ may add up to seven finer representations that share the exact same bound and
 children:
 
 ```cpp
+struct PayloadLodDesc {
+    UserPayload payload{};
+    float geometricError = 0.0f;
+};
+
 std::array<PayloadLodDesc, 3> finer{{
     {buildingMediumPayload, 16.0f},
     {buildingFinePayload, 4.0f},
     {buildingFullPayload, 0.0f},
 }};
-auto building = buildingBuilder.createNode(
-    NodeDesc{
-        .payload = buildingCoarsePayload,
-        .geometricError = 32.0f,
-        .bounds = buildingBounds,
-    },
-    finer);
+
+NodeDesc buildingCoarse{
+    .payload = buildingCoarsePayload,
+    .geometricError = 32.0f,
+    .bounds = buildingBounds,
+};
+
+// A direct node in a reusable definition.
+auto buildingNode = buildingBuilder.createNode(buildingCoarse, finer);
+
+// A child node in a reusable definition.
+auto childNode = buildingBuilder.createNode(
+    parentNode, buildingCoarse, finer);
+
+// Or a permanent top-level root with the same in-node LOD structure.
+InstanceHandle buildingInstance = database.instantiate(
+    buildingCoarse, finer,
+    InstanceDesc{.pos = buildingWorldPosition});
 ```
 
-Additional errors must be finite, non-negative, and non-increasing. Frontier
-walks choose the first slot whose projected error satisfies the threshold;
-only when the finest slot remains over threshold do they descend to structural
-children. `FrontierEntry::payloadIndex()` identifies the chosen slot, so payload
-lookup must pass it:
+These calls correspond to the three multi-payload overloads:
+
+```cpp
+SubtreeBuilder::NodeId SubtreeBuilder::createNode(
+    const NodeDesc&, std::span<const PayloadLodDesc> additionalPayloads);
+SubtreeBuilder::NodeId SubtreeBuilder::createNode(
+    NodeId parent, const NodeDesc&,
+    std::span<const PayloadLodDesc> additionalPayloads);
+InstanceHandle SpatialDatabase::instantiate(
+    const NodeDesc&,
+    std::span<const PayloadLodDesc> additionalPayloads,
+    const InstanceDesc& = {});
+```
+
+For example, the direct builder call above authors this single logical node:
+
+```text
+buildingNode / buildingBounds / shared children
+  slot 0: buildingCoarsePayload  error 32
+  slot 1: buildingMediumPayload  error 16
+  slot 2: buildingFinePayload    error  4
+  slot 3: buildingFullPayload    error  0
+```
+
+It does not create four structural nodes. All three APIs copy the additional
+descriptors during the call; the input span is not retained.
+
+The equivalent scalar-only call omits the span:
+
+```cpp
+auto scalarNode = buildingBuilder.createNode(
+    NodeDesc{
+        .payload = scalarPayload,
+        .geometricError = 0.0f,
+        .bounds = scalarBounds,
+    });
+```
+
+The complete sequence, including slot zero, must contain valid payloads and
+finite, non-negative, non-increasing errors. Frontier walks choose the first
+slot whose projected error satisfies the threshold; only when the finest slot
+remains over threshold do they descend to structural children.
+`FrontierEntry::payloadIndex()` identifies the chosen slot, so payload lookup
+must pass it:
 
 ```cpp
 UserPayload payload = database.tryGetPayload(
