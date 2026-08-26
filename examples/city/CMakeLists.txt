@@ -48,3 +48,14 @@ if(IOS)
         MACOSX_BUNDLE_GUI_IDENTIFIER "com.frontier.dynamic-city"
     )
 endif()
+
+if(FRONTIER_BUILD_TESTS AND NOT ANDROID AND NOT IOS)
+    add_test(
+        NAME frontier_city_streaming_make_before_break
+        COMMAND frontier_city --streaming-orbit-self-test
+    )
+    set_tests_properties(frontier_city_streaming_make_before_break PROPERTIES
+        LABELS "city;streaming"
+        TIMEOUT 120
+    )
+endif()

@@ -4,6 +4,7 @@
 #include "debugdraw/debugdraw.h"
 #include "camera.h"
 #include "entry/entry.h"
+#include "entry/input.h"
 #include "imgui/imgui.h"
 
 #include <bgfx/bgfx.h>
@@ -78,8 +79,13 @@ enum class Payload : UserPayload
 constexpr size_t kPayloadSlotCount =
     static_cast<size_t>(Payload::TowerCrown) + 1;
 constexpr size_t kHouseDetailResourceCount = 3;
+constexpr size_t kTowerFacadePayloadCount =
+    size_t(Payload::TowerFine) - size_t(Payload::TowerDistrict) + 1;
 constexpr size_t kTowerDetailResourceCount =
     size_t(Payload::TowerCrown) - size_t(Payload::TowerDistrict) + 1;
+constexpr size_t kTowerPayloadCount =
+    size_t(Payload::TowerCrown) - size_t(Payload::TowerTop) + 1;
+static_assert(kTowerFacadePayloadCount <= kMaxNodePayloads);
 constexpr uint16_t kHeroTowerInstancesPerAsset = 3;
 constexpr size_t kTowerBlocksPerDistrict = 6;
 constexpr size_t kTowerInstanceCount =
@@ -102,7 +108,11 @@ constexpr float kHeroOrbitCenterZ = -12.0f;
 constexpr float kHeroOrbitTargetHeight = 20.0f;
 constexpr float kHeroOrbitCameraHeight = 27.0f;
 constexpr float kHeroOrbitRadius = 58.0f;
+constexpr float kHeroApproachStartRadius = 150.0f;
+constexpr float kHeroApproachSeconds = 30.0f;
 constexpr float kHeroOrbitAngularSpeed = 0.035f;
+constexpr float kTowerRootHalfExtent = 5.2f;
+constexpr float kTowerRootHeight = 46.5f;
 constexpr float kHeroOrbitLookaheadSeconds = 6.0f;
 constexpr float kHeroOrbitWarmupSeconds = 20.0f;
 constexpr float kHeroOrbitTestSeconds = 180.0f;
@@ -112,8 +122,6 @@ constexpr float kHeroOrbitDominantFallbackErrorPixels = 3.0f;
 constexpr uint32_t kHeroOrbitMaxRapidReloads = 1;
 constexpr float kHeroOrbitRapidReloadWindowSeconds = 5.0f;
 constexpr float kStreamingReplacementMinimumGain = 1.05f;
-constexpr float kStreamingCurrentReplacementMinimumGain = 1.30f;
-constexpr float kStreamingCurrentMinimumResidencySeconds = 15.0f;
 constexpr size_t kPerformanceHistorySize = 300;
 constexpr float kPerformanceHistorySampleInterval = 1.0f / 60.0f;
 
@@ -172,9 +180,9 @@ struct VirtualResource
     HouseStyle houseStyle = HouseStyle::HouseA;
     StreamingResourceState state = StreamingResourceState::Unloaded;
     NodeHandle representative{};
+    uint8_t representativePayloadIndex = 0;
     float byteSizeMiB = 0.0f;
     float lastDemandTime = 0.0f;
-    float residentSince = 0.0f;
     StreamingErrorStats currentErrors;
     StreamingErrorStats currentBenefitErrors;
     StreamingErrorStats idealErrors;
@@ -198,6 +206,32 @@ struct PendingStreamingGroup
     float byteSizeMiB = 0.0f;
     float scorePerMiB = 0.0f;
     uint64_t serial = 0;
+};
+
+struct FrontierErrorSnapshot
+{
+    std::vector<float> instanceMaxPixels;
+    std::vector<uint8_t> instanceVisible;
+    std::vector<uint8_t> selectedGroupInstance;
+    float rmsPixels = 0.0f;
+    float worstPixels = 0.0f;
+    uint32_t visibleInstances = 0;
+};
+
+struct StreamingErrorImprovement
+{
+    std::string resourceNames;
+    uint64_t groupSerial = 0;
+    uint32_t affectedInstances = 0;
+    float localBeforeRmsPixels = 0.0f;
+    float localAfterRmsPixels = 0.0f;
+    float localBeforeWorstPixels = 0.0f;
+    float localAfterWorstPixels = 0.0f;
+    float sceneBeforeRmsPixels = 0.0f;
+    float sceneAfterRmsPixels = 0.0f;
+    float sceneBeforeWorstPixels = 0.0f;
+    float sceneAfterWorstPixels = 0.0f;
+    bool valid = false;
 };
 
 struct StreamingCandidateGroup
@@ -228,6 +262,7 @@ enum class PerformanceTimer : uint8_t
     Render,
     Streaming,
     StreamingRefinement,
+    StreamingErrorMeasurement,
     StreamingPlanner,
     StreamingPlannerIndex,
     StreamingPlannerDemand,
@@ -282,6 +317,30 @@ struct Entity
     uint16_t heroAsset = UINT16_MAX;
 };
 
+constexpr uint32_t entityKindBit(EntityKind kind)
+{
+    return 1u << uint32_t(kind);
+}
+
+constexpr uint32_t kAllEntityKindMask =
+    entityKindBit(EntityKind::House) |
+    entityKindBit(EntityKind::Car) |
+    entityKindBit(EntityKind::Pedestrian) |
+    entityKindBit(EntityKind::Tree) |
+    entityKindBit(EntityKind::Tower);
+
+struct SceneTreeSelection
+{
+    uint32_t entityKindMask = 0;
+    uint16_t heroAsset = UINT16_MAX;
+    InstanceId instance = kInvalidInstanceId;
+    Payload firstPayload = Payload::HouseTop;
+    Payload lastPayload = Payload::TowerCrown;
+    std::string label;
+
+    bool active() const { return entityKindMask != 0; }
+};
+
 struct CarPath
 {
     float centerX = 0.0f;
@@ -332,6 +391,7 @@ struct PerformanceSample
     float renderMs = 0.0f;
     float streamingMs = 0.0f;
     float streamingRefinementMs = 0.0f;
+    float streamingErrorMeasurementMs = 0.0f;
     float streamingPlannerMs = 0.0f;
     float streamingPlannerIndexMs = 0.0f;
     float streamingPlannerDemandMs = 0.0f;
@@ -467,6 +527,38 @@ AABB bounds(float minX, float minY, float minZ,
                             float4::point(maxX, maxY, maxZ));
 }
 
+constexpr float authoredGeometricError(Payload payload)
+{
+    switch (payload)
+    {
+    case Payload::HouseTop:         return 0.75f;
+    case Payload::HouseCoarse:      return 0.28f;
+    case Payload::CarTop:           return 0.55f;
+    case Payload::CarCoarse:        return 0.20f;
+    case Payload::PedestrianTop:    return 0.32f;
+    case Payload::PedestrianCoarse: return 0.12f;
+    case Payload::TreeTop:          return 0.65f;
+    case Payload::TreeCoarse:       return 0.22f;
+    case Payload::TowerTop:         return 0.90f;
+    case Payload::TowerDistrict:    return 0.70f;
+    case Payload::TowerCoarse:      return 0.52f;
+    case Payload::TowerMedium:      return 0.35f;
+    case Payload::TowerFine:        return 0.18f;
+    default:                        return 0.0f;
+    }
+}
+
+static_assert(authoredGeometricError(Payload::TowerTop) >=
+              authoredGeometricError(Payload::TowerDistrict));
+static_assert(authoredGeometricError(Payload::TowerDistrict) >=
+              authoredGeometricError(Payload::TowerCoarse));
+static_assert(authoredGeometricError(Payload::TowerCoarse) >=
+              authoredGeometricError(Payload::TowerMedium));
+static_assert(authoredGeometricError(Payload::TowerMedium) >=
+              authoredGeometricError(Payload::TowerFine));
+static_assert(authoredGeometricError(Payload::TowerFine) >=
+              authoredGeometricError(Payload::TowerBase));
+
 NodeDesc node(Payload payload, float error, const AABB& nodeBounds,
               uint32_t flags = 0)
 {
@@ -519,6 +611,41 @@ bool isTowerDetailPayload(Payload payload)
 {
     return payload >= Payload::TowerDistrict &&
            payload <= Payload::TowerCrown;
+}
+
+constexpr size_t towerRollingFallbackDetailIndex(Payload payload)
+{
+    if (payload < Payload::TowerDistrict || payload > Payload::TowerCrown)
+        return kTowerDetailResourceCount;
+    const size_t detailIndex =
+        size_t(payload) - size_t(Payload::TowerDistrict);
+    if (detailIndex == 0)
+        return kTowerDetailResourceCount;
+    const size_t fineIndex =
+        size_t(Payload::TowerFine) - size_t(Payload::TowerDistrict);
+    return std::min(detailIndex - 1, fineIndex);
+}
+
+static_assert(towerRollingFallbackDetailIndex(Payload::TowerDistrict) ==
+              kTowerDetailResourceCount);
+static_assert(towerRollingFallbackDetailIndex(Payload::TowerCoarse) == 0);
+static_assert(towerRollingFallbackDetailIndex(Payload::TowerMedium) == 1);
+static_assert(towerRollingFallbackDetailIndex(Payload::TowerFine) == 2);
+static_assert(towerRollingFallbackDetailIndex(Payload::TowerBase) == 3);
+static_assert(towerRollingFallbackDetailIndex(Payload::TowerShaft) == 3);
+static_assert(towerRollingFallbackDetailIndex(Payload::TowerCrown) == 3);
+
+EntityKind payloadEntityKind(Payload payload)
+{
+    if (payload <= Payload::HouseRoof)
+        return EntityKind::House;
+    if (payload <= Payload::CarCabin)
+        return EntityKind::Car;
+    if (payload <= Payload::PedestrianHead)
+        return EntityKind::Pedestrian;
+    if (payload <= Payload::TreeCrown)
+        return EntityKind::Tree;
+    return EntityKind::Tower;
 }
 
 const char* streamingStateName(StreamingResourceState state)
@@ -578,7 +705,8 @@ class DynamicCity final : public entry::AppI
 public:
     DynamicCity(const char* name, const char* description, const char* url)
         : entry::AppI(name, description, url), query_(4.0f),
-          streamingLookaheadQuery_(4.0f)
+          streamingLookaheadQuery_(4.0f),
+          streamingErrorMeasurementQuery_(0.0f)
     {}
 
     void init(int32_t argc, const char* const* argv, uint32_t width,
@@ -670,6 +798,16 @@ public:
         if (entry::processEvents(width_, height_, debug_, reset_, &mouse_))
             return false;
 
+        const bool leftMouseDown =
+            mouse_.m_buttons[entry::MouseButton::Left] != 0;
+        const uint8_t modifiers = inputGetModifiersState();
+        const bool controlDown =
+            (modifiers & (entry::Modifier::LeftCtrl |
+                          entry::Modifier::RightCtrl)) != 0;
+        const bool towerPickRequested =
+            leftMouseDown && !leftMouseWasDown_ && controlDown;
+        leftMouseWasDown_ = leftMouseDown;
+
         const int64_t now = bx::getHPCounter();
         const double frequency = double(bx::getHPFrequency());
         const float deltaTime = streamingSelfTest_
@@ -698,6 +836,14 @@ public:
             drawPerformanceUi();
         if (showSceneHierarchy_)
             drawSceneTreeUi();
+        else
+        {
+            sceneTreeSelection_ = {};
+            pendingHierarchyRevealHero_ = UINT16_MAX;
+            pendingHierarchyRevealInstance_ = kInvalidInstanceId;
+            currentInstanceEntryCounts_.clear();
+            sceneTreeStatsValid_ = false;
+        }
 #ifdef FRONTIER_DEBUG_TOOLS
         if (showTlasHealth_)
             drawTlasHealthUi();
@@ -865,6 +1011,8 @@ public:
                                      ? makeFreeCameraPose()
                                      : makeCameraPose(automaticPose.position,
                                                       automaticPose.target);
+        if (towerPickRequested && !uiHasFocus && !streamingSelfTest_)
+            pickTowerAtMouse(displayPose);
         if (captureCullCamera_)
         {
             captureFrozenCull(displayPose);
@@ -932,8 +1080,8 @@ public:
         performance.renderMs = milliseconds(stageStart, stageEnd);
 
         stageStart = stageEnd;
-        updateVirtualStreaming(frontier, prefetchFrontier, deltaTime,
-                               performance);
+        updateVirtualStreaming(frontier, prefetchFrontier, frontierCamera,
+                               selection, deltaTime, performance);
         const int64_t streamingPlannerEnd = bx::getHPCounter();
         updateHeroPressureScenario();
         stageEnd = bx::getHPCounter();
@@ -1434,7 +1582,8 @@ private:
             "while the simulation runs normally. It resets residency, applies "
             "an 85 MiB budget, and fails if the focal, screen-dominant hero "
             "or any other >150 px-tall hero drops to its pinned fallback after "
-            "a 20 second warm-up. It also rejects rapid unload/reload loops.");
+            "a 20 second warm-up. It also requires rolling fallback release "
+            "coverage and rejects rapid unload/reload loops.");
         if (heroPressureScenarioActive_)
         {
             const float elapsed =
@@ -1458,6 +1607,30 @@ private:
                 kHeroOrbitMaxRapidReloads);
             ImGui::Text("Worst per-resource state transitions: %u",
                         heroPressureMaxResourceTransitions_);
+            ImGui::Text(
+                "Make-before-break: invalidations %llu | error regressions %u",
+                static_cast<unsigned long long>(
+                    streamingCurrentCutInvalidations_ -
+                    heroPressureScenarioStartCurrentCutInvalidations_),
+                heroPressureGeometricErrorRegressions_);
+            ImGui::Text(
+                "Rolling fallback: observed %u | old ladders released %u | "
+                "violations %u",
+                heroPressureRollingPinObservations_,
+                heroPressureRollingReleaseObservations_,
+                heroPressureRollingPinViolations_);
+            ImGui::Text(
+                "LOD error measurements %llu | positive %llu | regressions "
+                "%llu",
+                static_cast<unsigned long long>(
+                    streamingErrorMeasurements_ -
+                    heroPressureScenarioStartErrorMeasurements_),
+                static_cast<unsigned long long>(
+                    streamingPositiveErrorMeasurements_ -
+                    heroPressureScenarioStartPositiveErrorMeasurements_),
+                static_cast<unsigned long long>(
+                    streamingErrorMeasurementRegressions_ -
+                    heroPressureScenarioStartErrorMeasurementRegressions_));
         }
         else if (heroPressureScenarioFinished_)
         {
@@ -1467,6 +1640,23 @@ private:
             {
                 if (!heroPressureScenarioWithinBudget_)
                     resultText = "FAIL: committed memory exceeded budget";
+                else if (heroPressureScenarioCurrentCutInvalidations_ != 0)
+                    resultText = "FAIL: loading invalidated current cut";
+                else if (heroPressureGeometricErrorRegressions_ != 0)
+                    resultText = "FAIL: visible geometric error regressed";
+                else if (
+                    heroPressureScenarioAtomicPublicationViolations_ != 0)
+                    resultText = "FAIL: streaming group published partially";
+                else if (heroPressureRollingPinViolations_ != 0)
+                    resultText = "FAIL: fallback pin retained stale ancestors";
+                else if (heroPressureRollingPinObservations_ == 0 ||
+                         heroPressureRollingReleaseObservations_ == 0)
+                    resultText = "FAIL: rolling fallback release not covered";
+                else if (heroPressureScenarioErrorMeasurementRegressions_ != 0)
+                    resultText = "FAIL: measured LOD error increased";
+                else if (heroPressureScenarioErrorMeasurements_ == 0 ||
+                         heroPressureScenarioPositiveErrorMeasurements_ == 0)
+                    resultText = "FAIL: LOD error measurement not covered";
                 else if (heroPressureFocalObservedFrames_ == 0)
                     resultText = "FAIL: focal hero was never observed";
                 else if (heroPressureFocalFallbackFrames_ != 0 ||
@@ -1505,6 +1695,29 @@ private:
                 kHeroOrbitMaxRapidReloads);
             ImGui::Text("Worst per-resource state transitions: %u",
                         heroPressureMaxResourceTransitions_);
+            ImGui::Text(
+                "Handoff: invalidations %llu | error regressions %u | "
+                "atomic groups %llu",
+                static_cast<unsigned long long>(
+                    heroPressureScenarioCurrentCutInvalidations_),
+                heroPressureGeometricErrorRegressions_,
+                static_cast<unsigned long long>(
+                    heroPressureScenarioAtomicGroupCompletions_));
+            ImGui::Text(
+                "Rolling fallback: observed %u | old ladders released %u | "
+                "violations %u",
+                heroPressureRollingPinObservations_,
+                heroPressureRollingReleaseObservations_,
+                heroPressureRollingPinViolations_);
+            ImGui::Text(
+                "LOD error measurements %llu | positive %llu | regressions "
+                "%llu",
+                static_cast<unsigned long long>(
+                    heroPressureScenarioErrorMeasurements_),
+                static_cast<unsigned long long>(
+                    heroPressureScenarioPositiveErrorMeasurements_),
+                static_cast<unsigned long long>(
+                    heroPressureScenarioErrorMeasurementRegressions_));
         }
 
         ImGui::Text("Memory");
@@ -1523,11 +1736,77 @@ private:
             ImVec2(-1.0f, 8.0f), "");
         ImGui::Text("Current cut %.2f MiB | ideal %.2f MiB",
                     currentFrontierMemoryMiB_, idealFrontierMemoryMiB_);
-        ImGui::Text("Protected ready fallback chains %.2f MiB",
+        ImGui::Text("Rolling fallback pins %.2f MiB",
                     protectedFallbackMemoryMiB_);
         ImGui::Text("Outside active target: %u resources | %.2f MiB",
                     lastReclaimableResourceCount_,
                     lastReclaimableResidentMiB_);
+
+        ImGui::Text("Last published LOD error improvement");
+        ImGui::Separator();
+        if (!lastStreamingErrorImprovement_.valid)
+        {
+            ImGui::TextDisabled("No LOD publication measured yet");
+        }
+        else
+        {
+            const StreamingErrorImprovement& improvement =
+                lastStreamingErrorImprovement_;
+            ImGui::TextWrapped("Group #%llu: %s",
+                               static_cast<unsigned long long>(
+                                   improvement.groupSerial),
+                               improvement.resourceNames.c_str());
+            if (improvement.affectedInstances == 0)
+            {
+                ImGui::TextDisabled(
+                    "Current cut unchanged at this camera; this publication "
+                    "serves prefetch or future demand.");
+            }
+            else
+            {
+                ImGui::Text(
+                    "Affected objects %u | local RMS %.3f -> %.3f px | "
+                    "gain %.3f px (%.1f%%)",
+                    improvement.affectedInstances,
+                    improvement.localBeforeRmsPixels,
+                    improvement.localAfterRmsPixels,
+                    improvement.localBeforeRmsPixels -
+                        improvement.localAfterRmsPixels,
+                    errorImprovementPercent(
+                        improvement.localBeforeRmsPixels,
+                        improvement.localAfterRmsPixels));
+                ImGui::Text(
+                    "Overall RMS %.3f -> %.3f px | gain %.4f px "
+                    "(%.3f%%)",
+                    improvement.sceneBeforeRmsPixels,
+                    improvement.sceneAfterRmsPixels,
+                    improvement.sceneBeforeRmsPixels -
+                        improvement.sceneAfterRmsPixels,
+                    errorImprovementPercent(
+                        improvement.sceneBeforeRmsPixels,
+                        improvement.sceneAfterRmsPixels));
+                ImGui::Text(
+                    "Scene worst %.3f -> %.3f px | local worst %.3f -> "
+                    "%.3f px",
+                    improvement.sceneBeforeWorstPixels,
+                    improvement.sceneAfterWorstPixels,
+                    improvement.localBeforeWorstPixels,
+                    improvement.localAfterWorstPixels);
+            }
+        }
+        ImGui::TextDisabled(
+            "Same-camera counterfactual; RMS uses each visible instance's "
+            "worst selected-entry projected geometric error.");
+        ImGui::Text(
+            "Measured %llu publications | cut changed %llu | positive gain "
+            "%llu | prefetch/unchanged %llu",
+            static_cast<unsigned long long>(streamingErrorMeasurements_),
+            static_cast<unsigned long long>(
+                streamingVisibleErrorMeasurements_),
+            static_cast<unsigned long long>(
+                streamingPositiveErrorMeasurements_),
+            static_cast<unsigned long long>(
+                streamingNoCutChangePublications_));
 
         ImGui::Text("Convergence");
         ImGui::Separator();
@@ -1649,23 +1928,29 @@ private:
                 "Replacement is transactional: the simulator first plans a "
                 "complete victim set without changing residency. It commits "
                 "only when the full request fits and its total visual value "
-                "exceeds unused cache victims by at least 5%%, or current-cut "
-                "victims by at least 30%. Score/MiB orders the choices; total "
-                "value and the stronger visible-cut hysteresis prevent "
-                "granularity and role-change churn.");
+                "exceeds unused cache victims by at least 5%%. Current-cut "
+                "resources are never load victims: resident current geometry "
+                "and its loading replacement are both charged to the hard "
+                "budget, so an upgrade without overlap capacity stays "
+                "blocked.");
             ImGui::TextWrapped(
-                "In quality-per-byte mode, a requested group may demote a "
-                "lower-score current group after safer victims are exhausted. "
-                "Ordinary replacements protect and charge the full ready "
-                "ancestor chain, so coarsening proceeds one available level "
-                "at a time instead of jumping directly to the pinned "
-                "fallback.");
+                "Loads use make-before-break publication. Every member of a "
+                "complete group remains unavailable while loading, then all "
+                "members become ready together. The next Frontier query may "
+                "select the finer cut only after that atomic publication; its "
+                "previous current representation remains ready throughout.");
+            ImGui::TextWrapped(
+                "Fallback residency is rolling rather than cumulative. A "
+                "selected representation pins only its immediate ready "
+                "predecessor. The current cut is protected separately during "
+                "a replacement load; after the handoff, the pin advances and "
+                "older LODs become reclaimable after the unload delay.");
             ImGui::TextWrapped(
                 "Minimum visible quality is enforced before scalar scoring: "
                 "a screen-dominant hero's district representation is loaded "
                 "first and cannot be selected as a victim. This quality-floor "
                 "request may displace lower-priority cache, refinement, or "
-                "fallback-chain resources; remaining bytes are still assigned "
+                "fallback-pinned resources; remaining bytes are still assigned "
                 "by score/MiB.");
             ImGui::TextWrapped(
                 "Refinement rows use the projected error of the parent that "
@@ -1904,6 +2189,8 @@ private:
         case PerformanceTimer::Streaming: return sample.streamingMs;
         case PerformanceTimer::StreamingRefinement:
             return sample.streamingRefinementMs;
+        case PerformanceTimer::StreamingErrorMeasurement:
+            return sample.streamingErrorMeasurementMs;
         case PerformanceTimer::StreamingPlanner:
             return sample.streamingPlannerMs;
         case PerformanceTimer::StreamingPlannerIndex:
@@ -2014,6 +2301,9 @@ private:
         drawPerformanceTimer("Frontier refine",
                              PerformanceTimer::StreamingRefinement,
                              ImVec4(0.98f, 0.70f, 0.28f, 1.0f));
+        drawPerformanceTimer("Error measurement",
+                             PerformanceTimer::StreamingErrorMeasurement,
+                             ImVec4(0.46f, 0.80f, 0.92f, 1.0f));
         drawPerformanceTimer("Streaming planner",
                              PerformanceTimer::StreamingPlanner,
                              ImVec4(0.82f, 0.52f, 0.22f, 1.0f));
@@ -2311,79 +2601,388 @@ private:
                       float((color >> 16) & 0xff) / 255.0f, 1.0f);
     }
 
-    bool beginPayloadTreeNode(const char* id, const char* label,
-                              Payload payload, bool defaultOpen = false)
+    bool sceneTreeSelectionEquals(uint32_t entityKindMask,
+                                  uint16_t heroAsset,
+                                  Payload firstPayload,
+                                  Payload lastPayload,
+                                  const char* label,
+                                  InstanceId instance =
+                                      kInvalidInstanceId) const
     {
-        const uint32_t current = payloadCount(currentPayloadCounts_, payload);
+        return sceneTreeSelection_.active() &&
+               sceneTreeSelection_.entityKindMask == entityKindMask &&
+               sceneTreeSelection_.heroAsset == heroAsset &&
+               sceneTreeSelection_.instance == instance &&
+               sceneTreeSelection_.firstPayload == firstPayload &&
+               sceneTreeSelection_.lastPayload == lastPayload &&
+               sceneTreeSelection_.label == label;
+    }
+
+    void toggleSceneTreeSelection(uint32_t entityKindMask,
+                                  uint16_t heroAsset,
+                                  Payload firstPayload,
+                                  Payload lastPayload,
+                                  const char* label,
+                                  InstanceId instance = kInvalidInstanceId)
+    {
+        if (sceneTreeSelectionEquals(entityKindMask, heroAsset,
+                                     firstPayload, lastPayload, label,
+                                     instance))
+        {
+            sceneTreeSelection_ = {};
+            return;
+        }
+        sceneTreeSelection_.entityKindMask = entityKindMask;
+        sceneTreeSelection_.heroAsset = heroAsset;
+        sceneTreeSelection_.instance = instance;
+        sceneTreeSelection_.firstPayload = firstPayload;
+        sceneTreeSelection_.lastPayload = lastPayload;
+        sceneTreeSelection_.label = label;
+    }
+
+    bool beginSceneTreeNode(const char* id, const char* label,
+                            uint32_t entityKindMask,
+                            uint16_t heroAsset,
+                            Payload firstPayload,
+                            Payload lastPayload,
+                            bool defaultOpen = false,
+                            const char* selectionLabel = nullptr,
+                            InstanceId instance = kInvalidInstanceId)
+    {
+        ImGuiTreeNodeFlags flags =
+            ImGuiTreeNodeFlags_SpanAvailWidth |
+            ImGuiTreeNodeFlags_OpenOnArrow;
+        if (defaultOpen)
+            flags |= ImGuiTreeNodeFlags_DefaultOpen;
+        const char* stableSelectionLabel =
+            selectionLabel ? selectionLabel : label;
+        if (sceneTreeSelectionEquals(entityKindMask, heroAsset,
+                                     firstPayload, lastPayload,
+                                     stableSelectionLabel, instance))
+            flags |= ImGuiTreeNodeFlags_Selected;
+        const bool open = ImGui::TreeNodeEx(id, flags, "%s", label);
+        if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen())
+        {
+            toggleSceneTreeSelection(entityKindMask, heroAsset,
+                                     firstPayload, lastPayload,
+                                     stableSelectionLabel, instance);
+        }
+        return open;
+    }
+
+    bool sceneTreeSelectionMatches(Payload payload, InstanceId instance,
+                                   const Entity& entity) const
+    {
+        if (!sceneTreeSelection_.active() ||
+            (sceneTreeSelection_.entityKindMask &
+             entityKindBit(entity.kind)) == 0)
+            return false;
+        if (sceneTreeSelection_.heroAsset != UINT16_MAX &&
+            entity.heroAsset != sceneTreeSelection_.heroAsset)
+            return false;
+        if (sceneTreeSelection_.instance != kInvalidInstanceId &&
+            sceneTreeSelection_.instance != instance)
+            return false;
+        return payload >= sceneTreeSelection_.firstPayload &&
+               payload <= sceneTreeSelection_.lastPayload;
+    }
+
+    size_t sceneTreeResourceSlot(
+        Payload payload, uint16_t heroAsset = UINT16_MAX) const
+    {
+        if (isTowerDetailPayload(payload))
+        {
+            if (heroAsset >= kHeroTowerAssetCount)
+                return kStreamingResourceSlotCount;
+            return kHeroTowerResourceBase +
+                   size_t(heroAsset) * kTowerDetailResourceCount +
+                   size_t(payload) - size_t(Payload::TowerDistrict);
+        }
+        if (isHouseDetailPayload(payload) &&
+            activeHouseStyle_ == HouseStyle::HouseB)
+        {
+            return kPayloadSlotCount +
+                   size_t(payload) - size_t(Payload::HouseCoarse);
+        }
+        const size_t slot = size_t(payload);
+        return slot < virtualResources_.size()
+                   ? slot
+                   : kStreamingResourceSlotCount;
+    }
+
+    uint32_t sceneTreeCurrentCount(
+        Payload payload, uint16_t heroAsset = UINT16_MAX) const
+    {
+        if (heroAsset < kHeroTowerAssetCount &&
+            payload >= Payload::TowerTop &&
+            payload <= Payload::TowerCrown)
+        {
+            return currentHeroPayloadCounts_[heroAsset][
+                size_t(payload) - size_t(Payload::TowerTop)];
+        }
+        return payloadCount(currentPayloadCounts_, payload);
+    }
+
+    void sceneTreeResidencyLabel(Payload payload, uint16_t heroAsset,
+                                 char* output, size_t outputSize) const
+    {
+        const size_t slot = sceneTreeResourceSlot(payload, heroAsset);
+        if (slot >= virtualResources_.size())
+        {
+            std::snprintf(output, outputSize, "residency n/a");
+            return;
+        }
+        const VirtualResource& resource = virtualResources_[slot];
+        const StreamingResourceState state =
+            sceneTreeStatsValid_ ? sceneTreeResourceStates_[slot]
+                                 : resource.state;
+        const bool fallbackPinned =
+            sceneTreeStatsValid_ &&
+            sceneTreeFallbackPinned_[slot] &&
+            state == StreamingResourceState::Resident;
+        const char* pinLabel = resource.pinned
+                                   ? "/pinned-permanent"
+                                   : fallbackPinned
+                                         ? "/pinned-fallback"
+                                         : "";
+        std::snprintf(output, outputSize, "%s%s",
+                      streamingStateName(state), pinLabel);
+    }
+
+    bool beginPayloadTreeNode(const char* id, const char* label,
+                              Payload payload, bool defaultOpen = false,
+                              uint16_t heroAsset = UINT16_MAX)
+    {
+        const uint32_t current =
+            sceneTreeCurrentCount(payload, heroAsset);
         const ImVec4 color = current != 0
                                  ? payloadUiColor(payload)
                                  : ImVec4(0.52f, 0.52f, 0.56f, 1.0f);
+        char residency[48];
+        sceneTreeResidencyLabel(payload, heroAsset, residency,
+                                sizeof(residency));
         ImGui::PushStyleColor(ImGuiCol_Text, color);
         ImGuiTreeNodeFlags flags =
             ImGuiTreeNodeFlags_SpanAvailWidth |
             ImGuiTreeNodeFlags_OpenOnArrow;
         if (defaultOpen)
             flags |= ImGuiTreeNodeFlags_DefaultOpen;
+        const uint32_t entityMask = entityKindBit(
+            payloadEntityKind(payload));
+        char selectionLabel[128];
+        if (heroAsset < kHeroTowerAssetCount)
+            std::snprintf(selectionLabel, sizeof(selectionLabel),
+                          "Hero asset %02u / %s",
+                          uint32_t(heroAsset) + 1, label);
+        else
+            std::snprintf(selectionLabel, sizeof(selectionLabel),
+                          "%s", label);
+        if (sceneTreeSelectionEquals(entityMask, heroAsset,
+                                     payload, payload, selectionLabel))
+            flags |= ImGuiTreeNodeFlags_Selected;
         const bool open = ImGui::TreeNodeEx(
-            id, flags, "%s  [current %u]", label, current);
+            id, flags, "%s  [error %.2f m | %s | current %u]", label,
+            authoredGeometricError(payload), residency, current);
+        if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen())
+        {
+            toggleSceneTreeSelection(entityMask, heroAsset, payload,
+                                     payload, selectionLabel);
+        }
         ImGui::PopStyleColor();
         return open;
     }
 
     void drawPayloadTreeLeaf(const char* id, const char* label,
-                             Payload payload)
+                             Payload payload,
+                             uint16_t heroAsset = UINT16_MAX)
     {
-        const uint32_t current = payloadCount(currentPayloadCounts_, payload);
+        const uint32_t current =
+            sceneTreeCurrentCount(payload, heroAsset);
         const ImVec4 color = current != 0
                                  ? payloadUiColor(payload)
                                  : ImVec4(0.52f, 0.52f, 0.56f, 1.0f);
+        char residency[48];
+        sceneTreeResidencyLabel(payload, heroAsset, residency,
+                                sizeof(residency));
         ImGui::PushStyleColor(ImGuiCol_Text, color);
-        ImGui::TreeNodeEx(
-            id,
+        const uint32_t entityMask = entityKindBit(
+            payloadEntityKind(payload));
+        ImGuiTreeNodeFlags flags =
             ImGuiTreeNodeFlags_Leaf |
-                ImGuiTreeNodeFlags_NoTreePushOnOpen |
-                ImGuiTreeNodeFlags_SpanAvailWidth,
-            "%s  [current %u]", label, current);
+            ImGuiTreeNodeFlags_NoTreePushOnOpen |
+            ImGuiTreeNodeFlags_SpanAvailWidth;
+        char selectionLabel[128];
+        if (heroAsset < kHeroTowerAssetCount)
+            std::snprintf(selectionLabel, sizeof(selectionLabel),
+                          "Hero asset %02u / %s",
+                          uint32_t(heroAsset) + 1, label);
+        else
+            std::snprintf(selectionLabel, sizeof(selectionLabel),
+                          "%s", label);
+        if (sceneTreeSelectionEquals(entityMask, heroAsset,
+                                     payload, payload, selectionLabel))
+            flags |= ImGuiTreeNodeFlags_Selected;
+        ImGui::TreeNodeEx(
+            id, flags,
+            "%s  [error %.2f m | %s | current %u]", label,
+            authoredGeometricError(payload), residency, current);
+        if (ImGui::IsItemClicked())
+        {
+            toggleSceneTreeSelection(entityMask, heroAsset, payload,
+                                     payload, selectionLabel);
+        }
         ImGui::PopStyleColor();
+    }
+
+    void drawTowerPlacementTreeLeaf(InstanceHandle handle,
+                                    uint32_t placementOrdinal)
+    {
+        if (handle.id >= entities_.size())
+            return;
+        const Entity& entity = entities_[handle.id];
+        if (entity.kind != EntityKind::Tower ||
+            entity.heroAsset >= kHeroTowerAssetCount)
+            return;
+
+        const uint32_t current =
+            handle.id < currentInstanceEntryCounts_.size()
+                ? currentInstanceEntryCounts_[handle.id]
+                : 0;
+        char residency[48];
+        sceneTreeResidencyLabel(Payload::TowerTop, entity.heroAsset,
+                                residency, sizeof(residency));
+        char displayLabel[192];
+        std::snprintf(
+            displayLabel, sizeof(displayLabel),
+            "Placement %u: instance %u at (%.1f, %.1f, %.1f)  "
+            "[error %.2f m | %s | current %u]",
+            placementOrdinal, handle.id, entity.position.x,
+            entity.position.y, entity.position.z,
+            authoredGeometricError(Payload::TowerTop), residency, current);
+        char selectionLabel[128];
+        std::snprintf(selectionLabel, sizeof(selectionLabel),
+                      "Hero asset %02u / placement %u (instance %u)",
+                      uint32_t(entity.heroAsset) + 1, placementOrdinal,
+                      handle.id);
+
+        ImGuiTreeNodeFlags flags =
+            ImGuiTreeNodeFlags_Leaf |
+            ImGuiTreeNodeFlags_NoTreePushOnOpen |
+            ImGuiTreeNodeFlags_SpanAvailWidth;
+        const uint32_t towerMask = entityKindBit(EntityKind::Tower);
+        if (sceneTreeSelectionEquals(
+                towerMask, entity.heroAsset, Payload::TowerTop,
+                Payload::TowerCrown, selectionLabel, handle.id))
+            flags |= ImGuiTreeNodeFlags_Selected;
+
+        ImGui::PushID(int(handle.id));
+        ImGui::TreeNodeEx("placement", flags, "%s", displayLabel);
+        if (ImGui::IsItemClicked())
+        {
+            toggleSceneTreeSelection(
+                towerMask, entity.heroAsset, Payload::TowerTop,
+                Payload::TowerCrown, selectionLabel, handle.id);
+        }
+        if (pendingHierarchyRevealInstance_ == handle.id)
+        {
+            ImGui::SetScrollHereY(0.5f);
+            pendingHierarchyRevealHero_ = UINT16_MAX;
+            pendingHierarchyRevealInstance_ = kInvalidInstanceId;
+        }
+        ImGui::PopID();
     }
 
     void drawSceneTreeUi()
     {
+        const bool revealTower =
+            pendingHierarchyRevealHero_ < kHeroTowerAssetCount;
+        if (revealTower)
+        {
+            ImGui::SetNextWindowFocus();
+            ImGui::SetNextWindowCollapsed(false, ImGuiCond_Always);
+        }
         ImGui::SetNextWindowPos(ImVec2(776.0f, 36.0f),
                                 ImGuiCond_FirstUseEver);
-        ImGui::SetNextWindowSize(ImVec2(492.0f, 652.0f),
+        ImGui::SetNextWindowSize(ImVec2(720.0f, 652.0f),
                                  ImGuiCond_FirstUseEver);
         if (!ImGui::Begin("Scene hierarchy", &showSceneHierarchy_))
         {
             ImGui::End();
+            if (!showSceneHierarchy_)
+            {
+                sceneTreeSelection_ = {};
+                pendingHierarchyRevealHero_ = UINT16_MAX;
+                pendingHierarchyRevealInstance_ = kInvalidInstanceId;
+                sceneTreeStatsValid_ = false;
+            }
             return;
         }
         ImGui::TextWrapped(
-            "Live Frontier topology. Bright nodes participate in the current "
-            "cut; values show current selected entries.");
+            "Live authored Frontier topology. Payload rows show local-space "
+            "geometric error, virtual residency, planner pinning, and current "
+            "selected-entry count. Permanent coarsest resources are shown as "
+            "pinned-permanent; ready fallback ancestors protected by the "
+            "streaming planner are shown as pinned-fallback. Click a row to "
+            "tint matching current-cut geometry; click it again to clear the "
+            "selection. Ctrl+left-click a skyscraper in the viewport to "
+            "select and reveal its exact placement.");
+        if (sceneTreeSelection_.active())
+        {
+            ImGui::TextColored(ImVec4(0.18f, 0.90f, 1.0f, 1.0f),
+                               "Selected: %s",
+                               sceneTreeSelection_.label.c_str());
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Clear selection"))
+                sceneTreeSelection_ = {};
+        }
+        else
+        {
+            ImGui::TextDisabled("Selected: none");
+        }
         ImGui::Separator();
 
         const uint32_t staticCount = houseCount_ + towerCount_ + treeCount_;
         const uint32_t dynamicCount = uint32_t(carHandles_.size() +
                                                pedestrianHandles_.size());
-        if (ImGui::TreeNodeEx(
-                "scene-root",
-                ImGuiTreeNodeFlags_DefaultOpen |
-                    ImGuiTreeNodeFlags_SpanAvailWidth,
-                "City scene  (%u instances)", staticCount + dynamicCount))
+        constexpr uint32_t staticKindMask =
+            entityKindBit(EntityKind::House) |
+            entityKindBit(EntityKind::Tree) |
+            entityKindBit(EntityKind::Tower);
+        constexpr uint32_t dynamicKindMask =
+            entityKindBit(EntityKind::Car) |
+            entityKindBit(EntityKind::Pedestrian);
+        char treeLabel[160];
+        std::snprintf(treeLabel, sizeof(treeLabel),
+                      "City scene  (%u instances)",
+                      staticCount + dynamicCount);
+        if (revealTower)
+            ImGui::SetNextItemOpen(true, ImGuiCond_Always);
+        if (beginSceneTreeNode(
+                "scene-root", treeLabel, kAllEntityKindMask, UINT16_MAX,
+                Payload::HouseTop, Payload::TowerCrown, true,
+                "City scene"))
         {
-            if (ImGui::TreeNodeEx(
-                    "static-scene",
-                    ImGuiTreeNodeFlags_DefaultOpen |
-                        ImGuiTreeNodeFlags_SpanAvailWidth,
-                    "%s environment  (%u)",
-                    animateWholeScene_ ? "Animated" : "Static",
-                    staticCount))
+            std::snprintf(treeLabel, sizeof(treeLabel),
+                          "%s environment  (%u)",
+                          animateWholeScene_ ? "Animated" : "Static",
+                          staticCount);
+            if (revealTower)
+                ImGui::SetNextItemOpen(true, ImGuiCond_Always);
+            if (beginSceneTreeNode(
+                    "static-scene", treeLabel, staticKindMask,
+                    UINT16_MAX, Payload::HouseTop,
+                    Payload::TowerCrown, true, "Static environment"))
             {
-                if (ImGui::TreeNode(
-                        "houses", "Houses %s, generation %u  (%u instances)",
-                        activeHouseStyle_ == HouseStyle::HouseA ? "A" : "B",
-                        houseGeneration_, houseCount_))
+                std::snprintf(
+                    treeLabel, sizeof(treeLabel),
+                    "Houses %s, generation %u  (%u instances)",
+                    activeHouseStyle_ == HouseStyle::HouseA ? "A" : "B",
+                    houseGeneration_, houseCount_);
+                if (beginSceneTreeNode(
+                        "houses", treeLabel,
+                        entityKindBit(EntityKind::House), UINT16_MAX,
+                        Payload::HouseTop, Payload::HouseRoof, false,
+                        "Houses"))
                 {
                     if (beginPayloadTreeNode("house-top", "Top / fallback",
                                              Payload::HouseTop, true))
@@ -2402,36 +3001,174 @@ private:
                     ImGui::TreePop();
                 }
 
-                if (ImGui::TreeNode("towers", "Skyscrapers  (%u instances)",
-                                    towerCount_))
+                std::snprintf(
+                    treeLabel, sizeof(treeLabel),
+                    "Skyscrapers  (%u instances, %u shared assets)",
+                    towerCount_, uint32_t(kHeroTowerAssetCount));
+                if (revealTower)
+                    ImGui::SetNextItemOpen(true, ImGuiCond_Always);
+                if (beginSceneTreeNode(
+                        "towers", treeLabel,
+                        entityKindBit(EntityKind::Tower), UINT16_MAX,
+                        Payload::TowerTop, Payload::TowerCrown, true,
+                        "Skyscrapers"))
                 {
-                    if (beginPayloadTreeNode("tower-top", "Top / fallback",
-                                             Payload::TowerTop, true))
+                    ImGui::TextDisabled(
+                        "Each asset has three instance roots and one shared "
+                        "streamed definition.");
+                    for (uint16_t hero = 0;
+                         hero < kHeroTowerAssetCount; ++hero)
                     {
-                        if (beginPayloadTreeNode("tower-district", "District",
-                                                 Payload::TowerDistrict, true))
+                        uint32_t currentEntries = 0;
+                        for (uint32_t count :
+                             currentHeroPayloadCounts_[hero])
+                            currentEntries += count;
+                        uint32_t resident = 0;
+                        uint32_t loading = 0;
+                        uint32_t unloaded = 0;
+                        uint32_t fallbackPinned = 0;
+                        const size_t resourceBase =
+                            kHeroTowerResourceBase +
+                            size_t(hero) * kTowerDetailResourceCount;
+                        for (size_t detail = 0;
+                             detail < kTowerDetailResourceCount; ++detail)
                         {
-                            if (beginPayloadTreeNode("tower-coarse", "Coarse",
-                                                     Payload::TowerCoarse,
-                                                     true))
+                            const size_t slot = resourceBase + detail;
+                            const StreamingResourceState state =
+                                sceneTreeStatsValid_
+                                    ? sceneTreeResourceStates_[slot]
+                                    : virtualResources_[slot].state;
+                            switch (state)
                             {
-                                if (beginPayloadTreeNode(
-                                        "tower-medium", "Medium",
-                                        Payload::TowerMedium, true))
+                            case StreamingResourceState::Resident:
+                                ++resident;
+                                break;
+                            case StreamingResourceState::Loading:
+                                ++loading;
+                                break;
+                            case StreamingResourceState::Unloaded:
+                                ++unloaded;
+                                break;
+                            }
+                            if (sceneTreeStatsValid_ &&
+                                state == StreamingResourceState::Resident &&
+                                sceneTreeFallbackPinned_[slot])
+                                ++fallbackPinned;
+                        }
+
+                        ImGui::PushID(int(hero));
+                        std::snprintf(
+                            treeLabel, sizeof(treeLabel),
+                            "Hero asset %02u  (%u placements | "
+                            "resident/loading/unloaded "
+                            "%u/%u/%u | fallback-pinned %u | current %u)",
+                            uint32_t(hero) + 1,
+                            uint32_t(kHeroTowerInstancesPerAsset), resident,
+                            loading, unloaded, fallbackPinned,
+                            currentEntries);
+                        char heroSelectionLabel[32];
+                        std::snprintf(heroSelectionLabel,
+                                      sizeof(heroSelectionLabel),
+                                      "Hero asset %02u",
+                                      uint32_t(hero) + 1);
+                        const bool revealHero =
+                            revealTower &&
+                            pendingHierarchyRevealHero_ == hero;
+                        if (revealHero)
+                            ImGui::SetNextItemOpen(true, ImGuiCond_Always);
+                        const bool assetOpen = beginSceneTreeNode(
+                            "hero-asset", treeLabel,
+                            entityKindBit(EntityKind::Tower), hero,
+                            Payload::TowerTop, Payload::TowerCrown,
+                            hero == 0, heroSelectionLabel);
+                        if (assetOpen)
+                        {
+                            char topologySelectionLabel[80];
+                            std::snprintf(
+                                topologySelectionLabel,
+                                sizeof(topologySelectionLabel),
+                                "Hero asset %02u / instance root nodes",
+                                uint32_t(hero) + 1);
+                            if (revealHero)
+                                ImGui::SetNextItemOpen(
+                                    true, ImGuiCond_Always);
+                            if (beginSceneTreeNode(
+                                    "instance-roots",
+                                    "Instance root nodes (3 independent "
+                                    "nodes)",
+                                    entityKindBit(EntityKind::Tower), hero,
+                                    Payload::TowerTop, Payload::TowerCrown,
+                                    true, topologySelectionLabel))
+                            {
+                                uint32_t placementOrdinal = 0;
+                                for (InstanceHandle handle : towerHandles_)
                                 {
-                                    if (beginPayloadTreeNode(
-                                            "tower-fine", "Fine",
-                                            Payload::TowerFine, true))
+                                    if (handle.id >= entities_.size() ||
+                                        entities_[handle.id].heroAsset != hero)
+                                        continue;
+                                    drawTowerPlacementTreeLeaf(
+                                        handle, ++placementOrdinal);
+                                }
+                                drawPayloadTreeLeaf(
+                                    "tower-top-payload",
+                                    "payload slot 0: Top / fallback",
+                                    Payload::TowerTop, hero);
+                                std::snprintf(
+                                    topologySelectionLabel,
+                                    sizeof(topologySelectionLabel),
+                                    "Hero asset %02u / facade node",
+                                    uint32_t(hero) + 1);
+                                if (beginSceneTreeNode(
+                                        "facade-node",
+                                        "Mounted facade node (1 shared "
+                                        "definition, 3 placements, 4 "
+                                        "payload slots)",
+                                        entityKindBit(EntityKind::Tower),
+                                        hero, Payload::TowerDistrict,
+                                        Payload::TowerCrown, true,
+                                        topologySelectionLabel))
+                                {
+                                    drawPayloadTreeLeaf(
+                                        "tower-district-payload",
+                                        "payload slot 0: District",
+                                        Payload::TowerDistrict, hero);
+                                    drawPayloadTreeLeaf(
+                                        "tower-coarse-payload",
+                                        "payload slot 1: Coarse",
+                                        Payload::TowerCoarse, hero);
+                                    drawPayloadTreeLeaf(
+                                        "tower-medium-payload",
+                                        "payload slot 2: Medium",
+                                        Payload::TowerMedium, hero);
+                                    drawPayloadTreeLeaf(
+                                        "tower-fine-payload",
+                                        "payload slot 3: Fine",
+                                        Payload::TowerFine, hero);
+                                    std::snprintf(
+                                        topologySelectionLabel,
+                                        sizeof(topologySelectionLabel),
+                                        "Hero asset %02u / detail children",
+                                        uint32_t(hero) + 1);
+                                    if (beginSceneTreeNode(
+                                            "detail-children",
+                                            "Structural detail child nodes",
+                                            entityKindBit(EntityKind::Tower),
+                                            hero, Payload::TowerBase,
+                                            Payload::TowerCrown, true,
+                                            topologySelectionLabel))
                                     {
                                         drawPayloadTreeLeaf(
-                                            "tower-base", "Base",
-                                            Payload::TowerBase);
+                                            "tower-base-node",
+                                            "Base node, payload slot 0",
+                                            Payload::TowerBase, hero);
                                         drawPayloadTreeLeaf(
-                                            "tower-shaft", "Shaft",
-                                            Payload::TowerShaft);
+                                            "tower-shaft-node",
+                                            "Shaft node, payload slot 0",
+                                            Payload::TowerShaft, hero);
                                         drawPayloadTreeLeaf(
-                                            "tower-crown", "Crown",
-                                            Payload::TowerCrown);
+                                            "tower-crown-node",
+                                            "Crown node, payload slot 0",
+                                            Payload::TowerCrown, hero);
                                         ImGui::TreePop();
                                     }
                                     ImGui::TreePop();
@@ -2440,13 +3177,18 @@ private:
                             }
                             ImGui::TreePop();
                         }
-                        ImGui::TreePop();
+                        ImGui::PopID();
                     }
                     ImGui::TreePop();
                 }
 
-                if (ImGui::TreeNode("trees", "Trees  (%u instances)",
-                                    treeCount_))
+                std::snprintf(treeLabel, sizeof(treeLabel),
+                              "Trees  (%u instances)", treeCount_);
+                if (beginSceneTreeNode(
+                        "trees", treeLabel,
+                        entityKindBit(EntityKind::Tree), UINT16_MAX,
+                        Payload::TreeTop, Payload::TreeCrown, false,
+                        "Trees"))
                 {
                     if (beginPayloadTreeNode("tree-top", "Top / fallback",
                                              Payload::TreeTop, true))
@@ -2467,14 +3209,21 @@ private:
                 ImGui::TreePop();
             }
 
-            if (ImGui::TreeNodeEx(
-                    "dynamic-scene",
-                    ImGuiTreeNodeFlags_DefaultOpen |
-                        ImGuiTreeNodeFlags_SpanAvailWidth,
-                    "Dynamic actors  (%u)", dynamicCount))
+            std::snprintf(treeLabel, sizeof(treeLabel),
+                          "Dynamic actors  (%u)", dynamicCount);
+            if (beginSceneTreeNode(
+                    "dynamic-scene", treeLabel, dynamicKindMask,
+                    UINT16_MAX, Payload::HouseTop,
+                    Payload::TowerCrown, true, "Dynamic actors"))
             {
-                if (ImGui::TreeNode("cars", "Cars  (%u instances)",
-                                    unsigned(carHandles_.size())))
+                std::snprintf(treeLabel, sizeof(treeLabel),
+                              "Cars  (%u instances)",
+                              unsigned(carHandles_.size()));
+                if (beginSceneTreeNode(
+                        "cars", treeLabel,
+                        entityKindBit(EntityKind::Car), UINT16_MAX,
+                        Payload::CarTop, Payload::CarCabin, false,
+                        "Cars"))
                 {
                     if (beginPayloadTreeNode("car-top", "Top / fallback",
                                              Payload::CarTop, true))
@@ -2493,9 +3242,15 @@ private:
                     ImGui::TreePop();
                 }
 
-                if (ImGui::TreeNode("pedestrians",
-                                    "Pedestrians  (%u instances)",
-                                    unsigned(pedestrianHandles_.size())))
+                std::snprintf(treeLabel, sizeof(treeLabel),
+                              "Pedestrians  (%u instances)",
+                              unsigned(pedestrianHandles_.size()));
+                if (beginSceneTreeNode(
+                        "pedestrians", treeLabel,
+                        entityKindBit(EntityKind::Pedestrian), UINT16_MAX,
+                        Payload::PedestrianTop,
+                        Payload::PedestrianHead, false,
+                        "Pedestrians"))
                 {
                     if (beginPayloadTreeNode(
                             "pedestrian-top", "Top / fallback",
@@ -2522,6 +3277,13 @@ private:
             ImGui::TreePop();
         }
         ImGui::End();
+        if (!showSceneHierarchy_)
+        {
+            sceneTreeSelection_ = {};
+            pendingHierarchyRevealHero_ = UINT16_MAX;
+            pendingHierarchyRevealInstance_ = kInvalidInstanceId;
+            sceneTreeStatsValid_ = false;
+        }
     }
 
     float cameraAspect() const
@@ -2595,6 +3357,99 @@ private:
         streamingLookaheadQuery_.reset();
     }
 
+    void selectTowerInstance(InstanceId instance)
+    {
+        if (instance >= entities_.size())
+            return;
+        const Entity& entity = entities_[instance];
+        if (entity.kind != EntityKind::Tower ||
+            entity.heroAsset >= kHeroTowerAssetCount)
+            return;
+
+        uint32_t placementOrdinal = 0;
+        bool found = false;
+        for (InstanceHandle handle : towerHandles_)
+        {
+            if (handle.id >= entities_.size() ||
+                entities_[handle.id].heroAsset != entity.heroAsset)
+                continue;
+            ++placementOrdinal;
+            if (handle.id == instance)
+            {
+                found = true;
+                break;
+            }
+        }
+        if (!found)
+            return;
+
+        char selectionLabel[128];
+        std::snprintf(selectionLabel, sizeof(selectionLabel),
+                      "Hero asset %02u / placement %u (instance %u)",
+                      uint32_t(entity.heroAsset) + 1, placementOrdinal,
+                      instance);
+        sceneTreeSelection_.entityKindMask =
+            entityKindBit(EntityKind::Tower);
+        sceneTreeSelection_.heroAsset = entity.heroAsset;
+        sceneTreeSelection_.instance = instance;
+        sceneTreeSelection_.firstPayload = Payload::TowerTop;
+        sceneTreeSelection_.lastPayload = Payload::TowerCrown;
+        sceneTreeSelection_.label = selectionLabel;
+        pendingHierarchyRevealHero_ = entity.heroAsset;
+        pendingHierarchyRevealInstance_ = instance;
+        showSceneHierarchy_ = true;
+    }
+
+    void pickTowerAtMouse(const CameraPose& pose)
+    {
+        if (width_ == 0 || height_ == 0 || mouse_.m_mx < 0 ||
+            mouse_.m_my < 0 || uint32_t(mouse_.m_mx) >= width_ ||
+            uint32_t(mouse_.m_my) >= height_)
+            return;
+
+        float inverseViewProjection[16];
+        bx::mtxInverse(inverseViewProjection, pose.viewProjection.data());
+        const float mouseX =
+            float(mouse_.m_mx) / float(width_) * 2.0f - 1.0f;
+        const float mouseY =
+            -(float(mouse_.m_my) / float(height_) * 2.0f - 1.0f);
+        const bx::Ray ray =
+            bx::makeRay(mouseX, mouseY, inverseViewProjection);
+
+        float nearestDistance = std::numeric_limits<float>::max();
+        InstanceId nearestInstance = kInvalidInstanceId;
+        for (InstanceHandle handle : towerHandles_)
+        {
+            if (handle.id >= entities_.size())
+                continue;
+            const Entity& entity = entities_[handle.id];
+            if (entity.kind != EntityKind::Tower)
+                continue;
+
+            const float halfExtent =
+                kTowerRootHalfExtent * entity.scale;
+            const bx::Aabb worldBounds = {
+                {entity.position.x - halfExtent, entity.position.y,
+                 entity.position.z - halfExtent},
+                {entity.position.x + halfExtent,
+                 entity.position.y + kTowerRootHeight * entity.scale,
+                 entity.position.z + halfExtent},
+            };
+            bx::Hit hit;
+            if (!bx::intersect(ray, worldBounds, &hit))
+                continue;
+            const float distance = std::max(hit.plane.dist, 0.0f);
+            if (distance < nearestDistance)
+            {
+                nearestDistance = distance;
+                nearestInstance = handle.id;
+            }
+        }
+
+        if (nearestInstance != kInvalidInstanceId)
+            selectTowerInstance(nearestInstance);
+    }
+
     static float milliseconds(int64_t begin, int64_t end)
     {
         return float(double(end - begin) * 1000.0 /
@@ -2604,16 +3459,44 @@ private:
     void updateFrontierStats(const FrontierResultView& frontier)
     {
         currentPayloadCounts_.fill(0);
+        for (auto& counts : currentHeroPayloadCounts_)
+            counts.fill(0);
         if (showSceneHierarchy_)
         {
+            for (size_t slot = 0; slot < virtualResources_.size(); ++slot)
+                sceneTreeResourceStates_[slot] =
+                    virtualResources_[slot].state;
+            sceneTreeStatsValid_ = true;
+            if (currentInstanceEntryCounts_.size() < entities_.size())
+                currentInstanceEntryCounts_.resize(entities_.size(), 0);
+            std::fill(currentInstanceEntryCounts_.begin(),
+                      currentInstanceEntryCounts_.end(), 0);
             for (const FrontierEntry& entry : frontier)
             {
                 const UserPayload rawPayload =
-                    database_.tryGetPayload(entry.nodeHandle);
+                    database_.tryGetPayload(entry.nodeHandle,
+                                            entry.payloadIndex());
                 const size_t slot = size_t(rawPayload);
                 if (rawPayload != kInvalidPayload &&
                     slot < kPayloadSlotCount)
+                {
                     ++currentPayloadCounts_[slot];
+                    if (entry.instance() <
+                        currentInstanceEntryCounts_.size())
+                        ++currentInstanceEntryCounts_[entry.instance()];
+                    if (rawPayload >= UserPayload(Payload::TowerTop) &&
+                        rawPayload <= UserPayload(Payload::TowerCrown) &&
+                        entry.instance() < entities_.size())
+                    {
+                        const Entity& entity = entities_[entry.instance()];
+                        if (entity.kind == EntityKind::Tower &&
+                            entity.heroAsset < kHeroTowerAssetCount)
+                        {
+                            ++currentHeroPayloadCounts_[entity.heroAsset][
+                                slot - size_t(Payload::TowerTop)];
+                        }
+                    }
+                }
             }
         }
         lastCurrentSize_ = uint32_t(frontier.size());
@@ -2759,7 +3642,8 @@ private:
                              : bounds(-3.6f, 0.0f, -3.0f,
                                       3.6f, 7.4f, 3.0f);
         const auto coarse = builder.createNode(
-            node(Payload::HouseCoarse, 0.28f, all));
+            node(Payload::HouseCoarse,
+                 authoredGeometricError(Payload::HouseCoarse), all));
         builder.createNode(
             coarse,
             node(Payload::HouseBody, 0.0f,
@@ -2782,7 +3666,8 @@ private:
         SubtreeBuilder builder;
         const AABB all = bounds(-2.2f, 0.0f, -2.2f, 2.2f, 2.2f, 2.2f);
         const auto coarse = builder.createNode(
-            node(Payload::CarCoarse, 0.20f, all));
+            node(Payload::CarCoarse,
+                 authoredGeometricError(Payload::CarCoarse), all));
         builder.createNode(coarse, node(Payload::CarBody, 0.0f,
                                         bounds(-2.1f, 0.1f, -1.0f,
                                                2.1f, 1.0f, 1.0f)));
@@ -2797,7 +3682,8 @@ private:
         SubtreeBuilder builder;
         const AABB all = bounds(-1.1f, 0.0f, -1.1f, 1.1f, 2.25f, 1.1f);
         const auto coarse = builder.createNode(
-            node(Payload::PedestrianCoarse, 0.12f, all));
+            node(Payload::PedestrianCoarse,
+                 authoredGeometricError(Payload::PedestrianCoarse), all));
         builder.createNode(coarse, node(Payload::PedestrianBody, 0.0f,
                                         bounds(-0.35f, 0.05f, -0.35f,
                                                0.35f, 1.75f, 0.35f)));
@@ -2812,7 +3698,8 @@ private:
         SubtreeBuilder builder;
         const AABB all = bounds(-1.8f, 0.0f, -1.8f, 1.8f, 6.5f, 1.8f);
         const auto coarse = builder.createNode(
-            node(Payload::TreeCoarse, 0.22f, all));
+            node(Payload::TreeCoarse,
+                 authoredGeometricError(Payload::TreeCoarse), all));
         builder.createNode(coarse, node(Payload::TreeTrunk, 0.0f,
                                         bounds(-0.35f, 0.0f, -0.35f,
                                                0.35f, 3.4f, 0.35f)));
@@ -2826,23 +3713,31 @@ private:
     {
         SubtreeBuilder builder;
         const AABB all = bounds(-5.0f, 0.0f, -5.0f, 5.0f, 46.0f, 5.0f);
+        // TowerTop remains the permanent per-instance fallback. Streamed
+        // facade payloads live on the registered definition so readiness and
+        // virtual resource cost stay shared by all placements of this asset.
+        const std::array<PayloadLodDesc,
+                         kTowerFacadePayloadCount - 1> facadeLods{{
+            {UserPayload(Payload::TowerCoarse),
+             authoredGeometricError(Payload::TowerCoarse)},
+            {UserPayload(Payload::TowerMedium),
+             authoredGeometricError(Payload::TowerMedium)},
+            {UserPayload(Payload::TowerFine),
+             authoredGeometricError(Payload::TowerFine)},
+        }};
         const auto district = builder.createNode(
-            node(Payload::TowerDistrict, 0.70f, all));
-        const auto coarse = builder.createNode(
-            district, node(Payload::TowerCoarse, 0.52f, all));
-        const auto medium = builder.createNode(
-            coarse, node(Payload::TowerMedium, 0.35f, all));
-        const auto fine = builder.createNode(
-            medium, node(Payload::TowerFine, 0.18f, all));
-        builder.createNode(fine, node(Payload::TowerBase, 0.0f,
-                                      bounds(-5.0f, 0.0f, -5.0f,
-                                             5.0f, 7.0f, 5.0f)));
-        builder.createNode(fine, node(Payload::TowerShaft, 0.0f,
-                                      bounds(-4.2f, 6.8f, -4.2f,
-                                             4.2f, 38.0f, 4.2f)));
-        builder.createNode(fine, node(Payload::TowerCrown, 0.0f,
-                                      bounds(-4.2f, 37.8f, -4.2f,
-                                             4.2f, 46.0f, 4.2f)));
+            node(Payload::TowerDistrict,
+                 authoredGeometricError(Payload::TowerDistrict), all),
+            facadeLods);
+        builder.createNode(district, node(Payload::TowerBase, 0.0f,
+                                          bounds(-5.0f, 0.0f, -5.0f,
+                                                 5.0f, 7.0f, 5.0f)));
+        builder.createNode(district, node(Payload::TowerShaft, 0.0f,
+                                          bounds(-4.2f, 6.8f, -4.2f,
+                                                 4.2f, 38.0f, 4.2f)));
+        builder.createNode(district, node(Payload::TowerCrown, 0.0f,
+                                          bounds(-4.2f, 37.8f, -4.2f,
+                                                 4.2f, 46.0f, 4.2f)));
         return database_.registerSubtree(builder.build());
     }
 
@@ -2863,14 +3758,15 @@ private:
             return NodeHandle{mounted.slot, packedIndex,
                               mounted.generation};
         };
-        const auto remember = [this, &mountedNode](size_t slot,
-                                                   uint32_t packedIndex,
-                                                   Payload expectedPayload)
+        const auto remember = [this, &mountedNode](
+                                  size_t slot, uint32_t packedIndex,
+                                  Payload expectedPayload,
+                                  uint8_t payloadIndex = 0)
         {
             if (slot < virtualResources_.size())
             {
                 const NodeHandle handle = mountedNode(packedIndex);
-                if (database_.tryGetPayload(handle) !=
+                if (database_.tryGetPayload(handle, payloadIndex) !=
                     UserPayload(expectedPayload))
                 {
                     FRONTIER_ASSERT(
@@ -2879,6 +3775,8 @@ private:
                     return;
                 }
                 virtualResources_[slot].representative = handle;
+                virtualResources_[slot].representativePayloadIndex =
+                    payloadIndex;
             }
         };
 
@@ -2908,10 +3806,20 @@ private:
                     size_t(entity.heroAsset) * kTowerDetailResourceCount;
                 for (size_t detail = 0;
                      detail < kTowerDetailResourceCount; ++detail)
+                {
+                    const bool facadePayload =
+                        detail < kTowerFacadePayloadCount;
+                    const uint32_t packedIndex =
+                        facadePayload
+                            ? 1u
+                            : uint32_t(2 + detail -
+                                       kTowerFacadePayloadCount);
                     remember(
-                        base + detail, uint32_t(detail + 1),
+                        base + detail, packedIndex,
                         static_cast<Payload>(
-                            size_t(Payload::TowerDistrict) + detail));
+                            size_t(Payload::TowerDistrict) + detail),
+                        facadePayload ? uint8_t(detail) : uint8_t(0));
+                }
             }
             break;
         case EntityKind::Tree:
@@ -2998,7 +3906,8 @@ private:
         const Entity house = makeHouse(style, position, random);
         const size_t definition = static_cast<size_t>(style);
         houseHandles_.push_back(instantiateActor(
-            Payload::HouseTop, 0.75f, houseBounds(style), house,
+            Payload::HouseTop,
+            authoredGeometricError(Payload::HouseTop), houseBounds(style), house,
             houseDefinitions_[definition]));
     }
 
@@ -3075,7 +3984,9 @@ private:
         const AABB treeBounds =
             bounds(-1.9f, 0.0f, -1.9f, 1.9f, 6.7f, 1.9f);
         const AABB towerBounds =
-            bounds(-5.2f, 0.0f, -5.2f, 5.2f, 46.5f, 5.2f);
+            bounds(-kTowerRootHalfExtent, 0.0f, -kTowerRootHalfExtent,
+                   kTowerRootHalfExtent, kTowerRootHeight,
+                   kTowerRootHalfExtent);
         const std::array<float, 2> offsets{-3.35f, 3.35f};
         const auto isTowerBlock = [](int x, int z)
         {
@@ -3116,7 +4027,8 @@ private:
                         uint8_t(125 + random01(heroRandom) * 60),
                         uint8_t(145 + random01(heroRandom) * 65));
                     towerHandles_.push_back(instantiateActor(
-                        Payload::TowerTop, 0.90f, towerBounds,
+                        Payload::TowerTop,
+                        authoredGeometricError(Payload::TowerTop), towerBounds,
                         tower, towerDefinitions[heroAsset]));
                     ++towerIndex;
                     ++towerCount_;
@@ -3154,7 +4066,8 @@ private:
                         uint8_t(115 + random01(random) * 80),
                         uint8_t(42 + random01(random) * 40));
                     treeHandles_.push_back(instantiateActor(
-                        Payload::TreeTop, 0.65f, treeBounds,
+                        Payload::TreeTop,
+                        authoredGeometricError(Payload::TreeTop), treeBounds,
                         tree, treeDefinition));
                     ++treeCount_;
                 }
@@ -3208,7 +4121,9 @@ private:
             car.color = abgr(red, green, blue);
 
             carHandles_.push_back(instantiateActor(
-                Payload::CarTop, 0.55f, carBounds, car, carDefinition));
+                Payload::CarTop,
+                authoredGeometricError(Payload::CarTop), carBounds, car,
+                carDefinition));
             carPaths_.push_back(path);
         }
         carMotion_.reset(carHandles_);
@@ -3252,7 +4167,8 @@ private:
                 uint8_t(70 + random01(random) * 170));
 
             pedestrianHandles_.push_back(instantiateActor(
-                Payload::PedestrianTop, 0.32f, pedestrianBounds,
+                Payload::PedestrianTop,
+                authoredGeometricError(Payload::PedestrianTop), pedestrianBounds,
                 pedestrian, pedestrianDefinition));
             pedestrianPaths_.push_back(path);
         }
@@ -3356,14 +4272,26 @@ private:
     void updateHeroPressureOrbitCamera(float time, float4& position,
                                        float4& target) const
     {
-        // This starts at the same close southern view used in the supplied
-        // regression image, then takes almost three minutes to circle the
-        // focal skyscraper once.
-        const float angle = -kPi * 0.5f + time * kHeroOrbitAngularSpeed;
+        // The automated regression approaches the focal tower before
+        // orbiting it, which makes any temporary LOD regression directly
+        // observable. The interactive scenario retains the close orbit.
+        float radius = kHeroOrbitRadius;
+        float orbitTime = time;
+        if (streamingSelfTest_)
+        {
+            const float approach = std::clamp(
+                time / kHeroApproachSeconds, 0.0f, 1.0f);
+            radius = kHeroApproachStartRadius +
+                     (kHeroOrbitRadius - kHeroApproachStartRadius) *
+                         approach;
+            orbitTime = std::max(time - kHeroApproachSeconds, 0.0f);
+        }
+        const float angle =
+            -kPi * 0.5f + orbitTime * kHeroOrbitAngularSpeed;
         position = float4::point(
-            kHeroOrbitCenterX + std::cos(angle) * kHeroOrbitRadius,
+            kHeroOrbitCenterX + std::cos(angle) * radius,
             kHeroOrbitCameraHeight,
-            kHeroOrbitCenterZ + std::sin(angle) * kHeroOrbitRadius);
+            kHeroOrbitCenterZ + std::sin(angle) * radius);
         target = float4::point(kHeroOrbitCenterX, kHeroOrbitTargetHeight,
                                kHeroOrbitCenterZ);
     }
@@ -3515,14 +4443,20 @@ private:
     }
 
     void drawPayload(DebugDrawEncoder& encoder, Payload payload,
+                     InstanceId instance,
                      const Entity& entity)
     {
         setEntityTransform(encoder, entity);
         encoder.setWireframe(wireframeDebug_);
+        const bool selected =
+            sceneTreeSelectionMatches(payload, instance, entity);
+        const uint32_t selectedTint = abgr(46, 224, 255);
         const auto paint = [&](uint32_t authoredColor)
         {
-            encoder.setColor(hierarchyTint_ ? hierarchyTint(payload)
-                                             : authoredColor);
+            encoder.setColor(selected
+                                 ? selectedTint
+                                 : hierarchyTint_ ? hierarchyTint(payload)
+                                                  : authoredColor);
         };
         switch (payload)
         {
@@ -3834,11 +4768,12 @@ private:
         for (const FrontierEntry& entry : frontier)
         {
             const UserPayload rawPayload =
-                database_.tryGetPayload(entry.nodeHandle);
+                database_.tryGetPayload(entry.nodeHandle,
+                                        entry.payloadIndex());
             if (rawPayload == kInvalidPayload ||
                 entry.instance() >= entities_.size())
                 continue;
-            drawPayload(encoder, Payload(rawPayload),
+            drawPayload(encoder, Payload(rawPayload), entry.instance(),
                         entities_[entry.instance()]);
         }
         drawFrozenCullFrustum(encoder);
@@ -3885,58 +4820,149 @@ private:
                    kTowerDetailResourceCount;
     }
 
-    void markStreamingFallbackAncestors(
-        size_t slot,
-        std::array<bool, kStreamingResourceSlotCount>& fallbackDemand) const
+    size_t streamingRollingFallbackSlot(size_t slot) const
     {
         if (slot >= virtualResources_.size())
-            return;
+            return kStreamingResourceSlotCount;
         const VirtualResource& resource = virtualResources_[slot];
         const Payload payload = resource.payload;
         if (isTowerDetailPayload(payload) &&
             resource.heroAsset < kHeroTowerAssetCount)
         {
-            const size_t detail =
-                size_t(payload) - size_t(Payload::TowerDistrict);
-            // Base/shaft/crown share Fine as their immediate parent. Retain
-            // the full District -> Fine chain so every pressure demotion has
-            // a ready next-coarser representation.
-            const size_t ancestorCount =
-                std::min(detail, size_t(Payload::TowerFine) -
-                                     size_t(Payload::TowerDistrict) + 1);
-            const size_t heroBase =
-                kHeroTowerResourceBase +
-                size_t(resource.heroAsset) * kTowerDetailResourceCount;
-            for (size_t ancestor = 0; ancestor < ancestorCount; ++ancestor)
-                fallbackDemand[heroBase + ancestor] = true;
-            return;
+            const size_t fallbackDetail =
+                towerRollingFallbackDetailIndex(payload);
+            if (fallbackDetail >= kTowerDetailResourceCount)
+                return kStreamingResourceSlotCount;
+            return kHeroTowerResourceBase +
+                   size_t(resource.heroAsset) * kTowerDetailResourceCount +
+                   fallbackDetail;
         }
 
-        size_t coarseSlot = kStreamingResourceSlotCount;
         switch (payload)
         {
         case Payload::HouseBody:
         case Payload::HouseRoof:
-            coarseSlot = resource.houseStyle == HouseStyle::HouseB
-                             ? kPayloadSlotCount
-                             : size_t(Payload::HouseCoarse);
-            break;
+            return resource.houseStyle == HouseStyle::HouseB
+                       ? kPayloadSlotCount
+                       : size_t(Payload::HouseCoarse);
         case Payload::CarBody:
         case Payload::CarCabin:
-            coarseSlot = size_t(Payload::CarCoarse);
-            break;
+            return size_t(Payload::CarCoarse);
         case Payload::PedestrianBody:
         case Payload::PedestrianHead:
-            coarseSlot = size_t(Payload::PedestrianCoarse);
-            break;
+            return size_t(Payload::PedestrianCoarse);
         case Payload::TreeTrunk:
         case Payload::TreeCrown:
-            coarseSlot = size_t(Payload::TreeCoarse);
-            break;
-        default: break;
+            return size_t(Payload::TreeCoarse);
+        default:
+            return kStreamingResourceSlotCount;
         }
-        if (coarseSlot < fallbackDemand.size())
-            fallbackDemand[coarseSlot] = true;
+    }
+
+    void markStreamingRollingFallback(
+        size_t slot,
+        std::array<bool, kStreamingResourceSlotCount>& fallbackDemand) const
+    {
+        const size_t fallbackSlot = streamingRollingFallbackSlot(slot);
+        if (fallbackSlot >= virtualResources_.size())
+            return;
+        // A fallback pin protects only a representation that is ready now.
+        // The current cut itself is protected independently while its finer
+        // replacement loads. Once that replacement becomes current, this pin
+        // rolls forward to the just-replaced representation and older levels
+        // become normal eviction candidates.
+        if (virtualResources_[fallbackSlot].state ==
+            StreamingResourceState::Resident)
+            fallbackDemand[fallbackSlot] = true;
+    }
+
+    void validateStreamingRollingFallbacks(
+        const std::array<bool, kStreamingResourceSlotCount>& currentDemand,
+        const std::array<bool, kStreamingResourceSlotCount>& prefetchDemand,
+        const std::array<bool, kStreamingResourceSlotCount>&
+            fallbackDemand)
+    {
+        bool validate = heroPressureScenarioActive_;
+#ifndef NDEBUG
+        validate = true;
+#endif
+        if (!validate)
+            return;
+
+        bool valid = true;
+        for (size_t fallbackSlot = 0;
+             fallbackSlot < fallbackDemand.size(); ++fallbackSlot)
+        {
+            if (!fallbackDemand[fallbackSlot])
+                continue;
+            bool directlyRequired = false;
+            for (size_t demandedSlot = 0;
+                 demandedSlot < currentDemand.size(); ++demandedSlot)
+            {
+                if (!currentDemand[demandedSlot] &&
+                    !prefetchDemand[demandedSlot])
+                    continue;
+                directlyRequired |=
+                    streamingRollingFallbackSlot(demandedSlot) ==
+                    fallbackSlot;
+            }
+            valid &= directlyRequired &&
+                     virtualResources_[fallbackSlot].state ==
+                         StreamingResourceState::Resident;
+        }
+
+        constexpr size_t fineDetail =
+            size_t(Payload::TowerFine) -
+            size_t(Payload::TowerDistrict);
+        for (uint16_t hero = 0; hero < kHeroTowerAssetCount; ++hero)
+        {
+            const size_t heroBase =
+                kHeroTowerResourceBase +
+                size_t(hero) * kTowerDetailResourceCount;
+            bool structuralDemand = false;
+            for (size_t detail = fineDetail + 1;
+                 detail < kTowerDetailResourceCount; ++detail)
+            {
+                structuralDemand |= currentDemand[heroBase + detail] ||
+                                    prefetchDemand[heroBase + detail];
+            }
+            bool facadeDemand = false;
+            for (size_t detail = 0; detail <= fineDetail; ++detail)
+            {
+                facadeDemand |= currentDemand[heroBase + detail] ||
+                                prefetchDemand[heroBase + detail];
+            }
+            if (!structuralDemand || facadeDemand)
+                continue;
+
+            bool olderPinned = false;
+            bool olderCommitted = false;
+            for (size_t detail = 0; detail < fineDetail; ++detail)
+            {
+                const size_t slot = heroBase + detail;
+                olderPinned |= fallbackDemand[slot];
+                olderCommitted |=
+                    virtualResources_[slot].state !=
+                    StreamingResourceState::Unloaded;
+            }
+            const bool finePinned = fallbackDemand[heroBase + fineDetail];
+            const bool heroValid = finePinned && !olderPinned;
+            valid &= heroValid;
+            if (heroPressureScenarioActive_)
+            {
+                ++heroPressureRollingPinObservations_;
+                if (heroValid && !olderCommitted)
+                    ++heroPressureRollingReleaseObservations_;
+            }
+        }
+
+        if (!valid && heroPressureScenarioActive_)
+            ++heroPressureRollingPinViolations_;
+#ifndef NDEBUG
+        FRONTIER_ASSERT(
+            valid,
+            "rolling fallback pins must contain only direct ready predecessors");
+#endif
     }
 
     void virtualResourceName(const VirtualResource& resource, char* output,
@@ -4143,9 +5169,10 @@ private:
             resource.state != StreamingResourceState::Resident)
             return;
         if (resource.representative.valid())
-            database_.markNodeUnavailable(resource.representative);
+            database_.markPayloadUnavailable(
+                resource.representative,
+                resource.representativePayloadIndex);
         resource.state = StreamingResourceState::Unloaded;
-        resource.residentSince = 0.0f;
         resource.residentBenefitErrors.reset();
         resource.decision = std::string("evicted: ") + reason;
         resource.lastAction = std::string("unloaded: ") + reason;
@@ -4208,10 +5235,13 @@ private:
             if (!active)
             {
                 if (resource.representative.valid() &&
-                    database_.isNodeReady(resource.representative))
-                    database_.markNodeUnavailable(resource.representative);
+                    database_.isPayloadReady(
+                        resource.representative,
+                        resource.representativePayloadIndex))
+                    database_.markPayloadUnavailable(
+                        resource.representative,
+                        resource.representativePayloadIndex);
                 resource.state = StreamingResourceState::Unloaded;
-                resource.residentSince = 0.0f;
                 resource.residentBenefitErrors.reset();
                 resource.decision = "inactive house style";
                 resource.lastAction =
@@ -4221,10 +5251,13 @@ private:
 
             ++activeResources;
             if (resource.representative.valid() &&
-                !database_.isNodeReady(resource.representative))
-                database_.markNodeReady(resource.representative);
+                !database_.isPayloadReady(
+                    resource.representative,
+                    resource.representativePayloadIndex))
+                database_.markPayloadReady(
+                    resource.representative,
+                    resource.representativePayloadIndex);
             resource.state = StreamingResourceState::Resident;
-            resource.residentSince = streamingTime_;
             resource.residentBenefitErrors.reset();
             resource.decision =
                 "resident: virtual streaming disabled";
@@ -4234,6 +5267,8 @@ private:
 
         query_.reset();
         streamingLookaheadQuery_.reset();
+        streamingErrorMeasurementQuery_.reset();
+        lastStreamingErrorImprovement_ = {};
         currentFrontierMemoryMiB_ = virtualResidentMiB();
         idealFrontierMemoryMiB_ = currentFrontierMemoryMiB_;
         protectedFallbackMemoryMiB_ = 0.0f;
@@ -4307,6 +5342,8 @@ private:
         lastStreamingConvergenceSeconds_ = 0.0f;
         query_.reset();
         streamingLookaheadQuery_.reset();
+        streamingErrorMeasurementQuery_.reset();
+        lastStreamingErrorImprovement_ = {};
         appendStreamingLog(ImVec4(0.50f, 0.85f, 1.0f, 1.0f),
                            "RESET complete: only coarsest resources resident");
     }
@@ -4356,13 +5393,15 @@ private:
 
         int focalRank = -1;
         float focalError = 0.0f;
+        float focalGeometricError = 0.0f;
         uint32_t dominantFallbacks = 0;
         float worstDominantFallbackError = 0.0f;
         InstanceId worstDominantFallbackInstance = kInvalidInstanceId;
         for (const FrontierEntry& entry : frontier)
         {
             const UserPayload rawPayload =
-                database_.tryGetPayload(entry.nodeHandle);
+                database_.tryGetPayload(entry.nodeHandle,
+                                        entry.payloadIndex());
             if (rawPayload == kInvalidPayload ||
                 rawPayload >= UserPayload(kPayloadSlotCount))
                 continue;
@@ -4375,6 +5414,9 @@ private:
             {
                 focalRank = std::max(focalRank, rank);
                 focalError = std::max(focalError, error);
+                focalGeometricError = std::max(
+                    focalGeometricError,
+                    authoredGeometricError(payload));
             }
             if (payload == Payload::TowerTop &&
                 error >= kHeroOrbitDominantFallbackErrorPixels)
@@ -4390,6 +5432,27 @@ private:
 
         const float elapsed =
             streamingTime_ - heroPressureScenarioStartTime_;
+        const bool approaching =
+            streamingSelfTest_ &&
+            heroPressureOrbitPhaseOffset_ + elapsed <=
+                kHeroApproachSeconds + 0.001f;
+        if (approaching && focalRank >= 0)
+        {
+            if (std::isfinite(heroPressureLastFocalGeometricError_) &&
+                focalGeometricError >
+                    heroPressureLastFocalGeometricError_ + 0.0001f)
+            {
+                ++heroPressureGeometricErrorRegressions_;
+                std::printf(
+                    "FRONTIER_STREAMING_SELF_TEST ERROR_REGRESSION "
+                    "t=%.2f previous=%.2fm current=%.2fm lod=%s\n",
+                    elapsed, heroPressureLastFocalGeometricError_,
+                    focalGeometricError, towerLodName(focalRank));
+                std::fflush(stdout);
+            }
+            heroPressureLastFocalGeometricError_ =
+                focalGeometricError;
+        }
         if (focalRank >= 0)
             ++heroPressureFocalObservedFrames_;
         if (elapsed >= kHeroOrbitWarmupSeconds && focalRank == 0)
@@ -4533,15 +5596,42 @@ private:
         heroPressureScenarioStartLoads_ = streamingLoadsCompleted_;
         heroPressureScenarioStartUnloads_ = streamingUnloads_;
         heroPressureScenarioStartDemotions_ = streamingQualityDemotions_;
+        heroPressureScenarioStartCurrentCutInvalidations_ =
+            streamingCurrentCutInvalidations_;
+        heroPressureScenarioStartAtomicPublicationViolations_ =
+            streamingAtomicPublicationViolations_;
+        heroPressureScenarioStartAtomicGroupCompletions_ =
+            streamingAtomicGroupCompletions_;
+        heroPressureScenarioStartCapacityBlockedRequests_ =
+            streamingCapacityBlockedRequests_;
+        heroPressureScenarioStartErrorMeasurements_ =
+            streamingErrorMeasurements_;
+        heroPressureScenarioStartPositiveErrorMeasurements_ =
+            streamingPositiveErrorMeasurements_;
+        heroPressureScenarioStartErrorMeasurementRegressions_ =
+            streamingErrorMeasurementRegressions_;
         heroPressureScenarioLoads_ = 0;
         heroPressureScenarioUnloads_ = 0;
         heroPressureScenarioDemotions_ = 0;
+        heroPressureScenarioCurrentCutInvalidations_ = 0;
+        heroPressureScenarioAtomicPublicationViolations_ = 0;
+        heroPressureScenarioAtomicGroupCompletions_ = 0;
+        heroPressureScenarioCapacityBlockedRequests_ = 0;
+        heroPressureScenarioErrorMeasurements_ = 0;
+        heroPressureScenarioPositiveErrorMeasurements_ = 0;
+        heroPressureScenarioErrorMeasurementRegressions_ = 0;
         heroPressureScenarioElapsed_ = 0.0f;
         heroPressureScenarioFineHeroes_ = 0;
         heroPressureFocalObservedFrames_ = 0;
         heroPressureFocalFallbackFrames_ = 0;
         heroPressureWorstFallbackError_ = 0.0f;
         heroPressureFirstFallbackTime_ = -1.0f;
+        heroPressureLastFocalGeometricError_ =
+            std::numeric_limits<float>::infinity();
+        heroPressureGeometricErrorRegressions_ = 0;
+        heroPressureRollingPinObservations_ = 0;
+        heroPressureRollingReleaseObservations_ = 0;
+        heroPressureRollingPinViolations_ = 0;
         heroPressureLastFocalRank_ = -2;
         heroPressureDominantFallbackFrames_ = 0;
         heroPressureMaxDominantFallbacks_ = 0;
@@ -4591,6 +5681,27 @@ private:
         heroPressureScenarioDemotions_ =
             streamingQualityDemotions_ -
             heroPressureScenarioStartDemotions_;
+        heroPressureScenarioCurrentCutInvalidations_ =
+            streamingCurrentCutInvalidations_ -
+            heroPressureScenarioStartCurrentCutInvalidations_;
+        heroPressureScenarioAtomicPublicationViolations_ =
+            streamingAtomicPublicationViolations_ -
+            heroPressureScenarioStartAtomicPublicationViolations_;
+        heroPressureScenarioAtomicGroupCompletions_ =
+            streamingAtomicGroupCompletions_ -
+            heroPressureScenarioStartAtomicGroupCompletions_;
+        heroPressureScenarioCapacityBlockedRequests_ =
+            streamingCapacityBlockedRequests_ -
+            heroPressureScenarioStartCapacityBlockedRequests_;
+        heroPressureScenarioErrorMeasurements_ =
+            streamingErrorMeasurements_ -
+            heroPressureScenarioStartErrorMeasurements_;
+        heroPressureScenarioPositiveErrorMeasurements_ =
+            streamingPositiveErrorMeasurements_ -
+            heroPressureScenarioStartPositiveErrorMeasurements_;
+        heroPressureScenarioErrorMeasurementRegressions_ =
+            streamingErrorMeasurementRegressions_ -
+            heroPressureScenarioStartErrorMeasurementRegressions_;
         heroPressureScenarioFineHeroes_ = residentHeroFineCount();
 
         char message[256];
@@ -4616,6 +5727,13 @@ private:
             "firstFallback=%.2fs worstFallbackError=%.2fpx "
             "dominantFallbackFrames=%u maxDominantFallbacks=%u "
             "firstDominantFallback=%.2fs worstDominantError=%.2fpx "
+            "cutInvalidations=%llu errorRegressions=%u "
+            "atomicPublishViolations=%llu atomicGroups=%llu "
+            "capacityBlocks=%llu "
+            "rollingPinObservations=%u rollingReleases=%u "
+            "rollingPinViolations=%u "
+            "errorMeasurements=%llu positiveErrorMeasurements=%llu "
+            "errorMeasurementRegressions=%llu "
             "rapidReloads=%u maxResourceRapidReloads=%u "
             "maxResourceTransitions=%u\n",
             passed ? "PASS" : "FAIL", heroPressureScenarioElapsed_,
@@ -4634,6 +5752,24 @@ private:
             heroPressureMaxDominantFallbacks_,
             heroPressureFirstDominantFallbackTime_,
             heroPressureWorstDominantFallbackError_,
+            static_cast<unsigned long long>(
+                heroPressureScenarioCurrentCutInvalidations_),
+            heroPressureGeometricErrorRegressions_,
+            static_cast<unsigned long long>(
+                heroPressureScenarioAtomicPublicationViolations_),
+            static_cast<unsigned long long>(
+                heroPressureScenarioAtomicGroupCompletions_),
+            static_cast<unsigned long long>(
+                heroPressureScenarioCapacityBlockedRequests_),
+            heroPressureRollingPinObservations_,
+            heroPressureRollingReleaseObservations_,
+            heroPressureRollingPinViolations_,
+            static_cast<unsigned long long>(
+                heroPressureScenarioErrorMeasurements_),
+            static_cast<unsigned long long>(
+                heroPressureScenarioPositiveErrorMeasurements_),
+            static_cast<unsigned long long>(
+                heroPressureScenarioErrorMeasurementRegressions_),
             heroPressureRapidReloads_,
             heroPressureMaxResourceRapidReloads_,
             heroPressureMaxResourceTransitions_);
@@ -4685,21 +5821,261 @@ private:
         const float committed = virtualResidentMiB() + virtualLoadingMiB();
         const bool withinBudget =
             committed <= virtualMemoryBudgetMiB_ + 0.001f;
+        heroPressureScenarioWithinBudget_ &= withinBudget;
         if (elapsed >= kHeroOrbitTestSeconds)
         {
-            heroPressureScenarioWithinBudget_ = withinBudget;
+            const uint64_t currentCutInvalidations =
+                streamingCurrentCutInvalidations_ -
+                heroPressureScenarioStartCurrentCutInvalidations_;
+            const uint64_t atomicPublicationViolations =
+                streamingAtomicPublicationViolations_ -
+                heroPressureScenarioStartAtomicPublicationViolations_;
+            const uint64_t atomicGroupCompletions =
+                streamingAtomicGroupCompletions_ -
+                heroPressureScenarioStartAtomicGroupCompletions_;
+            const uint64_t capacityBlockedRequests =
+                streamingCapacityBlockedRequests_ -
+                heroPressureScenarioStartCapacityBlockedRequests_;
+            const uint64_t qualityDemotions =
+                streamingQualityDemotions_ -
+                heroPressureScenarioStartDemotions_;
+            const bool handoffPassed =
+                currentCutInvalidations == 0 &&
+                atomicPublicationViolations == 0 &&
+                heroPressureGeometricErrorRegressions_ == 0;
+            const bool regressionCoveragePassed =
+                !streamingSelfTest_ ||
+                (atomicGroupCompletions != 0 &&
+                 capacityBlockedRequests != 0 &&
+                 qualityDemotions == 0 &&
+                 heroPressureRollingPinObservations_ != 0 &&
+                 heroPressureRollingReleaseObservations_ != 0 &&
+                 streamingErrorMeasurements_ !=
+                     heroPressureScenarioStartErrorMeasurements_ &&
+                 streamingPositiveErrorMeasurements_ !=
+                     heroPressureScenarioStartPositiveErrorMeasurements_);
             const bool passed =
-                withinBudget && heroPressureFocalObservedFrames_ != 0 &&
+                heroPressureScenarioWithinBudget_ &&
+                heroPressureFocalObservedFrames_ != 0 &&
                 heroPressureFocalFallbackFrames_ == 0 &&
                 heroPressureDominantFallbackFrames_ == 0 &&
                 heroPressureMaxResourceRapidReloads_ <=
-                    kHeroOrbitMaxRapidReloads;
+                    kHeroOrbitMaxRapidReloads &&
+                heroPressureRollingPinViolations_ == 0 &&
+                streamingErrorMeasurementRegressions_ ==
+                    heroPressureScenarioStartErrorMeasurementRegressions_ &&
+                handoffPassed && regressionCoveragePassed;
             finishHeroPressureScenario(passed);
         }
     }
 
-    void completePendingStreamingGroups()
+    void validateStreamingHandoff(
+        const FrontierResultView& frontier, bool preserveCurrentCut)
     {
+        bool validate = heroPressureScenarioActive_;
+#ifndef NDEBUG
+        validate = true;
+#endif
+        if (!validate)
+            return;
+
+        uint32_t currentCutViolations = 0;
+        if (preserveCurrentCut)
+        {
+            for (const FrontierEntry& entry : frontier)
+            {
+                if (database_.isPayloadReady(
+                        entry.nodeHandle, entry.payloadIndex()))
+                    continue;
+                ++currentCutViolations;
+                if (streamingSelfTest_)
+                {
+                    const UserPayload payload = database_.tryGetPayload(
+                        entry.nodeHandle, entry.payloadIndex());
+                    std::printf(
+                        "FRONTIER_STREAMING_SELF_TEST "
+                        "CURRENT_CUT_INVALIDATED t=%.2f instance=%u "
+                        "payload=%llu index=%u\n",
+                        streamingTime_ - heroPressureScenarioStartTime_,
+                        entry.instance(),
+                        static_cast<unsigned long long>(payload),
+                        uint32_t(entry.payloadIndex()));
+                }
+            }
+            streamingCurrentCutInvalidations_ += currentCutViolations;
+        }
+
+        uint32_t pendingPublicationViolations = 0;
+        for (const PendingStreamingGroup& group : pendingStreamingGroups_)
+        {
+            for (size_t slot : group.resources)
+            {
+                const VirtualResource& resource = virtualResources_[slot];
+                if (resource.state != StreamingResourceState::Loading ||
+                    database_.isPayloadReady(
+                        resource.representative,
+                        resource.representativePayloadIndex))
+                    ++pendingPublicationViolations;
+            }
+        }
+        streamingAtomicPublicationViolations_ +=
+            pendingPublicationViolations;
+        if (streamingSelfTest_ &&
+            (currentCutViolations != 0 ||
+             pendingPublicationViolations != 0))
+            std::fflush(stdout);
+        FRONTIER_ASSERT(
+            currentCutViolations == 0,
+            "streaming load invalidated an entry in the current cut");
+        FRONTIER_ASSERT(
+            pendingPublicationViolations == 0,
+            "pending streaming groups must remain wholly unavailable");
+    }
+
+    FrontierErrorSnapshot captureStreamingErrorSnapshot(
+        const Camera& camera, const SelectionParams& selection,
+        std::span<const size_t> groupResources,
+        PerformanceSample& performance)
+    {
+        const int64_t begin = bx::getHPCounter();
+        const FrontierResultView measured =
+            streamingErrorMeasurementQuery_.selectFrontier(
+                database_, camera, selection);
+
+        FrontierErrorSnapshot result;
+        result.instanceMaxPixels.resize(entities_.size(), 0.0f);
+        result.instanceVisible.resize(entities_.size(), 0);
+        result.selectedGroupInstance.resize(entities_.size(), 0);
+        for (const FrontierEntry& entry : measured)
+        {
+            const InstanceId instance = entry.instance();
+            if (instance >= entities_.size())
+                continue;
+            if (result.instanceVisible[instance] == 0)
+            {
+                result.instanceVisible[instance] = 1;
+                ++result.visibleInstances;
+            }
+            const float error =
+                entry.approximateError(selection.threshold);
+            result.instanceMaxPixels[instance] = std::max(
+                result.instanceMaxPixels[instance], error);
+
+            if (groupResources.empty())
+                continue;
+            const UserPayload rawPayload = database_.tryGetPayload(
+                entry.nodeHandle, entry.payloadIndex());
+            if (rawPayload == kInvalidPayload ||
+                rawPayload >= UserPayload(kPayloadSlotCount))
+                continue;
+            const size_t slot = virtualResourceSlot(
+                Payload(rawPayload), instance);
+            if (std::find(groupResources.begin(), groupResources.end(),
+                          slot) != groupResources.end())
+                result.selectedGroupInstance[instance] = 1;
+        }
+
+        double squaredError = 0.0;
+        for (size_t instance = 0;
+             instance < result.instanceMaxPixels.size(); ++instance)
+        {
+            if (result.instanceVisible[instance] == 0)
+                continue;
+            const float error = result.instanceMaxPixels[instance];
+            squaredError += double(error) * double(error);
+            result.worstPixels = std::max(result.worstPixels, error);
+        }
+        if (result.visibleInstances != 0)
+        {
+            result.rmsPixels = float(std::sqrt(
+                squaredError / double(result.visibleInstances)));
+        }
+        performance.streamingErrorMeasurementMs +=
+            milliseconds(begin, bx::getHPCounter());
+        return result;
+    }
+
+    StreamingErrorImprovement recordStreamingErrorImprovement(
+        const PendingStreamingGroup& group,
+        const std::string& resourceNames,
+        const FrontierErrorSnapshot& before,
+        const FrontierErrorSnapshot& after)
+    {
+        StreamingErrorImprovement result;
+        result.resourceNames = resourceNames;
+        result.groupSerial = group.serial;
+        result.sceneBeforeRmsPixels = before.rmsPixels;
+        result.sceneAfterRmsPixels = after.rmsPixels;
+        result.sceneBeforeWorstPixels = before.worstPixels;
+        result.sceneAfterWorstPixels = after.worstPixels;
+
+        double localBeforeSquared = 0.0;
+        double localAfterSquared = 0.0;
+        for (size_t instance = 0;
+             instance < after.selectedGroupInstance.size(); ++instance)
+        {
+            if (after.selectedGroupInstance[instance] == 0 ||
+                instance >= before.instanceVisible.size() ||
+                before.instanceVisible[instance] == 0 ||
+                after.instanceVisible[instance] == 0)
+                continue;
+            const float beforeError = before.instanceMaxPixels[instance];
+            const float afterError = after.instanceMaxPixels[instance];
+            localBeforeSquared +=
+                double(beforeError) * double(beforeError);
+            localAfterSquared += double(afterError) * double(afterError);
+            result.localBeforeWorstPixels = std::max(
+                result.localBeforeWorstPixels, beforeError);
+            result.localAfterWorstPixels = std::max(
+                result.localAfterWorstPixels, afterError);
+            ++result.affectedInstances;
+        }
+        if (result.affectedInstances != 0)
+        {
+            result.localBeforeRmsPixels = float(std::sqrt(
+                localBeforeSquared / double(result.affectedInstances)));
+            result.localAfterRmsPixels = float(std::sqrt(
+                localAfterSquared / double(result.affectedInstances)));
+        }
+        result.valid = true;
+        lastStreamingErrorImprovement_ = result;
+        ++streamingErrorMeasurements_;
+        if (result.affectedInstances == 0)
+        {
+            ++streamingNoCutChangePublications_;
+        }
+        else
+        {
+            ++streamingVisibleErrorMeasurements_;
+            if (result.localAfterRmsPixels + 0.0001f <
+                result.localBeforeRmsPixels)
+                ++streamingPositiveErrorMeasurements_;
+            if (result.localAfterRmsPixels >
+                result.localBeforeRmsPixels + 0.01f)
+                ++streamingErrorMeasurementRegressions_;
+#ifndef NDEBUG
+            FRONTIER_ASSERT(
+                result.localAfterRmsPixels <=
+                    result.localBeforeRmsPixels + 0.01f,
+                "a newly selected LOD must not increase affected-object error");
+#endif
+        }
+        return result;
+    }
+
+    static float errorImprovementPercent(float before, float after)
+    {
+        return before > 0.0001f
+                   ? 100.0f * (before - after) / before
+                   : 0.0f;
+    }
+
+    void completePendingStreamingGroups(
+        const Camera& errorCamera, const SelectionParams& selection,
+        PerformanceSample& performance)
+    {
+        bool haveBeforeSnapshot = false;
+        FrontierErrorSnapshot beforeSnapshot;
         for (size_t groupIndex = 0;
              groupIndex < pendingStreamingGroups_.size();)
         {
@@ -4711,46 +6087,177 @@ private:
                 continue;
             }
 
-            uint32_t completed = 0;
-            uint32_t stale = 0;
+            bool publishable = !group.resources.empty();
             for (size_t slot : group.resources)
             {
-                VirtualResource& resource = virtualResources_[slot];
-                if (resource.state != StreamingResourceState::Loading)
-                    continue;
+                const VirtualResource& resource = virtualResources_[slot];
                 const UserPayload payload =
-                    database_.tryGetPayload(resource.representative);
-                if (payload == UserPayload(resource.payload))
+                    database_.tryGetPayload(
+                        resource.representative,
+                        resource.representativePayloadIndex);
+                publishable &=
+                    resource.state == StreamingResourceState::Loading &&
+                    payload == UserPayload(resource.payload) &&
+                    !database_.isPayloadReady(
+                        resource.representative,
+                        resource.representativePayloadIndex);
+            }
+
+            if (publishable)
+            {
+                if (!haveBeforeSnapshot)
                 {
-                    database_.markNodeReady(resource.representative);
+                    streamingErrorMeasurementQuery_.reset();
+                    beforeSnapshot = captureStreamingErrorSnapshot(
+                        errorCamera, selection, {}, performance);
+                    haveBeforeSnapshot = true;
+                }
+                for (size_t slot : group.resources)
+                {
+                    VirtualResource& resource = virtualResources_[slot];
+                    database_.markPayloadReady(
+                        resource.representative,
+                        resource.representativePayloadIndex);
+                }
+                bool allReady = true;
+                for (size_t slot : group.resources)
+                {
+                    const VirtualResource& resource =
+                        virtualResources_[slot];
+                    allReady &= database_.isPayloadReady(
+                        resource.representative,
+                        resource.representativePayloadIndex);
+                }
+                if (!allReady)
+                {
+                    ++streamingAtomicPublicationViolations_;
+                    for (size_t slot : group.resources)
+                    {
+                        VirtualResource& resource =
+                            virtualResources_[slot];
+                        if (database_.isPayloadReady(
+                                resource.representative,
+                                resource.representativePayloadIndex))
+                        {
+                            database_.markPayloadUnavailable(
+                                resource.representative,
+                                resource.representativePayloadIndex);
+                        }
+                    }
+                    publishable = false;
+                    FRONTIER_ASSERT(
+                        false,
+                        "streaming group publication must be atomic");
+                }
+            }
+
+            uint32_t completed = 0;
+            uint32_t stale = 0;
+            std::string names;
+            for (size_t slot : group.resources)
+            {
+                char name[96];
+                virtualResourceName(virtualResources_[slot], name,
+                                    sizeof(name));
+                if (!names.empty())
+                    names += ", ";
+                names += name;
+            }
+            if (publishable)
+            {
+                for (size_t slot : group.resources)
+                {
+                    VirtualResource& resource = virtualResources_[slot];
                     resource.state = StreamingResourceState::Resident;
                     resource.lastDemandTime = streamingTime_;
-                    resource.residentSince = streamingTime_;
                     resource.decision = "keep: load completed";
                     resource.lastAction = "load completed";
                     ++completed;
                     ++streamingLoadsCompleted_;
                 }
-                else
+                if (group.resources.size() > 1)
+                    ++streamingAtomicGroupCompletions_;
+            }
+            else
+            {
+                for (size_t slot : group.resources)
                 {
-                    resource.state = StreamingResourceState::Unloaded;
-                    resource.residentBenefitErrors.reset();
-                    resource.decision =
-                        "unloaded: stale representative handle";
-                    resource.lastAction =
-                        "load completion skipped: stale handle";
+                    VirtualResource& resource = virtualResources_[slot];
+                    if (resource.state ==
+                        StreamingResourceState::Loading)
+                    {
+                        resource.state =
+                            StreamingResourceState::Unloaded;
+                        resource.residentBenefitErrors.reset();
+                        resource.decision =
+                            "unloaded: atomic group publish aborted";
+                        resource.lastAction =
+                            "load completion skipped: stale group";
+                    }
                     ++stale;
                 }
             }
 
-            char message[224];
-            std::snprintf(
-                message, sizeof(message),
-                "LOAD complete group #%llu: %u resources, %.3f MiB, "
-                "score %.1f/MiB%s",
-                static_cast<unsigned long long>(group.serial), completed,
-                group.byteSizeMiB, group.scorePerMiB,
-                stale != 0 ? " (stale handles skipped)" : "");
+            char message[768];
+            if (publishable)
+            {
+                const FrontierErrorSnapshot afterSnapshot =
+                    captureStreamingErrorSnapshot(
+                        errorCamera, selection, group.resources,
+                        performance);
+                const StreamingErrorImprovement improvement =
+                    recordStreamingErrorImprovement(
+                        group, names, beforeSnapshot, afterSnapshot);
+                beforeSnapshot = afterSnapshot;
+                if (improvement.affectedInstances != 0)
+                {
+                    std::snprintf(
+                        message, sizeof(message),
+                        "LOAD complete group #%llu: %s (%u resources) | "
+                        "%.3f MiB, score "
+                        "%.1f/MiB | error on %u objects: local RMS %.3f -> "
+                        "%.3f px (%.1f%% better), overall RMS %.3f -> %.3f "
+                        "px (%.3f%% better), scene worst %.3f -> %.3f px",
+                        static_cast<unsigned long long>(group.serial),
+                        names.c_str(), completed, group.byteSizeMiB,
+                        group.scorePerMiB,
+                        improvement.affectedInstances,
+                        improvement.localBeforeRmsPixels,
+                        improvement.localAfterRmsPixels,
+                        errorImprovementPercent(
+                            improvement.localBeforeRmsPixels,
+                            improvement.localAfterRmsPixels),
+                        improvement.sceneBeforeRmsPixels,
+                        improvement.sceneAfterRmsPixels,
+                        errorImprovementPercent(
+                            improvement.sceneBeforeRmsPixels,
+                            improvement.sceneAfterRmsPixels),
+                        improvement.sceneBeforeWorstPixels,
+                        improvement.sceneAfterWorstPixels);
+                }
+                else
+                {
+                    std::snprintf(
+                        message, sizeof(message),
+                        "LOAD complete group #%llu: %s (%u resources) | "
+                        "%.3f MiB, score "
+                        "%.1f/MiB | current cut unchanged at this camera "
+                        "(prefetch/future demand)",
+                        static_cast<unsigned long long>(group.serial),
+                        names.c_str(), completed, group.byteSizeMiB,
+                        group.scorePerMiB);
+                }
+            }
+            else
+            {
+                std::snprintf(
+                    message, sizeof(message),
+                    "LOAD complete group #%llu: %s | 0/%u resources, "
+                    "%.3f MiB, score %.1f/MiB (atomic publish aborted)",
+                    static_cast<unsigned long long>(group.serial),
+                    names.c_str(), uint32_t(group.resources.size()),
+                    group.byteSizeMiB, group.scorePerMiB);
+            }
             appendStreamingLog(
                 stale == 0 ? ImVec4(0.35f, 0.85f, 0.45f, 1.0f)
                            : ImVec4(1.0f, 0.55f, 0.20f, 1.0f),
@@ -4799,10 +6306,13 @@ private:
 
     void updateVirtualStreaming(const FrontierResultView& frontier,
                                 const FrontierResultView& prefetchFrontier,
+                                const Camera& errorCamera,
+                                const SelectionParams& selection,
                                 float deltaTime,
                                 PerformanceSample& performance)
     {
         performance.streamingRefinementMs = 0.0f;
+        performance.streamingErrorMeasurementMs = 0.0f;
         performance.streamingPlannerIndexMs = 0.0f;
         performance.streamingPlannerDemandMs = 0.0f;
         performance.streamingPlannerScoreMs = 0.0f;
@@ -4813,6 +6323,7 @@ private:
 
         if (!virtualStreamingEnabled_)
         {
+            sceneTreeFallbackPinned_.fill(false);
             std::array<bool, kStreamingResourceSlotCount> currentDemand{};
             for (VirtualResource& resource : virtualResources_)
             {
@@ -4833,7 +6344,8 @@ private:
             for (const FrontierEntry& entry : frontier)
             {
                 const UserPayload rawPayload =
-                    database_.tryGetPayload(entry.nodeHandle);
+                    database_.tryGetPayload(entry.nodeHandle,
+                                            entry.payloadIndex());
                 if (rawPayload == kInvalidPayload ||
                     rawPayload >= UserPayload(kPayloadSlotCount))
                     continue;
@@ -4885,6 +6397,10 @@ private:
             return;
         }
 
+        const bool preserveCurrentCut =
+            virtualResidentMiB() + virtualLoadingMiB() <=
+            virtualMemoryBudgetMiB_ + 0.001f;
+
         int64_t refinementStart = bx::getHPCounter();
         const FrontierRefinementView refinement =
             query_.computeFrontierRefinement(
@@ -4923,7 +6439,8 @@ private:
         const auto resourceForEntry = [this](const FrontierEntry& entry)
         {
             const UserPayload rawPayload =
-                database_.tryGetPayload(entry.nodeHandle);
+                database_.tryGetPayload(entry.nodeHandle,
+                                        entry.payloadIndex());
             if (rawPayload == kInvalidPayload ||
                 rawPayload >= UserPayload(kPayloadSlotCount))
                 return kStreamingResourceSlotCount;
@@ -4932,6 +6449,8 @@ private:
             if (slot >= virtualResources_.size())
                 return kStreamingResourceSlotCount;
             virtualResources_[slot].representative = entry.nodeHandle;
+            virtualResources_[slot].representativePayloadIndex =
+                entry.payloadIndex();
             return slot;
         };
 
@@ -4956,7 +6475,8 @@ private:
                 entry.approximateError(refinementThreshold);
             virtualResources_[slot].currentErrors.add(screenError);
             const UserPayload rawPayload =
-                database_.tryGetPayload(entry.nodeHandle);
+                database_.tryGetPayload(entry.nodeHandle,
+                                        entry.payloadIndex());
             if (rawPayload == UserPayload(Payload::TowerTop) &&
                 screenError >= kHeroOrbitDominantFallbackErrorPixels)
             {
@@ -5068,7 +6588,8 @@ private:
                     entry.approximateError(prefetchThreshold);
                 virtualResources_[slot].prefetchErrors.add(screenError);
                 const UserPayload rawPayload =
-                    database_.tryGetPayload(entry.nodeHandle);
+                    database_.tryGetPayload(entry.nodeHandle,
+                                            entry.payloadIndex());
                 if (rawPayload == UserPayload(Payload::TowerTop) &&
                     screenError >= kHeroOrbitDominantFallbackErrorPixels)
                 {
@@ -5141,7 +6662,10 @@ private:
 
         for (size_t slot = 0; slot < currentDemand.size(); ++slot)
             if (currentDemand[slot] || prefetchDemand[slot])
-                markStreamingFallbackAncestors(slot, fallbackDemand);
+                markStreamingRollingFallback(slot, fallbackDemand);
+        validateStreamingRollingFallbacks(
+            currentDemand, prefetchDemand, fallbackDemand);
+        sceneTreeFallbackPinned_ = fallbackDemand;
 
         for (VirtualResource& resource : virtualResources_)
         {
@@ -5199,7 +6723,7 @@ private:
                 protectedFallbackMemoryMiB_ += resource.byteSizeMiB;
                 if (!currentDemand[slot] && !transitionDemand[slot])
                     resource.decision =
-                        "keep: ready fallback chain for current cut";
+                        "keep: rolling immediate fallback pin";
             }
             if (!resource.pinned && qualityFloorDemand[slot] &&
                 resource.state == StreamingResourceState::Resident)
@@ -5238,7 +6762,6 @@ private:
             bool transition = false;
             bool fallback = false;
             bool qualityFloor = false;
-            bool currentResidencyYoung = false;
         };
         const auto residentGroupFor =
             [&](size_t seed)
@@ -5262,10 +6785,6 @@ private:
                     result.transition |= transitionDemand[slot];
                     result.fallback |= fallbackDemand[slot];
                     result.qualityFloor |= qualityFloorDemand[slot];
-                    result.currentResidencyYoung |=
-                        currentDemand[slot] &&
-                        streamingTime_ - resource.residentSince <
-                            kStreamingCurrentMinimumResidencySeconds;
                 }
                 result.scorePerMiB =
                     result.importanceScore /
@@ -5353,7 +6872,8 @@ private:
                                     "memory budget reduced", false);
         }
 
-        completePendingStreamingGroups();
+        completePendingStreamingGroups(
+            errorCamera, selection, performance);
 
         for (size_t slot = 0; slot < virtualResources_.size(); ++slot)
         {
@@ -5413,7 +6933,6 @@ private:
                 virtualResidentMiB() + virtualLoadingMiB();
             float plannedCommittedMiB = committedMiB;
             float plannedVictimImportance = 0.0f;
-            bool plannedCurrentDemotion = false;
             std::vector<ResidentGroup> evictionPlan;
             std::array<bool, kStreamingResourceSlotCount> plannedVictims{};
             while (plannedCommittedMiB + missingMiB >
@@ -5435,22 +6954,15 @@ private:
                         group.qualityFloor ||
                         (!candidate.qualityFloor && group.transition) ||
                         (!candidate.qualityFloor && group.fallback) ||
-                        (!candidate.qualityFloor &&
-                         group.currentResidencyYoung) ||
+                        group.current ||
                         (!candidate.qualityFloor &&
                          group.scorePerMiB >= candidate.scorePerMiB))
                         continue;
-                    const bool demotableCurrent =
-                        group.current &&
-                        streamingCutStrategy_ ==
-                            StreamingCutStrategy::QualityPerByte;
-                    if (group.current && !demotableCurrent)
-                        continue;
-                    const int evictionClass = group.current ? 1 : 0;
                     const bool betterTie =
                         evictionGroup.count != 0 &&
                         group.scorePerMiB == lowestScorePerMiB &&
                         group.byteSizeMiB > largestMiB;
+                    constexpr int evictionClass = 0;
                     if (evictionClass < bestEvictionClass ||
                         (evictionClass == bestEvictionClass &&
                          (group.scorePerMiB < lowestScorePerMiB ||
@@ -5468,17 +6980,14 @@ private:
                     plannedVictims[evictionGroup.resources[index]] = true;
                 plannedCommittedMiB -= evictionGroup.byteSizeMiB;
                 plannedVictimImportance += evictionGroup.importanceScore;
-                plannedCurrentDemotion |= evictionGroup.current;
                 evictionPlan.push_back(evictionGroup);
             }
 
             const bool capacityFeasible =
                 plannedCommittedMiB + missingMiB <=
                 virtualMemoryBudgetMiB_ + 0.001f;
-            const float replacementMinimumGain =
-                plannedCurrentDemotion
-                    ? kStreamingCurrentReplacementMinimumGain
-                    : kStreamingReplacementMinimumGain;
+            constexpr float replacementMinimumGain =
+                kStreamingReplacementMinimumGain;
             const bool valueImproves =
                 candidate.qualityFloor || evictionPlan.empty() ||
                 candidate.importanceScore >=
@@ -5488,7 +6997,10 @@ private:
             {
                 ++lastBudgetBlockedGroups_;
                 if (!capacityFeasible)
+                {
                     ++lastCapacityBlockedGroups_;
+                    ++streamingCapacityBlockedRequests_;
+                }
                 else
                     ++lastValueBlockedGroups_;
                 const float required = committedMiB + missingMiB;
@@ -5551,16 +7063,12 @@ private:
             }
             for (const ResidentGroup& evictionGroup : evictionPlan)
             {
-                if (evictionGroup.current)
-                    unloadResidentGroup(
-                        evictionGroup,
-                        "quality-per-byte replacement; coarsen complete "
-                        "group to ready ancestor",
-                        true);
-                else
-                    unloadResidentGroup(
-                        evictionGroup,
-                        "lower group score/MiB than requested group", false);
+                FRONTIER_ASSERT(
+                    !evictionGroup.current,
+                    "load admission cannot evict the current cut");
+                unloadResidentGroup(
+                    evictionGroup,
+                    "lower group score/MiB than requested group", false);
             }
 
             PendingStreamingGroup group;
@@ -5612,7 +7120,9 @@ private:
         }
 
         if (streamingLatencySeconds_ <= 0.0f)
-            completePendingStreamingGroups();
+            completePendingStreamingGroups(
+                errorCamera, selection, performance);
+        validateStreamingHandoff(frontier, preserveCurrentCut);
         performance.streamingPlannerResidencyMs =
             milliseconds(residencyStart, bx::getHPCounter());
     }
@@ -5620,6 +7130,7 @@ private:
     SpatialDatabase database_;
     SpatialQuery query_;
     SpatialQuery streamingLookaheadQuery_;
+    SpatialQuery streamingErrorMeasurementQuery_;
     std::vector<Entity> entities_;
 
     std::array<SubtreeHandle, 2> houseDefinitions_{};
@@ -5744,6 +7255,7 @@ private:
         heroPressureLastUnloadTime_{};
     std::vector<PendingStreamingGroup> pendingStreamingGroups_;
     std::vector<StreamingLogEntry> streamingLog_;
+    StreamingErrorImprovement lastStreamingErrorImprovement_;
     float virtualMemoryBudgetMiB_ = kHeroPressureTestBudgetMiB;
     float streamingLatencySeconds_ = 0.65f;
     float streamingUnloadDelaySeconds_ = 2.0f;
@@ -5762,12 +7274,35 @@ private:
     uint64_t streamingLoadsCompleted_ = 0;
     uint64_t streamingUnloads_ = 0;
     uint64_t streamingQualityDemotions_ = 0;
+    uint64_t streamingCurrentCutInvalidations_ = 0;
+    uint64_t streamingAtomicPublicationViolations_ = 0;
+    uint64_t streamingAtomicGroupCompletions_ = 0;
+    uint64_t streamingCapacityBlockedRequests_ = 0;
+    uint64_t streamingErrorMeasurements_ = 0;
+    uint64_t streamingVisibleErrorMeasurements_ = 0;
+    uint64_t streamingPositiveErrorMeasurements_ = 0;
+    uint64_t streamingNoCutChangePublications_ = 0;
+    uint64_t streamingErrorMeasurementRegressions_ = 0;
     uint64_t heroPressureScenarioStartLoads_ = 0;
     uint64_t heroPressureScenarioStartUnloads_ = 0;
     uint64_t heroPressureScenarioStartDemotions_ = 0;
+    uint64_t heroPressureScenarioStartCurrentCutInvalidations_ = 0;
+    uint64_t heroPressureScenarioStartAtomicPublicationViolations_ = 0;
+    uint64_t heroPressureScenarioStartAtomicGroupCompletions_ = 0;
+    uint64_t heroPressureScenarioStartCapacityBlockedRequests_ = 0;
+    uint64_t heroPressureScenarioStartErrorMeasurements_ = 0;
+    uint64_t heroPressureScenarioStartPositiveErrorMeasurements_ = 0;
+    uint64_t heroPressureScenarioStartErrorMeasurementRegressions_ = 0;
     uint64_t heroPressureScenarioLoads_ = 0;
     uint64_t heroPressureScenarioUnloads_ = 0;
     uint64_t heroPressureScenarioDemotions_ = 0;
+    uint64_t heroPressureScenarioCurrentCutInvalidations_ = 0;
+    uint64_t heroPressureScenarioAtomicPublicationViolations_ = 0;
+    uint64_t heroPressureScenarioAtomicGroupCompletions_ = 0;
+    uint64_t heroPressureScenarioCapacityBlockedRequests_ = 0;
+    uint64_t heroPressureScenarioErrorMeasurements_ = 0;
+    uint64_t heroPressureScenarioPositiveErrorMeasurements_ = 0;
+    uint64_t heroPressureScenarioErrorMeasurementRegressions_ = 0;
     std::array<float, kStreamingConvergenceHistorySize>
         streamingConvergenceHistory_{};
     size_t streamingConvergenceHistoryCursor_ = 0;
@@ -5787,6 +7322,8 @@ private:
     float heroPressureOrbitPhaseOffset_ = 0.0f;
     float heroPressureWorstFallbackError_ = 0.0f;
     float heroPressureFirstFallbackTime_ = -1.0f;
+    float heroPressureLastFocalGeometricError_ =
+        std::numeric_limits<float>::infinity();
     float heroPressureWorstDominantFallbackError_ = 0.0f;
     float heroPressureFirstDominantFallbackTime_ = -1.0f;
     float streamingTestCameraTime_ = 0.0f;
@@ -5803,6 +7340,10 @@ private:
     uint32_t heroPressureMaxResourceTransitions_ = 0;
     uint32_t heroPressureRapidReloads_ = 0;
     uint32_t heroPressureMaxResourceRapidReloads_ = 0;
+    uint32_t heroPressureGeometricErrorRegressions_ = 0;
+    uint32_t heroPressureRollingPinObservations_ = 0;
+    uint32_t heroPressureRollingReleaseObservations_ = 0;
+    uint32_t heroPressureRollingPinViolations_ = 0;
     int heroPressureLastFocalRank_ = -2;
     bool heroPressureScenarioRequested_ = false;
     bool heroPressureScenarioActive_ = false;
@@ -5812,7 +7353,19 @@ private:
     bool streamingSelfTest_ = false;
     bool streamingSelfTestFinished_ = false;
     int streamingSelfTestExitCode_ = 0;
+    bool leftMouseWasDown_ = false;
+    SceneTreeSelection sceneTreeSelection_;
+    uint16_t pendingHierarchyRevealHero_ = UINT16_MAX;
+    InstanceId pendingHierarchyRevealInstance_ = kInvalidInstanceId;
     std::array<uint32_t, kPayloadSlotCount> currentPayloadCounts_{};
+    std::array<std::array<uint32_t, kTowerPayloadCount>,
+               kHeroTowerAssetCount> currentHeroPayloadCounts_{};
+    std::array<StreamingResourceState, kStreamingResourceSlotCount>
+        sceneTreeResourceStates_{};
+    std::array<bool, kStreamingResourceSlotCount>
+        sceneTreeFallbackPinned_{};
+    std::vector<uint32_t> currentInstanceEntryCounts_;
+    bool sceneTreeStatsValid_ = false;
     PerformanceSample performance_;
     std::array<std::array<float, kPerformanceHistorySize>,
                kPerformanceTimerCount> performanceHistory_{};
