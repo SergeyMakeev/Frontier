@@ -716,7 +716,7 @@ struct SelectionSink
     {}
 
 private:
-    friend class SpatialDatabase;
+    friend class frontier::SpatialDatabase;
     bool retainsExisting_ = false;
 };
 

@@ -1649,7 +1649,7 @@ private:
                 "Replacement is transactional: the simulator first plans a "
                 "complete victim set without changing residency. It commits "
                 "only when the full request fits and its total visual value "
-                "exceeds unused cache victims by at least 5%, or current-cut "
+                "exceeds unused cache victims by at least 5%%, or current-cut "
                 "victims by at least 30%. Score/MiB orders the choices; total "
                 "value and the stronger visible-cut hysteresis prevent "
                 "granularity and role-change churn.");
