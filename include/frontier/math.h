@@ -147,8 +147,7 @@ static_assert(alignof(float4) >= 16, "frontier::float4 must be 16-byte aligned")
 // float8: lane-wise; lanes carry independent values.
 // ---------------------------------------------------------------------------
 
-// The historical name remains source-compatible; the actual lane count is
-// kWide, so a BVH4 build stores one 128-bit vector here.
+// float8 stores kWide lanes, so a BVH4 build stores one 128-bit vector here.
 struct alignas(kWide * sizeof(float)) float8
 {
     float v[kWide];

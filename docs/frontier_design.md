@@ -43,17 +43,22 @@ One registered serialized byte array permanently owns:
 
 - preorder topology and subtree extents;
 - wide child blocks and lane masks;
-- application payloads;
-- geometric errors;
+- base application payloads and geometric errors;
+- sparse extra-payload indices and padded records when nodes have additional
+  payload LODs;
 - authored local bounds;
 - mountable-node bits.
 
-Each registered definition owns one readiness bit per renderable node. That bit
-is shared across every placement of the definition. Runtime placements own
+Each registered definition owns readiness per renderable node and payload slot.
+Scalar slot zero uses the shared node-state bit; multi-payload nodes use a
+shared byte mask per sparse record. Runtime placements own
 accumulated transforms, derived coverage, mounted-child links, content stamps,
 and LRU state. Runtime deformation never rewrites the definition. Effective
 bounds use a copy-on-write overlay scoped to the top-level instance and
 placement.
+
+TLAS-root slot zero lives in dense instance streams and is permanently ready.
+Additional root slots use sparse runtime records with per-instance readiness.
 
 ## 5. Boundary invariants
 
@@ -62,7 +67,8 @@ Builder output and every mount boundary maintain:
 1. parents precede descendants in packed order;
 2. each subtree is a contiguous range;
 3. a parent bound contains every local child bound;
-4. effective error never increases below a parent;
+4. slot errors are finite and non-increasing coarse-to-fine, and a child's
+   slot-zero error is clamped to its parent's finest effective error;
 5. a node has local children or a mounted child, never both;
 6. a transformed mounted definition fits inside the shared authored bound of a
    definition node, or the current instance-local root bound of a TLAS root.
@@ -72,12 +78,18 @@ scalar. It does not modify shared error arrays.
 
 ## 6. Current selection and opt-in refinement
 
-Selection returns one ordered current cut. It contains only ready definition
-nodes plus permanent TLAS roots and has complete hierarchy coverage. By
+Selection returns one ordered current cut. Every entry identifies a selected
+payload slot on a node. It contains only ready definition slots plus permanent
+TLAS-root slot zero or ready additional root slots, and has complete hierarchy
+coverage. At one node, the first coarse-to-fine slot meeting the projected-error
+threshold is the target; structural descent begins only if its finest slot is
+still over threshold. By
 default, complete ready descendants may replace an unavailable
 threshold-target node; otherwise a ready parent remains selected.
 `CurrentCutPolicy::PreferReadyAncestors` disables the descendant substitution
-and permits only upward fallback, producing a smaller, coarser cut. This is the
+and permits only same-node or upward fallback, producing a smaller, coarser
+cut. The default policy may choose a finer ready slot or ready descendants
+before falling back to a coarser same-node/ancestor slot. This is the
 meaning of the hole-free guarantee; it does not concern mesh seams or
 rasterization.
 
@@ -90,6 +102,8 @@ result never truncates sibling coverage. Unlimited depth makes exhaustive work
 explicit rather than part of every selection. The result retains each complete
 parent entry and direct 32-bit expansion links for current and child entries,
 so consumers do not need to reconstruct the forest with handle searches.
+Successive payload slots appear as singleton groups with the same `NodeHandle`
+before any structural child group.
 
 A missing mounted definition stops both selection and refinement at its
 mountable parent; application metadata decides which definition handle to
@@ -99,20 +113,22 @@ descends.
 
 ## 7. Readiness and coverage
 
-Readiness means that every GPU resource required to dispatch one node's
-`UserPayload` is available. It belongs to the node in its registered definition,
-not to the payload value or placement. Every placement of that definition node
-shares the bit. Equal payload values in other nodes are independent; an
+Readiness means that every GPU resource required to dispatch one node payload
+slot is available. For mounted definitions it belongs to the node and slot in
+the registered definition, not to the payload value or placement. Every
+placement shares that slot state. Equal payload values in other nodes are independent; an
 integration may update them together when they identify one resource.
 
 Each mounted node records only derived coverage and a covered-child count. A
-node is covered when it is ready or its visible descendants provide
+node is covered when any authored slot is ready or its visible descendants provide
 a complete ready cut. Changes propagate toward each affected mount root
 incrementally. A fully ready mounted tree has a constant-time summary used to
-select the lean traversal path.
+select the lean traversal path; “fully ready” means every authored slot and
+descendant is ready.
 
 Topology and readiness are independent. Mounting exposes finer known topology;
-marking a node ready makes that definition node available in every placement.
+marking a payload slot ready makes that definition node representation
+available in every placement.
 
 ## 8. Handle safety
 
@@ -122,8 +138,8 @@ completion cannot modify a replacement occupying the same numeric slot.
 
 Expected asynchronous races are non-fatal:
 
-- readiness completions retain a `NodeHandle`; stale completions are ignored
-  rather than affecting a recycled placement;
+- readiness completions retain a `NodeHandle` plus payload index; stale
+  completions are ignored rather than affecting a recycled placement;
 - stale queries report absence;
 - mounting below a parent collected during IO returns an invalid placement;
 - unmounting/removing an already stale handle does nothing.
@@ -180,7 +196,7 @@ Mount retention is an application policy. A query records usage only when
 explicitly enabled, and collection consumes only the queries selected by the
 host. Cold mounted leaves older than the minimum age are removed from the LRU
 tail until the placement budget is met. Removing a placement invalidates its
-node handles but never changes the registered definition's readiness bits.
+node handles but never changes the registered definition's readiness state.
 
 Definitions are not collected implicitly. The host releases them explicitly
 after all placements are gone.
@@ -190,11 +206,11 @@ after all placements are gone.
 | Operation | Expected cost |
 |---|---:|
 | build definition | O(nodes) |
-| register definition | default: O(nodes + wide blocks) validation; `FRONTIER_VALIDATE_SUBTREES=0`: O(1) trusted registration |
+| register definition | O(nodes + wide blocks) classification and optional plan construction, plus structural validation when enabled; ownership transfer is O(1) |
 | release unused definition | O(1), excluding allocator cost |
 | mount | O(definition nodes) on its first mount; O(1) for later childless placements; the first nested child copies its owner's coverage state |
 | unmount mounted tree | O(placements removed) |
-| node readiness change | placements of one definition and ancestor paths until stable |
+| payload-slot readiness change | placements of one definition and ancestor paths until stable; a TLAS-root extra-slot change is per instance |
 | submit bound change | O(1) |
 | flush bound change | O(ancestor depth) until contained |
 | insert/remove/move instance | O(TLAS depth), plus caller-budgeted repair |

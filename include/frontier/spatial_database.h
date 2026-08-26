@@ -220,8 +220,9 @@ static_assert(sizeof(FrontierEntry) == 12, "FrontierEntry must stay 12 bytes");
 
 // Renderer-facing form of a frontier entry. Resolving an entire cut through
 // SpatialDatabase::resolveFrontier() amortizes mount validation across the
-// consecutive nodes emitted from each mounted subtree. The instance and error
-// retain the same packed representation as FrontierEntry, while the opaque
+// consecutive nodes emitted from each mounted subtree. Instance, payload
+// index, and error retain the same packed representation as FrontierEntry,
+// while the opaque
 // node handle is replaced by the immutable application payload needed for
 // render submission.
 struct ResolvedFrontierEntry
@@ -1467,9 +1468,9 @@ public:
 
     // ---- shared definition-node/payload readiness ---------------------------
     // Every payload slot is independently streamable, but any ready slot is a
-    // complete hole-free proxy for the node's common bound. Readiness is
-    // shared across every placement of the registered definition. The legacy
-    // node methods address slot zero. TLAS-root slot zero is permanently ready;
+    // complete hole-free proxy for the node's common bound. Mounted-definition
+    // readiness is shared across every placement. The node convenience methods
+    // address slot zero. TLAS-root slot zero is permanently ready;
     // additional root slots may transition normally. Stale handles are ignored.
     void markNodeReady(NodeHandle node);
     void markNodeUnavailable(NodeHandle node);
@@ -1804,8 +1805,8 @@ private:
         NodeRef owner;
         // Sparse-pool index; leaf placements never allocate a child array.
         uint32_t mountLinks = kInvalidIndex;
-        // Root of this mounted subtree tree. Occupies what was tail padding and
-        // lets cached traversal coalesce every descendant to one exact stamp.
+        // Root of this mounted subtree tree. Stored in tail padding so cached
+        // traversal can coalesce every descendant to one exact stamp.
         uint32_t rootSlot = kInvalidIndex;
         // Intrusive list of all live placements sharing one definition. This
         // lets a node-readiness transition visit affected placements without
@@ -2239,8 +2240,8 @@ private:
         const std::byte* wideBase = nullptr;
         // slot[20] | plane mask[6] | threshold target[1] | packed bounds[1]
         uint32_t      state = 0;
-        // Sparse overlay index, or kInvalidIndex. This occupies WorkItem's old
-        // tail padding, so sparse support does not grow the traversal stack.
+        // Sparse overlay index, or kInvalidIndex. This occupies tail padding,
+        // so sparse support does not grow the traversal stack.
         uint32_t      sparseOverlay = kInvalidIndex;
 
         WorkItem() = default;

@@ -1,5 +1,9 @@
 # Performance optimization 2026 — round 10
 
+> Historical engineering journal. This record describes the experiment and
+> measurements at the named revision; it is not the current API or algorithm
+> contract. Use the current documentation index for active behavior.
+
 ## Objective and baseline
 
 This experiment adds a low-cost explicit TLAS topology refresh for simulations

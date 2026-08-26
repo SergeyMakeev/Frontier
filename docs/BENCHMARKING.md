@@ -19,7 +19,8 @@ library's macro-based public payload customization.
 
 ## End-to-end subtree benchmark
 
-`frontier_bench` contains the city/house workloads:
+The main `frontier_bench` executable contains the city/house workloads below;
+isolated submission and payload-LOD executables are called out separately:
 
 - `BM_SubtreeAssembly_FrontierCost` compares a flattened city definition with
   a city whose house nodes mount one shared house definition;
@@ -71,9 +72,10 @@ library's macro-based public payload customization.
   percentage.
 - `BM_SubtreeBuilder_ConstructCost` isolates serialized definition building
   before registration and instantiation.
-- `BM_SubtreeRegistration` isolates validation and zero-copy registration for
-  128- and 4,096-node serialized definitions; input copying and release are
-  outside the timed region.
+- `BM_SubtreeRegistration` isolates registration classification and zero-copy
+  ownership transfer for 128- and 4,096-node serialized definitions. The
+  performance profile compiles structural validation out; input copying and
+  release are outside the timed region.
 - `BM_FlatTlasSelectionScale` covers raw and cached selection at 1,000 and
   10,000 TLAS-owned single-node objects. The reuse-enabled cases verify that
   the automatic all-flat direct path stays at raw-selection cost.
@@ -317,9 +319,10 @@ depends on the current registry, compiler, and host speed.
 
 The format-v3 comprehensive collector currently inventories `frontier_bench`
 and `frontier_bench_payload32`. It does not run the isolated
-`frontier_submission_bench` pair, so a comprehensive report does not include
-downstream payload-scan timings unless the caller runs and records those
-executables separately.
+`frontier_submission_bench` or `frontier_payload_lod_bench` pairs, so a
+comprehensive report does not include downstream payload-scan or node-local
+payload-LOD timings unless the caller runs and records those executables
+separately.
 
 ## macOS hardware counters
 

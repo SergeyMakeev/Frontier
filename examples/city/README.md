@@ -1,8 +1,8 @@
 # Frontier dynamic city sample
 
 This sample renders a procedural city through bgfx's portable example entry
-layer and debug-draw renderer. The world is a 3-by-3 arrangement of the
-original district: 24 by 24 blocks covering nine times the area. Frontier owns
+layer and debug-draw renderer. The world contains 24 by 24 blocks arranged as
+a 3-by-3 grid of districts. Frontier owns
 the visibility and LOD decisions for 2,088 houses, 54 skyscrapers, 1,152 trees,
 432 moving cars, and 864 moving pedestrians. Cars follow rounded rectangular
 roads with tangent-aligned yaw,

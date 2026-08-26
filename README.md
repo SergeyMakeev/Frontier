@@ -52,7 +52,9 @@ million mountable house nodes, all populated from the same house handle.
 `UserPayload` defaults to `uint64_t`. Applications may define
 `FRONTIER_USER_PAYLOAD` and `FRONTIER_INVALID_PAYLOAD` build-wide; for example,
 `uint32_t` and `UINT32_MAX`, or `void*` and `nullptr`. Four-byte payloads halve
-serialized and TLAS-root payload storage. The configured invalid value is
+the base serialized payload array and TLAS-root base-payload stream; padded
+multi-payload records are 64 rather than 96 bytes. The configured invalid
+value is
 reserved and cannot be authored. `tryGetPayload()` returns that value when its
 `NodeHandle` is stale or invalid. See the
 [API reference](docs/API_REFERENCE.md#3-node-authoring-types) for the exact type
@@ -62,7 +64,7 @@ A spatial node may carry up to eight ordered payload LODs that all share its
 bound and topology. Slot zero stays in `NodeDesc`; pass slots 1–7 as
 `PayloadLodDesc` values to `SubtreeBuilder::createNode()` or
 `SpatialDatabase::instantiate()`. Errors must be sorted coarse-to-fine. Scalar
-nodes retain the original compact streams and traversal specialization; only
+nodes retain the compact base streams and scalar traversal specialization; only
 multi-payload nodes allocate padded sidecar records. A frontier entry selects
 one slot through `payloadIndex()`:
 
@@ -82,7 +84,7 @@ builder.createNode(NodeDesc{
 Payload readiness is independent, while hole-free coverage remains a node
 property: any ready slot completely represents that node. Use
 `markPayloadReady(node, index)` and `markPayloadUnavailable(node, index)`;
-the older node readiness calls address slot zero.
+`markNodeReady()` and `markNodeUnavailable()` are slot-zero convenience calls.
 
 ## Example
 
@@ -185,9 +187,11 @@ selection, and the database must remain in the same published read interval.
 See the [bounded refinement guide](docs/API.md#bounded-refinement-analysis) and
 [exact API contract](docs/API_REFERENCE.md#refinement-computation).
 
-Readiness means the renderer has every GPU resource
-needed to dispatch a node's payload. It belongs to a node in a registered
-definition and is shared by that node across every placement of the definition.
+Readiness means the renderer has every GPU resource needed to dispatch one
+payload slot. Mounted-definition readiness belongs to a definition node and
+slot and is shared across every placement of that definition. Additional
+payload slots on permanent TLAS roots instead have per-instance readiness;
+root slot zero is always ready.
 Equal payload values in different nodes are independent; applications that use
 them for the same GPU resource may publish readiness to each corresponding
 node. Applications decide which definition handle belongs at
@@ -212,7 +216,10 @@ validates the complete structure in linear time and takes over the existing
 allocation without unpacking or copying its node arrays; there are no copy and
 borrowed registration variants. Trusted-content builds can configure
 `FRONTIER_VALIDATE_SUBTREES=OFF` to retain only constant-time format-envelope
-checks and remove the structural scan. The performance runners additionally set
+checks and remove the validation scan. Registration still classifies every
+definition for specialized traversal paths and may build an eligible terminal
+plan, so the complete call remains linear in nodes and wide blocks. The
+performance runners additionally set
 `FRONTIER_CONTRACT_CHECKS=OFF`, which assumes even that envelope is valid and
 must only be used with trusted benchmark inputs.
 
@@ -308,6 +315,7 @@ release verification commands are described in [docs/TESTING.md](docs/TESTING.md
 
 Important options are `FRONTIER_BUILD_TESTS`, `FRONTIER_BUILD_BENCH`,
 `FRONTIER_BUILD_CITY_SAMPLE`,
+`FRONTIER_TEST_PAYLOAD32`, `FRONTIER_PROFILE_SYMBOLS`,
 `FRONTIER_BVH_WIDTH`, `FRONTIER_AVX2`, `FRONTIER_SSE2_ONLY`,
 `FRONTIER_FORCE_SCALAR`,
 `FRONTIER_IPO`, `FRONTIER_PGO_MODE`, `FRONTIER_PGO_DIR`, `FRONTIER_STATS`,
@@ -337,7 +345,8 @@ included with `add_subdirectory()`, both default off and the
 
 See the [documentation index](docs/README.md), the
 [current codebase map](docs/CODEBASE.md), the progressive
-[API guide](docs/API.md) for the integration flow, the
+[API guide](docs/API.md) for the integration flow, the implementation-focused
+[onboarding guide](docs/ONBOARD.md), the
 exhaustive [API reference](docs/API_REFERENCE.md) for exact contracts,
 [ARCHITECTURE.md](docs/ARCHITECTURE.md) for implementation details, and
 [BENCHMARKING.md](docs/BENCHMARKING.md) for measurement guidance.

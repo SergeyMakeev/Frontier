@@ -24,12 +24,14 @@ width is linked into `frontier_tests_alternate`.
 The suite contains:
 
 - scalar, SIMD, frustum, screen-error, camera, and degenerate-math tests;
-- serialized-layout, builder-limit, allocator-ownership, stale-handle, and
-  public contract tests;
+- serialized-layout, sparse multi-payload authoring, error-clamp,
+  builder-limit, allocator-ownership, stale-handle, and public contract tests;
 - exact current-frontier tests for readiness, mounted coverage, both
-  current-cut policies, query reuse, masks, and contribution culling;
+  current-cut policies, per-slot readiness/fallback, TLAS-root payload slots,
+  query reuse, masks, and contribution culling;
 - bounded and exhaustive refinement tests for breadth-first depth, complete
-  sibling groups, atomic node limits, mount boundaries, and stale context;
+  sibling groups, singleton payload-slot steps, atomic node limits, mount
+  boundaries, and stale context;
 - TLAS lifecycle, explicit incremental-maintenance budgets, advisory quality
   recommendations, motion-group, copy-on-write bounds, collection, and cache
   invalidation tests, including sparse-to-dense bounds-overlay promotion;
@@ -37,7 +39,9 @@ The suite contains:
 - deterministic randomized node-readiness transitions checked against an
   independent complete-cover model, including repeated unmount/remount;
 - bit-identical serial/parallel selection and concurrent independent-query
-  readers over one published database snapshot.
+  readers over one published database snapshot;
+- renderer-facing and terminal-range tests, including finest terminal payload
+  selection and readiness contracts.
 
 The randomized tests use fixed seeds. A failure is therefore reproducible and
 does not introduce CI flakiness.
@@ -126,15 +130,19 @@ camera trajectory, 100 rotating/moving cars, 1,000 pedestrians, 100,000 total
 leaves, and a separately isolated motion/publication phase. Each result records
 `frontier_payload_bytes` in its benchmark context so files remain
 self-describing after collection.
+The separate `frontier_payload_lod_bench` pair compares eight same-bound
+representations stored as one multi-payload node against a unary structural
+chain without perturbing the scalar benchmark executables.
 `frontier_machine_bench` characterizes kernels and the machine independently.
 See [BENCHMARKING.md](BENCHMARKING.md) for the cases and collection procedure.
 
 The comprehensive collector records the exact benchmark and test inventories
 for the revision it builds and verifies that every listed benchmark appears in
-the result JSON. `BM_LiveCityRenderSubmissionFrame` remains in the isolated
-submission executables rather than the comprehensive collector, so measure
-downstream payload scanning explicitly when it is part of the performance
-question.
+the result JSON. `BM_LiveCityRenderSubmissionFrame` and
+`BM_SharedBoundPayloadLods` remain in their isolated submission and payload-LOD
+executable pairs rather than the comprehensive collector. Run them explicitly
+when downstream payload scanning or node-local payload LOD cost is part of the
+performance question.
 
 Benchmarks are measurements, not correctness tests. Repository performance
 runners build Release with `FRONTIER_STATS=OFF`,

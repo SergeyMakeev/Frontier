@@ -21,9 +21,13 @@ the historical records.
   contract.
 - [Architecture](ARCHITECTURE.md): current data structures, layouts,
   publication model, query paths, and memory checkpoints.
+- [Implementation onboarding](ONBOARD.md): detailed source-reading guide,
+  algorithm walkthrough, fast paths, and maintenance proofs.
 - [Testing](TESTING.md): current correctness matrix and release verification.
 - [Benchmarking](BENCHMARKING.md): current workloads, runners, and measurement
   protocol.
+- [City sample](../examples/city/README.md): current interactive integration
+  example and controls.
 
 ## Historical records
 

@@ -20,8 +20,8 @@ inline uint32_t metaChildCount(uint32_t m) { return m & kMaxChildren; }
 inline bool metaIsMountable(uint32_t m) { return (m & kMetaMountable) != 0; }
 inline uint32_t metaWideOffset(uint32_t m) { return m >> kMetaOffsetShift; }
 
-// A node index needs 20 bits. Nine of the remaining bits in the old parent
-// stream carry the node's ordinal among its siblings, making the canonical
+// A node index needs 20 bits. Nine remaining parent-word bits carry the node's
+// ordinal among its siblings, making the canonical
 // bound in the parent's wide block directly addressable without another array.
 inline constexpr uint32_t kParentIndexBits = 20;
 inline constexpr uint32_t kParentIndexMask = (1u << kParentIndexBits) - 1u;

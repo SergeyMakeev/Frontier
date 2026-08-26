@@ -103,9 +103,9 @@ inline constexpr uint32_t kInvalidIndex = 0xFFFFFFFFu;
 inline constexpr uint32_t kMaxNodePayloads = 8;
 
 // One additional complete representation of a node's common conservative
-// bound. NodeDesc::payload/geometricError remain payload slot zero so existing
-// scalar authoring stays source-compatible and keeps its compact fast path.
-// Additional slots are ordered from coarser to finer representation.
+// bound. NodeDesc::payload/geometricError store payload slot zero; additional
+// slots are ordered from coarser to finer representation. Scalar-only nodes
+// use the compact base representation and traversal path.
 struct PayloadLodDesc
 {
     UserPayload payload{};

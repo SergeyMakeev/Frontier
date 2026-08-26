@@ -51,8 +51,9 @@ instrumentation are compile-time choices.
   returns ordered `TerminalRenderRun` ranges.
 
 Payload equality has no semantic meaning inside Frontier. Readiness belongs to
-a specific registered definition node; placement and handle identity remain
-independent of `UserPayload` values.
+a specific node and payload slot. Mounted-definition slots share readiness
+across placements; additional TLAS-root slots keep per-instance readiness.
+Placement and handle identity remain independent of `UserPayload` values.
 
 ## Runtime spatial structure
 
@@ -79,8 +80,10 @@ Maximum error and layer masks are parallel cold metadata. BVH4 uses 128 hot +
 
 - a 128-byte versioned header;
 - canonical wide bound blocks;
-- lane masks;
+- lane masks for valid, leaf, zero-error, and multi-payload lanes;
 - payload, parent, subtree-size, metadata, and error arrays;
+- when any node has additional payload LODs, a sparse per-node record index and
+  one 32-byte-aligned padded payload/error record per such node;
 - the aggregate definition bound.
 
 Per-node scalar bounds are not duplicated. A node's canonical bound is the
@@ -89,9 +92,11 @@ complete structure and then moves the allocation into the database. Trusted
 builds may compile out the structural scan with
 `FRONTIER_VALIDATE_SUBTREES=OFF`.
 
-Definition-node readiness is shared by every placement of that registered
-definition. Placement-specific coverage is allocated only when mounted
-children make the shared summary insufficient.
+Definition payload-slot readiness is shared by every placement of that
+registered definition. Scalar nodes store slot zero in the shared 16-bit state;
+multi-payload nodes use a shared byte mask per sparse record. Placement-specific
+coverage is allocated only when mounted children make the shared summary
+insufficient.
 
 ## Placement and instance data
 
@@ -99,6 +104,9 @@ Top-level instances use dense structure-of-arrays streams for hot query and
 publication state while stable public handles map to dense indices. Each
 instance retains its exact transform, exact world bound, renderable root data,
 mask, mounted-root slot, generation, TLAS back-pointer, and dense-list index.
+Instances with additional root payloads also use a lazy dense-to-sparse index
+and one padded runtime record containing extra payloads, errors, and a
+per-instance readiness mask.
 
 Mounted placement state is split by access frequency:
 
@@ -106,7 +114,7 @@ Mounted placement state is split by access frequency:
 |---|---:|---|
 | `MountTransformRt` | 32 B | translation/scale, error clamp, generation, definition, root flags |
 | `MountStamp` | 8 B | content version, generation, liveness |
-| `MountReadiness` | 4 B | fully-ready summary and incomplete-child count |
+| `MountReadiness` | 4 B | fully-ready/multi-payload flags and incomplete-child count |
 | `SubtreeInstanceRt` | 56 B | ownership, definition, LRU, mount links, state pointers |
 | Node state | 2 B/node | coverage bit and covered-child count |
 
@@ -134,7 +142,7 @@ is reset, destroyed, or used for another selection.
 | Path | Use it for | Output and restrictions |
 |---|---|---|
 | `SpatialQuery` | General LOD, streaming readiness, nested mounts, nonzero error, deformed bounds | One current `FrontierEntry` cut plus opt-in complete-group refinement analysis |
-| `TerminalRenderQuery` | Fully resident terminal leaves with zero terminal error | Ordered `TerminalRenderRun` payload ranges; no general streaming/LOD semantics |
+| `TerminalRenderQuery` | Fully resident terminal nodes whose finest slot has zero error | Ordered `TerminalRenderRun` payload ranges; no general streaming/LOD semantics |
 | `TerminalInstanceBatch` | Large homogeneous moving cohorts | Caller-owned position/yaw streams plus one definition, constant bounds/scale/mask, consecutive ids |
 
 General selection traverses the TLAS first. Flat roots emit through a direct
@@ -142,14 +150,21 @@ path. Hierarchical roots either stop at the renderable root or enter a mounted
 definition. Wide bound/error tests visit four or eight children at once, and a
 compact DFS stack holds surviving hierarchy work.
 
+At a multi-payload node, selection chooses the first coarse-to-fine slot whose
+projected error satisfies the threshold. Structural refinement begins only if
+the finest slot remains above threshold. Ready-slot substitution follows the
+selected current-cut policy, and refinement exposes successive payload slots as
+singleton groups before structural children.
+
 Each `SpatialQuery` owns damping, two exact-view memo slots, frontier reuse
 records, dependency spills, traversal scratch, output slabs, optional
 statistics, and optional mount-use feedback. Fully inside instances can reuse
 recorded cuts while their travel budget, threshold epoch, instance version,
 and mounted-tree content stamps remain valid.
 
-The terminal path precomputes immutable definition plans containing decoded
-payloads and a `{begin,count}` range for every definition node. Fully accepted
+The terminal path precomputes immutable definition plans containing each
+terminal node's finest decoded payload and a `{begin,count}` range for every
+definition node. Fully accepted
 branches append one 16-byte run descriptor instead of one handle record per
 leaf. Boundary branches continue through exact wide traversal.
 
@@ -193,11 +208,16 @@ need streaming decisions.
 - `PreferReadyAncestors` emits the nearest ready ancestor fallback instead.
 
 Readiness changes update every placement of the affected registered
-definition node through its intrusive placement list. They do not scan
+definition node and slot through its intrusive placement list. They do not scan
 unrelated definitions or infer relationships from equal payload values.
+Any ready slot covers the node's common bound. A mounted tree is fully ready
+only when all authored slots and descendants are ready; strict and scalar-only
+fast paths rely on that stronger summary.
 `computeFrontierRefinement()` resumes below the current cut with the exact
 retained view context, returns breadth-first complete sibling groups, and
 honors depth and group-atomic node limits without choosing a streaming policy.
+For one node's additional payload LODs, those complete groups contain one entry
+with the same `NodeHandle` and the next `payloadIndex()`.
 Complete parent entries and direct current/child expansion links preserve the
 forest relationships for linear application-side planning.
 
@@ -235,8 +255,9 @@ flags themselves.
 
 The Debug matrix runs the complete suite across payload32/payload64 and
 BVH4/BVH8. It covers serialization, contracts, current cuts and refinement,
-streaming, mounting, cache validity, motion, TLAS maintenance, renderer-facing
-output, parallel determinism, randomized churn, and concurrent snapshot reads.
+multi-payload selection/readiness, streaming, mounting, cache validity, motion,
+TLAS maintenance, renderer-facing output, terminal finest-slot handling,
+parallel determinism, randomized churn, and concurrent snapshot reads.
 
 Capacity and latency are workload- and target-dependent. The repository
 benchmarks reusable assembly, cache behavior, motion/publication, lifecycle
@@ -251,10 +272,14 @@ revision and shipping configuration.
 - General query views and terminal views are query-owned and non-owning.
 - Mounted placement transforms support translation and uniform scale. Planar
   yaw belongs to top-level instances and terminal actor batches.
-- The terminal render path requires fully resident terminal leaves, zero
-  terminal error, and the strict supported topology documented by the API.
+- The terminal render path requires fully resident mounted trees, zero error on
+  each terminal node's finest payload slot, and the strict supported topology
+  documented by the API. Its runs contain resolved finest payloads and report
+  payload index zero.
 - Terminal actor batches require homogeneous definitions and spatially ordered
-  caller-owned streams with snapshot-stable lifetimes.
+  caller-owned streams with snapshot-stable lifetimes; the caller guarantees
+  their finest terminal payloads are resident and keeps output ids within the
+  21-bit frontier range.
 - Conservative batch envelopes trade culling tightness for avoiding per-frame
   bound reduction; under-bounds violate correctness.
 - BVH width, payload type, and ISA selection are build-wide. The library does

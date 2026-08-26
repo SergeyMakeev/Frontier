@@ -258,8 +258,8 @@ UserPayload payload = database.tryGetPayload(
 Slots stream independently through `markPayloadReady()` and
 `markPayloadUnavailable()`. Hole-free coverage remains per node: every payload
 is a complete representation of the common node bound, so any ready slot can
-cover it. The legacy node readiness methods operate on slot zero. Scalar-only
-definitions keep the original serialized streams and scalar traversal
+cover it. The node readiness convenience methods operate on slot zero.
+Scalar-only definitions keep the compact base streams and scalar traversal
 specialization; multi-payload nodes use sparse, padded sidecar records.
 
 `UserPayload` defaults to `uint64_t`, with `UINT64_MAX` as the invalid value.
@@ -373,15 +373,17 @@ By default, registration validates the header, layout, version, size,
 alignment, complete preorder topology, extents, node data, and wide traversal
 mirrors, then moves the existing allocation. Validation is linear in node and
 wide-block count, but it does not unpack or copy the node arrays and ownership
-transfer itself is constant-time. No per-node runtime state is allocated;
-shared readiness/coverage state is allocated lazily on the definition's first
-mount.
+transfer itself is constant-time. Registration also scans the definition to
+classify specialized paths and may construct an eligible terminal plan. Shared
+readiness/coverage state is allocated lazily on the definition's first mount.
 
 Applications whose registered bytes come exclusively from a trusted,
 compatible Frontier builder can compile with
 `FRONTIER_VALIDATE_SUBTREES=OFF`. Registration then performs only
 constant-time format-envelope and root-range checks before taking ownership;
-the O(nodes + wide blocks) structural scan is not compiled in. This is a
+the O(nodes + wide blocks) validation scan is not compiled in. Classification
+and optional plan construction still make complete registration linear in
+nodes and wide blocks. This is a
 build-wide trust decision: malformed internal arrays can otherwise become
 unchecked traversal data, so keep validation enabled for files, downloads,
 mod content, or any other untrusted or independently versioned input.
@@ -550,6 +552,12 @@ memoized output capacity is included in `SpatialQuery::bytes()`.
 - `PreferReadyAncestors` never searches below the unavailable threshold target. It
   falls back upward, normally producing a smaller but coarser current cut.
 
+For a multi-payload node, “target” includes the selected payload slot. The
+default policy searches finer ready slots and ready structural descendants
+before using a coarser fallback. The ancestor policy can use a ready slot at or
+before the target on the same node, but does not search a finer slot or below
+that node.
+
 ### Two current-cut policies
 
 The following three diagrams show the same hierarchy and camera decision.
@@ -629,17 +637,19 @@ eligible parents are visited before a deeper parent.
 
 Each group has the following contract:
 
-- `parent(group)` is an existing node. At depth 1 it is in `cut`; at greater
-  depths it is a child in an earlier group.
+- `parent(group)` is an existing node. At depth 1 its entry is in `cut`; at
+  greater depths its entry was returned by an earlier group.
 - `parentEntry(group)` is that complete entry, including its instance and
   projected error. Consumers do not need to reconstruct parent-error lookup
   tables.
-- `children(group)` is the complete set of that parent's visible immediate
-  children. Authored children outside the retained frustum are absent by
-  design. A parent with no visible children does not produce a group.
+- `children(group)` is either one next payload slot on the same node or the
+  complete set of visible immediate structural children. Authored children
+  outside the retained frustum are absent by design. A parent with neither a
+  finer slot nor visible structural children does not produce a group.
 - `depth(group)` counts refinement transitions below `cut`, starting at 1.
-- groups are ordered breadth-first. `findGroup(node)` returns the group that
-  expands `node`, or `kInvalidIndex` when none was emitted.
+- groups are ordered breadth-first. Consecutive payload-slot groups can share a
+  `NodeHandle`; use `findGroup(node, payloadIndex)` or `findGroup(entry)` to
+  distinguish them. `findGroup(node)` returns the first match.
 - `currentExpansion(index)` and `childExpansion(group, child)` return the next
   group directly, or `kInvalidIndex` when that entry is an endpoint of the
   returned horizon. They are the linear-time path for bulk planners;
@@ -757,9 +767,10 @@ owning copy or `Sink<FrontierEntry>` to write directly into fixed caller
 memory.
 
 Each `FrontierEntry` carries a generation-stamped `NodeHandle`, an
-`InstanceId` stable for the lifetime of its top-level instance, and a
-threshold-relative error code. The instance id is appropriate for indexing the
-application's top-level transform or entity table while that instance is live.
+`InstanceId` stable for the lifetime of its top-level instance, a three-bit
+payload index, and a threshold-relative error code. The instance id is
+appropriate for indexing the application's top-level transform or entity table
+while that instance is live.
 
 ### Renderer-facing current-cut output
 
@@ -779,7 +790,8 @@ for (const ResolvedFrontierEntry& entry : renderEntries)
     renderer.submit(entry.payload, entry.instance(), entry.errorCode());
 ```
 
-`resolveFrontier()` preserves order and the packed instance/error metadata. It
+`resolveFrontier()` preserves order and the packed
+instance/payload-index/error metadata. It
 validates consecutive entries from one mounted placement as a run, returns
 `kInvalidPayload` for a stale handle, and returns an empty span without writing
 when the destination is too small.
@@ -814,7 +826,8 @@ same frame also needs handle or refinement analysis.
 
 ### Fully resident max-detail output
 
-If a view always renders fully ready, zero-error terminal leaves, avoid
+If a view always renders fully ready terminal nodes whose finest payload slot
+has zero error, avoid
 materializing and resolving a handle for every leaf. `TerminalRenderQuery`
 returns immutable payload ranges with the instance id hoisted into each run:
 
@@ -834,9 +847,13 @@ does not remove downstream work from the measurement or API. It removes the
 intermediate per-leaf `NodeHandle`, instance id, error byte, payload-resolution
 lookup, and query-owned resolved copy. The view and payload pointers remain
 valid until this query's next selection/reset or a database mutation.
+The payload pointers already resolve the finest slots, so
+`TerminalRenderRun::payloadIndex()` is always zero.
 
 This path requires every selected mounted tree to be fully ready, overlay-free,
-free of nested mount points, and terminated by zero-error leaves. Use ordinary
+free of nested mount points, and terminated by nodes whose finest slots have
+zero error. Multi-payload TLAS-only roots must also have their finest authored
+slot ready; no coarser slot is substituted. Use ordinary
 `SpatialQuery` for streamed LOD, partial readiness, deformation, or nested
 topology. By default instances
 marked with `setInstanceRenderAsUnit()` retain their whole terminal range when
@@ -866,8 +883,9 @@ Static and heterogeneous instances in `database` still use its TLAS. Batch
 roots are tested directly from caller memory; fully visible actors append one
 payload range and only partial actors descend the definition. Position/yaw
 storage must remain valid for the call. Batches use consecutive caller-assigned
-instance ids, constant scale/mask/bounds per cohort, fully resident terminal
-definitions, and no general `InstanceHandle`. They are best for hundreds or
+instance ids within the 21-bit frontier range, constant scale/mask/bounds per
+cohort, caller-guaranteed resident finest terminal payloads, and no general
+`InstanceHandle` or readiness state. They are best for hundreds or
 thousands of same-shape actors; use ordinary instances when streaming,
 deformation, per-actor scale/mask variation, handle operations, or a dynamic
 broadphase is more important than zero-copy publication.
@@ -972,26 +990,27 @@ while a child definition is loading.
 
 After mounting, the next selection can expose much finer nodes around the
 camera. Those nodes are commonly unready at first, so the first loop requests
-their GPU resources and `markNodeReady()` publishes each completed upload.
+their GPU resources and `markPayloadReady()` publishes each completed slot.
 While the camera flies across the surface, the application keeps expanding
 over-threshold proxies ahead of it and removes detail behind it either
 explicitly with `unmountSubtree()` or by enabling query mount-usage feedback
 and calling `collect()` with a placement budget. The result is a small moving
 window of detailed topology rather than a fully expanded planet.
 
-Readiness belongs to one node in one registered definition. A `NodeHandle` from
-any live placement identifies that definition node, and the change applies to
-every current and future placement of the same definition:
+Mounted-node readiness belongs to one payload slot on one node in one
+registered definition. A `NodeHandle` from any live placement identifies that
+definition node, and the change applies to every current and future placement
+of the same definition:
 
 ```cpp
-void nodeUploadCompleted(NodeHandle node)
+void payloadUploadCompleted(NodeHandle node, uint8_t payloadIndex)
 {
-    database.markNodeReady(node);
+    database.markPayloadReady(node, payloadIndex);
 }
 
-void makeNodeUnavailable(NodeHandle node)
+void makePayloadUnavailable(NodeHandle node, uint8_t payloadIndex)
 {
-    database.markNodeUnavailable(node);
+    database.markPayloadUnavailable(node, payloadIndex);
 }
 ```
 
@@ -1003,10 +1022,12 @@ payload index or impose resource-identity policy.
 Once published, readiness remains on the registered definition even if all of
 its placements are temporarily unmounted. A later mount inherits it. Releasing
 the definition discards it. Publishing requires a live mounted `NodeHandle`;
-stale handles are ignored and `isNodeReady()` returns `false` for them.
+stale handles are ignored and `isPayloadReady()` returns `false` for them.
 
-Readiness and topology-independent coverage live once in the definition's
-shared node-state block. A childless placement points directly at that state.
+Scalar slot-zero readiness and topology-independent coverage live in the
+definition's shared node-state block. Multi-payload nodes use one shared
+readiness mask per sparse sidecar record. A childless placement points directly
+at shared coverage state.
 When a placement receives a mounted descendant it takes a private coverage copy
 because its completeness can now differ from other placements. Coverage
 propagates toward the root so the current cut remains complete while
@@ -1020,6 +1041,8 @@ database.markNodeReady(instance.rootNode());                 // no-op
 ```
 
 Calling `markNodeUnavailable()` on a live TLAS root is a contract violation.
+If a root has additional payload slots, those slots have per-instance readiness
+and may transition through the payload-indexed methods.
 
 An asynchronous topology completion normally retains only the parent handle:
 
@@ -1122,7 +1145,7 @@ order.
 This is the recommended path when the same collection moves repeatedly, such
 as traffic, particles, units, or a streamed terrain patch set. The application
 can keep its natural stable order—`positions[i]` always belongs to the handle
-originally stored at `i`—while Frontier updates the corresponding dense
+at group position `i`—while Frontier updates the corresponding dense
 instance records in physical database order.
 
 Physical ordering matters for non-global movement because it writes the
@@ -1245,9 +1268,11 @@ CollectResult result = database.collect(retentionViews, mountBudget, minAge);
 ```
 
 Use `subtreeInstanceStateBytes()`, `overlayCount()`, and `overlayBytes()` to
-track mutable hierarchy cost. The first metric includes mount records, shared
-coverage/readiness summaries and private coverage copies, but excludes
-registered bytes.
+track mutable hierarchy cost. The first metric includes mount records, scalar
+shared coverage/readiness words, private coverage copies, stamps, and retained
+placement/link capacity. It excludes immutable registered bytes, sparse
+multi-payload definition masks, and per-instance TLAS-root extra-payload
+records.
 
 ## 11. Update and threading model
 
@@ -1457,12 +1482,14 @@ void requestReadiness(const FrontierRefinementView& refinement)
             continue;
 
         for (const FrontierEntry& entry : children) {
-            if (database.isNodeReady(entry.nodeHandle))
+            if (database.isPayloadReady(entry.nodeHandle,
+                                        entry.payloadIndex()))
                 continue;
             if (UserPayload payload = database.tryGetPayload(
                     entry.nodeHandle, entry.payloadIndex());
                 payload != kInvalidPayload)
-                payloadStreamer.request(entry.nodeHandle, payload);
+                payloadStreamer.request(entry.nodeHandle,
+                                        entry.payloadIndex(), payload);
         }
     }
 }
@@ -1514,6 +1541,7 @@ completions and apply them during the next single-writer phase.
 ```cpp
 struct PayloadRequest {
     NodeHandle node;
+    uint8_t payloadIndex;
     UserPayload payload;
 };
 
@@ -1527,7 +1555,7 @@ void applyCompletions()
 {
     for (PayloadRequest& done : payloadStreamer.completed()) {
         uploadToGpu(done.payload);
-        database.markNodeReady(done.node);
+        database.markPayloadReady(done.node, done.payloadIndex);
     }
 
     for (DefinitionRequest& done : definitionStreamer.completed()) {
@@ -1547,8 +1575,8 @@ Making definition nodes unavailable does not change topology. GPU eviction is
 separate because one resource may be referenced by several independent nodes:
 
 ```cpp
-for (NodeHandle node : readinessPolicy.nodesToDisable())
-    database.markNodeUnavailable(node);
+for (const PayloadRequest& item : readinessPolicy.payloadsToDisable())
+    database.markPayloadUnavailable(item.node, item.payloadIndex);
 
 for (UserPayload payload : payloadCache.unreferencedResources())
     evictFromGpu(payload);

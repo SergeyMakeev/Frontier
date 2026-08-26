@@ -508,9 +508,9 @@ TerminalRenderView TerminalRenderQuery::select(
                        "TerminalRenderQuery::select: invalid batch bounds");
         FRONTIER_CHECK(
             uint64_t(batch.firstInstance) + batch.positions.size() <=
-                uint64_t(kInvalidInstanceId),
+                uint64_t(kFrontierInstanceIdMask) + 1u,
             "TerminalRenderQuery::select: batch instance range exceeds the "
-            "24-bit id space");
+            "21-bit frontier id space");
         const SpatialDatabase::SubtreeDefinitionRt* definition =
             database.resolveSubtree(batch.definition);
         FRONTIER_CHECK(definition != nullptr,

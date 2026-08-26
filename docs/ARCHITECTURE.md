@@ -15,6 +15,10 @@ and layer masks live in a parallel cold metadata stream used only when the
 query requests contribution or layer filtering. BVH4 uses 128 hot + 32 cold
 bytes per node; BVH8 uses 256 hot + 64 cold bytes per node.
 
+Root payload slot zero and its error remain in dense instance streams.
+Additional root slots use a lazy dense-to-sparse index plus one padded runtime
+record per multi-payload root; its readiness mask is per instance.
+
 Each mounted definition is a BLAS fragment below one renderable parent. A
 definition can have several direct roots because the parent is external. A
 definition reference is immutable content-DAG data; a `SubtreeInstanceRt` is a
@@ -26,8 +30,10 @@ single placement in one runtime tree.
 
 - a 128-byte header;
 - interleaved `WideBlock` data (128 bytes in BVH4, 256 bytes in BVH8);
-- valid/leaf/zero-error lane masks;
+- valid/leaf/zero-error/multi-payload lane masks;
 - payload, parent, contiguous-subtree-size, metadata, and error arrays;
+- when present, a sparse per-node extra-record index and one 32-byte-aligned
+  padded payload/error record per multi-payload node;
 - the definition aggregate bound in the header.
 
 Per-node bounds have no scalar duplicate. Each real node's canonical authored
@@ -49,17 +55,18 @@ context. Registration O(1)-moves that allocation into a cold
 over the same bytes. By default it first validates every scalar and wide
 traversal stream in O(nodes + wide blocks). `FRONTIER_VALIDATE_SUBTREES=0`
 compiles out that complete scan for trusted builder output while retaining
-constant-time format-envelope and root-range checks. No deserialized copy or
-public semantic definition object exists. The first mount lazily allocates one
-shared 16-bit node-state word per packed node. That word combines readiness
-with derived coverage; definition-local geometric slabs supply uncommon
-private coverage copies without one allocation per placement.
+constant-time format-envelope and root-range checks. Registration still scans
+the definition to classify specialized paths and may build an eligible terminal
+plan. No deserialized copy or public semantic definition object exists.
 
-The definition-node bit is the authoritative ready/unavailable state and is
-shared by every placement of that exact registered definition. Equal
-`UserPayload` values in other nodes are not indexed or coupled. Live placements
-of one definition form an intrusive list, so one node-readiness change updates
-every affected coverage tree without scanning unrelated definitions or mounts.
+The first mount lazily allocates one shared 16-bit node-state word per packed
+node. For scalar nodes that word combines slot-zero readiness with derived
+coverage. Multi-payload nodes instead use one shared byte readiness mask per
+sparse record while the node-state word continues to hold coverage. Definition
+slot state is shared by every placement of that exact registered definition.
+Equal `UserPayload` values in other nodes are not indexed or coupled. Live
+placements form an intrusive list, so one slot-readiness change updates every
+affected coverage tree without scanning unrelated definitions or mounts.
 
 ## Mounted placement state
 
@@ -69,7 +76,7 @@ The placement hot/cold split is:
 |---|---:|---|
 | `MountTransformRt` | 32 B | accumulated translation/scale, error clamp, generation, definition id, root-leaf flag |
 | `MountStamp` | 8 B | content version, generation, live flag |
-| `MountReadiness` | 4 B | fully-ready bit, incomplete-child count |
+| `MountReadiness` | 4 B | fully-ready/multi-payload flags, incomplete-child count |
 | `SubtreeInstanceRt` | 56 B | definition, node-state pointer, LRU, owner, mount links, mounted-tree root, definition-list links |
 | node state | 2 B/node | covered flag and covered-child count |
 
@@ -94,17 +101,24 @@ A `WorkItem` carries placement slot, effective wide bounds, one implicit
 threshold-target bit, and a narrowed frustum mask. Every queued branch produces
 the current cover. One dispatch selects dense authored/COW bounds or
 sparse-overlay lookup for the whole subtree walk. `wideVisit()` tests
-up to `kWide` children (four or eight) together. Plain leaves emit immediately;
-other survivors go onto a compact DFS stack.
+up to `kWide` children (four or eight) together. Plain scalar leaves emit
+immediately; other survivors go onto a compact DFS stack.
 
-Reusable definitions whose direct roots are all leaves have a batched
-fully-ready path. Consecutive placements of the same definition reuse the
-resolved immutable block while transform, error clamp, and generation advance
-through a dense stream.
+The selector dispatches scalar versus multi-payload behavior once per
+placement. Multi-payload lanes choose the first coarse-to-fine slot satisfying
+the projected-error threshold; structural descent starts only after the finest
+slot fails. The selected current-cut policy controls ready-slot substitution.
+
+Scalar-only reusable definitions whose direct roots are all leaves have a
+batched fully-ready path. Consecutive placements of the same definition reuse
+the resolved immutable block while transform, error clamp, and generation
+advance through a dense stream. Registration also excludes multi-payload
+definitions from the general fully-refined terminal-handle plan.
 
 The fully resident terminal-render path changes the output unit. Its query
-builds one cold definition plan containing decoded terminal payloads and one
-`{begin,count}` range per definition node. During selection, a frustum-inside
+builds one cold definition plan containing each terminal node's finest decoded
+payload and one `{begin,count}` range per definition node. During selection, a
+frustum-inside
 branch appends one pointer-plus-two-word `TerminalRenderRun` (16 bytes on a
 64-bit target) that references the plan range;
 only partial boundary branches visit lower wide blocks. Instance id and the
@@ -114,10 +128,10 @@ logical payload iteration downstream. Terminal leaf nodes reuse their own
 one-element range as the node-to-payload index, so the plan needs no duplicate
 node mapping stream.
 
-This is a separate archive member and a separate strict query type. The
+This is a separate translation/link unit and a separate strict query type. The
 ordinary LOD/readiness walker returns one current handle sequence.
-Scenes with streaming readiness, nested mounts, nonzero terminal error, or
-deformed bounds remain on `SpatialQuery`; the range path deliberately trades
+Scenes with streaming readiness, nested mounts, nonzero finest-terminal error,
+or deformed bounds remain on `SpatialQuery`; the range path deliberately trades
 those capabilities for a compact max-detail representation.
 
 Homogeneous terminal actors may bypass general instance publication entirely.
@@ -138,20 +152,24 @@ frame; published snapshots follow the normal publish-before-query rule and are
 coverage-checked in contract builds. Conservative looseness changes only the
 amount of member work, while under-bounds violate correctness. The trade is
 spatially ordered actor storage, optional envelope memory, and a deliberately
-narrower cohort contract: consecutive external ids, constant bounds/scale/mask
+narrower cohort contract: consecutive external ids within the 21-bit frontier
+range, constant bounds/scale/mask
 and one definition, no per-actor handles, streaming state, or deformed bounds.
 
 ## Current coverage and the implicit target
 
-Registered definitions own readiness by node. Mounted nodes carry only derived
-coverage. A 4-byte
+Registered definitions own readiness by node and payload slot. Mounted nodes
+carry only derived coverage. Additional TLAS-root slots keep per-instance
+readiness beside their sparse runtime payload record. A 4-byte
 per-placement summary makes a fully ready mounted tree a constant-time test;
 the lean traversal then emits directly to the current sequence.
 
 For partial readiness, one internal threshold-target bit travels with the DFS
 item. A set bit continues LOD decisions toward the threshold; a clear bit means
 an unavailable target has already been reached and traversal stops at the
-nearest ready descendant cover. There is no second liveness bit or second
+nearest ready descendant cover. At a multi-payload node the search can use a
+finer ready slot before descending, or a coarser fallback when descendant
+coverage is incomplete. There is no second liveness bit or second
 result.
 Visibility-aware coverage checks ignore unseen missing branches without
 allowing a visible hole.
@@ -177,6 +195,8 @@ entry. Parallel 32-bit expansion streams map the source current cut and every
 returned child entry directly to the group that expands it, or `kInvalidIndex`
 at a horizon endpoint. Streaming planners can consume the forest linearly
 without constructing handle maps or sorted parent-error indexes.
+Additional payload slots refine as singleton groups before structural children;
+such a group preserves the `NodeHandle` and advances `payloadIndex()`.
 
 ## TLAS maintenance
 
@@ -226,7 +246,7 @@ dense-list index together. Public ids map through stable handle-to-dense tables.
 `optimize(OptimizationMode::TopologyAndLayout)` compacts dead dense slots and
 rewrites physical back-pointers while preserving those ids.
 
-Rigid actor animation has a separate archive-level publication module.
+Rigid actor animation has a separate publication translation unit.
 `RigidMotionGroup` caches the same caller-to-dense mapping plus a proof that all
 members use authored yaw-invariant broadphase bounds. Positions and yaws arrive
 as independent contiguous streams; stable-scale actors translate their exact
@@ -285,7 +305,7 @@ assembly has a universal traversal advantage.
 
 `SpatialQuery::bytes()`, `SpatialDatabase::subtreeInstanceStateBytes()`,
 `overlayBytes()`, and `instanceOrientationStateBytes()` expose retained runtime
-capacity. Benchmark the current code and complete result-consumption path on
-each shipping target with [BENCHMARKING.md](BENCHMARKING.md). Historical
-measurements are kept only in the [documentation archive](archive/README.md)
-and `bench_results/`.
+capacity. The subtree-state counter excludes sparse multi-payload definition
+masks and TLAS-root extra-payload records. Benchmark the current code and
+complete result-consumption path on each shipping target with
+[BENCHMARKING.md](BENCHMARKING.md).

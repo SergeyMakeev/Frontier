@@ -5499,8 +5499,8 @@ void SpatialDatabase::runSubtreeImpl(const WorkItem& item,
                 const bool target = e.target();
                 uint8_t nextTarget = 0;
 
-                // Preserve the original scalar readiness path verbatim: it
-                // must not pay for node-local payload fallback machinery.
+                // The scalar readiness path does not pay for node-local
+                // payload fallback machinery.
                 if (!target)
                 {
                     if (definition.isNodeReady(i))

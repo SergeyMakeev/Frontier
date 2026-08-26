@@ -1153,6 +1153,40 @@ TEST(Frontier, TerminalRenderUsesTheFinestPayloadSlot)
     EXPECT_EQ(flatTerminal.runs()[0].payloadSpan()[0], 82u);
 }
 
+TEST(Frontier, TerminalActorBatchUsesTheFrontierInstanceIdRange)
+{
+    SubtreeBuilder builder;
+    builder.createNode(node(91, 0.0f, box(1.0f)));
+
+    SpatialDatabase database;
+    const SubtreeHandle definition =
+        database.registerSubtree(builder.build());
+    database.applyUpdates(0);
+    std::array<float4, 1> onePosition{
+        float4::point(0.0f, 0.0f, 0.0f)};
+    TerminalInstanceBatch batch;
+    batch.definition = definition;
+    batch.localBounds = box(1.0f);
+    batch.positions = onePosition;
+    batch.firstInstance = kFrontierInstanceIdMask;
+
+    TerminalRenderQuery query;
+    const TerminalRenderView boundary = query.select(
+        database, cameraAt(),
+        std::span<const TerminalInstanceBatch>(&batch, 1));
+    ASSERT_EQ(boundary.size(), 1u);
+    EXPECT_EQ(boundary.runs()[0].instance(), kFrontierInstanceIdMask);
+
+    std::array<float4, 2> twoPositions{
+        float4::point(0.0f, 0.0f, 0.0f),
+        float4::point(1.0f, 0.0f, 0.0f)};
+    batch.positions = twoPositions;
+    EXPECT_THROW(
+        query.select(database, cameraAt(),
+                     std::span<const TerminalInstanceBatch>(&batch, 1)),
+        std::logic_error);
+}
+
 TEST(Frontier, TerminalActorBatchMatchesMountedYawedInstance)
 {
     SpatialDatabase mountedDatabase;

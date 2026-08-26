@@ -135,6 +135,9 @@ uint32_t parent[nodeCount]
 uint32_t subtreeSize[nodeCount]
 uint32_t meta[nodeCount]
 float geometricError[nodeCount]
+if extraPayloadRecordCount > 0:
+    uint32_t extraPayloadIndex[nodeCount]
+    ExtraPayloadRecord extraPayload[extraPayloadRecordCount]
 padding to 64-byte allocation alignment
 ```
 
@@ -165,13 +168,15 @@ The scalar arrays are packed for constant-time navigation:
   bits for the first wide-block offset.
 - `subtreeSize[node]` makes every subtree a contiguous preorder range. Scalar
   coverage walks skip a child with `child += subtreeSize[child]`.
-- One block-mask word packs valid lanes, plain-leaf lanes, and zero-error lanes.
+- One block-mask word packs valid, plain-leaf, zero-error, and multi-payload
+  lanes.
   The low `kWide` bits are the valid mask, so a survivor mask can be ANDed with
   the complete word without first extracting those bits.
 
 The builder grows bounds bottom-up in its temporary authoring nodes, emits a
-preorder stream with a four-byte packed DFS stack, clamps error monotonically
-from parent to child, and then writes the wide blocks. Registration validates
+preorder stream with a four-byte packed DFS stack, clamps each child's base
+error against the parent's finest payload error, and then writes the wide
+blocks. Registration validates
 the representation and O(1)-moves the allocation into the database.
 `SubtreeView` is only a set of pointers into those bytes.
 
@@ -203,13 +208,14 @@ constraints.
 | `MountStamp` | 8 B | Content version, generation, liveness. |
 | `MountReadiness` | 4 B | Fully-ready and sparse multi-payload flags plus recursively incomplete-child count. |
 | `SubtreeInstanceRt` | 56 B | Cold placement ownership, coverage pointer, LRU, links, and definition-list state. |
-| Placement node state | 2 B/node | Covered bit, covered-child count, and—in shared state only—the authoritative ready bit. |
+| Placement node state | 2 B/node | Covered bit, covered-child count, and—for shared scalar nodes—the authoritative slot-zero ready bit. |
 | Multi-payload definition readiness | 1 B/multi node | One shared readiness mask for slots 0–7; absent from scalar definitions. |
 | Multi-payload serialized record | 96 B payload64 / 64 B payload32 | Sparse 32-byte-aligned padded errors/payloads; one record only for nodes with slots 1–7. |
+| Multi-payload TLAS-root record | 128 B payload64 / 96 B payload32 | Sparse per-instance extra payloads/errors plus readiness and padding; slot zero remains in base streams. |
 | `SpatialQuery::Rec` | 32 B | The random-access per-instance cache-hit record. |
 | `SpatialQuery::RecCold` | 8 B | Slab allocation and current-output offset, fetched only on misses/rebuilds. |
 | `RenderFrontierRun` | 12 B | Slab begin/count plus one instance id for a cached render run. |
-| `TerminalRenderRun` | 16 B on 64-bit | Payload pointer/count plus one packed instance/error word. |
+| `TerminalRenderRun` | 16 B on 64-bit | Payload pointer/count plus one packed instance/zero-slot/error word. |
 | Shared TLAS level scratch | 4 B/live root | Spatial-bin scatter during rebuild; retained exact-refit postorder between rebuilds. |
 
 Top-level public instance ids are stable. The database separately maps stable
@@ -229,6 +235,9 @@ Several absent allocations are part of the common-path design:
   contained a non-mountable root.
 - Mount-child arrays exist only for placements that actually gain mounted
   children.
+- Definition multi-payload readiness masks exist only for definitions with
+  extra records. TLAS-root extra records and their dense-to-sparse index exist
+  only after a root with slots 1–7 is instantiated.
 - Childless placements point at one definition-shared coverage block.
   Private coverage blocks come from definition-local geometric slabs instead
   of one allocation per placement.
@@ -290,15 +299,21 @@ d2 = squared separation(child AABB, camera envelope)
 px = e * camera.k / sqrt(d2)
 ```
 
-Refinement uses strict `px > threshold`. Plain leaves do not make this
+Refinement uses strict `px > threshold`. Plain scalar leaves do not make this
 decision: if visible they must be emitted, so the walker avoids scalar work
 for them.
+
+For a node with additional payload LODs, that calculation establishes slot
+zero's projected error. The selector then scales it by each finer slot's
+authored-error ratio and chooses the first coarse-to-fine slot at or below the
+threshold. Only a node whose finest slot remains above threshold proceeds to
+structural children. Scalar nodes keep the dedicated one-slot path.
 
 The error ceiling maintains monotonic LOD across a mount boundary. Mounting a
 child stores:
 
 ```text
-child.errClamp = min(parent.authoredError, parent.errClamp)
+child.errClamp = min(parent.finestAuthoredError, parent.errClamp)
                  / relativeChildScale
 ```
 
@@ -339,31 +354,35 @@ envelope also wholly contains its exact box.
 ### 5.3 Permanent-root decision
 
 `runTlasRootInstance()` first computes projected error for the permanent root.
-If the root is below threshold or no descendant definition is mounted, it
-emits the root into current and stops. The TLAS root is always ready.
+If the root target is below threshold, selection emits the nearest ready root
+slot: target, then finer slots, then coarser slots. If even the finest target is
+over threshold but no descendant definition is mounted, it emits the finest
+ready root slot. Root slot zero is always ready; additional root slots use
+per-instance readiness.
 
 If refinement is required, the camera is transformed into instance-local
 space. Identity yaw and the globally absent orientation stream have their own
 branch-free path. The root placement then dispatches by readiness:
 
-- A fully-ready mounted tree uses `runSubtree<true>()` and emits directly to current.
+- A fully-ready mounted tree uses `runSubtreeMode<true, MultiPayload>()` and
+  emits directly to current.
 - A partially-ready tree uses the selected current-cut policy.
 
 ### 5.4 Wide subtree traversal
 
-`wideVisit<FullyReady, SparseOverlay, TrackAncestor>()` is the central kernel.
-The template parameters remove readiness, overlay, and ancestor-policy work
-from paths that do not need it.
+`wideVisit<FullyReady, SparseOverlay, TrackAncestor, MultiPayload>()` is the
+central kernel. The template parameters remove readiness, overlay,
+ancestor-policy, and payload-slot work from paths that do not need it.
 
 For every child block it:
 
 1. Resolves authored, dense-overlay, or sparse-patched wide bounds.
 2. Performs one masked wide frustum test.
-3. Uses the packed leaf and zero-error masks to recognize blocks that can emit
-   immediately without loading errors or computing distance.
+3. Uses the packed leaf, zero-error, and multi-payload masks to recognize
+   blocks that can emit immediately without loading errors or computing distance.
 4. Computes clamped wide errors and squared distances only for the remaining
    block.
-5. Emits surviving plain leaves directly.
+5. Emits surviving plain scalar leaves directly.
 6. Pushes only surviving interior or mountable nodes as eight-byte `NodeItem`s.
 
 Bitsets are iterated with `countr_zero(mask)` and `mask &= mask - 1`, so cost is
@@ -393,6 +412,9 @@ ready descendant.
 For `PreferReadyDescendants`:
 
 - If a threshold-target node is ready, it is emitted to current.
+- On a multi-payload node, the target is a slot. If it is unavailable, the
+  default policy searches finer ready slots and then ready descendants before
+  using a coarser fallback.
 - If that node is unavailable but its visible descendants have a complete
   ready cover, current traversal continues below it until those ready
   descendants are found.
@@ -409,6 +431,10 @@ coverage is definitive and no visibility walk is needed.
 
 For `PreferReadyAncestors`, the implementation avoids a speculative second
 readiness traversal:
+
+Within the current node, the finest ready slot no finer than the unavailable
+target can become its candidate. This policy does not search below that target
+for a finer slot or descendant cover.
 
 1. The threshold-directed traversal carries the nearest ready ancestor candidate across
    local and mount boundaries.
@@ -437,6 +463,10 @@ inherited error clamps, and the retained camera. A mounted definition's direct
 roots are the children of the mountable parent, so the existing parent
 `NodeHandle` remains the group id across that boundary.
 
+Additional payload slots are immediate refinement steps before structural
+children. Each is a singleton group whose entry keeps the same `NodeHandle`
+and advances `payloadIndex()`.
+
 Parent, child-offset, depth, and entry buffers are committed only after the
 whole visible sibling cover fits `maxNodes`. Descendants are enqueued only
 after their group commits. This preserves complete groups at every limit and
@@ -461,14 +491,14 @@ The table below is a practical map of work that the implementation can skip.
 | Query uses all layers or `minPix == 0` | Template specialization | Cold `TlasMeta` loads and inner-loop feature branches. |
 | Every live instance is a flat root | Automatic uncached/direct mode | Per-instance cache records and every mounted-state read. |
 | Every flat root also has zero error | `runZeroErrorTlasFlatInstance()` | `Instance` fetch, distance, divide, and error encoding work. |
-| Root error is below threshold or has no mount | Emit TLAS root | Local camera transform and all definition traversal. |
+| Root payload target is at/below threshold or has no mount | Emit a ready TLAS-root slot | Local camera transform and all definition traversal. |
 | Orientation stream is absent / yaw is identity | Translation-scale camera path | Yaw transform and cold orientation reads. |
-| Mounted tree is fully ready | `runSubtree<true>()` | Per-node readiness and implicit-target branch logic. |
+| Mounted tree is fully ready | `runSubtreeMode<true, MultiPayload>()` | Per-node readiness and implicit-target branch logic. |
 | All surviving lanes are plain zero-error leaves, or clamp is zero | `wideVisit()` block shortcut | Error-vector load, distance, reciprocal/sqrt, and scalar metadata reads. |
-| Definition direct roots are all leaves | Root-leaves-only path | General scalar DFS loop. |
-| Root-leaf placement is wholly inside | `emitMountedRootLeavesInside()` | Frustum tests and node stack. |
-| Consecutive inside mount points use the same root-leaf definition | `emitMountedLeafBatchInside()` | Re-resolving immutable definition blocks and general work-item dispatch. |
-| Eligible definition is guaranteed to refine every interior node | Fully-refined boundary path | All error decisions; wholly-inside branches bulk-generate preplanned terminal handles. |
+| Scalar-only definition direct roots are all leaves | Root-leaves-only path | General scalar DFS loop. |
+| Scalar-only root-leaf placement is wholly inside | `emitMountedRootLeavesInside()` | Frustum tests and node stack. |
+| Consecutive inside mount points use the same scalar-only root-leaf definition | `emitMountedLeafBatchInside()` | Re-resolving immutable definition blocks and general work-item dispatch. |
+| Eligible scalar-only definition is guaranteed to refine every interior node | Fully-refined boundary path | All error decisions; wholly-inside branches bulk-generate preplanned terminal handles. |
 | Visible instance is wholly inside and its certificate is valid | Per-instance cache hit | Instance record fetch, local transform, mount resolution, and hierarchy walk. |
 | Visible stream and global certificate are unchanged | Retained whole-cut return | All per-instance record probes and output appends. |
 | Same visible stream, only some records miss, entry counts stay fixed | In-place output patch | Complete output reconstruction. |
@@ -616,20 +646,23 @@ classification remains exact even when the approximate magnitude ages.
 
 ## 8. Readiness and coverage maintenance
 
-The authoritative ready bit lives in the definition-shared 16-bit node-state
-block. The same word also contains intrinsic covered state and a covered-child
-count. A childless placement points directly at this block.
+Scalar nodes keep their authoritative slot-zero ready bit in the
+definition-shared 16-bit node-state block. Multi-payload nodes keep one shared
+byte mask for slots 0–7 in the sparse extra-record order. The node-state word
+also contains intrinsic covered state and a covered-child count. A childless
+placement points directly at shared coverage state.
 
 When a placement gains a mounted child, it needs placement-specific coverage.
 `ensurePrivateCoverage()` takes a block from a definition-local slab and copies
-only coverage/count bits; authoritative ready bits remain in the definition.
+only coverage/count bits; authoritative slot state remains in the definition.
 The slabs grow geometrically up to roughly 1 MiB and recycle blocks through a
 free list.
 
 A readiness change:
 
-1. Changes the definition's node ready bit and ready-node count.
-2. Incrementally propagates shared intrinsic coverage toward the definition
+1. Changes the selected definition-node slot and the node/all-slot summaries.
+2. If the node's “any ready slot” coverage changes, incrementally propagates
+   shared intrinsic coverage toward the definition
    root until state stops changing.
 3. Walks the intrusive list of placements of that definition—never unrelated
    definitions or payloads.
@@ -638,9 +671,13 @@ A readiness change:
 6. Updates the four-byte fully-ready summary and propagates only summary
    transitions through owner mounts.
 
-A node is covered when it is ready itself or all of its children are covered.
-For a mountable node, “children” means the mounted child's implicit root. The
-TLAS root needs no ready bit because it is permanently ready.
+A node is covered when any payload slot is ready or all of its children are
+covered. For a mountable node, “children” means the mounted child's implicit
+root. A mounted tree is fully ready only when every payload slot and descendant
+is ready. `MountReadiness` records both that stronger summary and whether the
+definition has multi-payload nodes so scalar walks retain their specialization.
+TLAS-root slot zero is permanently ready; additional root slots have
+per-instance masks and invalidate only that instance's frontier state.
 
 The separation between `MountReadiness` and detailed coverage matters:
 fully-ready selection is one load and then a lean traversal; partial-readiness
@@ -651,7 +688,7 @@ no use-recording cost. When enabled, it records physical placement touches;
 the writer later consumes only dirty query records into the database LRU.
 Collection walks from the LRU tail and removes only old leaf placements until
 the placement budget is met. It never implicitly releases registered
-definitions, and readiness bits survive the removal of placements.
+definitions, and definition readiness state survives the removal of placements.
 
 ## 9. TLAS construction and maintenance
 
@@ -834,6 +871,7 @@ reusable.
 Registration identifies definitions with:
 
 - at least 16 nodes;
+- no multi-payload nodes;
 - no mountable nodes;
 - zero error on every terminal leaf; and
 - a positive minimum error across interior nodes.
@@ -851,20 +889,27 @@ output order changes, update eligibility and plan construction together.
 
 `TerminalRenderQuery` is a deliberately narrower max-detail algorithm. It
 requires fully ready mounted definitions, no nested mounts, no deformed bounds,
-and zero error on every terminal leaf. It lazily builds a generation-stamped
-definition plan containing decoded payloads and a `{begin,count}` range for
-every node.
+and zero error on every terminal node's finest payload slot. It lazily builds a
+generation-stamped definition plan containing those finest decoded payloads and
+a `{begin,count}` range for every node. A multi-payload TLAS-only root likewise
+requires its finest authored slot to be ready; the query does not substitute a
+coarser ready slot.
 
 When a branch is wholly inside, the query emits one 16-byte run pointing at
 the plan's payload range. Only boundary branches descend through wide blocks.
 Adjacent payload ranges with the same instance/error word are coalesced. This
 avoids materializing and resolving one 12-byte handle per leaf and stores the
 constant instance/error once per run.
+`TerminalRenderRun::payloadIndex()` is always zero because the payload pointer
+already resolves each terminal node's finest slot.
 
 Homogeneous `TerminalInstanceBatch` actors can stay outside the general TLAS
 and mutable mount population. The query consumes caller-owned SoA position/yaw
 streams, one shared definition, constant bounds/scale/mask, and consecutive
-external ids. Optional ordered, gap-free clusters add a two-level broadphase:
+external ids in the 21-bit frontier range. Batch definitions have no mounted
+placement/readiness state, so the caller guarantees their finest terminal
+payloads are resident. Optional ordered, gap-free clusters add a two-level
+broadphase:
 
 - Bounds can be reduced from current members.
 - Yaw-invariant clusters reduce just the min/max position stream.
@@ -876,8 +921,8 @@ Published cluster bounds must contain every actor for the snapshot. Contract
 builds verify this; under-bounds are a correctness failure, not a quality
 tradeoff.
 
-`rigid_motion.cpp` and `terminal_render.cpp` deliberately remain separate
-static-library archive members. Programs that never call those specialized
+`rigid_motion.cpp` and `terminal_render.cpp` deliberately remain separate link
+units. Programs that never call those specialized
 APIs need not pull their code into the final link, and the generic
 `spatial_database.cpp` selector is not duplicated or rearranged to host them.
 
@@ -952,7 +997,7 @@ Debug. They are intentionally separate.
   and maximum error.
 - Preserve plane-mask narrowing and the meaning of mask zero.
 - Check fully-ready, partial descendant, ancestor fallback, sparse-overlay,
-  oriented-instance, and missing-mount variants.
+  multi-payload slot fallback, oriented-instance, and missing-mount variants.
 - Keep plain-leaf detection consistent between builder masks, validation, and
   every specialized plan.
 
@@ -977,8 +1022,10 @@ Debug. They are intentionally separate.
 
 ### Changing readiness or topology
 
-- Keep readiness definition-local and coverage placement-local.
-- Update both detailed coverage and the four-byte fully-ready summary.
+- Keep mounted-node readiness definition/slot-local, TLAS-root extra readiness
+  per instance, and coverage placement-local.
+- Update detailed any-slot coverage, all-slot readiness, and the four-byte
+  fully-ready/multi-payload summary.
 - Bump the exact placement/root/instance content stamps used by cache hits and
   whole-answer reuse.
 - Preserve mount bounds containment and inherited error monotonicity.
@@ -1032,6 +1079,7 @@ medians. The most diagnostic cases are:
 | Per-instance cache | `BM_KernelCacheHit*`, `BM_InstanceForestSelectionScale`, `BM_MovingCameraSelectionScale` |
 | Flat/direct paths | `BM_FlatTlasSelectionScale`, `BM_InstanceForestRootSelectionScale` |
 | Readiness policies | `BM_MixedReadinessFrontier`, `BM_SharedNodeReadiness*` |
+| Node-local payload LODs | `BM_SharedBoundPayloadLods` (separate `frontier_payload_lod_bench` executable) |
 | TLAS quality | `BM_TlasQualitySelection`, `BM_FlatInstanceLifecycle` |
 | Motion/publication | `BM_MotionGroupSteady`, `BM_MovingObjectsSelectionScale`, `BM_LiveCityMotionFrame` |
 | End-to-end selection | `BM_LiveCityDrivingFrame` |
@@ -1059,8 +1107,8 @@ Read these symbols in this order when debugging selection:
 5. `runSubtreeImpl()`, `runSubtreeAncestorImpl()`, and
    `runTlasRootInstance()` in the same file.
 6. `selectFrontierUncached()` and `selectFrontierCached()` for orchestration.
-7. `setDefinitionNodeReadiness()` and the coverage propagation helpers for
-   streaming behavior.
+7. `setDefinitionPayloadReadiness()`, root extra-payload readiness, and the
+   coverage propagation helpers for streaming behavior.
 8. `tlasOnInstanceMoved()`, `tlasRefitAllExact()`, and `tlasRebuild()` for
    publication behavior.
 9. `src/terminal_render.cpp` for the strict range-output path.
@@ -1069,9 +1117,6 @@ For serialized authoring, start with `SubtreeBuilder::build()` in
 `src/builder.cpp` and then read `validateSubtreeBytes()` in `src/subtree.cpp`.
 For performance intent and current measurement procedure, use
 [ARCHITECTURE.md](ARCHITECTURE.md) and [BENCHMARKING.md](BENCHMARKING.md).
-Historical measurements and optimization notes live under `docs/archive/`;
-the checked-in code and its tests remain authoritative when an old note
-disagrees.
 
 ## 17. Complexity and the real cost model
 
@@ -1082,7 +1127,7 @@ The nominal costs are:
 | Build definition | O(definition nodes) |
 | Register definition | O(nodes + wide blocks) worst case for validation and fast-path classification/plan construction; disabling structural validation removes only that scan, not classification |
 | Mount after shared state exists | O(1) for a childless placement; first nested child copies that definition's coverage block |
-| Readiness change | Placements of one definition plus changed ancestor paths |
+| Payload-slot readiness change | Placements of one definition plus changed ancestor paths; a TLAS-root extra slot is per instance |
 | Submit bound change | O(1) queue append |
 | Flush bound change | O(changed ancestor depth), stopping at containment |
 | Incremental TLAS insert/remove | O(TLAS depth), plus explicitly budgeted repair |

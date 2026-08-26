@@ -167,7 +167,7 @@
 
   <rect class="frame" x="870" y="492" width="290" height="142" rx="11"/>
   <text class="small muted" x="888" y="517">frame N + k · A and B ready</text>
-  <text class="code ink" x="888" y="542">setDefinitionNodeReadiness()</text>
+  <text class="code ink" x="888" y="542">markPayloadReady()</text>
   <text class="code ink" x="888" y="565">selectFrontier()</text>
   <text class="label ink" x="888" y="598">P may be replaced by</text>
   <rect class="token-new" x="1033" y="576" width="42" height="34" rx="6"/>
