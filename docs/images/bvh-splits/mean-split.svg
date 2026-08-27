@@ -1,0 +1,147 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="680"
+     viewBox="0 0 1000 680" role="img"
+     aria-labelledby="title description">
+  <title id="title">MeanSplit BVH construction strategy</title>
+  <desc id="description">
+    An elongated diagonal cloud of instance centers lies inside a parent box.
+    The principal covariance direction follows the cloud. A perpendicular
+    splitting plane passes through the mean center and separates two child
+    bounding boxes. The split is binary and repeats to fill a wide BVH node.
+  </desc>
+  <defs>
+    <marker id="principal-arrow" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0 0 L10 5 L0 10 Z" class="arrow-head"/>
+    </marker>
+    <style>
+      text { font-family: Inter, "Segoe UI", Arial, sans-serif; }
+      .canvas { fill: #ffffff; }
+      .ink { fill: #172033; }
+      .muted { fill: #526077; }
+      .title { font-size: 27px; font-weight: 600; }
+      .subtitle { font-size: 15px; }
+      .parent { fill: #f8fafc; stroke: #172033; stroke-width: 3; }
+      .parent-tag { fill: #172033; }
+      .parent-tag-text { fill: #ffffff; font-size: 12px; font-weight: 700; letter-spacing: .08em; }
+      .child-left { fill: #dbeafe; fill-opacity: .38; stroke: #2563eb; stroke-width: 2.5; }
+      .child-right { fill: #dcfce7; fill-opacity: .38; stroke: #16a34a; stroke-width: 2.5; }
+      .left-ink { fill: #1d4ed8; }
+      .right-ink { fill: #15803d; }
+      .child-label { font-size: 13px; font-weight: 700; }
+      .object { fill: #64748b; stroke: #334155; stroke-width: 1.2; }
+      .centroid { fill: #ffffff; stroke: #172033; stroke-width: 1.5; }
+      .split { stroke: #2563eb; stroke-width: 4; stroke-dasharray: 10 6; }
+      .principal { stroke: #172033; stroke-width: 3; marker-end: url(#principal-arrow); }
+      .arrow-head { fill: #172033; }
+      .mean { fill: #ea580c; stroke: #ffffff; stroke-width: 2; }
+      .mean-ring { fill: none; stroke: #ea580c; stroke-width: 2; }
+      .annotation { font-size: 12px; font-weight: 700; }
+      .split-ink { fill: #1d4ed8; }
+      .mean-ink { fill: #c2410c; }
+      .card { fill: #f8fafc; stroke: #cbd5e1; stroke-width: 1.5; }
+      .card-title { font-size: 16px; font-weight: 700; }
+      .step-number { fill: #2563eb; }
+      .step-digit { fill: #ffffff; font-size: 12px; font-weight: 700; text-anchor: middle; }
+      .step { font-size: 14px; }
+      .result { fill: #eff6ff; stroke: #93c5fd; stroke-width: 1.5; }
+      .result-title { fill: #1d4ed8; font-size: 12px; font-weight: 700; letter-spacing: .06em; }
+      .result-text { font-size: 13px; }
+      .formula { fill: #fff7ed; stroke: #fdba74; stroke-width: 1.5; }
+      .formula-main { fill: #9a3412; font-size: 15px; font-weight: 600; text-anchor: middle; }
+      .formula-note { fill: #526077; font-size: 11px; text-anchor: middle; }
+      .legend { fill: #ffffff; stroke: #cbd5e1; stroke-width: 1.5; }
+      .legend-text { font-size: 12px; }
+    </style>
+    <style media="(prefers-color-scheme: dark)">
+      .canvas { fill: #0f172a; }
+      .ink { fill: #e5edf8; }
+      .muted { fill: #a9b7ca; }
+      .parent { fill: #111c31; stroke: #dbe7f5; }
+      .parent-tag { fill: #dbe7f5; }
+      .parent-tag-text { fill: #0f172a; }
+      .child-left { fill: #183b68; stroke: #60a5fa; }
+      .child-right { fill: #123f32; stroke: #4ade80; }
+      .left-ink { fill: #93c5fd; }
+      .right-ink { fill: #86efac; }
+      .object { fill: #94a3b8; stroke: #cbd5e1; }
+      .centroid { fill: #0f172a; stroke: #f8fafc; }
+      .split { stroke: #60a5fa; }
+      .principal { stroke: #e5edf8; }
+      .arrow-head { fill: #e5edf8; }
+      .mean { fill: #fb923c; stroke: #0f172a; }
+      .mean-ring { stroke: #fb923c; }
+      .split-ink { fill: #93c5fd; }
+      .mean-ink { fill: #fdba74; }
+      .card { fill: #111c31; stroke: #475569; }
+      .result { fill: #142b4b; stroke: #3b82f6; }
+      .result-title { fill: #93c5fd; }
+      .formula { fill: #3a271d; stroke: #fb923c; }
+      .formula-main { fill: #fdba74; }
+      .formula-note { fill: #a9b7ca; }
+      .legend { fill: #111c31; stroke: #475569; }
+    </style>
+  </defs>
+
+  <rect class="canvas" width="1000" height="680"/>
+  <text class="title ink" x="40" y="46">MeanSplit · mean position + principal direction</text>
+  <text class="subtitle muted" x="40" y="73">
+    Split through the mean center with a plane normal to the highest-covariance direction.
+  </text>
+
+  <rect class="parent" x="60" y="125" width="660" height="410" rx="8"/>
+  <rect class="child-left" x="86" y="302" width="319" height="205" rx="5"/>
+  <text class="child-label left-ink" x="99" y="326">CHILD A</text>
+  <rect class="child-right" x="383" y="158" width="311" height="224" rx="5"/>
+  <text class="child-label right-ink" x="396" y="181">CHILD B</text>
+
+  <!-- Instances form a rotated elongated cloud. -->
+  <g transform="rotate(-10 120 448)"><rect class="object" x="98" y="430" width="44" height="36" rx="3"/><circle class="centroid" cx="120" cy="448" r="4"/></g>
+  <g transform="rotate(8 177 407)"><rect class="object" x="152" y="387" width="50" height="40" rx="3"/><circle class="centroid" cx="177" cy="407" r="4"/></g>
+  <g transform="rotate(-6 231 449)"><rect class="object" x="208" y="431" width="46" height="36" rx="3"/><circle class="centroid" cx="231" cy="449" r="4"/></g>
+  <g transform="rotate(9 262 360)"><rect class="object" x="237" y="340" width="50" height="40" rx="3"/><circle class="centroid" cx="262" cy="360" r="4"/></g>
+  <g transform="rotate(-7 326 399)"><rect class="object" x="302" y="380" width="48" height="38" rx="3"/><circle class="centroid" cx="326" cy="399" r="4"/></g>
+  <g transform="rotate(5 356 329)"><rect class="object" x="333" y="311" width="46" height="36" rx="3"/><circle class="centroid" cx="356" cy="329" r="4"/></g>
+
+  <g transform="rotate(-8 426 324)"><rect class="object" x="403" y="305" width="46" height="38" rx="3"/><circle class="centroid" cx="426" cy="324" r="4"/></g>
+  <g transform="rotate(7 466 265)"><rect class="object" x="442" y="246" width="48" height="38" rx="3"/><circle class="centroid" cx="466" cy="265" r="4"/></g>
+  <g transform="rotate(-5 522 310)"><rect class="object" x="497" y="290" width="50" height="40" rx="3"/><circle class="centroid" cx="522" cy="310" r="4"/></g>
+  <g transform="rotate(10 557 221)"><rect class="object" x="532" y="201" width="50" height="40" rx="3"/><circle class="centroid" cx="557" cy="221" r="4"/></g>
+  <g transform="rotate(-9 618 264)"><rect class="object" x="594" y="245" width="48" height="38" rx="3"/><circle class="centroid" cx="618" cy="264" r="4"/></g>
+  <g transform="rotate(6 652 195)"><rect class="object" x="629" y="177" width="46" height="36" rx="3"/><circle class="centroid" cx="652" cy="195" r="4"/></g>
+
+  <!-- Principal direction and perpendicular plane meet at the mean. -->
+  <line class="principal" x1="151" y1="463" x2="638" y2="190"/>
+  <line class="split" x1="287" y1="151" x2="493" y2="518"/>
+  <circle class="mean-ring" cx="390" cy="334" r="10"/>
+  <circle class="mean" cx="390" cy="334" r="5"/>
+  <text class="annotation ink" x="421" y="147">principal covariance direction v₁</text>
+  <text class="annotation split-ink" x="504" y="475">plane normal = v₁</text>
+  <text class="annotation mean-ink" x="405" y="351">mean μ</text>
+
+  <rect class="parent-tag" x="74" y="108" width="112" height="27" rx="5"/>
+  <text class="parent-tag-text" x="87" y="126">PARENT NODE</text>
+
+  <rect class="card" x="750" y="125" width="220" height="410" rx="10"/>
+  <text class="card-title ink" x="770" y="157">Partition rule</text>
+  <circle class="step-number" cx="783" cy="190" r="13"/><text class="step-digit" x="783" y="194">1</text>
+  <text class="step ink" x="807" y="187"><tspan x="807">Average the instance</tspan><tspan x="807" dy="19">centers to get μ.</tspan></text>
+  <circle class="step-number" cx="783" cy="245" r="13"/><text class="step-digit" x="783" y="249">2</text>
+  <text class="step ink" x="807" y="242"><tspan x="807">Build their 3 × 3</tspan><tspan x="807" dy="19">covariance matrix.</tspan></text>
+  <circle class="step-number" cx="783" cy="300" r="13"/><text class="step-digit" x="783" y="304">3</text>
+  <text class="step ink" x="807" y="297"><tspan x="807">Find its principal</tspan><tspan x="807" dy="19">eigenvector v₁.</tspan></text>
+  <circle class="step-number" cx="783" cy="355" r="13"/><text class="step-digit" x="783" y="359">4</text>
+  <text class="step ink" x="807" y="352"><tspan x="807">Partition by the sign</tspan><tspan x="807" dy="19">of (cᵢ − μ) · v₁.</tspan></text>
+  <rect class="result" x="770" y="405" width="180" height="105" rx="8"/>
+  <text class="result-title" x="784" y="428">KEY PROPERTY</text>
+  <text class="result-text ink" x="784" y="452"><tspan x="784">Follows rotated point</tspan><tspan x="784" dy="19">clouds; child counts</tspan><tspan x="784" dy="19">need not be equal.</tspan></text>
+
+  <rect class="formula" x="60" y="562" width="660" height="68" rx="9"/>
+  <text class="formula-main" x="390" y="590">μ = mean(cᵢ)    ·    C = Σ(cᵢ − μ)(cᵢ − μ)ᵀ</text>
+  <text class="formula-note" x="390" y="613">binary split; recompute μ and C for every subset</text>
+  <rect class="legend" x="750" y="555" width="220" height="75" rx="8"/>
+  <line class="principal" x1="770" y1="577" x2="799" y2="577"/>
+  <text class="legend-text ink" x="810" y="581">principal direction</text>
+  <line class="split" x1="772" y1="607" x2="798" y2="607"/>
+  <text class="legend-text ink" x="810" y="611">mean split plane</text>
+</svg>

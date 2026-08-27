@@ -291,6 +291,7 @@ TEST(Tlas, EveryQualityTierReturnsTheSameVisibleSet)
     std::vector<size_t> nodeCounts;
     for (const TlasQuality quality : {TlasQuality::SpatialBins,
                                       TlasQuality::Median,
+                                      TlasQuality::MeanSplit,
                                       TlasQuality::BinnedSAH})
     {
         SpatialDatabaseConfig config;
@@ -315,8 +316,52 @@ TEST(Tlas, EveryQualityTierReturnsTheSameVisibleSet)
         else
             EXPECT_EQ(selected, reference);
     }
-    ASSERT_EQ(nodeCounts.size(), 3u);
+    ASSERT_EQ(nodeCounts.size(), 4u);
     EXPECT_LT(nodeCounts[0], nodeCounts[1]);
+}
+
+TEST(Tlas, MeanSplitUsesThePrincipalCovarianceDirectionAtTheMean)
+{
+    SpatialDatabaseConfig config;
+    config.tlasQuality = TlasQuality::MeanSplit;
+    SpatialDatabase database(config);
+
+    // A thin rectangle rotated 45 degrees. Its principal direction is
+    // (1, 1), so the root plane classifies by x + y (the local u coordinate),
+    // rather than by either world axis independently.
+    constexpr int uRadius = 15;
+    constexpr int vRadius = 3;
+    for (int u = -uRadius; u <= uRadius; ++u)
+        for (int v = -vRadius; v <= vRadius; ++v)
+        {
+            InstanceDesc desc;
+            desc.pos = float4::point(float(u + v), float(u - v), 0.0f);
+            database.instantiate(
+                node(uint32_t((u + uRadius) * (2 * vRadius + 1) +
+                              (v + vRadius) + 1),
+                     0.0f, box(0.1f)),
+                desc);
+        }
+    database.applyUpdates(0);
+
+    const std::vector<float4> first =
+        TestAccess::tlasRootHalfInstanceCenters(database, false);
+    const std::vector<float4> second =
+        TestAccess::tlasRootHalfInstanceCenters(database, true);
+    ASSERT_FALSE(first.empty());
+    ASSERT_FALSE(second.empty());
+
+    // Eigenvector sign is canonicalized, so the first half is the negative
+    // side of the x + y plane. Points exactly on the theoretical plane may
+    // land on either side after the numerical eigensolve.
+    for (const float4 center : first)
+        EXPECT_LE(center.x + center.y, 0.0f);
+    for (const float4 center : second)
+        EXPECT_GE(center.x + center.y, 0.0f);
+#ifdef FRONTIER_DEBUG_TOOLS
+    EXPECT_EQ(database.debugTlasSummary().activeQuality,
+              TlasQuality::MeanSplit);
+#endif
 }
 
 #ifdef FRONTIER_DEBUG_TOOLS
@@ -358,13 +403,21 @@ TEST(Tlas, TopologyOnlyOptimizationAvoidsCitySpanningNearLeafBounds)
 
 TEST(Tlas, CoincidentCentroidsStillBuildACompleteTree)
 {
-    SpatialDatabase database;
     constexpr uint32_t count = 128;
-    for (uint32_t i = 0; i < count; ++i)
-        database.instantiate(node(1000 + i, 0.0f, box()));
+    for (const TlasQuality quality : {TlasQuality::SpatialBins,
+                                      TlasQuality::Median,
+                                      TlasQuality::MeanSplit,
+                                      TlasQuality::BinnedSAH})
+    {
+        SpatialDatabaseConfig config;
+        config.tlasQuality = quality;
+        SpatialDatabase database(config);
+        for (uint32_t i = 0; i < count; ++i)
+            database.instantiate(node(1000 + i, 0.0f, box()));
 
-    SpatialQuery query;
-    const FrontierResultView result =
-        select(database, query, cameraAt(-1000.0f));
-    EXPECT_EQ(result.entries.size(), count);
+        SpatialQuery query;
+        const FrontierResultView result =
+            select(database, query, cameraAt(-1000.0f));
+        EXPECT_EQ(result.entries.size(), count);
+    }
 }

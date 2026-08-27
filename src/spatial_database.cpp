@@ -33,6 +33,85 @@ inline float axisOf(float4 v, int axis)
     return axis == 0 ? v.x : (axis == 1 ? v.y : v.z);
 }
 
+// Dominant eigenvector of a symmetric 3x3 covariance matrix. Power iteration
+// from all three basis vectors avoids the failure mode where one seed is
+// orthogonal to the principal direction. Near-equal eigenvalues do not need a
+// precisely converged direction, so a small fixed iteration count keeps the
+// per-split overhead bounded and deterministic.
+bool principalCovarianceAxis(double xx, double yy, double zz,
+                             double xy, double xz, double yz,
+                             double out[3])
+{
+    const double scale = std::max({std::fabs(xx), std::fabs(yy),
+                                   std::fabs(zz), std::fabs(xy),
+                                   std::fabs(xz), std::fabs(yz)});
+    if (!(scale > 0.0) || !std::isfinite(scale)) return false;
+
+    const double matrix[3][3] = {
+        {xx / scale, xy / scale, xz / scale},
+        {xy / scale, yy / scale, yz / scale},
+        {xz / scale, yz / scale, zz / scale},
+    };
+    double bestRayleigh = -1.0;
+    for (int seed = 0; seed < 3; ++seed)
+    {
+        double v[3] = {};
+        v[seed] = 1.0;
+        bool usable = true;
+        for (int iteration = 0; iteration < 12; ++iteration)
+        {
+            const double w[3] = {
+                matrix[0][0] * v[0] + matrix[0][1] * v[1] +
+                    matrix[0][2] * v[2],
+                matrix[1][0] * v[0] + matrix[1][1] * v[1] +
+                    matrix[1][2] * v[2],
+                matrix[2][0] * v[0] + matrix[2][1] * v[1] +
+                    matrix[2][2] * v[2],
+            };
+            const double normSquared =
+                w[0] * w[0] + w[1] * w[1] + w[2] * w[2];
+            if (!(normSquared > 0.0) || !std::isfinite(normSquared))
+            {
+                usable = false;
+                break;
+            }
+            const double inverseNorm = 1.0 / std::sqrt(normSquared);
+            v[0] = w[0] * inverseNorm;
+            v[1] = w[1] * inverseNorm;
+            v[2] = w[2] * inverseNorm;
+        }
+        if (!usable) continue;
+
+        const double w[3] = {
+            matrix[0][0] * v[0] + matrix[0][1] * v[1] +
+                matrix[0][2] * v[2],
+            matrix[1][0] * v[0] + matrix[1][1] * v[1] +
+                matrix[1][2] * v[2],
+            matrix[2][0] * v[0] + matrix[2][1] * v[1] +
+                matrix[2][2] * v[2],
+        };
+        const double rayleigh = v[0] * w[0] + v[1] * w[1] + v[2] * w[2];
+        if (rayleigh > bestRayleigh)
+        {
+            bestRayleigh = rayleigh;
+            std::copy_n(v, 3, out);
+        }
+    }
+    if (!(bestRayleigh > 0.0) || !std::isfinite(bestRayleigh)) return false;
+
+    // Eigenvectors have arbitrary sign. Canonicalizing the dominant component
+    // makes lane order reproducible across builds and standard libraries.
+    int dominant = std::fabs(out[1]) > std::fabs(out[0]) ? 1 : 0;
+    if (std::fabs(out[2]) > std::fabs(out[dominant])) dominant = 2;
+    if (out[dominant] < 0.0)
+    {
+        out[0] = -out[0];
+        out[1] = -out[1];
+        out[2] = -out[2];
+    }
+    return true;
+}
+
 inline float surfaceArea(const AABB& b)
 {
     if (b.isEmpty()) return 0.0f;
@@ -605,7 +684,8 @@ SpatialDatabase::SpatialDatabase(const SpatialDatabaseConfig& config) : config_(
     if (config_.context.workerCount == 0) config_.context.workerCount = 1;
     FRONTIER_CHECK(config_.tlasQuality == TlasQuality::SpatialBins ||
                        config_.tlasQuality == TlasQuality::Median ||
-                       config_.tlasQuality == TlasQuality::BinnedSAH,
+                       config_.tlasQuality == TlasQuality::BinnedSAH ||
+                       config_.tlasQuality == TlasQuality::MeanSplit,
                    "SpatialDatabase: invalid TLAS quality");
     FRONTIER_CHECK(
         config_.tlasTraversalCost >= 0.0f &&
@@ -3821,8 +3901,9 @@ int32_t SpatialDatabase::tlasBuildSpatialBinsRange(
 }
 
 // Partition items[lo, hi) into [lo, m) and [m, hi). BinnedSAH scans 16 bins on
-// all three axes and takes the cheapest plane; Median (and any degenerate SAH
-// case, e.g. coincident centroids) falls back to a longest-axis median split,
+// all three axes and takes the cheapest plane. MeanSplit places a plane at the
+// mean centroid, normal to the principal covariance direction. Median, and
+// any degenerate quality split, falls back to a longest-axis median split,
 // which always makes progress.
 int SpatialDatabase::tlasSplit(std::vector<uint32_t>& items, int lo, int hi)
 {
@@ -3830,9 +3911,64 @@ int SpatialDatabase::tlasSplit(std::vector<uint32_t>& items, int lo, int hi)
     if (count <= 1) return hi;
 
     AABB cb = AABB::empty();
-    for (int k = lo; k < hi; ++k)
-        cb.expand(instances_[items[k]].worldBox.center());
+    double mean[3] = {};
+    double xx = 0.0, yy = 0.0, zz = 0.0;
+    double xy = 0.0, xz = 0.0, yz = 0.0;
+    if (tlasBuiltQuality_ == TlasQuality::MeanSplit)
+    {
+        // Multivariate Welford update: one stable pass computes both the mean
+        // and the symmetric, unnormalized covariance matrix.
+        double samples = 0.0;
+        for (int k = lo; k < hi; ++k)
+        {
+            const float4 center = instances_[items[k]].worldBox.center();
+            cb.expand(center);
+            samples += 1.0;
+            const double dx = double(center.x) - mean[0];
+            const double dy = double(center.y) - mean[1];
+            const double dz = double(center.z) - mean[2];
+            const double inverseSamples = 1.0 / samples;
+            mean[0] += dx * inverseSamples;
+            mean[1] += dy * inverseSamples;
+            mean[2] += dz * inverseSamples;
+            const double dx2 = double(center.x) - mean[0];
+            const double dy2 = double(center.y) - mean[1];
+            const double dz2 = double(center.z) - mean[2];
+            xx += dx * dx2;
+            yy += dy * dy2;
+            zz += dz * dz2;
+            xy += dx * dy2;
+            xz += dx * dz2;
+            yz += dy * dz2;
+        }
+    }
+    else
+    {
+        for (int k = lo; k < hi; ++k)
+            cb.expand(instances_[items[k]].worldBox.center());
+    }
     const float4 ext = cb.mx - cb.mn;
+
+    if (tlasBuiltQuality_ == TlasQuality::MeanSplit)
+    {
+        double normal[3] = {};
+        if (principalCovarianceAxis(xx, yy, zz, xy, xz, yz, normal))
+        {
+            const auto mid = std::partition(
+                items.begin() + lo, items.begin() + hi,
+                [&](uint32_t idx)
+                {
+                    const float4 center = instances_[idx].worldBox.center();
+                    const double projection =
+                        (double(center.x) - mean[0]) * normal[0] +
+                        (double(center.y) - mean[1]) * normal[1] +
+                        (double(center.z) - mean[2]) * normal[2];
+                    return projection < 0.0;
+                });
+            const int m = int(mid - items.begin());
+            if (m > lo && m < hi) return m;
+        }
+    }
 
     if (tlasBuiltQuality_ == TlasQuality::BinnedSAH)
     {
@@ -3923,8 +4059,8 @@ int SpatialDatabase::tlasSplit(std::vector<uint32_t>& items, int lo, int hi)
 }
 
 // Recursive kWide-way build: log2(kWide) levels of binary splits per node.
-// More comparison-heavy than SpatialBins. Used for explicit Median/BinnedSAH
-// quality builds, which are rare and long-lived.
+// More computation-heavy than SpatialBins. Used for explicit Median,
+// MeanSplit, and BinnedSAH quality builds, which are rare and long-lived.
 int32_t SpatialDatabase::tlasBuildRange(std::vector<uint32_t>& items, int lo, int hi, int32_t parent)
 {
     const int32_t idx = tlasAllocNode();

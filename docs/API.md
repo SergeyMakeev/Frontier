@@ -1437,10 +1437,12 @@ SpatialDatabase database(config);
 
 `BinnedSAH` uses a binned surface-area heuristic to build a tighter TLAS at a
 higher rebuild cost. `SpatialBins` uses linear count/scatter passes and
-`Median` uses comparison-based longest-axis partitioning. The drift thresholds
-decide when `UpdateReport` recommends explicit optimization; they never cause
-one implicitly. Use `optimize(OptimizationMode::TopologyOnly)` for a lower-cost
-SpatialBins rebuild during ordinary simulation and
+`Median` uses comparison-based longest-axis partitioning. `MeanSplit` places
+each binary plane at the mean instance center and orients it with the principal
+covariance direction; degenerate cases fall back to `Median`. The drift
+thresholds decide when `UpdateReport` recommends explicit optimization; they
+never cause one implicitly. Use `optimize(OptimizationMode::TopologyOnly)` for
+a lower-cost SpatialBins rebuild during ordinary simulation and
 `optimize(OptimizationMode::TopologyAndLayout)` when compaction or the
 configured higher-quality topology is worth the extra cost.
 

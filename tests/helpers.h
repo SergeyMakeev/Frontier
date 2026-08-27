@@ -140,6 +140,38 @@ struct SpatialDatabase::TestAccess
     {
         return database.tlasNodes_.size();
     }
+    static std::vector<float4> tlasRootHalfInstanceCenters(
+        const SpatialDatabase& database, bool secondHalf)
+    {
+        std::vector<float4> centers;
+        if (database.tlasRoot_ < 0) return centers;
+
+        const TlasNode& root =
+            database.tlasNodes_[uint32_t(database.tlasRoot_)];
+        std::vector<int32_t> stack;
+        const uint32_t first = secondHalf ? kWide / 2 : 0;
+        const uint32_t end = secondHalf ? kWide : kWide / 2;
+        for (uint32_t lane = first; lane < end; ++lane)
+            if (root.validMask & (1u << lane))
+                stack.push_back(root.child[lane]);
+
+        while (!stack.empty())
+        {
+            const int32_t child = stack.back();
+            stack.pop_back();
+            if (child < 0)
+            {
+                centers.push_back(
+                    database.instances_[uint32_t(~child)].worldBox.center());
+                continue;
+            }
+            const TlasNode& node = database.tlasNodes_[uint32_t(child)];
+            for (uint32_t lane = 0; lane < kWide; ++lane)
+                if (node.validMask & (1u << lane))
+                    stack.push_back(node.child[lane]);
+        }
+        return centers;
+    }
     static size_t liveInstanceSlots(const SpatialDatabase& database)
     {
         return database.liveInstances_.size();

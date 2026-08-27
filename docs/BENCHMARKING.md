@@ -118,8 +118,12 @@ isolated submission and payload-LOD executables are called out separately:
 - `BM_InstanceForestRootSelectionScale` uses the same mounted forest but a
   distant camera that stops at renderable TLAS roots, separating top-level
   query/dispatch cost from refined BLAS traversal.
-- `BM_TlasQualitySelection` compares spatial-bin, median, and binned-SAH TLAS
-  selection with all-visible and close-camera views, and reports entry count,
+- `BM_TlasQualityRebuild` compares SpatialBins, Median, MeanSplit, and
+  Binned-SAH configured-quality rebuilds on world-aligned and rotated
+  elongated layouts, including the common compaction and traversal-order
+  rewrite.
+- `BM_TlasQualitySelection` compares all four TLAS quality tiers with
+  all-visible and close-camera views on both layouts, and reports entry count,
   node count, and TLAS bytes.
 - `BM_FlatInstanceLifecycle` measures steady-state TLAS spawn/remove plus its
   amortized maintenance barrier in a 1,024-object population.

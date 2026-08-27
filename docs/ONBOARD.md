@@ -694,16 +694,20 @@ definitions, and definition readiness state survives the removal of placements.
 
 ### 9.1 Build tiers
 
-The configured quality tier is `SpatialBins`, `Median`, or 16-bin `BinnedSAH`.
+The configured quality tier is `SpatialBins`, `Median`, `MeanSplit`, or 16-bin
+`BinnedSAH`.
 Initial builds and `optimize(OptimizationMode::TopologyAndLayout)` use the
 configured tier. `optimize(OptimizationMode::TopologyOnly)` uses the
 SpatialBins builder and preserves the current dense instance layout.
 
 The quality builder recursively produces a `kWide`-way tree using
-`log2(kWide)` binary splits per node. SAH scans 16 bins on all three axes; a
-degenerate SAH choice falls back to a longest-axis median so progress is
-guaranteed. Ranges of at most `kWide * kWide` are packed explicitly into full
-leaf groups, avoiding an underfilled final internal level.
+`log2(kWide)` binary splits per node. MeanSplit computes the mean instance
+center and principal covariance direction for every split range, then uses a
+plane through that mean with the principal direction as its normal. SAH scans
+16 bins on all three axes. A degenerate MeanSplit or SAH choice falls back to a
+longest-axis median so progress is guaranteed. Ranges of at most
+`kWide * kWide` are packed explicitly into full leaf groups, avoiding an
+underfilled final internal level.
 
 The SpatialBins builder:
 

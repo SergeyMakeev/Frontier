@@ -201,7 +201,7 @@ such a group preserves the `NodeHandle` and advances `payloadIndex()`.
 ## TLAS maintenance
 
 Initial builds and `optimize(OptimizationMode::TopologyAndLayout)` use the
-configured `BinnedSAH`, `Median`, or `SpatialBins` tier.
+configured `BinnedSAH`, `MeanSplit`, `Median`, or `SpatialBins` tier.
 `optimize(OptimizationMode::TopologyOnly)` uses the SpatialBins builder and
 does not change dense instance layout. Incremental
 insertion descends by least bound growth and splits a full leaf. Removal

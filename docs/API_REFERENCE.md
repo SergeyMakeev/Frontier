@@ -1636,6 +1636,7 @@ enum class TlasQuality : uint8_t {
     SpatialBins,
     Median,
     BinnedSAH,
+    MeanSplit,
 };
 ```
 
@@ -1648,6 +1649,12 @@ enum class TlasQuality : uint8_t {
 - `Median` recursively splits the longest axis at the median.
 
   ![Median split: equal object counts on each side of the middle rank](images/bvh-splits/median.svg)
+
+- `MeanSplit` places a plane at the mean instance center, normal to the
+  principal covariance direction. Degenerate covariance or an empty side
+  falls back to the longest-axis median split.
+
+  ![Mean split: mean plane normal to the principal covariance direction](images/bvh-splits/mean-split.svg)
 
 - `BinnedSAH` uses a binned surface-area heuristic and normally gives the best
   traversal quality.

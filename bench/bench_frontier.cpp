@@ -1309,22 +1309,86 @@ BENCHMARK(BM_FlatTlasSelectionScale)
     ->ArgNames({"instances", "cached"})
     ->Unit(benchmark::kMicrosecond);
 
+float4 tlasQualityPosition(uint32_t index, bool rotatedLayout)
+{
+    if (!rotatedLayout)
+    {
+        constexpr uint32_t side = 100;
+        return float4::point(
+            float(int(index % side) - int(side / 2)) * 3.0f,
+            float(int(index / side) - int(side / 2)) * 3.0f, 0.0f);
+    }
+
+    // A 4:1 rectangle rotated 35 degrees exercises MeanSplit's covariance
+    // direction instead of handing every strategy a world-aligned grid.
+    constexpr uint32_t columns = 200;
+    constexpr float cosine = 0.8191520443f;
+    constexpr float sine = 0.5735764364f;
+    const float u = float(int(index % columns) - int(columns / 2)) * 3.0f;
+    const float v = float(int(index / columns) - 25) * 3.0f;
+    return float4::point(cosine * u - sine * v,
+                         sine * u + cosine * v, 0.0f);
+}
+
+// Measures the configured quality builder plus the common compaction and
+// traversal-order rewrite performed by TopologyAndLayout.
+static void BM_TlasQualityRebuild(benchmark::State& state)
+{
+    constexpr uint32_t count = 10000;
+    const bool rotatedLayout = state.range(1) != 0;
+    SpatialDatabaseConfig config;
+    config.tlasQuality = TlasQuality(state.range(0));
+    SpatialDatabase world(config);
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        InstanceDesc desc;
+        desc.pos = tlasQualityPosition(i, rotatedLayout);
+        world.instantiate(node(1000 + i, 0.0f, box(0.5f)), desc);
+    }
+    world.applyUpdates(0);
+
+    for (auto _ : state)
+    {
+        world.optimize(OptimizationMode::TopologyAndLayout);
+        benchmark::ClobberMemory();
+    }
+    state.counters["tlas_nodes"] =
+        double(TestAccess::tlasNodeCount(world));
+    state.counters["tlas_KB"] =
+        double(TestAccess::tlasNodeCount(world) *
+               TestAccess::tlasNodeBytes()) /
+        1024.0;
+    state.SetItemsProcessed(state.iterations() * int64_t(count));
+}
+
+BENCHMARK(BM_TlasQualityRebuild)
+    ->Args({int64_t(TlasQuality::SpatialBins), 0})
+    ->Args({int64_t(TlasQuality::Median), 0})
+    ->Args({int64_t(TlasQuality::MeanSplit), 0})
+    ->Args({int64_t(TlasQuality::BinnedSAH), 0})
+    ->Args({int64_t(TlasQuality::SpatialBins), 1})
+    ->Args({int64_t(TlasQuality::Median), 1})
+    ->Args({int64_t(TlasQuality::MeanSplit), 1})
+    ->Args({int64_t(TlasQuality::BinnedSAH), 1})
+    ->ArgNames({"quality", "rotated_layout"})
+    ->UseRealTime()
+    ->Unit(benchmark::kMicrosecond);
+
 // Separates TLAS topology quality from BLAS work. The distant camera sees the
-// complete grid and measures traversal/occupancy; the close camera rejects
-// most instances and measures whether tighter bounds repay a larger tree.
+// complete population and measures traversal/occupancy; the close camera
+// rejects most instances and measures whether tighter bounds repay a larger
+// tree. Both world-aligned and rotated elongated layouts are covered.
 static void BM_TlasQualitySelection(benchmark::State& state)
 {
     constexpr uint32_t count = 10000;
     SpatialDatabaseConfig config;
     config.tlasQuality = TlasQuality(state.range(0));
     SpatialDatabase world(config);
-    constexpr uint32_t side = 100;
+    const bool rotatedLayout = state.range(2) != 0;
     for (uint32_t i = 0; i < count; ++i)
     {
         InstanceDesc desc;
-        desc.pos = float4::point(
-            float(int(i % side) - int(side / 2)) * 3.0f,
-            float(int(i / side) - int(side / 2)) * 3.0f, 0.0f);
+        desc.pos = tlasQualityPosition(i, rotatedLayout);
         world.instantiate(node(1000 + i, 0.0f, box(0.5f)), desc);
     }
     world.applyUpdates(0);
@@ -1349,13 +1413,23 @@ static void BM_TlasQualitySelection(benchmark::State& state)
 }
 
 BENCHMARK(BM_TlasQualitySelection)
-    ->Args({int64_t(TlasQuality::SpatialBins), 0})
-    ->Args({int64_t(TlasQuality::Median), 0})
-    ->Args({int64_t(TlasQuality::BinnedSAH), 0})
-    ->Args({int64_t(TlasQuality::SpatialBins), 1})
-    ->Args({int64_t(TlasQuality::Median), 1})
-    ->Args({int64_t(TlasQuality::BinnedSAH), 1})
-    ->ArgNames({"quality", "close_camera"})
+    ->Args({int64_t(TlasQuality::SpatialBins), 0, 0})
+    ->Args({int64_t(TlasQuality::Median), 0, 0})
+    ->Args({int64_t(TlasQuality::MeanSplit), 0, 0})
+    ->Args({int64_t(TlasQuality::BinnedSAH), 0, 0})
+    ->Args({int64_t(TlasQuality::SpatialBins), 1, 0})
+    ->Args({int64_t(TlasQuality::Median), 1, 0})
+    ->Args({int64_t(TlasQuality::MeanSplit), 1, 0})
+    ->Args({int64_t(TlasQuality::BinnedSAH), 1, 0})
+    ->Args({int64_t(TlasQuality::SpatialBins), 0, 1})
+    ->Args({int64_t(TlasQuality::Median), 0, 1})
+    ->Args({int64_t(TlasQuality::MeanSplit), 0, 1})
+    ->Args({int64_t(TlasQuality::BinnedSAH), 0, 1})
+    ->Args({int64_t(TlasQuality::SpatialBins), 1, 1})
+    ->Args({int64_t(TlasQuality::Median), 1, 1})
+    ->Args({int64_t(TlasQuality::MeanSplit), 1, 1})
+    ->Args({int64_t(TlasQuality::BinnedSAH), 1, 1})
+    ->ArgNames({"quality", "close_camera", "rotated_layout"})
     ->Unit(benchmark::kMicrosecond);
 
 // Exercises the indexed/dependent-load pipelines between the TLAS result,

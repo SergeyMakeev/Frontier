@@ -1181,8 +1181,9 @@ private:
 enum class TlasQuality : uint8_t
 {
     SpatialBins, // linear-pass longest-axis spatial bins; fast and tight
-    Median,     // recursive longest-axis median split
-    BinnedSAH,  // binned surface-area-heuristic split; best traversal cost
+    Median,      // recursive longest-axis median split
+    BinnedSAH,   // binned surface-area-heuristic split; best traversal cost
+    MeanSplit,   // mean plane normal to the principal covariance direction
 };
 
 enum class OptimizationMode : uint8_t

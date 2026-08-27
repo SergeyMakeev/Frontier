@@ -679,6 +679,7 @@ const char* tlasQualityName(TlasQuality quality)
     case TlasQuality::SpatialBins: return "Spatial bins";
     case TlasQuality::Median: return "Median";
     case TlasQuality::BinnedSAH: return "Binned SAH";
+    case TlasQuality::MeanSplit: return "Mean split";
     }
     return "Unknown";
 }
