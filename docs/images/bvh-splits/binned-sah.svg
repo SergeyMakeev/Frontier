@@ -1,0 +1,188 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="680"
+     viewBox="0 0 1000 680" role="img"
+     aria-labelledby="title description">
+  <title id="title">Binned surface-area heuristic BVH split strategy</title>
+  <desc id="description">
+    A parent bounding box contains two spatial clusters. Sixteen candidate bins
+    are evaluated along each axis. The selected plane lies in the gap between
+    clusters because it minimizes the traversal plus area-times-count cost,
+    producing two tight child bounding boxes.
+  </desc>
+  <defs>
+    <marker id="axis-arrow" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0 0 L10 5 L0 10 Z" class="arrow-head"/>
+    </marker>
+    <style>
+      text { font-family: Inter, "Segoe UI", Arial, sans-serif; }
+      .canvas { fill: #ffffff; }
+      .ink { fill: #172033; }
+      .muted { fill: #526077; }
+      .title { font-size: 27px; font-weight: 600; }
+      .subtitle { font-size: 15px; }
+      .parent { fill: #f8fafc; stroke: #172033; stroke-width: 3; }
+      .parent-tag { fill: #172033; }
+      .parent-tag-text { fill: #ffffff; font-size: 12px; font-weight: 700; letter-spacing: .08em; }
+      .left-zone { fill: #eff6ff; }
+      .right-zone { fill: #f0fdf4; }
+      .candidate { stroke: #cbd5e1; stroke-width: 1; stroke-dasharray: 3 5; }
+      .candidate-label { fill: #64748b; font-size: 10px; text-anchor: middle; }
+      .child-left { fill: #dbeafe; fill-opacity: .38; stroke: #2563eb; stroke-width: 2.5; }
+      .child-right { fill: #dcfce7; fill-opacity: .38; stroke: #16a34a; stroke-width: 2.5; }
+      .left-ink { fill: #1d4ed8; }
+      .right-ink { fill: #15803d; }
+      .child-label { font-size: 13px; font-weight: 700; }
+      .object { fill: #64748b; stroke: #334155; stroke-width: 1.2; }
+      .centroid { fill: #ffffff; stroke: #172033; stroke-width: 1.5; }
+      .chosen { stroke: #ea580c; stroke-width: 4; }
+      .chosen-label-bg { fill: #fff7ed; stroke: #fdba74; stroke-width: 1; }
+      .chosen-label { fill: #c2410c; font-size: 12px; font-weight: 700; text-anchor: middle; }
+      .axis { stroke: #ea580c; stroke-width: 2.5; marker-end: url(#axis-arrow); }
+      .arrow-head { fill: #ea580c; }
+      .axis-label { fill: #c2410c; font-size: 13px; font-weight: 700; }
+      .formula { fill: #fff7ed; stroke: #fdba74; stroke-width: 1.5; }
+      .formula-main { fill: #9a3412; font-size: 15px; font-weight: 600; text-anchor: middle; }
+      .formula-note { fill: #526077; font-size: 11px; text-anchor: middle; }
+      .card { fill: #f8fafc; stroke: #cbd5e1; stroke-width: 1.5; }
+      .card-title { font-size: 16px; font-weight: 700; }
+      .step-number { fill: #2563eb; }
+      .step-digit { fill: #ffffff; font-size: 12px; font-weight: 700; text-anchor: middle; }
+      .step { font-size: 14px; }
+      .result { fill: #eff6ff; stroke: #93c5fd; stroke-width: 1.5; }
+      .result-title { fill: #1d4ed8; font-size: 12px; font-weight: 700; letter-spacing: .06em; }
+      .result-text { font-size: 13px; }
+      .legend { fill: #ffffff; stroke: #cbd5e1; stroke-width: 1.5; }
+      .legend-text { font-size: 12px; }
+    </style>
+    <style media="(prefers-color-scheme: dark)">
+      .canvas { fill: #0f172a; }
+      .ink { fill: #e5edf8; }
+      .muted { fill: #a9b7ca; }
+      .parent { fill: #111c31; stroke: #dbe7f5; }
+      .parent-tag { fill: #dbe7f5; }
+      .parent-tag-text { fill: #0f172a; }
+      .left-zone { fill: #10213a; }
+      .right-zone { fill: #10291f; }
+      .candidate { stroke: #475569; }
+      .candidate-label { fill: #94a3b8; }
+      .child-left { fill: #183b68; stroke: #60a5fa; }
+      .child-right { fill: #123f32; stroke: #4ade80; }
+      .left-ink { fill: #93c5fd; }
+      .right-ink { fill: #86efac; }
+      .object { fill: #94a3b8; stroke: #cbd5e1; }
+      .centroid { fill: #0f172a; stroke: #f8fafc; }
+      .chosen { stroke: #fb923c; }
+      .chosen-label-bg { fill: #3a271d; stroke: #fb923c; }
+      .chosen-label { fill: #fdba74; }
+      .axis { stroke: #fb923c; }
+      .arrow-head { fill: #fb923c; }
+      .axis-label { fill: #fdba74; }
+      .formula { fill: #3a271d; stroke: #fb923c; }
+      .formula-main { fill: #fdba74; }
+      .formula-note { fill: #a9b7ca; }
+      .card { fill: #111c31; stroke: #475569; }
+      .result { fill: #142b4b; stroke: #3b82f6; }
+      .result-title { fill: #93c5fd; }
+      .legend { fill: #111c31; stroke: #475569; }
+    </style>
+  </defs>
+
+  <rect class="canvas" width="1000" height="680"/>
+  <text class="title ink" x="40" y="46">BinnedSAH · minimum estimated traversal cost</text>
+  <text class="subtitle muted" x="40" y="73">
+    Test binned planes on X, Y, and Z; choose the split with the lowest area-weighted cost.
+  </text>
+
+  <rect class="parent" x="60" y="125" width="660" height="410" rx="8"/>
+  <rect class="left-zone" x="63" y="128" width="286" height="404"/>
+  <rect class="right-zone" x="349" y="128" width="368" height="404"/>
+
+  <!-- Sixteen candidate bins on the illustrated X axis. -->
+  <g>
+    <line class="candidate" x1="101.25" y1="128" x2="101.25" y2="532"/>
+    <line class="candidate" x1="142.5" y1="128" x2="142.5" y2="532"/>
+    <line class="candidate" x1="183.75" y1="128" x2="183.75" y2="532"/>
+    <line class="candidate" x1="225" y1="128" x2="225" y2="532"/>
+    <line class="candidate" x1="266.25" y1="128" x2="266.25" y2="532"/>
+    <line class="candidate" x1="307.5" y1="128" x2="307.5" y2="532"/>
+    <line class="candidate" x1="348.75" y1="128" x2="348.75" y2="532"/>
+    <line class="candidate" x1="390" y1="128" x2="390" y2="532"/>
+    <line class="candidate" x1="431.25" y1="128" x2="431.25" y2="532"/>
+    <line class="candidate" x1="472.5" y1="128" x2="472.5" y2="532"/>
+    <line class="candidate" x1="513.75" y1="128" x2="513.75" y2="532"/>
+    <line class="candidate" x1="555" y1="128" x2="555" y2="532"/>
+    <line class="candidate" x1="596.25" y1="128" x2="596.25" y2="532"/>
+    <line class="candidate" x1="637.5" y1="128" x2="637.5" y2="532"/>
+    <line class="candidate" x1="678.75" y1="128" x2="678.75" y2="532"/>
+  </g>
+  <text class="candidate-label" x="80" y="151">0</text>
+  <text class="candidate-label" x="101" y="151">1</text>
+  <text class="candidate-label" x="142" y="151">2</text>
+  <text class="candidate-label" x="184" y="151">3</text>
+  <text class="candidate-label" x="225" y="151">4</text>
+  <text class="candidate-label" x="266" y="151">5</text>
+  <text class="candidate-label" x="308" y="151">6</text>
+  <text class="candidate-label" x="349" y="151">7</text>
+  <text class="candidate-label" x="390" y="151">8</text>
+  <text class="candidate-label" x="431" y="151">9</text>
+  <text class="candidate-label" x="473" y="151">10</text>
+  <text class="candidate-label" x="514" y="151">11</text>
+  <text class="candidate-label" x="555" y="151">12</text>
+  <text class="candidate-label" x="596" y="151">13</text>
+  <text class="candidate-label" x="638" y="151">14</text>
+  <text class="candidate-label" x="679" y="151">15</text>
+
+  <rect class="child-left" x="82" y="184" width="209" height="290" rx="5"/>
+  <text class="child-label left-ink" x="95" y="207">LEFT CHILD · Nₗ = 5</text>
+  <rect class="child-right" x="438" y="181" width="257" height="306" rx="5"/>
+  <text class="child-label right-ink" x="451" y="204">RIGHT CHILD · Nᵣ = 7</text>
+
+  <!-- Left cluster. -->
+  <g transform="rotate(-10 117 261)"><rect class="object" x="95" y="242" width="44" height="38" rx="3"/><circle class="centroid" cx="117" cy="261" r="4"/></g>
+  <g transform="rotate(8 190 236)"><rect class="object" x="165" y="216" width="50" height="40" rx="3"/><circle class="centroid" cx="190" cy="236" r="4"/></g>
+  <g transform="rotate(-6 249 318)"><rect class="object" x="226" y="299" width="46" height="38" rx="3"/><circle class="centroid" cx="249" cy="318" r="4"/></g>
+  <g transform="rotate(9 137 401)"><rect class="object" x="112" y="380" width="50" height="42" rx="3"/><circle class="centroid" cx="137" cy="401" r="4"/></g>
+  <g transform="rotate(-7 229 430)"><rect class="object" x="205" y="411" width="48" height="38" rx="3"/><circle class="centroid" cx="229" cy="430" r="4"/></g>
+
+  <!-- Right cluster. -->
+  <g transform="rotate(-7 469 251)"><rect class="object" x="446" y="232" width="46" height="38" rx="3"/><circle class="centroid" cx="469" cy="251" r="4"/></g>
+  <g transform="rotate(8 535 260)"><rect class="object" x="510" y="240" width="50" height="40" rx="3"/><circle class="centroid" cx="535" cy="260" r="4"/></g>
+  <g transform="rotate(-5 616 257)"><rect class="object" x="593" y="238" width="46" height="38" rx="3"/><circle class="centroid" cx="616" cy="257" r="4"/></g>
+  <g transform="rotate(10 487 338)"><rect class="object" x="462" y="317" width="50" height="42" rx="3"/><circle class="centroid" cx="487" cy="338" r="4"/></g>
+  <g transform="rotate(-9 577 346)"><rect class="object" x="552" y="326" width="50" height="40" rx="3"/><circle class="centroid" cx="577" cy="346" r="4"/></g>
+  <g transform="rotate(6 652 385)"><rect class="object" x="628" y="365" width="48" height="40" rx="3"/><circle class="centroid" cx="652" cy="385" r="4"/></g>
+  <g transform="rotate(-8 539 445)"><rect class="object" x="515" y="426" width="48" height="38" rx="3"/><circle class="centroid" cx="539" cy="445" r="4"/></g>
+
+  <line class="chosen" x1="349" y1="128" x2="349" y2="532"/>
+  <rect class="chosen-label-bg" x="292" y="137" width="114" height="27" rx="6"/>
+  <text class="chosen-label" x="349" y="155">LOWEST COST</text>
+  <rect class="parent-tag" x="74" y="108" width="112" height="27" rx="5"/>
+  <text class="parent-tag-text" x="87" y="126">PARENT NODE</text>
+
+  <line class="axis" x1="78" y1="558" x2="704" y2="558"/>
+  <text class="axis-label" x="78" y="582">illustrated candidate axis: X</text>
+  <rect class="formula" x="182" y="590" width="420" height="61" rx="9"/>
+  <text class="formula-main" x="392" y="616">C = Cₜ + Cᵢ (AₗNₗ + AᵣNᵣ)</text>
+  <text class="formula-note" x="392" y="638">smaller child area × population wins</text>
+
+  <rect class="card" x="750" y="125" width="220" height="410" rx="10"/>
+  <text class="card-title ink" x="770" y="157">Partition rule</text>
+  <circle class="step-number" cx="783" cy="190" r="13"/><text class="step-digit" x="783" y="194">1</text>
+  <text class="step ink" x="807" y="187"><tspan x="807">Bin centroids on all</tspan><tspan x="807" dy="19">three axes (16 each).</tspan></text>
+  <circle class="step-number" cx="783" cy="245" r="13"/><text class="step-digit" x="783" y="249">2</text>
+  <text class="step ink" x="807" y="242"><tspan x="807">Accumulate left/right</tspan><tspan x="807" dy="19">bounds and counts.</tspan></text>
+  <circle class="step-number" cx="783" cy="300" r="13"/><text class="step-digit" x="783" y="304">3</text>
+  <text class="step ink" x="807" y="297"><tspan x="807">Evaluate every valid</tspan><tspan x="807" dy="19">candidate plane.</tspan></text>
+  <circle class="step-number" cx="783" cy="355" r="13"/><text class="step-digit" x="783" y="359">4</text>
+  <text class="step ink" x="807" y="352"><tspan x="807">Choose minimum cost;</tspan><tspan x="807" dy="19">then recurse.</tspan></text>
+  <rect class="result" x="770" y="405" width="180" height="105" rx="8"/>
+  <text class="result-title" x="784" y="428">KEY PROPERTY</text>
+  <text class="result-text ink" x="784" y="452"><tspan x="784">Tighter child bounds</tspan><tspan x="784" dy="19">usually reduce query</tspan><tspan x="784" dy="19">traversal work.</tspan></text>
+
+  <rect class="legend" x="750" y="555" width="220" height="75" rx="8"/>
+  <line class="candidate" x1="772" y1="568" x2="772" y2="592"/>
+  <text class="legend-text ink" x="786" y="584">candidate plane</text>
+  <line class="chosen" x1="772" y1="602" x2="772" y2="624"/>
+  <text class="legend-text ink" x="786" y="617">selected plane</text>
+</svg>

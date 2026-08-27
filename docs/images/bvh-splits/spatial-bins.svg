@@ -1,0 +1,158 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="680"
+     viewBox="0 0 1000 680" role="img"
+     aria-labelledby="title description">
+  <title id="title">SpatialBins BVH split strategy</title>
+  <desc id="description">
+    A parent bounding box is divided along its longest centroid axis into four
+    equal-width spatial bins. The objects in each non-empty bin are grouped
+    into a child bounding box. The same rule uses eight bins in a BVH8 build.
+  </desc>
+  <defs>
+    <marker id="axis-arrow" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0 0 L10 5 L0 10 Z" class="arrow-head"/>
+    </marker>
+    <style>
+      text { font-family: Inter, "Segoe UI", Arial, sans-serif; }
+      .canvas { fill: #ffffff; }
+      .ink { fill: #172033; }
+      .muted { fill: #526077; }
+      .title { font-size: 27px; font-weight: 600; }
+      .subtitle { font-size: 15px; }
+      .parent { fill: #f8fafc; stroke: #172033; stroke-width: 3; }
+      .parent-tag { fill: #172033; }
+      .parent-tag-text { fill: #ffffff; font-size: 12px; font-weight: 700; letter-spacing: .08em; }
+      .bin-a { fill: #eff6ff; }
+      .bin-b { fill: #f8fafc; }
+      .bin-line { stroke: #94a3b8; stroke-width: 1.5; stroke-dasharray: 7 6; }
+      .bin-label { fill: #64748b; font-size: 12px; font-weight: 600; text-anchor: middle; }
+      .child-0 { fill: #dbeafe; fill-opacity: .42; stroke: #2563eb; stroke-width: 2.5; }
+      .child-1 { fill: #dcfce7; fill-opacity: .42; stroke: #16a34a; stroke-width: 2.5; }
+      .child-2 { fill: #fef3c7; fill-opacity: .48; stroke: #d97706; stroke-width: 2.5; }
+      .child-3 { fill: #f3e8ff; fill-opacity: .45; stroke: #9333ea; stroke-width: 2.5; }
+      .child-label { font-size: 13px; font-weight: 700; }
+      .c0 { fill: #1d4ed8; } .c1 { fill: #15803d; }
+      .c2 { fill: #b45309; } .c3 { fill: #7e22ce; }
+      .object { fill: #64748b; stroke: #334155; stroke-width: 1.2; }
+      .centroid { fill: #ffffff; stroke: #172033; stroke-width: 1.5; }
+      .axis { stroke: #ea580c; stroke-width: 2.5; marker-end: url(#axis-arrow); }
+      .arrow-head { fill: #ea580c; }
+      .axis-label { fill: #c2410c; font-size: 13px; font-weight: 700; }
+      .card { fill: #f8fafc; stroke: #cbd5e1; stroke-width: 1.5; }
+      .card-title { font-size: 16px; font-weight: 700; }
+      .step-number { fill: #2563eb; }
+      .step-digit { fill: #ffffff; font-size: 12px; font-weight: 700; text-anchor: middle; }
+      .step { font-size: 14px; }
+      .result { fill: #eff6ff; stroke: #93c5fd; stroke-width: 1.5; }
+      .result-title { fill: #1d4ed8; font-size: 12px; font-weight: 700; letter-spacing: .06em; }
+      .result-text { font-size: 13px; }
+      .legend { fill: #ffffff; stroke: #cbd5e1; stroke-width: 1.5; }
+      .legend-text { font-size: 12px; }
+    </style>
+    <style media="(prefers-color-scheme: dark)">
+      .canvas { fill: #0f172a; }
+      .ink { fill: #e5edf8; }
+      .muted { fill: #a9b7ca; }
+      .parent { fill: #111c31; stroke: #dbe7f5; }
+      .parent-tag { fill: #dbe7f5; }
+      .parent-tag-text { fill: #0f172a; }
+      .bin-a { fill: #10213a; }
+      .bin-b { fill: #111c31; }
+      .bin-line { stroke: #64748b; }
+      .bin-label { fill: #a9b7ca; }
+      .child-0 { fill: #183b68; stroke: #60a5fa; }
+      .child-1 { fill: #123f32; stroke: #4ade80; }
+      .child-2 { fill: #493319; stroke: #fbbf24; }
+      .child-3 { fill: #3b2455; stroke: #c084fc; }
+      .c0 { fill: #93c5fd; } .c1 { fill: #86efac; }
+      .c2 { fill: #fde68a; } .c3 { fill: #d8b4fe; }
+      .object { fill: #94a3b8; stroke: #cbd5e1; }
+      .centroid { fill: #0f172a; stroke: #f8fafc; }
+      .axis { stroke: #fb923c; }
+      .arrow-head { fill: #fb923c; }
+      .axis-label { fill: #fdba74; }
+      .card { fill: #111c31; stroke: #475569; }
+      .result { fill: #142b4b; stroke: #3b82f6; }
+      .result-title { fill: #93c5fd; }
+      .legend { fill: #111c31; stroke: #475569; }
+    </style>
+  </defs>
+
+  <rect class="canvas" width="1000" height="680"/>
+  <text class="title ink" x="40" y="46">SpatialBins · equal spatial intervals</text>
+  <text class="subtitle muted" x="40" y="73">
+    Split the longest centroid axis into kWide bins; every non-empty bin becomes one child lane.
+  </text>
+
+  <!-- Parent node and equal-width BVH4 bins. -->
+  <rect class="parent" x="60" y="125" width="660" height="410" rx="8"/>
+  <rect class="bin-a" x="63" y="128" width="163.5" height="404"/>
+  <rect class="bin-b" x="226.5" y="128" width="163.5" height="404"/>
+  <rect class="bin-a" x="390" y="128" width="163.5" height="404"/>
+  <rect class="bin-b" x="553.5" y="128" width="163.5" height="404"/>
+  <line class="bin-line" x1="226.5" y1="128" x2="226.5" y2="532"/>
+  <line class="bin-line" x1="390" y1="128" x2="390" y2="532"/>
+  <line class="bin-line" x1="553.5" y1="128" x2="553.5" y2="532"/>
+  <text class="bin-label" x="145" y="151">BIN 0</text>
+  <text class="bin-label" x="308" y="151">BIN 1</text>
+  <text class="bin-label" x="472" y="151">BIN 2</text>
+  <text class="bin-label" x="635" y="151">BIN 3</text>
+
+  <!-- Child AABBs. -->
+  <rect class="child-0" x="86" y="208" width="116" height="247" rx="5"/>
+  <text class="child-label c0" x="98" y="230">CHILD 0</text>
+  <rect class="child-1" x="250" y="176" width="115" height="260" rx="5"/>
+  <text class="child-label c1" x="262" y="198">CHILD 1</text>
+  <rect class="child-2" x="414" y="247" width="113" height="238" rx="5"/>
+  <text class="child-label c2" x="426" y="269">CHILD 2</text>
+  <rect class="child-3" x="577" y="186" width="115" height="224" rx="5"/>
+  <text class="child-label c3" x="589" y="208">CHILD 3</text>
+
+  <!-- Instances and their centroids. -->
+  <g transform="rotate(-12 124 277)"><rect class="object" x="102" y="258" width="44" height="38" rx="3"/><circle class="centroid" cx="124" cy="277" r="4"/></g>
+  <g transform="rotate(9 167 352)"><rect class="object" x="141" y="333" width="52" height="38" rx="3"/><circle class="centroid" cx="167" cy="352" r="4"/></g>
+  <g transform="rotate(-7 121 416)"><rect class="object" x="99" y="398" width="44" height="36" rx="3"/><circle class="centroid" cx="121" cy="416" r="4"/></g>
+
+  <g transform="rotate(8 285 246)"><rect class="object" x="263" y="226" width="44" height="40" rx="3"/><circle class="centroid" cx="285" cy="246" r="4"/></g>
+  <g transform="rotate(-9 334 308)"><rect class="object" x="309" y="288" width="50" height="40" rx="3"/><circle class="centroid" cx="334" cy="308" r="4"/></g>
+  <g transform="rotate(5 292 393)"><rect class="object" x="268" y="374" width="48" height="38" rx="3"/><circle class="centroid" cx="292" cy="393" r="4"/></g>
+
+  <g transform="rotate(-10 451 314)"><rect class="object" x="428" y="295" width="46" height="38" rx="3"/><circle class="centroid" cx="451" cy="314" r="4"/></g>
+  <g transform="rotate(8 495 373)"><rect class="object" x="470" y="352" width="50" height="42" rx="3"/><circle class="centroid" cx="495" cy="373" r="4"/></g>
+  <g transform="rotate(-4 455 445)"><rect class="object" x="432" y="428" width="46" height="34" rx="3"/><circle class="centroid" cx="455" cy="445" r="4"/></g>
+
+  <g transform="rotate(7 611 251)"><rect class="object" x="587" y="231" width="48" height="40" rx="3"/><circle class="centroid" cx="611" cy="251" r="4"/></g>
+  <g transform="rotate(-11 655 319)"><rect class="object" x="630" y="298" width="50" height="42" rx="3"/><circle class="centroid" cx="655" cy="319" r="4"/></g>
+  <g transform="rotate(4 608 375)"><rect class="object" x="585" y="357" width="46" height="36" rx="3"/><circle class="centroid" cx="608" cy="375" r="4"/></g>
+
+  <rect class="parent-tag" x="74" y="108" width="112" height="27" rx="5"/>
+  <text class="parent-tag-text" x="87" y="126">PARENT NODE</text>
+  <line class="axis" x1="78" y1="558" x2="704" y2="558"/>
+  <text class="axis-label" x="78" y="582">longest centroid axis: X</text>
+  <text class="axis-label" x="627" y="582">equal Δx</text>
+
+  <!-- Rule card. -->
+  <rect class="card" x="750" y="125" width="220" height="410" rx="10"/>
+  <text class="card-title ink" x="770" y="157">Partition rule</text>
+  <circle class="step-number" cx="783" cy="190" r="13"/><text class="step-digit" x="783" y="194">1</text>
+  <text class="step ink" x="807" y="187"><tspan x="807">Find the longest</tspan><tspan x="807" dy="19">centroid axis.</tspan></text>
+  <circle class="step-number" cx="783" cy="245" r="13"/><text class="step-digit" x="783" y="249">2</text>
+  <text class="step ink" x="807" y="242"><tspan x="807">Divide its range into</tspan><tspan x="807" dy="19">kWide equal bins.</tspan></text>
+  <circle class="step-number" cx="783" cy="300" r="13"/><text class="step-digit" x="783" y="304">3</text>
+  <text class="step ink" x="807" y="297"><tspan x="807">Count and scatter by</tspan><tspan x="807" dy="19">centroid position.</tspan></text>
+  <circle class="step-number" cx="783" cy="355" r="13"/><text class="step-digit" x="783" y="359">4</text>
+  <text class="step ink" x="807" y="352"><tspan x="807">Recurse into each</tspan><tspan x="807" dy="19">non-empty bin.</tspan></text>
+  <rect class="result" x="770" y="405" width="180" height="105" rx="8"/>
+  <text class="result-title" x="784" y="428">KEY PROPERTY</text>
+  <text class="result-text ink" x="784" y="452"><tspan x="784">Fast linear passes;</tspan><tspan x="784" dy="19">child counts follow</tspan><tspan x="784" dy="19">spatial density.</tspan></text>
+
+  <rect class="legend" x="60" y="610" width="910" height="45" rx="8"/>
+  <rect class="object" x="82" y="622" width="25" height="20" rx="2"/><circle class="centroid" cx="94.5" cy="632" r="3"/>
+  <text class="legend-text ink" x="119" y="636">instance + centroid</text>
+  <rect class="child-0" x="272" y="620" width="35" height="24" rx="3"/>
+  <text class="legend-text ink" x="319" y="636">child bounds</text>
+  <line class="bin-line" x1="448" y1="619" x2="448" y2="645"/>
+  <text class="legend-text ink" x="463" y="636">equal-width bin boundary</text>
+  <text class="legend-text muted" x="690" y="636">BVH4 shown · BVH8 uses 8 bins</text>
+</svg>

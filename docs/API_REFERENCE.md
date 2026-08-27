@@ -1642,9 +1642,17 @@ enum class TlasQuality : uint8_t {
 - `SpatialBins` recursively partitions the longest centroid axis into wide
   equal-width bins using linear count/scatter passes. Small or severely skewed
   ranges use a median fallback.
+
+  ![SpatialBins split: equal-width spatial bins become child bounds](images/bvh-splits/spatial-bins.svg)
+
 - `Median` recursively splits the longest axis at the median.
+
+  ![Median split: equal object counts on each side of the middle rank](images/bvh-splits/median.svg)
+
 - `BinnedSAH` uses a binned surface-area heuristic and normally gives the best
   traversal quality.
+
+  ![Binned SAH split: choose the lowest-cost candidate plane](images/bvh-splits/binned-sah.svg)
 
 ### `OptimizationMode`
 
