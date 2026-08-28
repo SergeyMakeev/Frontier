@@ -1432,6 +1432,248 @@ BENCHMARK(BM_TlasQualitySelection)
     ->ArgNames({"quality", "close_camera", "rotated_layout"})
     ->Unit(benchmark::kMicrosecond);
 
+// Experimental adaptive AoSoA leaves. The clustered layout places up to four
+// SIMD blocks at the same center, making the final interior bounds overlap and
+// giving the collapse cost model a reason to remove that level. The regular
+// grid is the control case where spatial pruning should retain it.
+float4 tlasFatLeafPosition(uint32_t index, uint32_t count, bool clustered)
+{
+    const uint32_t instancesPerCenter = 4u * kWide;
+    const uint32_t positionCount =
+        clustered ? (count + instancesPerCenter - 1) / instancesPerCenter
+                  : count;
+    const uint32_t side =
+        uint32_t(std::ceil(std::sqrt(double(positionCount))));
+    const uint32_t position =
+        clustered ? index / instancesPerCenter : index;
+    const float pitch = clustered ? 12.0f : 3.0f;
+    return float4::point(
+        float(int(position % side) - int(side / 2)) * pitch,
+        float(int(position / side) - int(side / 2)) * pitch, 0.0f);
+}
+
+float4 tlasFatLeafWidthPosition(uint32_t index,
+                                uint32_t instancesPerCenter,
+                                uint32_t groupCount)
+{
+    const uint32_t side = uint32_t(std::ceil(std::sqrt(double(groupCount))));
+    const uint32_t position = index / instancesPerCenter;
+    return float4::point(
+        float(int(position % side) - int(side / 2)) * 12.0f,
+        float(int(position / side) - int(side / 2)) * 12.0f, 0.0f);
+}
+
+static void BM_TlasFatLeafSelection(benchmark::State& state)
+{
+    constexpr uint32_t count = 8192;
+    const uint32_t maxLeafBlocks = uint32_t(state.range(0));
+    const bool clustered = state.range(1) != 0;
+    const bool closeCamera = state.range(2) != 0;
+
+    SpatialDatabaseConfig config;
+    config.tlasQuality = TlasQuality::BinnedSAH;
+    config.tlasMaxLeafBlocks = maxLeafBlocks;
+    SpatialDatabase world(config);
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        InstanceDesc desc;
+        desc.pos = tlasFatLeafPosition(i, count, clustered);
+        world.instantiate(node(1000 + i, 0.0f, box(0.5f)), desc);
+    }
+    world.applyUpdates(0);
+
+    Camera camera = cameraAt(closeCamera ? -50.0f : -2000.0f);
+    camera.viewMask = 1u; // force TLAS traversal instead of overview emission
+    SpatialQuery query;
+    query.setReuseEnabled(false);
+
+    FrontierResultView result;
+    for (auto _ : state)
+    {
+        result = query.selectFrontier(world, camera, {});
+        consume(result);
+    }
+    state.counters["entries"] = double(result.size());
+    state.counters["fat_leaves"] =
+        double(TestAccess::tlasFatLeafCount(world));
+    state.counters["leaf_blocks"] =
+        double(TestAccess::tlasLeafBlockCount(world));
+    state.counters["max_depth"] =
+        double(TestAccess::tlasMaxDepth(world));
+    state.counters["tlas_nodes"] =
+        double(TestAccess::tlasNodeCount(world));
+    state.counters["tlas_KB"] =
+        double(TestAccess::tlasNodeCount(world) *
+               TestAccess::tlasNodeBytes()) /
+        1024.0;
+}
+
+BENCHMARK(BM_TlasFatLeafSelection)
+    ->Args({1, 0, 0})
+    ->Args({4, 0, 0})
+    ->Args({1, 0, 1})
+    ->Args({4, 0, 1})
+    ->Args({1, 1, 0})
+    ->Args({4, 1, 0})
+    ->Args({1, 1, 1})
+    ->Args({4, 1, 1})
+    ->ArgNames({"max_leaf_blocks", "clustered", "close_camera"})
+    ->Unit(benchmark::kMicrosecond);
+
+// Holds the number of spatial groups constant while sweeping the number of
+// colocated SIMD blocks in each group. Every size is measured both with its
+// final interior node retained and with the adaptive leaf capacity raised to
+// the requested width. The observed_blocks counter verifies that the builder
+// actually emitted the requested logical leaf size.
+static void BM_TlasFatLeafWidthSweep(benchmark::State& state)
+{
+    // Use a power of the compiled BVH width so median partitioning preserves
+    // the requested number of blocks in every final range.
+    constexpr uint32_t groupCount = kWide == 8 ? 512u : 1024u;
+    const uint32_t leafBlocks = uint32_t(state.range(0));
+    const bool collapse = state.range(1) != 0;
+    const bool closeCamera = state.range(2) != 0;
+    const uint32_t instancesPerCenter = leafBlocks * kWide;
+    const uint32_t count = groupCount * instancesPerCenter;
+
+    SpatialDatabaseConfig config;
+    config.tlasQuality = TlasQuality::Median;
+    config.tlasMaxLeafBlocks = collapse ? leafBlocks : 1u;
+    config.tlasTraversalCost = collapse ? 1.0e9f : 1.0f;
+    SpatialDatabase world(config);
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        InstanceDesc desc;
+        desc.pos = tlasFatLeafWidthPosition(
+            i, instancesPerCenter, groupCount);
+        world.instantiate(node(20000 + i, 0.0f, box(0.5f)), desc);
+    }
+    world.applyUpdates(0);
+
+    Camera camera = cameraAt(closeCamera ? -50.0f : -2000.0f);
+    camera.viewMask = 1u;
+    SpatialQuery query;
+    query.setReuseEnabled(false);
+
+    FrontierResultView result;
+    for (auto _ : state)
+    {
+        result = query.selectFrontier(world, camera, {});
+        consume(result);
+    }
+    state.counters["entries"] = double(result.size());
+    state.counters["fat_leaves"] =
+        double(TestAccess::tlasFatLeafCount(world));
+    state.counters["observed_blocks"] =
+        double(TestAccess::tlasMaxLeafBlocks(world));
+    state.counters["max_depth"] =
+        double(TestAccess::tlasMaxDepth(world));
+    state.counters["tlas_nodes"] =
+        double(TestAccess::tlasNodeCount(world));
+    state.counters["tlas_KB"] =
+        double(TestAccess::tlasNodeCount(world) *
+               TestAccess::tlasNodeBytes()) /
+        1024.0;
+    state.SetItemsProcessed(state.iterations() * int64_t(count));
+}
+
+BENCHMARK(BM_TlasFatLeafWidthSweep)
+    ->ArgsProduct({{2, 4, 6, 8}, {0, 1}, {0, 1}})
+    ->ArgNames({"leaf_blocks", "collapse", "close_camera"})
+    ->Unit(benchmark::kMicrosecond);
+
+static void BM_TlasFatLeafRebuild(benchmark::State& state)
+{
+    constexpr uint32_t count = 8192;
+    const uint32_t maxLeafBlocks = uint32_t(state.range(0));
+    const bool clustered = state.range(1) != 0;
+    SpatialDatabaseConfig config;
+    config.tlasQuality = TlasQuality::BinnedSAH;
+    config.tlasMaxLeafBlocks = maxLeafBlocks;
+    SpatialDatabase world(config);
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        InstanceDesc desc;
+        desc.pos = tlasFatLeafPosition(i, count, clustered);
+        world.instantiate(node(1000 + i, 0.0f, box(0.5f)), desc);
+    }
+    world.applyUpdates(0);
+
+    for (auto _ : state)
+    {
+        world.optimize(OptimizationMode::TopologyAndLayout);
+        benchmark::ClobberMemory();
+    }
+    state.counters["fat_leaves"] =
+        double(TestAccess::tlasFatLeafCount(world));
+    state.counters["tlas_nodes"] =
+        double(TestAccess::tlasNodeCount(world));
+    state.SetItemsProcessed(state.iterations() * int64_t(count));
+}
+
+BENCHMARK(BM_TlasFatLeafRebuild)
+    ->Args({1, 0})
+    ->Args({4, 0})
+    ->Args({1, 1})
+    ->Args({4, 1})
+    ->ArgNames({"max_leaf_blocks", "clustered"})
+    ->UseRealTime()
+    ->Unit(benchmark::kMicrosecond);
+
+static void BM_TlasFatLeafDenseRefit(benchmark::State& state)
+{
+    constexpr uint32_t count = 8192;
+    const uint32_t maxLeafBlocks = uint32_t(state.range(0));
+    const bool clustered = state.range(1) != 0;
+    SpatialDatabaseConfig config;
+    config.tlasQuality = TlasQuality::BinnedSAH;
+    config.tlasMaxLeafBlocks = maxLeafBlocks;
+    SpatialDatabase world(config);
+    std::vector<InstanceHandle> handles;
+    std::vector<float4> positions;
+    handles.reserve(count);
+    positions.reserve(count);
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        InstanceDesc desc;
+        desc.pos = tlasFatLeafPosition(i, count, clustered);
+        positions.push_back(desc.pos);
+        handles.push_back(
+            world.instantiate(node(1000 + i, 0.0f, box(0.5f)), desc));
+    }
+    world.applyUpdates(0);
+
+    bool phase = false;
+    for (auto _ : state)
+    {
+        phase = !phase;
+        const float delta = phase ? 0.25f : -0.25f;
+        for (uint32_t i = 0; i < count; i += 4)
+        {
+            float4 position = positions[i];
+            position.x += delta;
+            world.moveInstance(handles[i], Transform{position, 1.0f});
+        }
+        const UpdateReport report = world.applyUpdates(0);
+        benchmark::DoNotOptimize(report);
+    }
+    state.counters["fat_leaves"] =
+        double(TestAccess::tlasFatLeafCount(world));
+    state.counters["moved"] = double(count / 4);
+    state.counters["tlas_nodes"] =
+        double(TestAccess::tlasNodeCount(world));
+    state.SetItemsProcessed(state.iterations() * int64_t(count / 4));
+}
+
+BENCHMARK(BM_TlasFatLeafDenseRefit)
+    ->Args({1, 0})
+    ->Args({4, 0})
+    ->Args({1, 1})
+    ->Args({4, 1})
+    ->ArgNames({"max_leaf_blocks", "clustered"})
+    ->UseRealTime()
+    ->Unit(benchmark::kMicrosecond);
+
 // Exercises the indexed/dependent-load pipelines between the TLAS result,
 // Instance records, mount slots, and shared subtree arrays. Reuse mode 0 is
 // uncached, 1 measures stable whole-view hits, and 2 cycles three thresholds

@@ -1689,6 +1689,8 @@ struct SpatialDatabaseConfig {
     float tlasAreaDrift = 0.5f;
     float tlasEditFraction = 0.05f;
     uint32_t parallelInstanceThreshold = 0;
+    uint32_t tlasMaxLeafBlocks = 16u / kWide;
+    float tlasLeafBlockCost = 1.0f;
 };
 ```
 
@@ -1708,9 +1710,19 @@ struct SpatialDatabaseConfig {
 - `parallelInstanceThreshold` is the minimum visible-instance count for
   uncached parallel selection. Zero disables it; `context.workerCount` must
   also exceed one.
+- `tlasMaxLeafBlocks` enables adaptive AoSoA leaves. The default permits up to
+  16 instances: four linked blocks in BVH4 or two in BVH8. The builder still
+  collapses only when its cost estimate predicts a win. Setting one retains
+  classic BVH4/BVH8 leaves; values through the compiled BVH width permit up to
+  16 instances in BVH4 or 64 in BVH8.
+- `tlasLeafBlockCost` is the relative cost assigned to testing one SIMD leaf
+  block. A candidate fat leaf costs `blocks * tlasLeafBlockCost`; retaining
+  the level costs `tlasTraversalCost` plus the surface-area-weighted expected
+  child-block visits. Collapse occurs only when the former is lower.
 
 Construction rejects unknown quality values and non-finite or negative cost
-and drift values. When `parallelInstanceThreshold` is non-zero and
+and drift values, and rejects `tlasMaxLeafBlocks` outside `[1, kWide]`. When
+`parallelInstanceThreshold` is non-zero and
 `workerCount > 1`, `context.parallelFor` must be non-null. Internal parallel
 selection is blocking and concatenates worker output in instance order, so
 serial and parallel cuts are identical.
@@ -2317,6 +2329,9 @@ struct TlasDebugSummary {
     uint32_t looseInstanceCount = 0;
     uint32_t internalLaneCount = 0;
     uint32_t instanceLaneCount = 0;
+    uint32_t leafBlockCount = 0;
+    uint32_t fatLeafCount = 0;
+    uint32_t maxLeafBlocks = 0;
     uint32_t maxDepth = 0;
     uint32_t editsSinceRebuild = 0;
     uint32_t rebuildBaselineInstances = 0;

@@ -1153,6 +1153,41 @@ TEST(Frontier, TerminalRenderUsesTheFinestPayloadSlot)
     EXPECT_EQ(flatTerminal.runs()[0].payloadSpan()[0], 82u);
 }
 
+TEST(Frontier, TerminalRenderTraversesEveryFatLeafBlock)
+{
+    SpatialDatabaseConfig config;
+    config.tlasMaxLeafBlocks = 4;
+    SpatialDatabase database(config);
+    const SubtreeHandle subtree = database.registerSubtree(
+        makeFullyRefinedReferenceSubtree(0.0f));
+    constexpr uint32_t instanceCount = 3u * kWide;
+    for (uint32_t i = 0; i < instanceCount; ++i)
+        instantiateFor(database, subtree, box(5.0f), 64.0f);
+    TestAccess::markAllNodesReady(database);
+    database.applyUpdates(0);
+    ASSERT_EQ(TestAccess::tlasFatLeafCount(database), 1u);
+
+    Camera camera = cameraAt(-8.0f);
+    camera.viewMask = 1u;
+    SpatialQuery referenceQuery;
+    referenceQuery.setReuseEnabled(false);
+    std::vector<UserPayload> reference = payloads(
+        database,
+        referenceQuery.selectFrontier(database, camera, {}));
+
+    TerminalRenderQuery terminalQuery;
+    const TerminalRenderView terminal =
+        terminalQuery.select(database, camera);
+    std::vector<UserPayload> ranged;
+    ranged.reserve(terminal.size());
+    for (const TerminalRenderRun run : terminal.runs())
+        ranged.insert(ranged.end(), run.payloadSpan().begin(),
+                      run.payloadSpan().end());
+    std::sort(reference.begin(), reference.end());
+    std::sort(ranged.begin(), ranged.end());
+    EXPECT_EQ(ranged, reference);
+}
+
 TEST(Frontier, TerminalActorBatchUsesTheFrontierInstanceIdRange)
 {
     SubtreeBuilder builder;

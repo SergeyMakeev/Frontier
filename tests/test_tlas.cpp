@@ -149,6 +149,120 @@ TEST(Tlas, DebugToolsExposeHealthAndDepthBoxes)
 }
 #endif
 
+TEST(Tlas, AdaptiveFatLeavesCollapseOnlyWhenTheCostModelWins)
+{
+    constexpr uint32_t count = 3u * kWide;
+
+    SpatialDatabaseConfig baselineConfig;
+    baselineConfig.tlasMaxLeafBlocks = 1;
+    SpatialDatabase baseline(baselineConfig);
+    SpatialDatabaseConfig fatConfig;
+    fatConfig.tlasMaxLeafBlocks = 4;
+    SpatialDatabase fat(fatConfig);
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        baseline.instantiate(node(1000 + i, 0.0f, box()));
+        fat.instantiate(node(1000 + i, 0.0f, box()));
+    }
+    baseline.applyUpdates(0);
+    fat.applyUpdates(0);
+
+    EXPECT_EQ(TestAccess::tlasFatLeafCount(baseline), 0u);
+    EXPECT_EQ(TestAccess::tlasMaxDepth(baseline), 2u);
+    EXPECT_EQ(TestAccess::tlasFatLeafCount(fat), 1u);
+    EXPECT_EQ(TestAccess::tlasLeafBlockCount(fat), 3u);
+    EXPECT_EQ(TestAccess::tlasMaxLeafBlocks(fat), 3u);
+    EXPECT_EQ(TestAccess::tlasMaxDepth(fat), 1u);
+    EXPECT_EQ(TestAccess::tlasNodeCount(fat) + 1u,
+              TestAccess::tlasNodeCount(baseline));
+
+    Camera camera = cameraAt(-1000.0f);
+    camera.viewMask = 1u; // bypass the all-population overview shortcut
+    SpatialQuery baselineQuery;
+    SpatialQuery fatQuery;
+    std::vector<UserPayload> baselinePayloads =
+        payloads(baseline, select(baseline, baselineQuery, camera));
+    std::vector<UserPayload> fatPayloads =
+        payloads(fat, select(fat, fatQuery, camera));
+    std::sort(baselinePayloads.begin(), baselinePayloads.end());
+    std::sort(fatPayloads.begin(), fatPayloads.end());
+    EXPECT_EQ(fatPayloads, baselinePayloads);
+
+    SpatialDatabase spread(fatConfig);
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        InstanceDesc desc;
+        desc.pos = float4::point(float(i) * 100.0f, 0.0f, 0.0f);
+        spread.instantiate(node(2000 + i, 0.0f, box()), desc);
+    }
+    spread.applyUpdates(0);
+    EXPECT_EQ(TestAccess::tlasFatLeafCount(spread), 0u);
+    EXPECT_EQ(TestAccess::tlasMaxDepth(spread), 2u);
+}
+
+TEST(Tlas, AdaptiveFatLeavesSupportAFullFinalLevel)
+{
+    constexpr uint32_t count = kWide * kWide;
+    SpatialDatabaseConfig config;
+    config.tlasMaxLeafBlocks = kWide;
+    SpatialDatabase database(config);
+    for (uint32_t i = 0; i < count; ++i)
+        database.instantiate(node(2500 + i, 0.0f, box()));
+    database.applyUpdates(0);
+
+    EXPECT_EQ(TestAccess::tlasFatLeafCount(database), 1u);
+    EXPECT_EQ(TestAccess::tlasLeafBlockCount(database), kWide);
+    EXPECT_EQ(TestAccess::tlasMaxLeafBlocks(database), kWide);
+    EXPECT_EQ(TestAccess::tlasMaxDepth(database), 1u);
+
+    Camera camera = cameraAt(-1000.0f);
+    camera.viewMask = 1u;
+    SpatialQuery query;
+    EXPECT_EQ(select(database, query, camera).size(), count);
+}
+
+TEST(Tlas, FatLeafChainsSurviveMoveRemoveInsertAndLayoutRebuild)
+{
+    SpatialDatabaseConfig config;
+    config.tlasMaxLeafBlocks = 4;
+    SpatialDatabase database(config);
+    constexpr uint32_t count = 3u * kWide - 1u;
+    std::vector<InstanceHandle> handles;
+    for (uint32_t i = 0; i < count; ++i)
+        handles.push_back(
+            database.instantiate(node(3000 + i, 0.0f, box())));
+    database.applyUpdates(0);
+    ASSERT_EQ(TestAccess::tlasFatLeafCount(database), 1u);
+
+    Camera camera = cameraAt(-1000.0f);
+    camera.viewMask = 1u;
+    SpatialQuery query;
+    EXPECT_EQ(select(database, query, camera).size(), count);
+
+    database.moveInstance(
+        handles[kWide + 1u],
+        Transform{float4::point(100.0f, 0.0f, 0.0f), 1.0f});
+    database.applyUpdates(kUnlimitedTlasMaintenance);
+    EXPECT_EQ(select(database, query, camera).size(), count);
+
+    // Empty the head block while later blocks remain linked and visible.
+    for (uint32_t i = 0; i < kWide; ++i)
+        database.removeInstance(handles[i]);
+    database.applyUpdates(kUnlimitedTlasMaintenance);
+    EXPECT_EQ(select(database, query, camera).size(), count - kWide);
+    EXPECT_EQ(TestAccess::tlasFatLeafCount(database), 1u);
+
+    const InstanceHandle inserted =
+        database.instantiate(node(9999, 0.0f, box()));
+    database.applyUpdates(kUnlimitedTlasMaintenance);
+    EXPECT_EQ(select(database, query, camera).size(), count - kWide + 1u);
+    EXPECT_FALSE(TestAccess::instanceBounds(database, inserted).isEmpty());
+
+    database.optimize(OptimizationMode::TopologyAndLayout);
+    EXPECT_EQ(select(database, query, camera).size(), count - kWide + 1u);
+    EXPECT_GT(TestAccess::tlasFatLeafCount(database), 0u);
+}
+
 TEST(Tlas, StaleInstanceHandleCannotMoveReusedSlot)
 {
     SpatialDatabase database;

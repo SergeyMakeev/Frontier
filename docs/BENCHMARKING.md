@@ -255,6 +255,26 @@ storage from 320 to 160 bytes, but can require more blocks and a deeper tree.
 Favor it only when target-scene lane occupancy, culling, and cache behavior
 compensate for that extra traversal.
 
+`BM_TlasFatLeafSelection`, `BM_TlasFatLeafRebuild`, and
+`BM_TlasFatLeafDenseRefit` compare classic one-block leaves with the adaptive
+four-block experiment on a regular grid and on colocated clusters. Selection
+includes wide and close views, forces actual TLAS traversal, and reports
+fat-leaf count, physical leaf blocks, maximum logical depth, TLAS nodes, and
+bytes. Rebuild times the complete configured-quality topology/layout pass;
+dense refit moves one quarter of the population to trigger the streaming exact
+refit path. Treat the regular grid as the pruning control: a candidate is
+useful only if cluster wins do not come with a material control regression.
+
+`BM_TlasFatLeafWidthSweep` holds a power-of-width number of spatial groups
+constant—512 in BVH8 or 1,024 in BVH4—and compares a retained final interior
+node with one logical AoSoA leaf at several block counts. `observed_blocks`
+confirms that the requested width was built. The diagnostic uses median
+partitioning and a deliberately dominant traversal cost in the `collapse:1`
+cases, so every equal final range is linearized and exactly one interior node
+per range is removed. This override is benchmark-only; use the paired
+`collapse:0/1` cases at each width rather than comparing absolute times
+between differently sized scenes.
+
 ## Machine characterization
 
 `frontier_machine_bench` is kept separate so synthetic probes do not perturb

@@ -1210,6 +1210,9 @@ struct TlasDebugSummary
     uint32_t looseInstanceCount = 0;
     uint32_t internalLaneCount = 0;
     uint32_t instanceLaneCount = 0;
+    uint32_t leafBlockCount = 0;
+    uint32_t fatLeafCount = 0;
+    uint32_t maxLeafBlocks = 0;
     uint32_t maxDepth = 0;
     uint32_t editsSinceRebuild = 0;
     uint32_t rebuildBaselineInstances = 0;
@@ -1287,6 +1290,18 @@ struct SpatialDatabaseConfig
     // SpatialDatabase and writes only per-worker buffers, which are concatenated in
     // instance order, so parallel and serial selection are bit-identical.
     uint32_t parallelInstanceThreshold = 0;
+
+    // Adaptive fat TLAS leaves. The default caps a logical leaf at 16
+    // instances: four BVH4 blocks or two BVH8 blocks. One explicitly preserves
+    // the classic topology. Values through kWide let the builder replace the
+    // final interior level with an AoSoA chain of SIMD-width leaf blocks when
+    // its surface-area cost estimate predicts a win.
+    uint32_t tlasMaxLeafBlocks = 16u / kWide;
+
+    // Relative cost of testing one SIMD-width leaf block. Fat-leaf cost is
+    // `blocks * tlasLeafBlockCost`; the retained hierarchy costs one
+    // `tlasTraversalCost` plus the area-weighted child-block visits.
+    float tlasLeafBlockCost = 1.0f;
 };
 
 inline constexpr uint32_t kUnlimitedTlasMaintenance = UINT32_MAX;
@@ -2187,6 +2202,11 @@ private:
         // Low kWide bits mark valid lanes.
         uint32_t   validMask = 0;
         int32_t    parent = -1;
+        // A logical fat leaf is a linked AoSoA chain. Interior nodes have both
+        // fields set to -1. Every block in a leaf chain records the same head;
+        // only the head is referenced by the surrounding BVH.
+        int32_t    nextLeafBlock = -1;
+        int32_t    leafChainHead = -1;
 
         uint32_t validLanes() const { return validMask & kValidLaneMask; }
         void setLeafLane(uint32_t lane)
@@ -2555,6 +2575,10 @@ private:
     int32_t tlasBuildSpatialBinsRange(std::vector<uint32_t>& items,
                                       std::vector<uint32_t>& scratch,
                                       int lo, int hi, int32_t parent);
+    int32_t tlasBuildLeafRange(std::vector<uint32_t>& items, int lo, int hi,
+                               int32_t parent);
+    bool tlasShouldCollapseLeafRange(const std::vector<uint32_t>& items,
+                                     int lo, int hi) const;
     int32_t tlasBuildRange(std::vector<uint32_t>& items, int lo, int hi, int32_t parent);
     int  tlasSplit(std::vector<uint32_t>& items, int lo, int hi);
     void tlasQuery(const Camera& view, float minPix,
@@ -2583,6 +2607,10 @@ private:
     float tlasGrowUp(uint32_t nodeIdx, const AABB& box,
                      float maxContribution, uint32_t laneMask);
     int32_t tlasAllocNode();
+    uint32_t tlasTreeNode(uint32_t node) const;
+    uint32_t tlasLeafBlockCount(uint32_t head) const;
+    bool tlasLeafChainEmpty(uint32_t head) const;
+    void tlasFreeLeafChain(uint32_t head);
     // Union of a node's valid lanes, which is what its parent's lane must hold.
     AABB tlasNodeExtent(uint32_t node, float& maxContribution,
                         uint32_t& laneMask) const;

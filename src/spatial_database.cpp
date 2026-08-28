@@ -697,9 +697,13 @@ SpatialDatabase::SpatialDatabase(const SpatialDatabaseConfig& config) : config_(
             config_.tlasAreaDrift >= 0.0f &&
             std::isfinite(config_.tlasAreaDrift) &&
             config_.tlasEditFraction >= 0.0f &&
-            std::isfinite(config_.tlasEditFraction),
+            std::isfinite(config_.tlasEditFraction) &&
+            config_.tlasMaxLeafBlocks >= 1 &&
+            config_.tlasMaxLeafBlocks <= kWide &&
+            config_.tlasLeafBlockCost >= 0.0f &&
+            std::isfinite(config_.tlasLeafBlockCost),
         "SpatialDatabase: TLAS costs and maintenance thresholds must be "
-        "finite and non-negative");
+        "finite and non-negative, and max leaf blocks must be in [1, kWide]");
     FRONTIER_CHECK(config_.parallelInstanceThreshold == 0 ||
                        config_.context.workerCount <= 1 ||
                        config_.context.parallelFor != nullptr,
@@ -3387,8 +3391,12 @@ bool SpatialDatabase::repairTlasNode(uint32_t nodeIndex)
             changed = true;
         }
     }
-    if (changed && node.parent >= 0)
-        queueTlasRepair(uint32_t(node.parent));
+    if (changed)
+    {
+        const uint32_t treeNode = tlasTreeNode(nodeIndex);
+        const int32_t parent = tlasNodes_[treeNode].parent;
+        if (parent >= 0) queueTlasRepair(uint32_t(parent));
+    }
     return changed;
 }
 
@@ -3420,6 +3428,7 @@ float SpatialDatabase::tlasGrowUp(uint32_t nodeIdx, const AABB& box,
                                   float maxContribution, uint32_t laneMask)
 {
     float added = 0.0f;
+    nodeIdx = tlasTreeNode(nodeIdx);
     TlasNode* node = &tlasNodes_[nodeIdx];
     while (node->parent >= 0)
     {
@@ -3450,20 +3459,79 @@ float SpatialDatabase::tlasGrowUp(uint32_t nodeIdx, const AABB& box,
 AABB SpatialDatabase::tlasNodeExtent(uint32_t node, float& maxContribution,
                                      uint32_t& laneMask) const
 {
-    const TlasNode& n = tlasNodes_[node];
-    const TlasMeta& meta = tlasMeta_[node];
+    node = tlasTreeNode(node);
     AABB u = AABB::empty();
     maxContribution = 0.0f;
     laneMask = 0;
-    for (uint32_t l = 0; l < kWide; ++l)
+    uint32_t block = node;
+    for (;;)
     {
-        if (!(n.validMask & (1u << l))) continue;
-        u.expand(n.bounds.lane(l));
-        maxContribution =
-            std::max(maxContribution, meta.maxContribution.v[l]);
-        laneMask |= meta.laneMask[l];
+        const TlasNode& n = tlasNodes_[block];
+        const TlasMeta& meta = tlasMeta_[block];
+        for (uint32_t l = 0; l < kWide; ++l)
+        {
+            if (!(n.validMask & (1u << l))) continue;
+            u.expand(n.bounds.lane(l));
+            maxContribution =
+                std::max(maxContribution, meta.maxContribution.v[l]);
+            laneMask |= meta.laneMask[l];
+        }
+        if (n.leafChainHead < 0 || n.nextLeafBlock < 0) break;
+        block = uint32_t(n.nextLeafBlock);
     }
     return u;
+}
+
+uint32_t SpatialDatabase::tlasTreeNode(uint32_t node) const
+{
+    const int32_t head = tlasNodes_[node].leafChainHead;
+    return head >= 0 ? uint32_t(head) : node;
+}
+
+uint32_t SpatialDatabase::tlasLeafBlockCount(uint32_t head) const
+{
+    head = tlasTreeNode(head);
+    if (tlasNodes_[head].leafChainHead < 0) return 0;
+    uint32_t count = 0;
+    for (uint32_t block = head;;)
+    {
+        ++count;
+        const int32_t next = tlasNodes_[block].nextLeafBlock;
+        if (next < 0) break;
+        block = uint32_t(next);
+    }
+    return count;
+}
+
+bool SpatialDatabase::tlasLeafChainEmpty(uint32_t head) const
+{
+    head = tlasTreeNode(head);
+    for (uint32_t block = head;;)
+    {
+        const TlasNode& node = tlasNodes_[block];
+        if (node.validLanes() != 0) return false;
+        if (node.nextLeafBlock < 0) break;
+        block = uint32_t(node.nextLeafBlock);
+    }
+    return true;
+}
+
+void SpatialDatabase::tlasFreeLeafChain(uint32_t head)
+{
+    head = tlasTreeNode(head);
+    uint32_t block = head;
+    for (;;)
+    {
+        TlasNode& node = tlasNodes_[block];
+        const int32_t next = node.nextLeafBlock;
+        node.validMask = 0;
+        node.parent = -1;
+        node.nextLeafBlock = -1;
+        node.leafChainHead = -1;
+        tlasFreeNodes_.push_back(int32_t(block));
+        if (next < 0) break;
+        block = uint32_t(next);
+    }
 }
 
 int32_t SpatialDatabase::tlasAllocNode()
@@ -3478,6 +3546,8 @@ int32_t SpatialDatabase::tlasAllocNode()
         meta.maxContribution = float8::splat(0.0f);
         n.validMask = 0;
         n.parent = -1;
+        n.nextLeafBlock = -1;
+        n.leafChainHead = -1;
         for (uint32_t l = 0; l < kWide; ++l)
         {
             n.child[l] = 0;
@@ -3494,6 +3564,8 @@ int32_t SpatialDatabase::tlasAllocNode()
     n.bounds = WideBounds::allEmpty();
     meta.maxContribution = float8::splat(0.0f);
     n.parent = -1;
+    n.nextLeafBlock = -1;
+    n.leafChainHead = -1;
     for (uint32_t l = 0; l < kWide; ++l)
     {
         n.child[l] = 0;
@@ -3553,30 +3625,69 @@ void SpatialDatabase::tlasInsert(InstanceId id)
     }
 
     const uint32_t full = (1u << kWide) - 1;
+    cur = tlasTreeNode(cur);
     uint32_t host = cur;
+    bool needsSplit = false;
+    if (tlasNodes_[cur].leafChainHead >= 0)
+    {
+        uint32_t block = cur;
+        for (;;)
+        {
+            if (tlasNodes_[block].validLanes() != full)
+            {
+                host = block;
+                break;
+            }
+            const int32_t next = tlasNodes_[block].nextLeafBlock;
+            if (next < 0)
+            {
+                needsSplit = true;
+                break;
+            }
+            block = uint32_t(next);
+        }
+    }
+    else
+    {
+        needsSplit = tlasNodes_[cur].validLanes() == full;
+    }
+
     double areaDelta = 0.0;
-    if (tlasNodes_[cur].validLanes() == full)
+    if (needsSplit)
     {
         // Split. The new node replaces `cur` wherever `cur` was referenced, and
         // adopts it, so nothing above needs to know the difference.
-        const int32_t mIdx = tlasAllocNode();
-        TlasNode& m = tlasNodes_[uint32_t(mIdx)];
-        TlasMeta& mMeta = tlasMeta_[uint32_t(mIdx)];
-        TlasNode& l0 = tlasNodes_[cur];
-
         float    childContribution = 0.0f;
         uint32_t childMask = 0;
         const AABB childBox =
             tlasNodeExtent(cur, childContribution, childMask);
+        const int32_t oldParent = tlasNodes_[cur].parent;
+        const int32_t mIdx = tlasAllocNode();
+        TlasNode& m = tlasNodes_[uint32_t(mIdx)];
+        TlasMeta& mMeta = tlasMeta_[uint32_t(mIdx)];
 
-        m.parent = l0.parent;
+        m.parent = oldParent;
         m.bounds.setLane(0, childBox);
         areaDelta += surfaceArea(childBox);
         mMeta.maxContribution.v[0] = childContribution;
         m.child[0] = int32_t(cur);
         mMeta.laneMask[0] = childMask;
         m.validMask = 1u;
-        l0.parent = mIdx;
+
+        if (tlasNodes_[cur].leafChainHead >= 0)
+        {
+            for (uint32_t block = cur;;)
+            {
+                TlasNode& leafBlock = tlasNodes_[block];
+                leafBlock.parent = mIdx;
+                if (leafBlock.nextLeafBlock < 0) break;
+                block = uint32_t(leafBlock.nextLeafBlock);
+            }
+        }
+        else
+        {
+            tlasNodes_[cur].parent = mIdx;
+        }
 
         if (m.parent < 0)
             tlasRoot_ = mIdx;
@@ -3635,6 +3746,38 @@ void SpatialDatabase::tlasRemove(InstanceId id)
     tlasNodes_[nodeIdx].clearLane(lane);
     inst.clearTlasPlacement();
     if (tlasLeafCount_) --tlasLeafCount_;
+
+    if (tlasNodes_[nodeIdx].leafChainHead >= 0)
+    {
+        const uint32_t head = tlasTreeNode(nodeIdx);
+        if (!tlasLeafChainEmpty(head))
+        {
+            const int32_t parent = tlasNodes_[head].parent;
+            if (parent >= 0) queueTlasRepair(uint32_t(parent));
+            tlasNoteEdit();
+            return;
+        }
+
+        const int32_t parent = tlasNodes_[head].parent;
+        if (parent < 0)
+        {
+            tlasRoot_ = -1;
+            tlasFreeLeafChain(head);
+            tlasNoteEdit();
+            return;
+        }
+
+        TlasNode& p = tlasNodes_[uint32_t(parent)];
+        for (uint32_t l = 0; l < kWide; ++l)
+            if ((p.validMask & (1u << l)) && p.child[l] == int32_t(head))
+            {
+                tlasAdjustCurrentArea(-double(surfaceArea(p.bounds.lane(l))));
+                p.clearLane(l);
+                break;
+            }
+        tlasFreeLeafChain(head);
+        nodeIdx = uint32_t(parent);
+    }
 
     while (tlasNodes_[nodeIdx].validLanes() == 0)
     {
@@ -3778,35 +3921,41 @@ void SpatialDatabase::tlasRefitAllExact()
     double exactArea = 0.0;
     for (const uint32_t nodeIndex : tlasLevelTmp_)
     {
-        TlasNode& node = tlasNodes_[nodeIndex];
-        TlasMeta& meta = tlasMeta_[nodeIndex];
-        uint32_t lanes = node.validLanes();
-        while (lanes)
+        uint32_t blockIndex = nodeIndex;
+        for (;;)
         {
-            const uint32_t lane = uint32_t(std::countr_zero(lanes));
-            lanes &= lanes - 1;
-            const int32_t child = node.child[lane];
-            AABB bounds;
-            float maxContribution;
-            uint32_t layerMask;
-            if (child < 0)
+            TlasNode& node = tlasNodes_[blockIndex];
+            TlasMeta& meta = tlasMeta_[blockIndex];
+            uint32_t lanes = node.validLanes();
+            while (lanes)
             {
-                const InstanceId dense = InstanceId(~child);
-                const Instance& instance = instances_[dense];
-                bounds = instance.worldBox;
-                maxContribution = contributionDiameter(instance.worldBox);
-                layerMask = instance.mask;
-                instanceTlasLoose_[dense] = 0;
+                const uint32_t lane = uint32_t(std::countr_zero(lanes));
+                lanes &= lanes - 1;
+                const int32_t child = node.child[lane];
+                AABB bounds;
+                float maxContribution;
+                uint32_t layerMask;
+                if (child < 0)
+                {
+                    const InstanceId dense = InstanceId(~child);
+                    const Instance& instance = instances_[dense];
+                    bounds = instance.worldBox;
+                    maxContribution = contributionDiameter(instance.worldBox);
+                    layerMask = instance.mask;
+                    instanceTlasLoose_[dense] = 0;
+                }
+                else
+                {
+                    bounds = tlasNodeExtent(uint32_t(child), maxContribution,
+                                            layerMask);
+                }
+                node.bounds.setLane(lane, bounds);
+                meta.maxContribution.v[lane] = maxContribution;
+                meta.laneMask[lane] = layerMask;
+                exactArea += double(surfaceArea(bounds));
             }
-            else
-            {
-                bounds = tlasNodeExtent(uint32_t(child), maxContribution,
-                                        layerMask);
-            }
-            node.bounds.setLane(lane, bounds);
-            meta.maxContribution.v[lane] = maxContribution;
-            meta.laneMask[lane] = layerMask;
-            exactArea += double(surfaceArea(bounds));
+            if (node.leafChainHead < 0 || node.nextLeafBlock < 0) break;
+            blockIndex = uint32_t(node.nextLeafBlock);
         }
     }
 
@@ -4058,33 +4207,91 @@ int SpatialDatabase::tlasSplit(std::vector<uint32_t>& items, int lo, int hi)
     return mid;
 }
 
+int32_t SpatialDatabase::tlasBuildLeafRange(std::vector<uint32_t>& items,
+                                            int lo, int hi, int32_t parent)
+{
+    FRONTIER_ASSERT(lo < hi, "TLAS leaf range must not be empty");
+    FRONTIER_ASSERT(uint32_t(hi - lo) <= config_.tlasMaxLeafBlocks * kWide,
+                    "TLAS leaf range exceeds configured fat-leaf capacity");
+
+    const bool chained = hi - lo > int(kWide);
+    int32_t head = -1;
+    int32_t previous = -1;
+    for (int begin = lo; begin < hi; begin += int(kWide))
+    {
+        const int32_t blockIndex = tlasAllocNode();
+        if (head < 0) head = blockIndex;
+        if (previous >= 0)
+            tlasNodes_[uint32_t(previous)].nextLeafBlock = blockIndex;
+
+        TlasNode& block = tlasNodes_[uint32_t(blockIndex)];
+        TlasMeta& meta = tlasMeta_[uint32_t(blockIndex)];
+        block.parent = parent;
+        block.leafChainHead = chained ? head : -1;
+
+        const int end = std::min(begin + int(kWide), hi);
+        for (int item = begin; item < end; ++item)
+        {
+            const uint32_t lane = uint32_t(item - begin);
+            const uint32_t instIdx = items[item];
+            Instance& inst = instances_[instIdx];
+            block.bounds.setLane(lane, inst.worldBox);
+            meta.maxContribution.v[lane] =
+                contributionDiameter(inst.worldBox);
+            block.child[lane] = ~int32_t(instIdx);
+            meta.laneMask[lane] = inst.mask;
+            block.setLeafLane(lane);
+            inst.setTlasPlacement(uint32_t(blockIndex), lane);
+        }
+        previous = blockIndex;
+    }
+    return head;
+}
+
+bool SpatialDatabase::tlasShouldCollapseLeafRange(
+    const std::vector<uint32_t>& items, int lo, int hi) const
+{
+    const uint32_t count = uint32_t(hi - lo);
+    const uint32_t blocks = (count + kWide - 1) / kWide;
+    if (blocks <= 1 || blocks > config_.tlasMaxLeafBlocks) return false;
+
+    AABB parentBounds = AABB::empty();
+    for (int item = lo; item < hi; ++item)
+        parentBounds.expand(instances_[items[item]].worldBox);
+    const double parentArea = double(surfaceArea(parentBounds));
+    if (!(parentArea > 0.0)) return true;
+
+    // Expected SIMD block visits after the range itself has survived. Keeping
+    // the final hierarchy costs one interior-node visit and tests a child leaf
+    // block with probability proportional to its surface area. The collapsed
+    // AoSoA leaf always tests all blocks.
+    double hierarchyCost = double(config_.tlasTraversalCost);
+    for (int begin = lo; begin < hi; begin += int(kWide))
+    {
+        AABB blockBounds = AABB::empty();
+        const int end = std::min(begin + int(kWide), hi);
+        for (int item = begin; item < end; ++item)
+            blockBounds.expand(instances_[items[item]].worldBox);
+        const double probability =
+            std::min(1.0, double(surfaceArea(blockBounds)) / parentArea);
+        hierarchyCost +=
+            probability * double(config_.tlasLeafBlockCost);
+    }
+    const double fatLeafCost =
+        double(blocks) * double(config_.tlasLeafBlockCost);
+    return fatLeafCost < hierarchyCost;
+}
+
 // Recursive kWide-way build: log2(kWide) levels of binary splits per node.
 // More computation-heavy than SpatialBins. Used for explicit Median,
 // MeanSplit, and BinnedSAH quality builds, which are rare and long-lived.
-int32_t SpatialDatabase::tlasBuildRange(std::vector<uint32_t>& items, int lo, int hi, int32_t parent)
+int32_t SpatialDatabase::tlasBuildRange(std::vector<uint32_t>& items, int lo,
+                                        int hi, int32_t parent)
 {
-    const int32_t idx = tlasAllocNode();
-    tlasNodes_[idx].parent = parent;
 
     const int count = hi - lo;
     if (count <= int(kWide))
-    {
-        for (int k = 0; k < count; ++k)
-        {
-            const uint32_t instIdx = items[lo + k];
-            Instance& inst = instances_[instIdx];
-            TlasNode& n = tlasNodes_[idx];
-            TlasMeta& meta = tlasMeta_[idx];
-            n.bounds.setLane(uint32_t(k), inst.worldBox);
-            meta.maxContribution.v[k] =
-                contributionDiameter(inst.worldBox);
-            n.child[k] = ~int32_t(instIdx);
-            meta.laneMask[k] = inst.mask;
-            n.setLeafLane(uint32_t(k));
-            inst.setTlasPlacement(uint32_t(idx), uint32_t(k));
-        }
-        return idx;
-    }
+        return tlasBuildLeafRange(items, lo, hi, parent);
 
     // The fixed kWide-way splitter is excellent for large ranges, but using
     // all kWide groups directly above the leaves creates mostly empty leaf
@@ -4113,12 +4320,21 @@ int32_t SpatialDatabase::tlasBuildRange(std::vector<uint32_t>& items, int lo, in
                       return av < bv || (av == bv && a < b);
                   });
 
+        const uint32_t blocks =
+            (uint32_t(count) + kWide - 1) / kWide;
+        if (blocks <= config_.tlasMaxLeafBlocks &&
+            tlasShouldCollapseLeafRange(items, lo, hi))
+            return tlasBuildLeafRange(items, lo, hi, parent);
+
+        const int32_t idx = tlasAllocNode();
+        tlasNodes_[uint32_t(idx)].parent = parent;
+
         uint32_t lane = 0;
         for (int begin = lo; begin < hi; begin += int(kWide), ++lane)
         {
             const int end = std::min(begin + int(kWide), hi);
             const int32_t child =
-                tlasBuildRange(items, begin, end, idx);
+                tlasBuildLeafRange(items, begin, end, idx);
             float maxContribution = 0.0f;
             uint32_t layerMask = 0;
             const AABB bounds = tlasNodeExtent(
@@ -4133,6 +4349,9 @@ int32_t SpatialDatabase::tlasBuildRange(std::vector<uint32_t>& items, int lo, in
         }
         return idx;
     }
+
+    const int32_t idx = tlasAllocNode();
+    tlasNodes_[uint32_t(idx)].parent = parent;
 
     int cuts[kWide + 1] = {};
     cuts[0] = lo;
@@ -4150,20 +4369,10 @@ int32_t SpatialDatabase::tlasBuildRange(std::vector<uint32_t>& items, int lo, in
         if (cuts[g] >= cuts[g + 1]) continue;
         const int32_t child = tlasBuildRange(items, cuts[g], cuts[g + 1], idx);
 
-        // Union the child's lanes into our lane for it.
-        AABB u = AABB::empty();
         float maxContribution = 0.0f;
         uint32_t lm = 0;
-        const TlasNode& cn = tlasNodes_[child];
-        const TlasMeta& childMeta = tlasMeta_[child];
-        for (uint32_t l = 0; l < kWide; ++l)
-        {
-            if (!(cn.validMask & (1u << l))) continue;
-            u.expand(cn.bounds.lane(l));
-            maxContribution = std::max(
-                maxContribution, childMeta.maxContribution.v[l]);
-            lm |= childMeta.laneMask[l];
-        }
+        const AABB u =
+            tlasNodeExtent(uint32_t(child), maxContribution, lm);
         TlasNode& n = tlasNodes_[idx];
         TlasMeta& meta = tlasMeta_[idx];
         n.bounds.setLane(g, u);
@@ -4197,15 +4406,23 @@ void SpatialDatabase::reorderInstancesByTlas()
         {
             const int32_t node = stack.back();
             stack.pop_back();
-            const TlasNode& n = tlasNodes_[uint32_t(node)];
-            for (uint32_t lane = 0; lane < kWide; ++lane)
+            uint32_t blockIndex = uint32_t(node);
+            for (;;)
             {
-                if (!(n.validMask & (1u << lane))) continue;
-                const int32_t child = n.child[lane];
-                if (child >= 0)
-                    stack.push_back(child);
-                else
-                    order.push_back(InstanceId(~child));
+                const TlasNode& block = tlasNodes_[blockIndex];
+                for (uint32_t lane = 0; lane < kWide; ++lane)
+                {
+                    if (!(block.validMask & (1u << lane))) continue;
+                    const int32_t child = block.child[lane];
+                    if (child >= 0)
+                        stack.push_back(child);
+                    else
+                        order.push_back(InstanceId(~child));
+                }
+                if (block.leafChainHead < 0 ||
+                    block.nextLeafBlock < 0)
+                    break;
+                blockIndex = uint32_t(block.nextLeafBlock);
             }
         }
     }
@@ -4397,68 +4614,74 @@ void SpatialDatabase::tlasQueryImpl(const Camera& view, float minPix,
     {
         const TlasItem it = stack.back();
         stack.pop_back();
-        const TlasNode& n = tlasNodes_[it.node()];
-
         const uint8_t inMask = it.mask();
-        uint8_t outMasks[kWide];
-        uint32_t survivors = inMask
-                                 ? testWideAabb(n.bounds, view.frustum, inMask,
-                                                outMasks) & n.validMask
-                                 : n.validLanes();
-        if (!survivors) continue;
-
-        // Query-level dispatch removes this block entirely for the default
-        // all-ones view mask.
-        if constexpr (UseMask)
+        uint32_t blockIndex = it.node();
+        for (;;)
         {
-            const TlasMeta& meta = tlasMeta_[it.node()];
-            for (uint32_t l = 0; l < kWide; ++l)
-                if (!(meta.laneMask[l] & view.viewMask)) survivors &= ~(1u << l);
-            if (!survivors) continue;
-        }
+            const TlasNode& n = tlasNodes_[blockIndex];
+            uint8_t outMasks[kWide];
+            uint32_t survivors =
+                inMask ? testWideAabb(n.bounds, view.frustum, inMask,
+                                      outMasks) & n.validLanes()
+                       : n.validLanes();
 
-        if constexpr (UseMinPix)
-        {
-            const TlasMeta& meta = tlasMeta_[it.node()];
-            const float8 d2 = distanceToBoxesSq(n.bounds, qmn, qmx);
-            const float8 contributions = screenErrorFromSq8(
-                meta.maxContribution, view.k, d2);
-            for (uint32_t l = 0; l < kWide; ++l)
-                if (contributions.v[l] < minPix)
-                    survivors &= ~(1u << l);
-        }
-
-        while (survivors)
-        {
-            const uint32_t l = uint32_t(std::countr_zero(survivors));
-            survivors &= survivors - 1;
-            const int32_t c = n.child[l];
-            if (c >= 0)
-                stack.push_back({c, inMask ? outMasks[l] : uint8_t(0)});
-            else
+            // Query-level dispatch removes this block entirely for the
+            // default all-ones view mask.
+            if constexpr (UseMask)
             {
-                const uint32_t instance = uint32_t(~c);
-                uint8_t exactMask = inMask ? outMasks[l] : uint8_t(0);
-                if (instanceTlasLoose_[instance])
-                {
-                    const Instance& inst = instances_[instance];
-                    if (exactMask != 0 &&
-                        testAabb(inst.worldBox, view.frustum, exactMask) ==
-                            CullState::Outside)
-                        continue;
-                    if constexpr (UseMinPix)
-                    {
-                        const float distance =
-                            distanceToBox(inst.worldBox, qmn, qmx);
-                        const float contribution = screenError(
-                            contributionDiameter(inst.worldBox), view.k,
-                            distance);
-                        if (contribution < minPix)
-                            continue;
-                    }
-                }
-                outVisible.emplace_back(instance, exactMask);
+                const TlasMeta& meta = tlasMeta_[blockIndex];
+                for (uint32_t l = 0; l < kWide; ++l)
+                    if (!(meta.laneMask[l] & view.viewMask))
+                        survivors &= ~(1u << l);
             }
+
+            if constexpr (UseMinPix)
+            {
+                const TlasMeta& meta = tlasMeta_[blockIndex];
+                const float8 d2 = distanceToBoxesSq(n.bounds, qmn, qmx);
+                const float8 contributions = screenErrorFromSq8(
+                    meta.maxContribution, view.k, d2);
+                for (uint32_t l = 0; l < kWide; ++l)
+                    if (contributions.v[l] < minPix)
+                        survivors &= ~(1u << l);
+            }
+
+            while (survivors)
+            {
+                const uint32_t l = uint32_t(std::countr_zero(survivors));
+                survivors &= survivors - 1;
+                const int32_t c = n.child[l];
+                if (c >= 0)
+                    stack.push_back(
+                        {c, inMask ? outMasks[l] : uint8_t(0)});
+                else
+                {
+                    const uint32_t instance = uint32_t(~c);
+                    uint8_t exactMask =
+                        inMask ? outMasks[l] : uint8_t(0);
+                    if (instanceTlasLoose_[instance])
+                    {
+                        const Instance& inst = instances_[instance];
+                        if (exactMask != 0 &&
+                            testAabb(inst.worldBox, view.frustum, exactMask) ==
+                                CullState::Outside)
+                            continue;
+                        if constexpr (UseMinPix)
+                        {
+                            const float distance =
+                                distanceToBox(inst.worldBox, qmn, qmx);
+                            const float contribution = screenError(
+                                contributionDiameter(inst.worldBox), view.k,
+                                distance);
+                            if (contribution < minPix) continue;
+                        }
+                    }
+                    outVisible.emplace_back(instance, exactMask);
+                }
+            }
+
+            if (n.leafChainHead < 0 || n.nextLeafBlock < 0) break;
+            blockIndex = uint32_t(n.nextLeafBlock);
         }
     }
 }
@@ -4514,19 +4737,26 @@ bool SpatialDatabase::tlasRootContainsPopulation(const Camera& view) const
                    "database changes");
     if (tlasRoot_ < 0) return true;
 
-    const TlasNode& root = tlasNodes_[uint32_t(tlasRoot_)];
-    uint8_t rootMasks[kWide];
-    const uint32_t valid = root.validLanes();
-    const uint32_t inside =
-        testWideAabb(root.bounds, view.frustum, kAllPlanes, rootMasks) & valid;
-    if (inside != valid) return false;
-
-    uint32_t lanes = valid;
-    while (lanes)
+    uint32_t blockIndex = uint32_t(tlasRoot_);
+    for (;;)
     {
-        const uint32_t lane = uint32_t(std::countr_zero(lanes));
-        lanes &= lanes - 1;
-        if (rootMasks[lane] != 0) return false;
+        const TlasNode& root = tlasNodes_[blockIndex];
+        uint8_t rootMasks[kWide];
+        const uint32_t valid = root.validLanes();
+        const uint32_t inside =
+            testWideAabb(root.bounds, view.frustum, kAllPlanes, rootMasks) &
+            valid;
+        if (inside != valid) return false;
+
+        uint32_t lanes = valid;
+        while (lanes)
+        {
+            const uint32_t lane = uint32_t(std::countr_zero(lanes));
+            lanes &= lanes - 1;
+            if (rootMasks[lane] != 0) return false;
+        }
+        if (root.leafChainHead < 0 || root.nextLeafBlock < 0) break;
+        blockIndex = uint32_t(root.nextLeafBlock);
     }
     return true;
 }
@@ -4667,26 +4897,46 @@ TlasDebugSummary SpatialDatabase::debugTlasSummary() const
     const auto visit = [&](auto&& self, uint32_t nodeIndex,
                            uint32_t nodeDepth) -> void
     {
-        const TlasNode& node = tlasNodes_[nodeIndex];
-        ++summary.activeNodes;
-        const uint32_t lanes = node.validLanes();
-        validLanes += std::popcount(lanes);
-        uint32_t remaining = lanes;
-        while (remaining)
+        uint32_t leafBlocks = 0;
+        uint32_t blockIndex = nodeIndex;
+        for (;;)
         {
-            const uint32_t lane = uint32_t(std::countr_zero(remaining));
-            remaining &= remaining - 1;
-            summary.maxDepth = std::max(summary.maxDepth, nodeDepth + 1);
-            if (node.child[lane] >= 0)
+            const TlasNode& node = tlasNodes_[blockIndex];
+            ++summary.activeNodes;
+            const uint32_t lanes = node.validLanes();
+            validLanes += std::popcount(lanes);
+            uint32_t remaining = lanes;
+            bool hasInternalLane = false;
+            while (remaining)
             {
-                ++summary.internalLaneCount;
-                self(self, uint32_t(node.child[lane]), nodeDepth + 1);
+                const uint32_t lane =
+                    uint32_t(std::countr_zero(remaining));
+                remaining &= remaining - 1;
+                summary.maxDepth =
+                    std::max(summary.maxDepth, nodeDepth + 1);
+                if (node.child[lane] >= 0)
+                {
+                    hasInternalLane = true;
+                    ++summary.internalLaneCount;
+                    self(self, uint32_t(node.child[lane]), nodeDepth + 1);
+                }
+                else
+                {
+                    ++summary.instanceLaneCount;
+                }
             }
-            else
+            if (node.leafChainHead >= 0 ||
+                (lanes != 0 && !hasInternalLane))
             {
-                ++summary.instanceLaneCount;
+                ++summary.leafBlockCount;
+                ++leafBlocks;
             }
+            if (node.leafChainHead < 0 || node.nextLeafBlock < 0) break;
+            blockIndex = uint32_t(node.nextLeafBlock);
         }
+        if (leafBlocks > 1) ++summary.fatLeafCount;
+        summary.maxLeafBlocks =
+            std::max(summary.maxLeafBlocks, leafBlocks);
     };
     visit(visit, uint32_t(tlasRoot_), 0);
     if (summary.activeNodes != 0)
@@ -4731,38 +4981,45 @@ size_t SpatialDatabase::debugTlasBoxes(
     const auto visit = [&](auto&& self, uint32_t nodeIndex,
                            uint32_t nodeDepth) -> void
     {
-        const TlasNode& node = tlasNodes_[nodeIndex];
-        uint32_t remaining = node.validLanes();
-        while (remaining)
+        uint32_t blockIndex = nodeIndex;
+        for (;;)
         {
-            const uint32_t lane = uint32_t(std::countr_zero(remaining));
-            remaining &= remaining - 1;
-            const int32_t child = node.child[lane];
-            const uint32_t childDepth = nodeDepth + 1;
-            const bool terminal = child < 0;
-            if (childDepth == depth || terminal)
+            const TlasNode& node = tlasNodes_[blockIndex];
+            uint32_t remaining = node.validLanes();
+            while (remaining)
             {
-                TlasDebugBox box;
-                box.bounds = worldBounds(node.bounds.lane(lane));
-                box.depth = childDepth;
-                if (!terminal)
+                const uint32_t lane =
+                    uint32_t(std::countr_zero(remaining));
+                remaining &= remaining - 1;
+                const int32_t child = node.child[lane];
+                const uint32_t childDepth = nodeDepth + 1;
+                const bool terminal = child < 0;
+                if (childDepth == depth || terminal)
                 {
-                    box.kind = TlasDebugBoxKind::Internal;
+                    TlasDebugBox box;
+                    box.bounds = worldBounds(node.bounds.lane(lane));
+                    box.depth = childDepth;
+                    if (!terminal)
+                    {
+                        box.kind = TlasDebugBoxKind::Internal;
+                    }
+                    else
+                    {
+                        const InstanceId dense = InstanceId(~child);
+                        box.kind = TlasDebugBoxKind::Instance;
+                        box.instance = publicInstanceId(dense);
+                        box.loose = dense < instanceTlasLoose_.size() &&
+                                    instanceTlasLoose_[dense] != 0;
+                    }
+                    emit(box);
                 }
-                else
+                else if (childDepth < depth)
                 {
-                    const InstanceId dense = InstanceId(~child);
-                    box.kind = TlasDebugBoxKind::Instance;
-                    box.instance = publicInstanceId(dense);
-                    box.loose = dense < instanceTlasLoose_.size() &&
-                                instanceTlasLoose_[dense] != 0;
+                    self(self, uint32_t(child), childDepth);
                 }
-                emit(box);
             }
-            else if (childDepth < depth)
-            {
-                self(self, uint32_t(child), childDepth);
-            }
+            if (node.leafChainHead < 0 || node.nextLeafBlock < 0) break;
+            blockIndex = uint32_t(node.nextLeafBlock);
         }
     };
     visit(visit, uint32_t(tlasRoot_), 0);

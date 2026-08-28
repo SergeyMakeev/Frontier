@@ -239,8 +239,23 @@ TEST(Contracts, SerializedSubtreeValidationMatchesBuildMode)
 
 TEST(Contracts, InvalidConfigurationAndSelectionInputsAreRejected)
 {
+    EXPECT_EQ(SpatialDatabaseConfig{}.tlasMaxLeafBlocks * kWide, 16u);
+
     SpatialDatabaseConfig invalidConfig;
     invalidConfig.tlasAreaDrift =
+        std::numeric_limits<float>::quiet_NaN();
+    EXPECT_THROW(SpatialDatabase{invalidConfig}, std::logic_error);
+
+    invalidConfig = {};
+    invalidConfig.tlasMaxLeafBlocks = 0;
+    EXPECT_THROW(SpatialDatabase{invalidConfig}, std::logic_error);
+
+    invalidConfig = {};
+    invalidConfig.tlasMaxLeafBlocks = kWide + 1;
+    EXPECT_THROW(SpatialDatabase{invalidConfig}, std::logic_error);
+
+    invalidConfig = {};
+    invalidConfig.tlasLeafBlockCost =
         std::numeric_limits<float>::quiet_NaN();
     EXPECT_THROW(SpatialDatabase{invalidConfig}, std::logic_error);
 

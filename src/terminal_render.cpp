@@ -188,46 +188,54 @@ TerminalRenderView TerminalRenderQuery::select(
             stack.pop_back();
             const uint32_t nodeIndex = itemValue(item);
             const uint8_t inMask = itemMask(item);
-            const SpatialDatabase::TlasNode& node =
-                database.tlasNodes_[nodeIndex];
-            uint8_t outMasks[kWide];
-            uint32_t survivors =
-                inMask ? testWideAabb(node.bounds, view.frustum, inMask,
-                                      outMasks) &
-                             node.validLanes()
-                       : node.validLanes();
-            if (!survivors) continue;
-
-            if (camera.viewMask != ~0u)
+            uint32_t blockIndex = nodeIndex;
+            for (;;)
             {
-                const SpatialDatabase::TlasMeta& meta =
-                    database.tlasMeta_[nodeIndex];
-                for (uint32_t lane = 0; lane < kWide; ++lane)
-                    if (!(meta.laneMask[lane] & camera.viewMask))
-                        survivors &= ~(1u << lane);
-                if (!survivors) continue;
-            }
+                const SpatialDatabase::TlasNode& node =
+                    database.tlasNodes_[blockIndex];
+                uint8_t outMasks[kWide];
+                uint32_t survivors =
+                    inMask ? testWideAabb(node.bounds, view.frustum, inMask,
+                                          outMasks) &
+                                 node.validLanes()
+                           : node.validLanes();
 
-            while (survivors)
-            {
-                const uint32_t lane =
-                    uint32_t(std::countr_zero(survivors));
-                survivors &= survivors - 1;
-                const int32_t child = node.child[lane];
-                const uint8_t mask = inMask ? outMasks[lane] : uint8_t(0);
-                if (child >= 0)
+                if (camera.viewMask != ~0u)
                 {
-                    stack.push_back(packItem(uint32_t(child), mask));
-                    continue;
+                    const SpatialDatabase::TlasMeta& meta =
+                        database.tlasMeta_[blockIndex];
+                    for (uint32_t lane = 0; lane < kWide; ++lane)
+                        if (!(meta.laneMask[lane] & camera.viewMask))
+                            survivors &= ~(1u << lane);
                 }
 
-                const InstanceId dense = InstanceId(~child);
-                uint8_t exactMask = mask;
-                if (database.instanceTlasLoose_[dense] && exactMask != 0 &&
-                    testAabb(database.instances_[dense].worldBox,
-                             view.frustum, exactMask) == CullState::Outside)
-                    continue;
-                visible.push_back(packItem(dense, exactMask));
+                while (survivors)
+                {
+                    const uint32_t lane =
+                        uint32_t(std::countr_zero(survivors));
+                    survivors &= survivors - 1;
+                    const int32_t child = node.child[lane];
+                    const uint8_t mask =
+                        inMask ? outMasks[lane] : uint8_t(0);
+                    if (child >= 0)
+                    {
+                        stack.push_back(packItem(uint32_t(child), mask));
+                        continue;
+                    }
+
+                    const InstanceId dense = InstanceId(~child);
+                    uint8_t exactMask = mask;
+                    if (database.instanceTlasLoose_[dense] &&
+                        exactMask != 0 &&
+                        testAabb(database.instances_[dense].worldBox,
+                                 view.frustum, exactMask) == CullState::Outside)
+                        continue;
+                    visible.push_back(packItem(dense, exactMask));
+                }
+
+                if (node.leafChainHead < 0 || node.nextLeafBlock < 0)
+                    break;
+                blockIndex = uint32_t(node.nextLeafBlock);
             }
         }
     }

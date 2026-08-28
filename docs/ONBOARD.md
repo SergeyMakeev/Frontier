@@ -709,6 +709,19 @@ longest-axis median so progress is guaranteed. Ranges of at most
 `kWide * kWide` are packed explicitly into full leaf groups, avoiding an
 underfilled final internal level.
 
+`SpatialDatabaseConfig::tlasMaxLeafBlocks` optionally lets the final range
+become one logical AoSoA leaf backed by two through `kWide` linked `TlasNode`
+blocks. The default caps logical leaves at 16 instances: four BVH4 blocks or
+two BVH8 blocks. One explicitly keeps the classic topology; the largest
+supported value represents 16 instances in BVH4 or 64 in BVH8. The builder
+compares the cost of testing every leaf block with an interior-node visit plus
+the surface-area-weighted expected child-block visits and collapses only when
+the flat cost is lower. The chain metadata occupies existing `TlasNode`
+alignment padding, so BVH4 remains 128 hot bytes and BVH8 remains 256 hot
+bytes. Only the chain head participates in the surrounding tree; movement,
+exact refit, removal, normal selection, and terminal selection still operate
+on each SIMD block.
+
 The SpatialBins builder:
 
 - finds the longest centroid axis for each large range;

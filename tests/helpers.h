@@ -140,6 +140,87 @@ struct SpatialDatabase::TestAccess
     {
         return database.tlasNodes_.size();
     }
+    static uint32_t tlasFatLeafCount(const SpatialDatabase& database)
+    {
+        uint32_t count = 0;
+        for (uint32_t node = 0; node < database.tlasNodes_.size(); ++node)
+        {
+            const TlasNode& block = database.tlasNodes_[node];
+            if (block.leafChainHead == int32_t(node) &&
+                block.nextLeafBlock >= 0)
+                ++count;
+        }
+        return count;
+    }
+    static uint32_t tlasLeafBlockCount(const SpatialDatabase& database)
+    {
+        uint32_t count = 0;
+        for (const TlasNode& node : database.tlasNodes_)
+        {
+            if (node.leafChainHead >= 0)
+            {
+                ++count;
+                continue;
+            }
+            uint32_t lanes = node.validLanes();
+            bool hasInstance = false;
+            bool hasInternal = false;
+            while (lanes)
+            {
+                const uint32_t lane = uint32_t(std::countr_zero(lanes));
+                lanes &= lanes - 1;
+                hasInstance |= node.child[lane] < 0;
+                hasInternal |= node.child[lane] >= 0;
+            }
+            count += hasInstance && !hasInternal;
+        }
+        return count;
+    }
+    static uint32_t tlasMaxLeafBlocks(const SpatialDatabase& database)
+    {
+        uint32_t maximum = 0;
+        for (uint32_t node = 0; node < database.tlasNodes_.size(); ++node)
+        {
+            if (database.tlasNodes_[node].leafChainHead == int32_t(node))
+                maximum = std::max(
+                    maximum, database.tlasLeafBlockCount(node));
+            else if (database.tlasNodes_[node].validLanes() != 0)
+            {
+                bool hasInternal = false;
+                uint32_t lanes = database.tlasNodes_[node].validLanes();
+                while (lanes)
+                {
+                    const uint32_t lane = uint32_t(std::countr_zero(lanes));
+                    lanes &= lanes - 1;
+                    hasInternal |= database.tlasNodes_[node].child[lane] >= 0;
+                }
+                if (!hasInternal) maximum = std::max(maximum, 1u);
+            }
+        }
+        return maximum;
+    }
+    static uint32_t tlasMaxDepth(const SpatialDatabase& database)
+    {
+        if (database.tlasRoot_ < 0) return 0;
+        const auto visit = [&](auto&& self, uint32_t node,
+                               uint32_t depth) -> uint32_t
+        {
+            uint32_t maximum = depth + 1;
+            const TlasNode& block = database.tlasNodes_[node];
+            uint32_t lanes = block.validLanes();
+            while (lanes)
+            {
+                const uint32_t lane = uint32_t(std::countr_zero(lanes));
+                lanes &= lanes - 1;
+                if (block.child[lane] >= 0)
+                    maximum = std::max(
+                        maximum,
+                        self(self, uint32_t(block.child[lane]), depth + 1));
+            }
+            return maximum;
+        };
+        return visit(visit, uint32_t(database.tlasRoot_), 0);
+    }
     static std::vector<float4> tlasRootHalfInstanceCenters(
         const SpatialDatabase& database, bool secondHalf)
     {
@@ -165,10 +246,17 @@ struct SpatialDatabase::TestAccess
                     database.instances_[uint32_t(~child)].worldBox.center());
                 continue;
             }
-            const TlasNode& node = database.tlasNodes_[uint32_t(child)];
-            for (uint32_t lane = 0; lane < kWide; ++lane)
-                if (node.validMask & (1u << lane))
-                    stack.push_back(node.child[lane]);
+            uint32_t blockIndex = uint32_t(child);
+            for (;;)
+            {
+                const TlasNode& node = database.tlasNodes_[blockIndex];
+                for (uint32_t lane = 0; lane < kWide; ++lane)
+                    if (node.validMask & (1u << lane))
+                        stack.push_back(node.child[lane]);
+                if (node.leafChainHead < 0 || node.nextLeafBlock < 0)
+                    break;
+                blockIndex = uint32_t(node.nextLeafBlock);
+            }
         }
         return centers;
     }
