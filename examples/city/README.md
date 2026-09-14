@@ -255,10 +255,34 @@ drag to look. **Freeze camera / cull state** captures the active culling camera,
 switches to the free debug camera, and renders the captured frustum as
 translucent magenta planes.
 
-From the repository root:
+On Armbian and other Debian/Ubuntu Linux systems, install the build tools and
+graphics development packages once before configuring:
+
+```sh
+sudo apt-get update
+sudo apt-get install build-essential cmake ninja-build git \
+  libx11-dev libgl1-mesa-dev libwayland-dev
+```
+
+Use CMake 3.24 or newer and a C++20 compiler. A working desktop alone does not
+provide the development headers and linker libraries. In particular,
+`Could NOT find X11 (missing: X11_X11_INCLUDE_PATH X11_X11_LIB)` means
+`libx11-dev` is missing. The pinned bgfx build also requires OpenGL development
+files and, with its default `BGFX_WITH_WAYLAND=ON`, the Wayland EGL library.
+The sample checks these dependencies before fetching bgfx and prints the
+installation command if any are missing. These packages are only needed for
+the city sample, not the core Frontier library.
+
+After installing the packages, rerun `bash ./run_city_sample.sh`; an existing
+failed `build-city` configure can be reused. Launch from an X11 desktop session
+(or a Wayland desktop with XWayland available), since the sample's native Linux
+window layer uses X11.
+
+To configure and build manually from the repository root:
 
 ```sh
 cmake -S . -B build-city \
+  -DCMAKE_BUILD_TYPE=Release \
   -DFRONTIER_BUILD_CITY_SAMPLE=ON \
   -DFRONTIER_DEBUG_TOOLS=ON \
   -DFRONTIER_BUILD_TESTS=OFF

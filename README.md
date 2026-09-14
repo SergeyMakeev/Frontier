@@ -304,6 +304,9 @@ cmake --build build-city --config Release --target frontier_city
 
 Or configure, build, and launch it in one command with
 `bash ./run_city_sample.sh` on macOS/Linux or `run_city_sample.bat` on Windows.
+On Armbian/Debian/Ubuntu, first install `libx11-dev`, `libgl1-mesa-dev`, and
+`libwayland-dev` alongside the build tools; see the
+[Linux setup instructions](examples/city/README.md).
 Set `FRONTIER_CITY_BUILD_DIR` to override the default `build-city` directory;
 additional command-line arguments are forwarded to the bgfx application.
 

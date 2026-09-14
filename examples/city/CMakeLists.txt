@@ -8,6 +8,43 @@ set(BGFX_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(BGFX_INSTALL OFF CACHE BOOL "" FORCE)
 set(BGFX_CUSTOM_TARGETS OFF CACHE BOOL "" FORCE)
 
+# Diagnose system dependencies before downloading/configuring bgfx. Desktop
+# images can have the runtime libraries without their development packages.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    find_package(X11 QUIET)
+    find_package(OpenGL QUIET)
+    set(FRONTIER_CITY_MISSING_DEPENDENCIES "")
+    if(NOT X11_FOUND)
+        list(APPEND FRONTIER_CITY_MISSING_DEPENDENCIES "X11 (libx11-dev)")
+    endif()
+    if(NOT OPENGL_FOUND)
+        list(APPEND FRONTIER_CITY_MISSING_DEPENDENCIES "OpenGL (libgl1-mesa-dev)")
+    endif()
+
+    # The pinned bgfx.cmake defaults BGFX_WITH_WAYLAND to ON on Linux and
+    # links wayland-egl even when the sample uses its native X11 entry layer.
+    if(NOT DEFINED BGFX_WITH_WAYLAND OR BGFX_WITH_WAYLAND)
+        find_library(FRONTIER_CITY_WAYLAND_EGL_LIBRARY NAMES wayland-egl)
+        mark_as_advanced(FRONTIER_CITY_WAYLAND_EGL_LIBRARY)
+        if(NOT FRONTIER_CITY_WAYLAND_EGL_LIBRARY)
+            list(APPEND FRONTIER_CITY_MISSING_DEPENDENCIES
+                "Wayland EGL (libwayland-dev)")
+        endif()
+    endif()
+
+    if(FRONTIER_CITY_MISSING_DEPENDENCIES)
+        list(JOIN FRONTIER_CITY_MISSING_DEPENDENCIES ", " FRONTIER_CITY_MISSING_TEXT)
+        message(FATAL_ERROR
+            "The Frontier city sample is missing Linux development dependencies:\n"
+            "  ${FRONTIER_CITY_MISSING_TEXT}\n"
+            "On Armbian, Debian, or Ubuntu, install them with:\n"
+            "  sudo apt-get update\n"
+            "  sudo apt-get install libx11-dev libgl1-mesa-dev libwayland-dev\n"
+            "Then rerun ./run_city_sample.sh (or your CMake configure command).\n"
+            "See examples/city/README.md for Linux setup instructions.")
+    endif()
+endif()
+
 FetchContent_Declare(
     bgfx_cmake
     GIT_REPOSITORY https://github.com/bkaradzic/bgfx.cmake.git

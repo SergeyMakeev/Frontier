@@ -112,6 +112,31 @@ jobs:
       - name: Unit tests (BVH4 + BVH8)
         run: ctest --test-dir build -C Debug --output-on-failure --parallel 4
 
+  city-linux-arm64:
+    name: city-linux-arm64-gcc
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install city sample dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build git \
+            libx11-dev libgl1-mesa-dev libwayland-dev
+
+      - name: Configure city sample
+        run: >-
+          cmake -S . -B build-city -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DFRONTIER_BUILD_CITY_SAMPLE=ON
+          -DFRONTIER_DEBUG_TOOLS=ON
+          -DFRONTIER_BUILD_TESTS=OFF
+          -DFRONTIER_BUILD_BENCH=OFF
+
+      - name: Build city sample
+        run: cmake --build build-city --target frontier_city --parallel 2
+
   performance:
     name: perf-${{ matrix.name }}
     runs-on: ${{ matrix.os }}
