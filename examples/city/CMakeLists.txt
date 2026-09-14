@@ -8,6 +8,21 @@ set(BGFX_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(BGFX_INSTALL OFF CACHE BOOL "" FORCE)
 set(BGFX_CUSTOM_TARGETS OFF CACHE BOOL "" FORCE)
 
+# The pinned debug-draw shaders use integer a_indices to select model matrices
+# for cones/cylinders. bgfx's default GL 2.1 build binds those as floats, which
+# corrupts nonzero indices and stretches triangles across unrelated geometry.
+# GL 3.1 uses integer vertex attributes and the GLSL 1.40 shader path. Upgrade
+# the empty cache value left by existing builds, while preserving higher minima.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" OR WIN32)
+    if(NOT DEFINED BGFX_OPENGL_VERSION OR BGFX_OPENGL_VERSION STREQUAL "")
+        set(BGFX_OPENGL_VERSION 31 CACHE STRING "Specify minimum opengl version" FORCE)
+    elseif(BGFX_OPENGL_VERSION LESS 31)
+        message(FATAL_ERROR
+            "The city sample's debug-draw shaders require OpenGL 3.1 or newer. "
+            "Reconfigure with -DBGFX_OPENGL_VERSION=31 (or a higher version).")
+    endif()
+endif()
+
 # Diagnose system dependencies before downloading/configuring bgfx. Desktop
 # images can have the runtime libraries without their development packages.
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")

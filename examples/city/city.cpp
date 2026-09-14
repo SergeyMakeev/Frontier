@@ -305,6 +305,35 @@ enum class EntityKind : uint8_t
     Tower,
 };
 
+struct SceneDefinition
+{
+    SubtreeHandle handle;
+    uint32_t authoredNodeCount = 0;
+};
+
+// Count authoring calls before packing can introduce internal spatial nodes.
+// Additional payload LODs belong to the same node and do not increase the count.
+class SceneDefinitionBuilder
+{
+public:
+    template <typename... Args>
+    SubtreeBuilder::NodeId createNode(Args&&... args)
+    {
+        const auto id = builder_.createNode(std::forward<Args>(args)...);
+        ++authoredNodeCount_;
+        return id;
+    }
+
+    SceneDefinition registerWith(SpatialDatabase& database)
+    {
+        return {database.registerSubtree(builder_.build()), authoredNodeCount_};
+    }
+
+private:
+    SubtreeBuilder builder_;
+    uint32_t authoredNodeCount_ = 0;
+};
+
 struct Entity
 {
     float4 localPosition = float4::point(0.0f, 0.0f, 0.0f);
@@ -313,6 +342,7 @@ struct Entity
     float localYaw = 0.0f;
     float yaw = 0.0f;
     uint32_t color = 0xffffffff;
+    uint32_t authoredHlodNodeCount = 0;
     EntityKind kind = EntityKind::House;
     HouseStyle houseStyle = HouseStyle::HouseA;
     uint16_t heroAsset = UINT16_MAX;
@@ -1261,6 +1291,9 @@ private:
             return;
         }
 
+        ImGui::Text("Backend: %s",
+                    bgfx::getRendererName(bgfx::getRendererType()));
+        ImGui::Separator();
         ImGui::Text("Simulation");
         ImGui::Separator();
         ImGui::Checkbox("Freeze simulation", &freezeSimulation_);
@@ -2156,6 +2189,13 @@ private:
         ImGui::Text("%u cars | %u pedestrians",
                     unsigned(carHandles_.size()),
                     unsigned(pedestrianHandles_.size()));
+        ImGui::Text("Authored HLOD nodes: %llu",
+                    static_cast<unsigned long long>(authoredHlodNodeCount_));
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(
+                "Full authored hierarchy per scene instance, including the "
+                "aggregate parent.\nExcludes generated spatial nodes; multiple "
+                "LOD payloads on one node count once.");
         ImGui::Text("Current cut %u", lastCurrentSize_);
         ImGui::Text("Refinement %u groups | %u entries",
                     lastRefinementGroups_, lastRefinementEntries_);
@@ -3672,12 +3712,12 @@ private:
                    : bounds(-3.7f, 0.0f, -3.7f, 3.7f, 7.6f, 3.7f);
     }
 
-    SubtreeHandle createHouseDefinition(HouseStyle style)
+    SceneDefinition createHouseDefinition(HouseStyle style)
     {
         // Geometric errors are world-space deviations. Sub-meter values make
         // the default 0.75 px threshold span several LODs across this city rather
         // than forcing every visible object to its zero-error leaves.
-        SubtreeBuilder builder;
+        SceneDefinitionBuilder builder;
         const bool houseA = style == HouseStyle::HouseA;
         const AABB all = houseA
                              ? bounds(-3.3f, 0.0f, -3.3f,
@@ -3701,12 +3741,12 @@ private:
                                  3.3f, 8.6f, 3.3f)
                         : bounds(-3.6f, 6.3f, -3.0f,
                                  3.6f, 7.4f, 3.0f)));
-        return database_.registerSubtree(builder.build());
+        return builder.registerWith(database_);
     }
 
-    SubtreeHandle createCarDefinition()
+    SceneDefinition createCarDefinition()
     {
-        SubtreeBuilder builder;
+        SceneDefinitionBuilder builder;
         const AABB all = bounds(-2.2f, 0.0f, -2.2f, 2.2f, 2.2f, 2.2f);
         const auto coarse = builder.createNode(
             node(Payload::CarCoarse,
@@ -3717,12 +3757,12 @@ private:
         builder.createNode(coarse, node(Payload::CarCabin, 0.0f,
                                         bounds(-0.9f, 0.9f, -0.85f,
                                                1.0f, 1.8f, 0.85f)));
-        return database_.registerSubtree(builder.build());
+        return builder.registerWith(database_);
     }
 
-    SubtreeHandle createPedestrianDefinition()
+    SceneDefinition createPedestrianDefinition()
     {
-        SubtreeBuilder builder;
+        SceneDefinitionBuilder builder;
         const AABB all = bounds(-1.1f, 0.0f, -1.1f, 1.1f, 2.25f, 1.1f);
         const auto coarse = builder.createNode(
             node(Payload::PedestrianCoarse,
@@ -3733,12 +3773,12 @@ private:
         builder.createNode(coarse, node(Payload::PedestrianHead, 0.0f,
                                         bounds(-0.3f, 1.65f, -0.3f,
                                                0.58f, 2.25f, 0.3f)));
-        return database_.registerSubtree(builder.build());
+        return builder.registerWith(database_);
     }
 
-    SubtreeHandle createTreeDefinition()
+    SceneDefinition createTreeDefinition()
     {
-        SubtreeBuilder builder;
+        SceneDefinitionBuilder builder;
         const AABB all = bounds(-1.8f, 0.0f, -1.8f, 1.8f, 6.5f, 1.8f);
         const auto coarse = builder.createNode(
             node(Payload::TreeCoarse,
@@ -3749,12 +3789,12 @@ private:
         builder.createNode(coarse, node(Payload::TreeCrown, 0.0f,
                                         bounds(-1.8f, 2.2f, -1.8f,
                                                1.8f, 6.5f, 1.8f)));
-        return database_.registerSubtree(builder.build());
+        return builder.registerWith(database_);
     }
 
-    SubtreeHandle createTowerDefinition()
+    SceneDefinition createTowerDefinition()
     {
-        SubtreeBuilder builder;
+        SceneDefinitionBuilder builder;
         const AABB all = bounds(-5.0f, 0.0f, -5.0f, 5.0f, 46.0f, 5.0f);
         // TowerTop remains the permanent per-instance fallback. Streamed
         // facade payloads live on the registered definition so readiness and
@@ -3781,7 +3821,7 @@ private:
         builder.createNode(district, node(Payload::TowerCrown, 0.0f,
                                           bounds(-4.2f, 37.8f, -4.2f,
                                                  4.2f, 46.0f, 4.2f)));
-        return database_.registerSubtree(builder.build());
+        return builder.registerWith(database_);
     }
 
     void rememberEntity(InstanceHandle handle, const Entity& entity)
@@ -3894,7 +3934,7 @@ private:
     InstanceHandle instantiateActor(Payload fallback, float error,
                                     const AABB& localBounds,
                                     const Entity& entity,
-                                    SubtreeHandle definition)
+                                    const SceneDefinition& definition)
     {
         Entity placed = entity;
         placed.localPosition = entity.position;
@@ -3909,9 +3949,12 @@ private:
         };
         const InstanceHandle handle = database_.instantiate(root, placement);
         const SubtreeInstanceHandle mounted =
-            database_.mountSubtree(handle.rootNode(), definition);
+            database_.mountSubtree(handle.rootNode(), definition.handle);
+        placed.authoredHlodNodeCount =
+            1 + (mounted.valid() ? definition.authoredNodeCount : 0);
         rememberStreamingRepresentatives(mounted, placed);
         rememberEntity(handle, placed);
+        authoredHlodNodeCount_ += placed.authoredHlodNodeCount;
         return handle;
     }
 
@@ -3984,7 +4027,11 @@ private:
         for (InstanceHandle handle : houseHandles_)
         {
             if (handle.id < entities_.size())
+            {
                 lots.push_back(entities_[handle.id].localPosition);
+                authoredHlodNodeCount_ -=
+                    entities_[handle.id].authoredHlodNodeCount;
+            }
             database_.removeInstance(handle);
         }
 
@@ -4014,12 +4061,12 @@ private:
             createHouseDefinition(HouseStyle::HouseA);
         houseDefinitions_[static_cast<size_t>(HouseStyle::HouseB)] =
             createHouseDefinition(HouseStyle::HouseB);
-        const SubtreeHandle carDefinition = createCarDefinition();
-        const SubtreeHandle pedestrianDefinition =
+        const SceneDefinition carDefinition = createCarDefinition();
+        const SceneDefinition pedestrianDefinition =
             createPedestrianDefinition();
-        const SubtreeHandle treeDefinition = createTreeDefinition();
-        std::array<SubtreeHandle, kHeroTowerAssetCount> towerDefinitions{};
-        for (SubtreeHandle& definition : towerDefinitions)
+        const SceneDefinition treeDefinition = createTreeDefinition();
+        std::array<SceneDefinition, kHeroTowerAssetCount> towerDefinitions{};
+        for (SceneDefinition& definition : towerDefinitions)
             definition = createTowerDefinition();
         uint32_t random = 0x5eed1234u;
         size_t towerIndex = 0;
@@ -7176,7 +7223,7 @@ private:
     SpatialQuery streamingErrorMeasurementQuery_;
     std::vector<Entity> entities_;
 
-    std::array<SubtreeHandle, 2> houseDefinitions_{};
+    std::array<SceneDefinition, 2> houseDefinitions_{};
     std::vector<InstanceHandle> houseHandles_;
     std::vector<InstanceHandle> towerHandles_;
     std::vector<InstanceHandle> treeHandles_;
@@ -7274,6 +7321,7 @@ private:
     HouseStyle activeHouseStyle_ = HouseStyle::HouseA;
     HouseStyle pendingHouseStyle_ = HouseStyle::HouseA;
     uint32_t houseGeneration_ = 0;
+    uint64_t authoredHlodNodeCount_ = 0;
     uint32_t houseCount_ = 0;
     uint32_t towerCount_ = 0;
     uint32_t treeCount_ = 0;

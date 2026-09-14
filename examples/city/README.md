@@ -42,8 +42,8 @@ The UI is split into independent, movable ImGui windows so diagnostics do not
 cover one another. The global **Debug windows** menu in the top bar toggles
 each widget independently and provides **Show all** / **Hide all** actions;
 each window can also be closed with its title-bar button. Only
-**Frontier debug** is open by default. **Frontier debug**
-controls simulation freeze,
+**Frontier debug** is open by default. **Frontier debug** shows the active
+graphics backend (for example OpenGL or Vulkan) and controls simulation freeze,
 hierarchy-level tinting (green top nodes, yellow intermediate nodes, red
 leaves), optional scene-wide wireframe rendering, LOD and contribution
 thresholds, camera modes, and workload generators. **Replace all with House
@@ -204,6 +204,13 @@ registers this command as `frontier_city_streaming_make_before_break`.
 Wireframe can also be toggled directly from the top-bar
 **Rendering** menu and composes with hierarchy tinting. **Scene stats** contains
 entity, cut, streaming, cache, simulation, and camera status.
+Its **Authored HLOD nodes** total counts the full hierarchy for every current
+scene instance, including each aggregate parent, regardless of visibility or
+residency. Generated spatial nodes and implicit packing roots are excluded;
+multiple LOD payloads on one authored node count once. Shared definitions count
+once per placement, and replacing houses removes their old counts before adding
+the new hierarchy. The default city contains 18,414 authored HLOD nodes: four
+per house, car, pedestrian, and tree, and five per tower.
 **Performance** reports timings in microseconds and puts Frontier selection,
 motion/database work, and virtual streaming first. The virtual-streaming total
 is decomposed into all `computeFrontierRefinement()` calls, the remaining
@@ -306,6 +313,16 @@ Other platforms keep the 4x MSAA default. Use `--msaa` to request 4x MSAA or
 show the selected renderer and requested MSAA mode; the log also prints the GPU
 vendor/device IDs. The viewport and backbuffer are kept in sync even if a global
 input event follows a resize event.
+
+The desktop OpenGL backend requires OpenGL 3.1 or newer. CMake selects
+`BGFX_OPENGL_VERSION=31`, including when updating an existing build whose cache
+contains the old empty default. The pinned debug-draw shaders use integer
+transform indices; bgfx's OpenGL 2.1 build supplies floating-point attributes
+instead, which can stretch cone/cylinder triangles across the city and look
+like cracks in other surfaces. If an older build reports **OpenGL 2.1**, rerun
+the launcher to reconfigure and rebuild. An explicitly configured lower
+`BGFX_OPENGL_VERSION` must be changed to `31` or higher. The renderer label
+reports bgfx's compiled minimum, not the driver's maximum supported version.
 
 Renderer-selection arguments are supported, so Linux graphics issues can be
 compared with a single-sample backbuffer:
