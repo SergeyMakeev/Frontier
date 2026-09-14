@@ -68,14 +68,18 @@ FetchContent_Declare(
     GIT_SUBMODULES_RECURSE TRUE
 )
 FetchContent_MakeAvailable(bgfx_cmake)
+include(cmake/bgfx_diagnostics.cmake)
 
 if(ANDROID)
-    add_library(frontier_city SHARED city.cpp)
+    add_library(frontier_city SHARED city.cpp hardware_info.cpp)
 else()
-    add_executable(frontier_city WIN32 city.cpp)
+    add_executable(frontier_city WIN32 city.cpp hardware_info.cpp)
 endif()
 
 target_link_libraries(frontier_city PRIVATE frontier example-common)
+if(WIN32)
+    target_link_libraries(frontier_city PRIVATE advapi32)
+endif()
 target_compile_features(frontier_city PRIVATE cxx_std_20)
 target_compile_definitions(frontier_city PRIVATE ENTRY_CONFIG_IMPLEMENT_MAIN=1)
 set_target_properties(frontier_city PROPERTIES

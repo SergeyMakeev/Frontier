@@ -7,6 +7,7 @@
 #include "entry/entry.h"
 #include "entry/input.h"
 #include "imgui/imgui.h"
+#include "hardware_info.h"
 
 #include <bgfx/bgfx.h>
 #include <bx/bounds.h>
@@ -343,6 +344,7 @@ struct Entity
     float yaw = 0.0f;
     uint32_t color = 0xffffffff;
     uint32_t authoredHlodNodeCount = 0;
+    uint64_t lastMotionFrame = 0;
     EntityKind kind = EntityKind::House;
     HouseStyle houseStyle = HouseStyle::HouseA;
     uint16_t heroAsset = UINT16_MAX;
@@ -759,6 +761,10 @@ public:
             {
                 enableMsaa = true;
             }
+            else if (std::strcmp(argv[index], "--unlit") == 0)
+            {
+                unlitSurfaces_ = true;
+            }
             else if (std::strcmp(argv[index], "--streaming-self-test") == 0)
             {
                 streamingSelfTest_ = true;
@@ -812,12 +818,21 @@ public:
             std::exit(EXIT_FAILURE);
         }
         const bgfx::Caps* rendererCaps = bgfx::getCaps();
+        cpuModel_ = city::cpuModel();
+        gpuModel_ = rendererCaps->frontierGpuName[0] != '\0'
+                        ? rendererCaps->frontierGpuName : "Model unavailable";
+        if (bgfx::getRendererType() == bgfx::RendererType::OpenGL ||
+            bgfx::getRendererType() == bgfx::RendererType::OpenGLES)
+            gpuDriver_ = rendererCaps->frontierGpuDriver;
         std::printf("Frontier city renderer: %s | requested MSAA: %s | "
                     "GPU: %04x:%04x\n",
                     bgfx::getRendererName(bgfx::getRendererType()),
                     enableMsaa ? "4x" : "off",
                     unsigned(rendererCaps->vendorId),
                     unsigned(rendererCaps->deviceId));
+        std::printf("CPU: %s\nGPU: %s\n", cpuModel_.c_str(), gpuModel_.c_str());
+        if (!gpuDriver_.empty())
+            std::printf("Graphics driver: %s\n", gpuDriver_.c_str());
         std::fflush(stdout);
 
         bgfx::setDebug(debug_);
@@ -925,6 +940,9 @@ public:
         int64_t stageEnd = bx::getHPCounter();
         performance.uiMs = milliseconds(stageStart, stageEnd);
 
+        ++motionFrame_;
+        updatedHlodNodes_ = 0;
+        movedInstances_ = 0;
         stageStart = stageEnd;
         if (streamingResetRequested_)
         {
@@ -1283,7 +1301,7 @@ private:
     void drawDebugUi()
     {
         ImGui::SetNextWindowPos(ImVec2(12.0f, 36.0f), ImGuiCond_FirstUseEver);
-        ImGui::SetNextWindowSize(ImVec2(390.0f, 590.0f),
+        ImGui::SetNextWindowSize(ImVec2(390.0f, 660.0f),
                                  ImGuiCond_FirstUseEver);
         if (!ImGui::Begin("Frontier debug", &showFrontierDebug_))
         {
@@ -1293,12 +1311,20 @@ private:
 
         ImGui::Text("Backend: %s",
                     bgfx::getRendererName(bgfx::getRendererType()));
+        ImGui::TextWrapped("CPU: %s", cpuModel_.c_str());
+        ImGui::TextWrapped("GPU: %s", gpuModel_.c_str());
+        if (ImGui::IsItemHovered() && !gpuDriver_.empty())
+            ImGui::SetTooltip("%s", gpuDriver_.c_str());
         ImGui::Separator();
         ImGui::Text("Simulation");
         ImGui::Separator();
         ImGui::Checkbox("Freeze simulation", &freezeSimulation_);
         ImGui::Checkbox("Hierarchy level tint", &hierarchyTint_);
         ImGui::Checkbox("Wireframe scene rendering", &wireframeDebug_);
+        ImGui::Checkbox("Unlit surfaces (seam test)", &unlitSurfaces_);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Disable lighting without changing geometry or depth.\n"
+                              "If the seams disappear, they come from shading.");
         if (hierarchyTint_)
             ImGui::TextWrapped(
                 "Tint follows the selected cut. Higher LOD thresholds expose "
@@ -2171,7 +2197,7 @@ private:
     {
         ImGui::SetNextWindowPos(ImVec2(414.0f, 36.0f),
                                 ImGuiCond_FirstUseEver);
-        ImGui::SetNextWindowSize(ImVec2(350.0f, 300.0f),
+        ImGui::SetNextWindowSize(ImVec2(350.0f, 470.0f),
                                  ImGuiCond_FirstUseEver);
         if (!ImGui::Begin("Scene stats", &showSceneStats_))
         {
@@ -2197,6 +2223,16 @@ private:
                 "aggregate parent.\nExcludes generated spatial nodes; multiple "
                 "LOD payloads on one node count once.");
         ImGui::Text("Current cut %u", lastCurrentSize_);
+        ImGui::Text("Updated HLOD nodes/frame: %llu",
+                    static_cast<unsigned long long>(updatedHlodNodes_));
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(
+                "Authored nodes affected by changed instance transforms in the "
+                "last completed frame.\nEach hierarchy counts once, even if moved "
+                "twice. Includes culled and nonresident nodes.\nRigid motion "
+                "updates the instance transform; it does not rewrite every "
+                "child node. Spatial maintenance is counted separately.");
+        ImGui::Text("Moved instances/frame: %u", movedInstances_);
         ImGui::Text("Refinement %u groups | %u entries",
                     lastRefinementGroups_, lastRefinementEntries_);
         ImGui::Text("Virtual residency %.2f / %.2f MiB | %u loading",
@@ -4294,14 +4330,28 @@ private:
         }
     }
 
+    void updateEntityPose(Entity& entity, float4 position, float yaw)
+    {
+        const bool changed = entity.position.x != position.x ||
+                             entity.position.y != position.y ||
+                             entity.position.z != position.z || entity.yaw != yaw;
+        if (changed && entity.lastMotionFrame != motionFrame_)
+        {
+            entity.lastMotionFrame = motionFrame_;
+            updatedHlodNodes_ += entity.authoredHlodNodeCount;
+            ++movedInstances_;
+        }
+        entity.position = position;
+        entity.yaw = yaw;
+    }
+
     void updateActors(float time)
     {
         updateMovingActorSources(time);
         for (size_t index = 0; index < carHandles_.size(); ++index)
         {
             Entity& entity = entities_[carHandles_[index].id];
-            entity.position = entity.localPosition;
-            entity.yaw = entity.localYaw;
+            updateEntityPose(entity, entity.localPosition, entity.localYaw);
             carPositions_[index] = entity.position;
             carYaws_[index] = yawRotation(entity.yaw);
         }
@@ -4310,8 +4360,7 @@ private:
         for (size_t index = 0; index < pedestrianHandles_.size(); ++index)
         {
             Entity& entity = entities_[pedestrianHandles_[index].id];
-            entity.position = entity.localPosition;
-            entity.yaw = entity.localYaw;
+            updateEntityPose(entity, entity.localPosition, entity.localYaw);
             pedestrianPositions_[index] = entity.position;
             pedestrianYaws_[index] = yawRotation(entity.yaw);
         }
@@ -4329,10 +4378,10 @@ private:
             const float phase = entity.localPosition.x * 0.045f +
                                 entity.localPosition.z * 0.037f +
                                 float(handle.id % 251u) * 0.017f;
-            entity.position = entity.localPosition;
-            entity.position.y += amplitude * std::cos(
+            float4 position = entity.localPosition;
+            position.y += amplitude * std::cos(
                 time * kWorstCaseWaveFrequency + phase);
-            entity.yaw = entity.localYaw;
+            updateEntityPose(entity, position, entity.localYaw);
             wholeScenePositions_[index] = entity.position;
             wholeSceneYaws_[index] = yawRotation(entity.yaw);
         }
@@ -4854,6 +4903,7 @@ private:
     {
         DebugDrawEncoder encoder;
         encoder.begin(kMainView);
+        encoder.setLighting(!unlitSurfaces_);
         drawWorld(encoder);
         for (const FrontierEntry& entry : frontier)
         {
@@ -7251,6 +7301,9 @@ private:
     uint32_t height_ = 720;
     uint32_t debug_ = BGFX_DEBUG_NONE;
     uint32_t reset_ = BGFX_RESET_VSYNC;
+    std::string cpuModel_;
+    std::string gpuModel_;
+    std::string gpuDriver_;
     int64_t previousCounter_ = 0;
     float smoothedFps_ = 60.0f;
     float simulationTime_ = 0.0f;
@@ -7263,6 +7316,7 @@ private:
     bool houseReplacementPending_ = false;
     bool hierarchyTint_ = false;
     bool wireframeDebug_ = false;
+    bool unlitSurfaces_ = false;
     bool freeCamera_ = false;
     bool freezeCullCamera_ = false;
     bool drawCullFrustum_ = true;
@@ -7322,6 +7376,9 @@ private:
     HouseStyle pendingHouseStyle_ = HouseStyle::HouseA;
     uint32_t houseGeneration_ = 0;
     uint64_t authoredHlodNodeCount_ = 0;
+    uint64_t motionFrame_ = 0;
+    uint64_t updatedHlodNodes_ = 0;
+    uint32_t movedInstances_ = 0;
     uint32_t houseCount_ = 0;
     uint32_t towerCount_ = 0;
     uint32_t treeCount_ = 0;

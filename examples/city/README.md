@@ -43,7 +43,11 @@ cover one another. The global **Debug windows** menu in the top bar toggles
 each widget independently and provides **Show all** / **Hide all** actions;
 each window can also be closed with its title-bar button. Only
 **Frontier debug** is open by default. **Frontier debug** shows the active
-graphics backend (for example OpenGL or Vulkan) and controls simulation freeze,
+graphics backend (for example OpenGL or Vulkan), CPU model, and selected GPU
+model. On Linux ARM systems, the CPU label identifies the core models and their
+counts. Hardware names are read once at startup; unavailable information is
+labelled explicitly. Hover over the GPU name for the OpenGL driver/version
+string, which is also printed in the startup log. This window controls simulation freeze,
 hierarchy-level tinting (green top nodes, yellow intermediate nodes, red
 leaves), optional scene-wide wireframe rendering, LOD and contribution
 thresholds, camera modes, and workload generators. **Replace all with House
@@ -211,6 +215,16 @@ multiple LOD payloads on one authored node count once. Shared definitions count
 once per placement, and replacing houses removes their old counts before adding
 the new hierarchy. The default city contains 18,414 authored HLOD nodes: four
 per house, car, pedestrian, and tree, and five per tower.
+**Updated HLOD nodes/frame** counts authored nodes affected by changed instance
+positions or orientations in the last completed frame, regardless of visibility
+or residency. Each instance's complete hierarchy counts once even if moved more
+than once that frame. **Moved instances/frame** reports the corresponding
+instance count. These are logical world-transform changes: rigid motion updates
+an instance transform without rewriting its children, and generated spatial
+maintenance is reported separately. Normal motion affects 5,184 authored nodes
+in 1,296 cars/pedestrians; whole-scene stress can affect all 18,414 nodes in 4,590
+instances. Frozen simulation reports zero unless a pending action changes poses
+(for example restoring the scene when stopping stress).
 **Performance** reports timings in microseconds and puts Frontier selection,
 motion/database work, and virtual streaming first. The virtual-streaming total
 is decomposed into all `computeFrontierRefinement()` calls, the remaining
@@ -324,6 +338,14 @@ the launcher to reconfigure and rebuild. An explicitly configured lower
 `BGFX_OPENGL_VERSION` must be changed to `31` or higher. The renderer label
 reports bgfx's compiled minimum, not the driver's maximum supported version.
 
+If triangle seams persist with OpenGL 3.1, use **Unlit surfaces (seam test)** in
+**Frontier debug**, or launch with `--unlit`. This disables surface lighting
+while preserving positions, indices, depth testing, and culling. Seams that
+disappear implicate the lighting shader; seams that remain need further
+geometry/rasterization investigation. Report the CPU, GPU, driver string, and
+whether this comparison changes the seams. The OpenGL 3.1 attribute fix does
+not by itself establish the cause of every SBC seam artifact.
+
 Renderer-selection arguments are supported, so Linux graphics issues can be
 compared with a single-sample backbuffer:
 
@@ -336,6 +358,13 @@ These request a backend; bgfx may fall back if it cannot initialize it, so check
 the renderer reported at startup. Omit `--gl`/`--vk` to let bgfx choose. On other
 platforms the standard bgfx arguments such as `--d3d11`, `--d3d12`, and `--mtl`
 are also accepted.
+
+The sample applies checked, idempotent adaptations to the pinned bgfx sources
+through `cmake/bgfx_diagnostics.cmake`: selected GPU information is appended to
+both the C++ and C capability structures, and debug draw gets a lighting switch.
+GPU names come from the active GL, Vulkan, DXGI, or Metal device rather than an
+unrelated installed adapter. Revisit these adaptations when changing the bgfx
+pin; configuration fails if the patch no longer applies.
 
 Run `build-city/examples/city/frontier_city` on single-config generators. With
 Visual Studio, run `build-city/examples/city/Release/frontier_city.exe`.

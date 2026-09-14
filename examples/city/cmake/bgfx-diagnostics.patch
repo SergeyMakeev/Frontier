@@ -1,0 +1,172 @@
+diff --git a/examples/common/debugdraw/debugdraw.cpp b/examples/common/debugdraw/debugdraw.cpp
+index c7f34c944..ace466e6f 100644
+--- a/examples/common/debugdraw/debugdraw.cpp
++++ b/examples/common/debugdraw/debugdraw.cpp
+@@ -493,6 +493,7 @@ struct Attrib
+ 	uint32_t m_abgr;
+ 	bool     m_stipple;
+ 	bool     m_wireframe;
++	bool     m_lighting;
+ 	uint8_t  m_lod;
+ };
+ 
+@@ -1061,6 +1062,7 @@ struct DebugDrawEncoderImpl
+ 		attrib.m_abgr      = UINT32_MAX;
+ 		attrib.m_stipple   = false;
+ 		attrib.m_wireframe = false;
++		attrib.m_lighting = true;
+ 		attrib.m_lod       = 0;
+ 
+ 		m_mtxStackCurrent = 0;
+@@ -1252,6 +1254,8 @@ struct DebugDrawEncoderImpl
+ 		m_attrib[m_stack].m_lod = _lod;
+ 	}
+ 
++	void setLighting(bool _enabled) { m_attrib[m_stack].m_lighting = _enabled; }
++
+ 	void setWireframe(bool _wireframe)
+ 	{
+ 		BX_ASSERT(State::Count != m_state, "");
+@@ -1585,7 +1589,7 @@ struct DebugDrawEncoderImpl
+ 		}
+ 
+ 		m_encoder->setTransform(m_mtxStack[m_mtxStackCurrent].mtx);
+-		bgfx::ProgramHandle program = s_dds.m_program[wireframe ? Program::FillMesh : Program::FillLitMesh];
++		bgfx::ProgramHandle program = s_dds.m_program[wireframe || !attrib.m_lighting ? Program::FillMesh : Program::FillLitMesh];
+ 		m_encoder->submit(m_viewId, program);
+ 	}
+ 
+@@ -1639,7 +1643,7 @@ struct DebugDrawEncoderImpl
+ 			}
+ 
+ 			m_encoder->setTransform(m_mtxStack[m_mtxStackCurrent].mtx);
+-			bgfx::ProgramHandle program = s_dds.m_program[wireframe
++			bgfx::ProgramHandle program = s_dds.m_program[wireframe || !attrib.m_lighting
+ 				? Program::FillMesh
+ 				: Program::FillLitMesh
+ 				];
+@@ -2133,7 +2137,7 @@ struct DebugDrawEncoderImpl
+ 		m_encoder->setTransform(stack.mtx, stack.num);
+ 
+ 		m_encoder->setVertexBuffer(0, s_dds.m_vbh, mesh.m_startVertex, mesh.m_numVertices);
+-		m_encoder->submit(m_viewId, s_dds.m_program[_wireframe ? Program::Fill : Program::FillLit]);
++		m_encoder->submit(m_viewId, s_dds.m_program[_wireframe || !attrib.m_lighting ? Program::Fill : Program::FillLit]);
+ 
+ 		popTransform(false /* flush */);
+ 	}
+@@ -2366,6 +2370,11 @@ void DebugDrawEncoder::setLod(uint8_t _lod)
+ 	DEBUG_DRAW_ENCODER(setLod(_lod) );
+ }
+ 
++void DebugDrawEncoder::setLighting(bool _enabled)
++{
++	DEBUG_DRAW_ENCODER(setLighting(_enabled) );
++}
++
+ void DebugDrawEncoder::setWireframe(bool _wireframe)
+ {
+ 	DEBUG_DRAW_ENCODER(setWireframe(_wireframe) );
+diff --git a/examples/common/debugdraw/debugdraw.h b/examples/common/debugdraw/debugdraw.h
+index 595cbf540..73adab12c 100644
+--- a/examples/common/debugdraw/debugdraw.h
++++ b/examples/common/debugdraw/debugdraw.h
+@@ -86,6 +86,7 @@ struct DebugDrawEncoder
+ 
+ 	///
+ 	void setWireframe(bool _wireframe);
++	void setLighting(bool _enabled);
+ 
+ 	///
+ 	void setStipple(bool _stipple, float _scale = 1.0f, float _offset = 0.0f);
+diff --git a/include/bgfx/bgfx.h b/include/bgfx/bgfx.h
+index d0091f0bb..9b1d8d632 100644
+--- a/include/bgfx/bgfx.h
++++ b/include/bgfx/bgfx.h
+@@ -621,6 +621,9 @@ namespace bgfx
+ 		                                        ///    - `BGFX_CAPS_VIDEO_CODEC_CHROMA_420` - 4:2:0 chroma subsampling is supported.
+ 		                                        ///    - `BGFX_CAPS_VIDEO_CODEC_CHROMA_422` - 4:2:2 chroma subsampling is supported.
+ 		                                        ///    - `BGFX_CAPS_VIDEO_CODEC_CHROMA_444` - 4:4:4 chroma subsampling is supported.
++		// Frontier city diagnostics, populated by the selected backend.
++		char frontierGpuName[256];
++		char frontierGpuDriver[256];
+ 	};
+ 
+ 	/// Internal data.
+diff --git a/include/bgfx/c99/bgfx.h b/include/bgfx/c99/bgfx.h
+index d616e7514..aafd8daf0 100644
+--- a/include/bgfx/c99/bgfx.h
++++ b/include/bgfx/c99/bgfx.h
+@@ -682,6 +682,8 @@ typedef struct bgfx_caps_s
+      */
+     uint32_t             codecs[BGFX_VIDEO_CODEC_COUNT];
+ 
++    char frontierGpuName[256];
++    char frontierGpuDriver[256];
+ } bgfx_caps_t;
+ 
+ /**
+diff --git a/src/dxgi.cpp b/src/dxgi.cpp
+index 6c90ff395..9d4c762c5 100644
+--- a/src/dxgi.cpp
++++ b/src/dxgi.cpp
+@@ -415,6 +415,11 @@ namespace bgfx
+ 			bx::memSet(&m_adapterDesc, 0, sizeof(m_adapterDesc) );
+ 			hr = m_adapter->GetDesc(&m_adapterDesc);
+ 			BX_WARN(SUCCEEDED(hr), "Adapter GetDesc failed 0x%08x.", hr);
++			if (SUCCEEDED(hr))
++			{
++				wcstombs(g_caps.frontierGpuName, m_adapterDesc.Description, BX_COUNTOF(g_caps.frontierGpuName)-1);
++				g_caps.frontierGpuName[BX_COUNTOF(g_caps.frontierGpuName)-1] = '\0';
++			}
+ 
+ 			m_adapter->EnumOutputs(0, &m_output);
+ 
+@@ -458,6 +463,11 @@ namespace bgfx
+ 			bx::memSet(&m_adapterDesc, 0, sizeof(m_adapterDesc) );
+ 			hr = m_adapter->GetDesc(&m_adapterDesc);
+ 			BX_WARN(SUCCEEDED(hr), "Adapter GetDesc failed 0x%08x.", hr);
++			if (SUCCEEDED(hr))
++			{
++				wcstombs(g_caps.frontierGpuName, m_adapterDesc.Description, BX_COUNTOF(g_caps.frontierGpuName)-1);
++				g_caps.frontierGpuName[BX_COUNTOF(g_caps.frontierGpuName)-1] = '\0';
++			}
+ 
+ 			DX_CHECK(m_adapter->GetParent(IID_IDXGIFactory2, (void**)&m_factory) );
+ 		}
+diff --git a/src/renderer_gl.cpp b/src/renderer_gl.cpp
+index b036b552d..6c876acda 100644
+--- a/src/renderer_gl.cpp
++++ b/src/renderer_gl.cpp
+@@ -2351,6 +2351,8 @@ namespace bgfx { namespace gl
+ 			m_renderer    = getGLString(GL_RENDERER);
+ 			m_version     = getGLString(GL_VERSION);
+ 			m_glslVersion = getGLString(GL_SHADING_LANGUAGE_VERSION);
++			bx::strCopy(g_caps.frontierGpuName, BX_COUNTOF(g_caps.frontierGpuName), m_renderer);
++			bx::strCopy(g_caps.frontierGpuDriver, BX_COUNTOF(g_caps.frontierGpuDriver), m_version);
+ 
+ 			{
+ 				if (BX_ENABLED(BX_PLATFORM_EMSCRIPTEN) )
+diff --git a/src/renderer_mtl.cpp b/src/renderer_mtl.cpp
+index 85b919cdb..2ebb95ba2 100644
+--- a/src/renderer_mtl.cpp
++++ b/src/renderer_mtl.cpp
+@@ -970,6 +970,7 @@ static_assert(BX_COUNTOF(s_accessNames) == Access::Count, "Invalid s_accessNames
+ 			g_caps.numGPUs = 1;
+ 			g_caps.gpu[0].vendorId = g_caps.vendorId;
+ 			g_caps.gpu[0].deviceId = g_caps.deviceId;
++			bx::strCopy(g_caps.frontierGpuName, BX_COUNTOF(g_caps.frontierGpuName), m_device->name()->utf8String());
+ 
+ 			g_caps.supported |= (0
+ 				| BGFX_CAPS_ALPHA_TO_COVERAGE
+diff --git a/src/renderer_vk.cpp b/src/renderer_vk.cpp
+index 25d1c1dfa..75d9b2ac8 100644
+--- a/src/renderer_vk.cpp
++++ b/src/renderer_vk.cpp
+@@ -1681,6 +1681,7 @@ VK_IMPORT_INSTANCE
+ 				g_caps.deviceId = uint16_t(m_deviceProperties.deviceID);
+ 
+ 				BX_TRACE("Using physical device %d: %s", physicalDeviceIdx, m_deviceProperties.deviceName);
++			bx::strCopy(g_caps.frontierGpuName, BX_COUNTOF(g_caps.frontierGpuName), m_deviceProperties.deviceName);
+ 
+ 				VkPhysicalDeviceFeatures supportedFeatures;
+ 
