@@ -2,6 +2,7 @@
 #include <frontier/spatial_database.h>
 
 #include "debugdraw/debugdraw.h"
+#include "args.h"
 #include "camera.h"
 #include "entry/entry.h"
 #include "entry/input.h"
@@ -713,9 +714,22 @@ public:
     void init(int32_t argc, const char* const* argv, uint32_t width,
               uint32_t height) override
     {
+        const Args rendererArgs(argc, argv);
+        // Keep the Linux/SBC backbuffer single-sampled by default. Its MSAA
+        // resolve/presentation path varies across drivers, especially on resize.
+        // --msaa opts back into 4x sampling for systems where it works reliably.
+        bool enableMsaa = !BX_ENABLED(BX_PLATFORM_LINUX || BX_PLATFORM_RPI);
         for (int32_t index = 1; index < argc; ++index)
         {
-            if (std::strcmp(argv[index], "--streaming-self-test") == 0)
+            if (std::strcmp(argv[index], "--no-msaa") == 0)
+            {
+                enableMsaa = false;
+            }
+            else if (std::strcmp(argv[index], "--msaa") == 0)
+            {
+                enableMsaa = true;
+            }
+            else if (std::strcmp(argv[index], "--streaming-self-test") == 0)
             {
                 streamingSelfTest_ = true;
             }
@@ -748,11 +762,13 @@ public:
         }
         width_ = width;
         height_ = height;
-        reset_ = BGFX_RESET_MSAA_X4 |
+        reset_ = (enableMsaa ? BGFX_RESET_MSAA_X4 : 0) |
                  (streamingSelfTest_ ? 0 : BGFX_RESET_VSYNC);
         debug_ = BGFX_DEBUG_NONE;
 
         bgfx::Init init;
+        init.type = rendererArgs.m_type;
+        init.vendorId = rendererArgs.m_pciId;
         init.platformData.nwh =
             entry::getNativeWindowHandle(entry::kDefaultWindowHandle);
         init.platformData.ndt = entry::getNativeDisplayHandle();
@@ -760,7 +776,19 @@ public:
         init.resolution.width = width_;
         init.resolution.height = height_;
         init.resolution.reset = reset_;
-        bgfx::init(init);
+        if (!bgfx::init(init))
+        {
+            std::fprintf(stderr, "ERROR: Failed to initialize the city renderer.\n");
+            std::exit(EXIT_FAILURE);
+        }
+        const bgfx::Caps* rendererCaps = bgfx::getCaps();
+        std::printf("Frontier city renderer: %s | requested MSAA: %s | "
+                    "GPU: %04x:%04x\n",
+                    bgfx::getRendererName(bgfx::getRendererType()),
+                    enableMsaa ? "4x" : "off",
+                    unsigned(rendererCaps->vendorId),
+                    unsigned(rendererCaps->deviceId));
+        std::fflush(stdout);
 
         bgfx::setDebug(debug_);
         bgfx::setViewClear(kMainView,
@@ -796,8 +824,19 @@ public:
 
     bool update() override
     {
+        const uint32_t previousWidth = width_;
+        const uint32_t previousHeight = height_;
+        const uint32_t previousReset = reset_;
         if (entry::processEvents(width_, height_, debug_, reset_, &mouse_))
             return false;
+        if (width_ != previousWidth || height_ != previousHeight ||
+            reset_ != previousReset)
+        {
+            // entry::processEvents gates its reset on the last event's window
+            // handle. A later global key/modifier event can hide a resize.
+            // bgfx ignores an identical reset if the entry layer already did it.
+            bgfx::reset(width_, height_, reset_);
+        }
 
         const bool leftMouseDown =
             mouse_.m_buttons[entry::MouseButton::Left] != 0;
@@ -2284,6 +2323,9 @@ private:
             return;
         }
         ImGui::Text("Smoothed values | rolling 5-10 second charts");
+        ImGui::Text("Renderer: %s", bgfx::getRendererName(bgfx::getRendererType()));
+        ImGui::Text("Requested MSAA: %s",
+                    (reset_ & BGFX_RESET_MSAA_MASK) != 0 ? "4x" : "off");
 
         ImGui::TextColored(ImVec4(1.0f, 0.78f, 0.20f, 1.0f), "Frontier");
         ImGui::Separator();

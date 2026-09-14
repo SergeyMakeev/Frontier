@@ -299,6 +299,27 @@ run_city_sample.bat      # Windows
 Set `FRONTIER_CITY_BUILD_DIR` to use a different build directory. Arguments
 after the script name are forwarded to the bgfx application.
 
+On Linux/SBCs the sample defaults to a single-sample backbuffer to avoid
+driver-dependent MSAA resolve/presentation artifacts during window resizing.
+Other platforms keep the 4x MSAA default. Use `--msaa` to request 4x MSAA or
+`--no-msaa` to disable it explicitly. The startup log and **Performance** window
+show the selected renderer and requested MSAA mode; the log also prints the GPU
+vendor/device IDs. The viewport and backbuffer are kept in sync even if a global
+input event follows a resize event.
+
+Renderer-selection arguments are supported, so Linux graphics issues can be
+compared with a single-sample backbuffer:
+
+```sh
+bash ./run_city_sample.sh --gl --no-msaa # OpenGL
+bash ./run_city_sample.sh --vk --no-msaa # Vulkan
+```
+
+These request a backend; bgfx may fall back if it cannot initialize it, so check
+the renderer reported at startup. Omit `--gl`/`--vk` to let bgfx choose. On other
+platforms the standard bgfx arguments such as `--d3d11`, `--d3d12`, and `--mtl`
+are also accepted.
+
 Run `build-city/examples/city/frontier_city` on single-config generators. With
 Visual Studio, run `build-city/examples/city/Release/frontier_city.exe`.
 
