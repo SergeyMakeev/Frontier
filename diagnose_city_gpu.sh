@@ -133,10 +133,14 @@ Compare the renderer for the active window platform, not just a surfaceless
 EGL device. The city requests desktop OpenGL through EGL on Linux, with SDL2
 selecting native Wayland in a Wayland desktop unless SDL_VIDEODRIVER is set.
 If Wayland uses Mali/Panfrost but X11 uses llvmpipe with DRI3 errors, run:
-  SDL_VIDEODRIVER=wayland bash ./run_city_sample.sh --gl --no-msaa
+  SDL_VIDEODRIVER=wayland bash ./run_city_sample.sh --gl
 Verify "Window system: Wayland" and the hardware GPU name in Frontier debug.
 
-Wayland title bars and resize borders may need SDL's libdecor runtime and plugin:
+The city draws a Wayland title bar and resize border by default. Drag the title
+to move, or an edge/corner to resize. Plain --gl uses 4x MSAA on Wayland, which
+removed triangle seams on the reported Mali-G52/Panfrost system.
+
+The optional --native-window-frame path may need SDL's libdecor runtime/plugin:
   sudo apt-get install libdecor-0-0 libdecor-0-plugin-1-gtk
 The city also supports Alt + left drag to move and Alt + Shift + left drag to
 resize, even when no decoration provider is available.

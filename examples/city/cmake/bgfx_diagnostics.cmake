@@ -4,7 +4,8 @@ find_package(Git REQUIRED)
 set(frontier_bgfx_directory "${bgfx_cmake_SOURCE_DIR}/bgfx")
 foreach(frontier_bgfx_patch_name IN ITEMS
         bgfx-diagnostics.patch bgfx-sdl-wayland.patch
-        bgfx-sdl-decorations.patch bgfx-debugdraw-msaa.patch)
+        bgfx-sdl-decorations.patch bgfx-debugdraw-msaa.patch
+        bgfx-city-window-frame.patch)
     set(frontier_bgfx_patch "${CMAKE_CURRENT_LIST_DIR}/${frontier_bgfx_patch_name}")
     execute_process(
         COMMAND "${GIT_EXECUTABLE}" apply --reverse --check "${frontier_bgfx_patch}"

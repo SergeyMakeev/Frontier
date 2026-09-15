@@ -1,0 +1,23 @@
+diff --git a/examples/common/entry/entry_sdl.cpp b/examples/common/entry/entry_sdl.cpp
+--- a/examples/common/entry/entry_sdl.cpp
++++ b/examples/common/entry/entry_sdl.cpp
+@@ -15,6 +15,9 @@
+ #include <bx/os.h>
+ 
+ #include <SDL2/SDL.h>
++#if FRONTIER_CITY_SDL_WINDOW_FRAME
++#include "window_frame.h"
++#endif
+ 
+ BX_PRAGMA_DIAGNOSTIC_PUSH()
+ BX_PRAGMA_DIAGNOSTIC_IGNORED_CLANG("-Wextern-c-compat")
+@@ -536,6 +539,9 @@
+ 			while (!exit)
+ 			{
+ 				bgfx::renderFrame();
++#if FRONTIER_CITY_SDL_WINDOW_FRAME
++				city::serviceWindowFrame(m_window[0]);
++#endif
+ 
+ 				while (SDL_PollEvent(&event) )
+ 				{

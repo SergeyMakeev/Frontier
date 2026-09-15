@@ -8,6 +8,7 @@
 #include "entry/input.h"
 #include "imgui/imgui.h"
 #include "hardware_info.h"
+#include "window_frame.h"
 
 #include <bgfx/bgfx.h>
 #include <bx/bounds.h>
@@ -747,19 +748,26 @@ public:
               uint32_t height) override
     {
         const Args rendererArgs(argc, argv);
-        // Keep the Linux/SBC backbuffer single-sampled by default. Its MSAA
-        // resolve/presentation path varies across drivers, especially on resize.
-        // --msaa opts back into 4x sampling for systems where it works reliably.
+        // Retain the conservative X11 default. Native Wayland/OpenGL selects
+        // 4x below, before creating the EGL surface, unless explicitly overridden.
         bool enableMsaa = !BX_ENABLED(BX_PLATFORM_LINUX || BX_PLATFORM_RPI);
+        bool msaaSpecified = false;
+        bool nativeWindowFrame = false;
         for (int32_t index = 1; index < argc; ++index)
         {
             if (std::strcmp(argv[index], "--no-msaa") == 0)
             {
                 enableMsaa = false;
+                msaaSpecified = true;
             }
             else if (std::strcmp(argv[index], "--msaa") == 0)
             {
                 enableMsaa = true;
+                msaaSpecified = true;
+            }
+            else if (std::strcmp(argv[index], "--native-window-frame") == 0)
+            {
+                nativeWindowFrame = true;
             }
             else if (std::strcmp(argv[index], "--unlit") == 0)
             {
@@ -798,8 +806,6 @@ public:
         }
         width_ = width;
         height_ = height;
-        reset_ = (enableMsaa ? BGFX_RESET_MSAA_X4 : 0) |
-                 (streamingSelfTest_ ? 0 : BGFX_RESET_VSYNC);
         debug_ = BGFX_DEBUG_NONE;
 
         bgfx::Init init;
@@ -813,6 +819,18 @@ public:
         windowSystem_ = init.platformData.type == bgfx::NativeWindowHandleType::Wayland
                             ? "Wayland" : "X11";
 #endif
+        city::enableWindowFrame(!nativeWindowFrame &&
+            init.platformData.type == bgfx::NativeWindowHandleType::Wayland);
+        // The Mali-G52/Panfrost report confirms seams with single-sample GL
+        // and clean coverage with 4x MSAA on this native window path. Select
+        // it at initialization, so plain --gl uses the verified EGL setup.
+        if (!msaaSpecified &&
+            init.platformData.type == bgfx::NativeWindowHandleType::Wayland &&
+            (init.type == bgfx::RendererType::OpenGL ||
+             init.type == bgfx::RendererType::Count))
+            enableMsaa = true;
+        reset_ = (enableMsaa ? BGFX_RESET_MSAA_X4 : 0) |
+                 (streamingSelfTest_ ? 0 : BGFX_RESET_VSYNC);
         init.resolution.width = width_;
         init.resolution.height = height_;
         init.resolution.reset = reset_;
@@ -914,6 +932,7 @@ public:
         int64_t stageStart = now;
 
         beginDebugUi();
+        city::drawWindowFrame();
         drawGlobalMenuBar();
         if (showFrontierDebug_)
             drawDebugUi();
@@ -1306,7 +1325,7 @@ private:
 
     void drawDebugUi()
     {
-        ImGui::SetNextWindowPos(ImVec2(12.0f, 36.0f), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowPos(ImVec2(12.0f, 36.0f + city::windowFrameHeight()), ImGuiCond_FirstUseEver);
         ImGui::SetNextWindowSize(ImVec2(390.0f, 660.0f),
                                  ImGuiCond_FirstUseEver);
         if (!ImGui::Begin("Frontier debug", &showFrontierDebug_))
@@ -1321,9 +1340,9 @@ private:
         {
             ImGui::Text("Window system: %s", windowSystem_.c_str());
             if (windowSystem_ == "Wayland" && ImGui::IsItemHovered())
-                ImGui::SetTooltip("Alt + left drag: move window\n"
-                                  "Alt + Shift + left drag: resize window\n"
-                                  "Title bar: install libdecor and its decoration plugin.");
+                ImGui::SetTooltip(city::windowFrameHeight() > 0.0f
+                    ? "Drag the title bar to move; drag an edge or corner to resize."
+                    : "Native frame: Alt + left drag to move; Alt + Shift + left drag to resize.");
         }
         ImGui::TextWrapped("CPU: %s", cpuModel_.c_str());
         ImGui::TextWrapped("GPU: %s", gpuModel_.c_str());
@@ -1445,7 +1464,7 @@ private:
 
     void drawTlasMaintenanceUi()
     {
-        ImGui::SetNextWindowPos(ImVec2(414.0f, 36.0f),
+        ImGui::SetNextWindowPos(ImVec2(414.0f, 36.0f + city::windowFrameHeight()),
                                 ImGuiCond_FirstUseEver);
         ImGui::SetNextWindowSize(ImVec2(390.0f, 480.0f),
                                  ImGuiCond_FirstUseEver);
@@ -1576,7 +1595,7 @@ private:
 
     void drawVirtualStreamingUi()
     {
-        ImGui::SetNextWindowPos(ImVec2(520.0f, 36.0f),
+        ImGui::SetNextWindowPos(ImVec2(520.0f, 36.0f + city::windowFrameHeight()),
                                 ImGuiCond_FirstUseEver);
         ImGui::SetNextWindowSize(ImVec2(760.0f, 680.0f),
                                  ImGuiCond_FirstUseEver);
@@ -2209,7 +2228,7 @@ private:
 
     void drawSceneStatsUi()
     {
-        ImGui::SetNextWindowPos(ImVec2(414.0f, 36.0f),
+        ImGui::SetNextWindowPos(ImVec2(414.0f, 36.0f + city::windowFrameHeight()),
                                 ImGuiCond_FirstUseEver);
         ImGui::SetNextWindowSize(ImVec2(350.0f, 470.0f),
                                  ImGuiCond_FirstUseEver);
@@ -2403,7 +2422,7 @@ private:
 
     void drawPerformanceUi()
     {
-        ImGui::SetNextWindowPos(ImVec2(414.0f, 258.0f),
+        ImGui::SetNextWindowPos(ImVec2(414.0f, 258.0f + city::windowFrameHeight()),
                                 ImGuiCond_FirstUseEver);
         ImGui::SetNextWindowSize(ImVec2(350.0f, 430.0f),
                                  ImGuiCond_FirstUseEver);
@@ -2525,7 +2544,7 @@ private:
     void drawTlasHealthUi()
     {
         sampleTlasHealth();
-        ImGui::SetNextWindowPos(ImVec2(12.0f, 478.0f),
+        ImGui::SetNextWindowPos(ImVec2(12.0f, 478.0f + city::windowFrameHeight()),
                                 ImGuiCond_FirstUseEver);
         ImGui::SetNextWindowSize(ImVec2(390.0f, 410.0f),
                                  ImGuiCond_FirstUseEver);
@@ -2641,7 +2660,7 @@ private:
         const float hitRate = total != 0
                                   ? float(cache.reused) / float(total)
                                   : 0.0f;
-        ImGui::SetNextWindowPos(ImVec2(776.0f, 700.0f),
+        ImGui::SetNextWindowPos(ImVec2(776.0f, 700.0f + city::windowFrameHeight()),
                                 ImGuiCond_FirstUseEver);
         ImGui::SetNextWindowSize(ImVec2(390.0f, 330.0f),
                                  ImGuiCond_FirstUseEver);
@@ -3034,7 +3053,7 @@ private:
             ImGui::SetNextWindowFocus();
             ImGui::SetNextWindowCollapsed(false, ImGuiCond_Always);
         }
-        ImGui::SetNextWindowPos(ImVec2(776.0f, 36.0f),
+        ImGui::SetNextWindowPos(ImVec2(776.0f, 36.0f + city::windowFrameHeight()),
                                 ImGuiCond_FirstUseEver);
         ImGui::SetNextWindowSize(ImVec2(720.0f, 652.0f),
                                  ImGuiCond_FirstUseEver);

@@ -278,13 +278,12 @@ switches to the free debug camera, and renders the captured frustum as
 translucent magenta planes.
 
 On Armbian and other Debian/Ubuntu Linux systems, install the build tools and
-graphics development packages and Wayland decoration runtime once before configuring:
+graphics development packages once before configuring:
 
 ```sh
 sudo apt-get update
 sudo apt-get install build-essential cmake ninja-build git \
-  libx11-dev libgl1-mesa-dev libwayland-dev libsdl2-dev \
-  libdecor-0-0 libdecor-0-plugin-1-gtk
+  libx11-dev libgl1-mesa-dev libwayland-dev libsdl2-dev
 ```
 
 Use CMake 3.24 or newer and a C++20 compiler. A working desktop alone does not
@@ -305,20 +304,22 @@ native Wayland; in an X11 session, SDL selects X11. An explicit
 renderer support but does not by itself select a native Wayland window.
 `-DFRONTIER_CITY_USE_SDL=OFF` restores the older X11-only entry layer.
 
-Native Wayland title bars and resize borders need a decoration provider. The
-sample asks SDL to prefer **libdecor**; install both `libdecor-0-0` and
-`libdecor-0-plugin-1-gtk` on Armbian/Ubuntu, then restart the sample. The Cairo
-plugin is another option on distributions without the GTK plugin. Explicit
-`SDL_VIDEO_WAYLAND_PREFER_LIBDECOR` and `SDL_VIDEO_WAYLAND_ALLOW_LIBDECOR`
-environment settings retain precedence. See [SDL's libdecor hint](https://wiki.libsdl.org/SDL2/SDL_HINT_VIDEO_WAYLAND_PREFER_LIBDECOR).
+On Wayland, the sample draws its own title bar and six-pixel resize border.
+Drag **Frontier - Dynamic City** to move, or an edge/corner to resize. The
+caption buttons minimize, maximize/restore, and close the window. This works
+without a desktop decoration plugin. The title and border use
+[SDL's window hit testing](https://wiki.libsdl.org/SDL2/SDL_SetWindowHitTest)
+to request moves/resizes from the compositor; all SDL operations run on the
+entry/event thread. The application menu and initial debug-panel positions
+are offset below the frame. Alt + left drag and Alt + Shift + left drag also
+remain available for moving/resizing from inside the window.
 
-The sample also provides Wayland move/resize gestures when decorations are
-unavailable: hold **Alt** and drag with the left mouse button to move; hold
-**Alt + Shift** and drag to resize from the nearest corner. These use
-[SDL's window hit testing](https://wiki.libsdl.org/SDL2/SDL_SetWindowHitTest),
-which forwards the operation to the compositor. Hover over **Window system**
-in Frontier debug for the shortcut reminder. Ordinary camera and UI mouse
-input is unaffected when Alt is released.
+Use `--native-window-frame` to let SDL/the desktop provide decorations instead.
+That optional path prefers **libdecor** and may require
+`sudo apt-get install libdecor-0-0 libdecor-0-plugin-1-gtk` on Armbian/Ubuntu.
+Explicit `SDL_VIDEO_WAYLAND_PREFER_LIBDECOR` and
+`SDL_VIDEO_WAYLAND_ALLOW_LIBDECOR` environment settings retain precedence for
+the native frame. See [SDL's libdecor hint](https://wiki.libsdl.org/SDL2/SDL_HINT_VIDEO_WAYLAND_PREFER_LIBDECOR).
 
 To configure and build manually from the repository root:
 
@@ -341,9 +342,12 @@ run_city_sample.bat      # Windows
 Set `FRONTIER_CITY_BUILD_DIR` to use a different build directory. Arguments
 after the script name are forwarded to the bgfx application.
 
-On Linux/SBCs the sample defaults to a single-sample backbuffer to avoid
-driver-dependent MSAA resolve/presentation artifacts during window resizing.
-Other platforms keep the 4x MSAA default. Use `--msaa` to request 4x MSAA or
+Native Wayland/OpenGL defaults to **4x MSAA**, including plain `--gl` and
+automatic backend selection on Wayland. The reported Mali-G52/Panfrost system
+still shows seams without MSAA, while `--gl --msaa` removes them. The sample
+selects the verified setting before creating the EGL surface. Linux X11 and
+explicit non-GL Linux backends keep the single-sample default; other platforms
+keep their 4x default. Use `--msaa` to request 4x MSAA or
 `--no-msaa` to disable it explicitly. The startup log and **Performance** window
 show the selected renderer and requested MSAA mode; the log also prints the GPU
 vendor/device IDs. The viewport and backbuffer are kept in sync even if a global
@@ -353,9 +357,9 @@ Solid debug-draw geometry now enables bgfx's `BGFX_STATE_MSAA` draw flag, so
 `--msaa` actually applies sample coverage to the city as well as the UI.
 Previously the helper disabled multisampling for every solid draw regardless
 of the requested backbuffer mode. The draw flag does not allocate extra samples
-when using a single-sample backbuffer. This corrects the rendering state;
-whether it resolves a particular driver's triangle-edge artifacts still needs
-verification on that GPU.
+when using a single-sample backbuffer. MSAA is a verified workaround for the
+reported Panfrost seams; their underlying single-sample cause has not been
+established. The unlit comparison on that GPU did not remove the seams.
 
 The desktop OpenGL backend requires OpenGL 3.1 or newer. CMake selects
 `BGFX_OPENGL_VERSION=31`, including when updating an existing build whose cache
@@ -429,7 +433,7 @@ unaccelerated Xwayland connection. After installing `libsdl2-dev`, rebuild and
 run from the Wayland desktop:
 
 ```sh
-SDL_VIDEODRIVER=wayland bash ./run_city_sample.sh --gl --no-msaa
+SDL_VIDEODRIVER=wayland bash ./run_city_sample.sh --gl
 ```
 
 Verify **Window system: Wayland** and **GPU: Mali-G52 ... (Panfrost)** in
@@ -445,6 +449,8 @@ and the SDL entry selects native Wayland and reports initialization failures.
 Separate incremental patches provide Wayland decoration/gesture support and
 correct debug-draw's multisample state, so existing patched build directories
 can be upgraded without deleting the dependency checkout.
+The window-frame hook services the sample's caption actions on SDL's event
+thread, without adding SDL calls to the rendering thread.
 GPU names come from the active GL, Vulkan, DXGI, or Metal device rather than an
 unrelated installed adapter. Revisit these adaptations when changing the bgfx
 pin; configuration fails if the patch no longer applies.
