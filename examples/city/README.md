@@ -359,6 +359,37 @@ the renderer reported at startup. Omit `--gl`/`--vk` to let bgfx choose. On othe
 platforms the standard bgfx arguments such as `--d3d11`, `--d3d12`, and `--mtl`
 are also accepted.
 
+If the GPU label contains **llvmpipe**, **softpipe**, or **lavapipe**, rendering
+is running on the CPU. The sample does not force software rendering by default.
+Installing the build dependencies above supplies headers and libraries; it does
+not establish that the board's GPU driver is working.
+
+Run this read-only report from the SBC's local desktop terminal, using the same
+session and user as the sample:
+
+```sh
+bash ./diagnose_city_gpu.sh 2>&1 | tee city-gpu-report.txt
+```
+
+The report checks the board/SoC identity, kernel, GPU device access, installed
+graphics packages, driver overrides, and available GLX/EGL/Vulkan probes. Missing
+probe utilities are reported and skipped; on Debian/Ubuntu, `mesa-utils`
+provides the GL/EGL diagnostics and `vulkan-tools` provides `vulkaninfo`.
+Graphics probes have a 20-second timeout. No packages, drivers, permissions,
+or persistent environment variables are changed.
+
+The pinned bgfx Linux renderer uses **EGL**, including for desktop OpenGL, so
+`glxinfo -B` alone cannot establish which driver the sample uses. Compare the
+EGL renderer for the window's platform with its desktop OpenGL and OpenGL ES
+results. A vendor Mali stack may accelerate only ES; the default Linux build
+does not compile bgfx's ES renderer, so passing `--gles` alone is insufficient.
+Mesa Panfrost can provide desktop OpenGL on supported Mali GPUs. Do not infer
+the GPU or driver solely from the RK35xx family name, or assume `--vk` enables
+hardware acceleration: Vulkan also has software implementations. See
+[Mesa's EGL fallback behavior](https://docs.mesa3d.org/egl.html#bootstrapping),
+[Panfrost hardware support](https://docs.mesa3d.org/drivers/panfrost.html), and
+[Mesa driver overrides](https://docs.mesa3d.org/envvars.html).
+
 The sample applies checked, idempotent adaptations to the pinned bgfx sources
 through `cmake/bgfx_diagnostics.cmake`: selected GPU information is appended to
 both the C++ and C capability structures, and debug draw gets a lighting switch.
