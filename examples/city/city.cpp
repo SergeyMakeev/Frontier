@@ -809,6 +809,10 @@ public:
             entry::getNativeWindowHandle(entry::kDefaultWindowHandle);
         init.platformData.ndt = entry::getNativeDisplayHandle();
         init.platformData.type = entry::getNativeWindowHandleType();
+#if BX_PLATFORM_LINUX || BX_PLATFORM_RPI
+        windowSystem_ = init.platformData.type == bgfx::NativeWindowHandleType::Wayland
+                            ? "Wayland" : "X11";
+#endif
         init.resolution.width = width_;
         init.resolution.height = height_;
         init.resolution.reset = reset_;
@@ -831,6 +835,8 @@ public:
                     unsigned(rendererCaps->vendorId),
                     unsigned(rendererCaps->deviceId));
         std::printf("CPU: %s\nGPU: %s\n", cpuModel_.c_str(), gpuModel_.c_str());
+        if (!windowSystem_.empty())
+            std::printf("Window system: %s\n", windowSystem_.c_str());
         if (!gpuDriver_.empty())
             std::printf("Graphics driver: %s\n", gpuDriver_.c_str());
         std::fflush(stdout);
@@ -1311,6 +1317,8 @@ private:
 
         ImGui::Text("Backend: %s",
                     bgfx::getRendererName(bgfx::getRendererType()));
+        if (!windowSystem_.empty())
+            ImGui::Text("Window system: %s", windowSystem_.c_str());
         ImGui::TextWrapped("CPU: %s", cpuModel_.c_str());
         ImGui::TextWrapped("GPU: %s", gpuModel_.c_str());
         if (ImGui::IsItemHovered() && !gpuDriver_.empty())
@@ -7304,6 +7312,7 @@ private:
     std::string cpuModel_;
     std::string gpuModel_;
     std::string gpuDriver_;
+    std::string windowSystem_;
     int64_t previousCounter_ = 0;
     float smoothedFps_ = 60.0f;
     float simulationTime_ = 0.0f;

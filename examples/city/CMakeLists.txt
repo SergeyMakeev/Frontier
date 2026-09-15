@@ -26,9 +26,18 @@ endif()
 # Diagnose system dependencies before downloading/configuring bgfx. Desktop
 # images can have the runtime libraries without their development packages.
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    option(FRONTIER_CITY_USE_SDL
+           "Use SDL2 for native Wayland and X11 city windows" ON)
+    set(BGFX_WITH_SDL ${FRONTIER_CITY_USE_SDL})
     find_package(X11 QUIET)
     find_package(OpenGL QUIET)
     set(FRONTIER_CITY_MISSING_DEPENDENCIES "")
+    if(FRONTIER_CITY_USE_SDL)
+        find_package(SDL2 2.0.22 QUIET CONFIG)
+        if(NOT SDL2_FOUND)
+            list(APPEND FRONTIER_CITY_MISSING_DEPENDENCIES "SDL2 >= 2.0.22 (libsdl2-dev)")
+        endif()
+    endif()
     if(NOT X11_FOUND)
         list(APPEND FRONTIER_CITY_MISSING_DEPENDENCIES "X11 (libx11-dev)")
     endif()
@@ -37,7 +46,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     endif()
 
     # The pinned bgfx.cmake defaults BGFX_WITH_WAYLAND to ON on Linux and
-    # links wayland-egl even when the sample uses its native X11 entry layer.
+    # links wayland-egl independently of the selected window entry layer.
     if(NOT DEFINED BGFX_WITH_WAYLAND OR BGFX_WITH_WAYLAND)
         find_library(FRONTIER_CITY_WAYLAND_EGL_LIBRARY NAMES wayland-egl)
         mark_as_advanced(FRONTIER_CITY_WAYLAND_EGL_LIBRARY)
@@ -54,7 +63,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
             "  ${FRONTIER_CITY_MISSING_TEXT}\n"
             "On Armbian, Debian, or Ubuntu, install them with:\n"
             "  sudo apt-get update\n"
-            "  sudo apt-get install libx11-dev libgl1-mesa-dev libwayland-dev\n"
+            "  sudo apt-get install libx11-dev libgl1-mesa-dev libwayland-dev libsdl2-dev\n"
             "Then rerun ./run_city_sample.sh (or your CMake configure command).\n"
             "See examples/city/README.md for Linux setup instructions.")
     endif()
@@ -69,6 +78,11 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(bgfx_cmake)
 include(cmake/bgfx_diagnostics.cmake)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND FRONTIER_CITY_USE_SDL)
+    # Propagate the imported target's include paths as well as its library.
+    target_link_libraries(example-common PUBLIC SDL2::SDL2)
+    message(STATUS "Frontier city windows: SDL2 (native Wayland / X11)")
+endif()
 
 if(ANDROID)
     add_library(frontier_city SHARED city.cpp hardware_info.cpp)

@@ -1,0 +1,45 @@
+diff --git a/examples/common/entry/entry_sdl.cpp b/examples/common/entry/entry_sdl.cpp
+--- a/examples/common/entry/entry_sdl.cpp
++++ b/examples/common/entry/entry_sdl.cpp
+@@ -403,9 +403,24 @@
+ 			m_mte.m_argc = _argc;
+ 			m_mte.m_argv = _argv;
+ 
+-			SDL_Init(0
+-				| SDL_INIT_GAMECONTROLLER
+-				);
++#	if BX_PLATFORM_LINUX
++			// Use the native Wayland path in Wayland sessions. Xwayland can
++			// lack DRI3 even when native Wayland has working GPU acceleration.
++			const char* session = SDL_getenv("XDG_SESSION_TYPE");
++			const char* display = SDL_getenv("WAYLAND_DISPLAY");
++			if (NULL == SDL_getenv("SDL_VIDEODRIVER")
++			&&  NULL != session && 0 == SDL_strcmp(session, "wayland")
++			&&  NULL != display && '\0' != display[0])
++			{
++				SDL_SetHint("SDL_VIDEODRIVER", "wayland");
++			}
++#	endif // BX_PLATFORM_LINUX
++
++			if (0 != SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER))
++			{
++				SDL_Log("Frontier: SDL initialization failed: %s", SDL_GetError());
++				return 1;
++			}
+ 
+ 			m_windowAlloc.alloc();
+ 			m_window[0] = SDL_CreateWindow("bgfx"
+@@ -416,6 +431,13 @@
+ 							, SDL_WINDOW_SHOWN
+ 							| SDL_WINDOW_RESIZABLE
+ 							);
++
++			if (NULL == m_window[0])
++			{
++				SDL_Log("Frontier: SDL window creation failed: %s", SDL_GetError());
++				SDL_Quit();
++				return 1;
++			}
+ 
+ 			m_flags[0] = 0
+ 				| ENTRY_WINDOW_FLAG_ASPECT_RATIO

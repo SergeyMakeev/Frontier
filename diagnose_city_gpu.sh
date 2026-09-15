@@ -21,7 +21,7 @@ probe() {
         return
     fi
     printf '+ %s' "${executable}"
-    printf ' %q' "$@"
+    if (( $# != 0 )); then printf ' %q' "$@"; fi
     printf '\n'
     if command -v timeout >/dev/null 2>&1; then
         timeout --kill-after=2s 20s "${executable}" "$@" 2>&1 || status=$?
@@ -52,7 +52,7 @@ for path in /etc/os-release /etc/armbian-release; do
 done
 
 section "Graphics environment (only graphics-related variables)"
-for name in XDG_SESSION_TYPE DISPLAY WAYLAND_DISPLAY EGL_PLATFORM EGL_LOG_LEVEL \
+for name in XDG_SESSION_TYPE DISPLAY WAYLAND_DISPLAY SDL_VIDEODRIVER EGL_PLATFORM EGL_LOG_LEVEL \
     LIBGL_ALWAYS_SOFTWARE LIBGL_ALWAYS_INDIRECT LIBGL_DRIVERS_PATH \
     MESA_LOADER_DRIVER_OVERRIDE MESA_GL_VERSION_OVERRIDE MESA_GLES_VERSION_OVERRIDE \
     GALLIUM_DRIVER DRI_PRIME MESA_VK_DEVICE_SELECT VK_DRIVER_FILES VK_ICD_FILENAMES \
@@ -128,7 +128,12 @@ llvmpipe, softpipe, and lavapipe render on the CPU. "Direct rendering: Yes"
 alone does not establish hardware acceleration.
 
 Compare the renderer for the active window platform, not just a surfaceless
-EGL device. The city currently requests desktop OpenGL through EGL on Linux.
+EGL device. The city requests desktop OpenGL through EGL on Linux, with SDL2
+selecting native Wayland in a Wayland desktop unless SDL_VIDEODRIVER is set.
+If Wayland uses Mali/Panfrost but X11 uses llvmpipe with DRI3 errors, run:
+  SDL_VIDEODRIVER=wayland bash ./run_city_sample.sh --gl --no-msaa
+Verify "Window system: Wayland" and the hardware GPU name in Frontier debug.
+
 Its default bgfx build does not enable OpenGL ES; a runtime --gles flag alone
 cannot enable a renderer that was not compiled in.
 

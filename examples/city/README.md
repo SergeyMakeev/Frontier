@@ -44,7 +44,8 @@ each widget independently and provides **Show all** / **Hide all** actions;
 each window can also be closed with its title-bar button. Only
 **Frontier debug** is open by default. **Frontier debug** shows the active
 graphics backend (for example OpenGL or Vulkan), CPU model, and selected GPU
-model. On Linux ARM systems, the CPU label identifies the core models and their
+model. On Linux it also shows the actual window system, Wayland or X11. On Linux
+ARM systems, the CPU label identifies the core models and their
 counts. Hardware names are read once at startup; unavailable information is
 labelled explicitly. Hover over the GPU name for the OpenGL driver/version
 string, which is also printed in the startup log. This window controls simulation freeze,
@@ -282,22 +283,26 @@ graphics development packages once before configuring:
 ```sh
 sudo apt-get update
 sudo apt-get install build-essential cmake ninja-build git \
-  libx11-dev libgl1-mesa-dev libwayland-dev
+  libx11-dev libgl1-mesa-dev libwayland-dev libsdl2-dev
 ```
 
 Use CMake 3.24 or newer and a C++20 compiler. A working desktop alone does not
 provide the development headers and linker libraries. In particular,
 `Could NOT find X11 (missing: X11_X11_INCLUDE_PATH X11_X11_LIB)` means
 `libx11-dev` is missing. The pinned bgfx build also requires OpenGL development
-files and, with its default `BGFX_WITH_WAYLAND=ON`, the Wayland EGL library.
+files, SDL2 2.0.22 or newer, and, with its default `BGFX_WITH_WAYLAND=ON`, the
+Wayland EGL library.
 The sample checks these dependencies before fetching bgfx and prints the
 installation command if any are missing. These packages are only needed for
 the city sample, not the core Frontier library.
 
 After installing the packages, rerun `bash ./run_city_sample.sh`; an existing
-failed `build-city` configure can be reused. Launch from an X11 desktop session
-(or a Wayland desktop with XWayland available), since the sample's native Linux
-window layer uses X11.
+failed `build-city` configure can be reused. Linux builds use bgfx's SDL2 entry
+layer for window creation and input. In a Wayland desktop session, it selects
+native Wayland; in an X11 session, SDL selects X11. An explicit
+`SDL_VIDEODRIVER` overrides this choice. CMake's `BGFX_WITH_WAYLAND=ON` enables
+renderer support but does not by itself select a native Wayland window.
+`-DFRONTIER_CITY_USE_SDL=OFF` restores the older X11-only entry layer.
 
 To configure and build manually from the repository root:
 
@@ -390,9 +395,27 @@ hardware acceleration: Vulkan also has software implementations. See
 [Panfrost hardware support](https://docs.mesa3d.org/drivers/panfrost.html), and
 [Mesa driver overrides](https://docs.mesa3d.org/envvars.html).
 
+On the reported NanoPi M5 / RK3576 configuration, Panfrost successfully exposes
+Mali-G52 hardware through native Wayland, while X11 reports missing DRI3 and
+uses llvmpipe for both OpenGL and OpenGL ES. The SDL2 window path bypasses that
+unaccelerated Xwayland connection. After installing `libsdl2-dev`, rebuild and
+run from the Wayland desktop:
+
+```sh
+SDL_VIDEODRIVER=wayland bash ./run_city_sample.sh --gl --no-msaa
+```
+
+Verify **Window system: Wayland** and **GPU: Mali-G52 ... (Panfrost)** in
+**Frontier debug**. `SDL_VIDEODRIVER=x11` allows comparison with Xwayland. Changing
+only `EGL_PLATFORM` cannot convert an existing X11 window into a Wayland window.
+An OpenGL ES build is unnecessary for this case: Panfrost already supports the
+sample's desktop OpenGL 3.1 requirement on Wayland.
+
 The sample applies checked, idempotent adaptations to the pinned bgfx sources
 through `cmake/bgfx_diagnostics.cmake`: selected GPU information is appended to
-both the C++ and C capability structures, and debug draw gets a lighting switch.
+both the C++ and C capability structures, debug draw gets a lighting switch,
+and the SDL entry selects native Wayland and reports initialization failures.
+Each patch is applied independently so existing build directories upgrade.
 GPU names come from the active GL, Vulkan, DXGI, or Metal device rather than an
 unrelated installed adapter. Revisit these adaptations when changing the bgfx
 pin; configuration fails if the patch no longer applies.
