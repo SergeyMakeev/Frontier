@@ -278,12 +278,13 @@ switches to the free debug camera, and renders the captured frustum as
 translucent magenta planes.
 
 On Armbian and other Debian/Ubuntu Linux systems, install the build tools and
-graphics development packages once before configuring:
+graphics development packages and Wayland decoration runtime once before configuring:
 
 ```sh
 sudo apt-get update
 sudo apt-get install build-essential cmake ninja-build git \
-  libx11-dev libgl1-mesa-dev libwayland-dev libsdl2-dev
+  libx11-dev libgl1-mesa-dev libwayland-dev libsdl2-dev \
+  libdecor-0-0 libdecor-0-plugin-1-gtk
 ```
 
 Use CMake 3.24 or newer and a C++20 compiler. A working desktop alone does not
@@ -303,6 +304,21 @@ native Wayland; in an X11 session, SDL selects X11. An explicit
 `SDL_VIDEODRIVER` overrides this choice. CMake's `BGFX_WITH_WAYLAND=ON` enables
 renderer support but does not by itself select a native Wayland window.
 `-DFRONTIER_CITY_USE_SDL=OFF` restores the older X11-only entry layer.
+
+Native Wayland title bars and resize borders need a decoration provider. The
+sample asks SDL to prefer **libdecor**; install both `libdecor-0-0` and
+`libdecor-0-plugin-1-gtk` on Armbian/Ubuntu, then restart the sample. The Cairo
+plugin is another option on distributions without the GTK plugin. Explicit
+`SDL_VIDEO_WAYLAND_PREFER_LIBDECOR` and `SDL_VIDEO_WAYLAND_ALLOW_LIBDECOR`
+environment settings retain precedence. See [SDL's libdecor hint](https://wiki.libsdl.org/SDL2/SDL_HINT_VIDEO_WAYLAND_PREFER_LIBDECOR).
+
+The sample also provides Wayland move/resize gestures when decorations are
+unavailable: hold **Alt** and drag with the left mouse button to move; hold
+**Alt + Shift** and drag to resize from the nearest corner. These use
+[SDL's window hit testing](https://wiki.libsdl.org/SDL2/SDL_SetWindowHitTest),
+which forwards the operation to the compositor. Hover over **Window system**
+in Frontier debug for the shortcut reminder. Ordinary camera and UI mouse
+input is unaffected when Alt is released.
 
 To configure and build manually from the repository root:
 
@@ -333,6 +349,14 @@ show the selected renderer and requested MSAA mode; the log also prints the GPU
 vendor/device IDs. The viewport and backbuffer are kept in sync even if a global
 input event follows a resize event.
 
+Solid debug-draw geometry now enables bgfx's `BGFX_STATE_MSAA` draw flag, so
+`--msaa` actually applies sample coverage to the city as well as the UI.
+Previously the helper disabled multisampling for every solid draw regardless
+of the requested backbuffer mode. The draw flag does not allocate extra samples
+when using a single-sample backbuffer. This corrects the rendering state;
+whether it resolves a particular driver's triangle-edge artifacts still needs
+verification on that GPU.
+
 The desktop OpenGL backend requires OpenGL 3.1 or newer. CMake selects
 `BGFX_OPENGL_VERSION=31`, including when updating an existing build whose cache
 contains the old empty default. The pinned debug-draw shaders use integer
@@ -350,6 +374,9 @@ disappear implicate the lighting shader; seams that remain need further
 geometry/rasterization investigation. Report the CPU, GPU, driver string, and
 whether this comparison changes the seams. The OpenGL 3.1 attribute fix does
 not by itself establish the cause of every SBC seam artifact.
+If unlit surfaces still have seams, compare `--gl --no-msaa` and `--gl --msaa`
+after rebuilding with the corrected draw flag. Lighting is not the remaining
+explanation in that case; do not compensate by changing the light or material.
 
 Renderer-selection arguments are supported, so Linux graphics issues can be
 compared with a single-sample backbuffer:
@@ -415,7 +442,9 @@ The sample applies checked, idempotent adaptations to the pinned bgfx sources
 through `cmake/bgfx_diagnostics.cmake`: selected GPU information is appended to
 both the C++ and C capability structures, debug draw gets a lighting switch,
 and the SDL entry selects native Wayland and reports initialization failures.
-Each patch is applied independently so existing build directories upgrade.
+Separate incremental patches provide Wayland decoration/gesture support and
+correct debug-draw's multisample state, so existing patched build directories
+can be upgraded without deleting the dependency checkout.
 GPU names come from the active GL, Vulkan, DXGI, or Metal device rather than an
 unrelated installed adapter. Revisit these adaptations when changing the bgfx
 pin; configuration fails if the patch no longer applies.

@@ -52,7 +52,8 @@ for path in /etc/os-release /etc/armbian-release; do
 done
 
 section "Graphics environment (only graphics-related variables)"
-for name in XDG_SESSION_TYPE DISPLAY WAYLAND_DISPLAY SDL_VIDEODRIVER EGL_PLATFORM EGL_LOG_LEVEL \
+for name in XDG_SESSION_TYPE XDG_CURRENT_DESKTOP DISPLAY WAYLAND_DISPLAY SDL_VIDEODRIVER \
+    SDL_VIDEO_WAYLAND_ALLOW_LIBDECOR SDL_VIDEO_WAYLAND_PREFER_LIBDECOR EGL_PLATFORM EGL_LOG_LEVEL \
     LIBGL_ALWAYS_SOFTWARE LIBGL_ALWAYS_INDIRECT LIBGL_DRIVERS_PATH \
     MESA_LOADER_DRIVER_OVERRIDE MESA_GL_VERSION_OVERRIDE MESA_GLES_VERSION_OVERRIDE \
     GALLIUM_DRIVER DRI_PRIME MESA_VK_DEVICE_SELECT VK_DRIVER_FILES VK_ICD_FILENAMES \
@@ -90,7 +91,8 @@ section "Installed graphics packages"
 if command -v dpkg-query >/dev/null 2>&1; then
     dpkg-query -W -f='${binary:Package}\t${Version}\t${db:Status-Abbrev}\n' \
         libegl1 libegl-mesa0 libgl1-mesa-dri libglx-mesa0 mesa-vulkan-drivers \
-        mesa-utils mesa-utils-extra 'libmali*' 2>&1 || true
+        mesa-utils mesa-utils-extra 'libmali*' libsdl2-2.0-0 \
+        libdecor-0-0 libdecor-0-plugin-1-gtk libdecor-0-plugin-1-cairo 2>&1 || true
 fi
 
 section "City build configuration"
@@ -111,7 +113,7 @@ EGL_LOG_LEVEL=debug LIBGL_DEBUG=verbose probe eglinfo -B
 
 section "OpenGL ES / EGL on X11"
 # Also useful with older eglinfo versions that list configurations without
-# printing a renderer for each client API. The city uses an X11 window.
+# printing a renderer for each client API. This probe uses an X11 window.
 EGL_LOG_LEVEL=debug LIBGL_DEBUG=verbose probe es2_info
 
 section "Vulkan"
@@ -133,6 +135,11 @@ selecting native Wayland in a Wayland desktop unless SDL_VIDEODRIVER is set.
 If Wayland uses Mali/Panfrost but X11 uses llvmpipe with DRI3 errors, run:
   SDL_VIDEODRIVER=wayland bash ./run_city_sample.sh --gl --no-msaa
 Verify "Window system: Wayland" and the hardware GPU name in Frontier debug.
+
+Wayland title bars and resize borders may need SDL's libdecor runtime and plugin:
+  sudo apt-get install libdecor-0-0 libdecor-0-plugin-1-gtk
+The city also supports Alt + left drag to move and Alt + Shift + left drag to
+resize, even when no decoration provider is available.
 
 Its default bgfx build does not enable OpenGL ES; a runtime --gles flag alone
 cannot enable a renderer that was not compiled in.

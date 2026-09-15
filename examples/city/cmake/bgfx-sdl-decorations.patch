@@ -1,0 +1,76 @@
+diff --git a/examples/common/entry/entry_sdl.cpp b/examples/common/entry/entry_sdl.cpp
+--- a/examples/common/entry/entry_sdl.cpp
++++ b/examples/common/entry/entry_sdl.cpp
+@@ -35,6 +35,30 @@
+ 
+ namespace entry
+ {
++#	if BX_PLATFORM_LINUX
++	// These gestures work even if the desktop has no decoration provider.
++	// SDL forwards the hit test to xdg_toplevel_move/resize on the event thread.
++	static SDL_HitTestResult SDLCALL sdlWaylandHitTest(SDL_Window* _window, const SDL_Point* _point, void*)
++	{
++		const Uint32 flags = SDL_GetWindowFlags(_window);
++		const SDL_Keymod modifiers = SDL_GetModState();
++		if (0 != (flags & SDL_WINDOW_FULLSCREEN) || 0 == (modifiers & KMOD_ALT))
++		{
++			return SDL_HITTEST_NORMAL;
++		}
++		if (0 != (modifiers & KMOD_SHIFT) && 0 != (flags & SDL_WINDOW_RESIZABLE))
++		{
++			int width, height;
++			SDL_GetWindowSize(_window, &width, &height);
++			const bool left = _point->x < width / 2;
++			const bool top = _point->y < height / 2;
++			return top
++				? (left ? SDL_HITTEST_RESIZE_TOPLEFT : SDL_HITTEST_RESIZE_TOPRIGHT)
++				: (left ? SDL_HITTEST_RESIZE_BOTTOMLEFT : SDL_HITTEST_RESIZE_BOTTOMRIGHT);
++		}
++		return SDL_HITTEST_DRAGGABLE;
++	}
++#	endif // BX_PLATFORM_LINUX
+ 	///
+ 	static void* sdlNativeWindowHandle(SDL_Window* _window)
+ 	{
+@@ -400,6 +424,11 @@
+ 
+ 		int run(int _argc, char** _argv)
+ 		{
++#	if BX_PLATFORM_LINUX
++			// Request client-side title/resize controls; explicit SDL hints still win.
++			SDL_SetHint(SDL_HINT_VIDEO_WAYLAND_PREFER_LIBDECOR, "1");
++#	endif // BX_PLATFORM_LINUX
++
+ 			m_mte.m_argc = _argc;
+ 			m_mte.m_argv = _argv;
+ 
+@@ -446,6 +475,29 @@
+ 
+ 			s_userEventStart = SDL_RegisterEvents(7);
+ 
++#	if BX_PLATFORM_LINUX
++			if (0 == SDL_strcmp(SDL_GetCurrentVideoDriver(), "wayland"))
++			{
++				if (0 != SDL_SetWindowHitTest(m_window[0], sdlWaylandHitTest, NULL))
++				{
++					SDL_Log("Frontier: Wayland move/resize hit test failed: %s", SDL_GetError());
++				}
++				else
++				{
++					SDL_Log("Frontier: Alt + left drag moves the window; Alt + Shift + left drag resizes it.");
++				}
++				void* decor = SDL_LoadObject("libdecor-0.so.0");
++				if (NULL == decor)
++				{
++					SDL_Log("Frontier: Wayland title bar needs libdecor. On Armbian/Ubuntu: sudo apt-get install libdecor-0-0 libdecor-0-plugin-1-gtk");
++				}
++				else
++				{
++					SDL_UnloadObject(decor);
++				}
++			}
++#	endif // BX_PLATFORM_LINUX
++
+ 			bgfx::renderFrame();
+ 
+ 			m_thread.init(MainThreadEntry::threadFunc, &m_mte);

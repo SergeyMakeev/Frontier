@@ -123,7 +123,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential cmake ninja-build git \
-            libx11-dev libgl1-mesa-dev libwayland-dev libsdl2-dev
+            libx11-dev libgl1-mesa-dev libwayland-dev libsdl2-dev \
+            libdecor-0-0 libdecor-0-plugin-1-gtk
 
       - name: Configure city sample
         run: >-

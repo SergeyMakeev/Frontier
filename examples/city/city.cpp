@@ -1318,7 +1318,13 @@ private:
         ImGui::Text("Backend: %s",
                     bgfx::getRendererName(bgfx::getRendererType()));
         if (!windowSystem_.empty())
+        {
             ImGui::Text("Window system: %s", windowSystem_.c_str());
+            if (windowSystem_ == "Wayland" && ImGui::IsItemHovered())
+                ImGui::SetTooltip("Alt + left drag: move window\n"
+                                  "Alt + Shift + left drag: resize window\n"
+                                  "Title bar: install libdecor and its decoration plugin.");
+        }
         ImGui::TextWrapped("CPU: %s", cpuModel_.c_str());
         ImGui::TextWrapped("GPU: %s", gpuModel_.c_str());
         if (ImGui::IsItemHovered() && !gpuDriver_.empty())

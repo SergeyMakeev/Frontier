@@ -63,7 +63,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
             "  ${FRONTIER_CITY_MISSING_TEXT}\n"
             "On Armbian, Debian, or Ubuntu, install them with:\n"
             "  sudo apt-get update\n"
-            "  sudo apt-get install libx11-dev libgl1-mesa-dev libwayland-dev libsdl2-dev\n"
+            "  sudo apt-get install libx11-dev libgl1-mesa-dev libwayland-dev libsdl2-dev libdecor-0-0 libdecor-0-plugin-1-gtk\n"
             "Then rerun ./run_city_sample.sh (or your CMake configure command).\n"
             "See examples/city/README.md for Linux setup instructions.")
     endif()
